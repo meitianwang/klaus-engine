@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{}\\n{}\", roundtrip(&plain), roundtrip(&escaped))"
+---
+"file:///workspace/src/lib.rs"
+"file:///workspace/a%20b/%E6%B5%8B%E8%AF%95.txt"

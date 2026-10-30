@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{scheme_error}\\n{shape_error}\")"
+---
+runtime codec path must be a file URI at <root>
+runtime codec ExpectedString at <root>

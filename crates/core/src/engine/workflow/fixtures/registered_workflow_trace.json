@@ -1,0 +1,73 @@
+{
+  "scenario": "registered-nested",
+  "meta": {
+    "name": "registered-parent",
+    "phases": [
+      "Parent",
+      "Child",
+      "Done"
+    ]
+  },
+  "runs": [
+    {
+      "name": "fresh",
+      "statuses": [
+        "phase: Parent",
+        "agent ▸ parent",
+        "before child",
+        "phase: Child",
+        "agent ▸ child",
+        "phase: Done"
+      ],
+      "agentCalls": [
+        {
+          "idx": 0,
+          "kind": "registered:parent",
+          "prompt": "registered:parent:root topic",
+          "options": {
+            "agentType": null,
+            "model": null,
+            "isolation": null,
+            "outputSchema": null
+          }
+        },
+        {
+          "idx": 1,
+          "kind": "registered:child",
+          "prompt": "registered:child:parent answer",
+          "options": {
+            "agentType": null,
+            "model": "child-model",
+            "isolation": null,
+            "outputSchema": null
+          }
+        }
+      ],
+      "result": {
+        "parent": "parent answer",
+        "child": {
+          "topic": "parent answer",
+          "child": "child answer"
+        }
+      },
+      "agentsSpawned": 2,
+      "outputTokensSpent": 26,
+      "journal": [
+        {
+          "runId": "wf_registered_nested_trace",
+          "idx": 0,
+          "hash": "03383d9be4cb00b9",
+          "result": "parent answer",
+          "outputTokens": 12
+        },
+        {
+          "runId": "wf_registered_nested_trace",
+          "idx": 1,
+          "hash": "d87a43d4b2d990cf",
+          "result": "child answer",
+          "outputTokens": 14
+        }
+      ]
+    }
+  ]
+}

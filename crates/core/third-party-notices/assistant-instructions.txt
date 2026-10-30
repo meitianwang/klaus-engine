@@ -1,0 +1,24 @@
+Assistant instruction and policy text
+=====================================
+
+The following files contain modified assistant instructions, goal-tool policy,
+or instruction contract text licensed under the Apache License, Version 2.0:
+
+- src/planning/prompts/default.md
+- src/planning/prompts/plan.md
+- src/goal/steering.rs
+- src/goal/tools.rs
+- src/goal/templates/continuation.md
+- src/goal/templates/budget_limit.md
+- src/goal/templates/objective_updated.md
+
+Original work: OpenAI Codex
+Copyright 2025 OpenAI
+
+Modifications to these files integrate collaboration modes, tool availability,
+planning artifact handling, and persistent goal execution with Klaus.
+The conditional progress guidance is included in
+src/goal/templates/continuation.md.
+
+A copy of the Apache License, Version 2.0 is provided in Apache-2.0.txt in this
+directory.

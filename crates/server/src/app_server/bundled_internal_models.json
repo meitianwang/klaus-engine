@@ -1,0 +1,104 @@
+[
+  {
+    "id": "gpt-daybreak-blue-latest",
+    "name": "Daybreak Blue",
+    "visibility": "hide",
+    "supportedInApi": true,
+    "description": "Latest frontier agentic coding model for broad defensive cybersecurity work.",
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "modelSpecialty": "cyber",
+    "supportsImageDetailOriginal": true,
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultReasoningEffort": "low",
+    "defaultReasoning": "low",
+    "modelMessages": {
+      "guardian_v2": null
+    }
+  },
+  {
+    "id": "gpt-daybreak-red-latest",
+    "name": "Daybreak Red",
+    "visibility": "hide",
+    "supportedInApi": true,
+    "description": "Cyber-permissive variant of our latest frontier agentic coding model for advanced, authorized cybersecurity research.",
+    "contextWindow": 372000,
+    "maxContextWindow": 372000,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "modelSpecialty": "cyber",
+    "supportsImageDetailOriginal": true,
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultReasoningEffort": "medium",
+    "defaultReasoning": "medium",
+    "modelMessages": {
+      "guardian_v2": null
+    }
+  },
+  {
+    "id": "gpt-5.5",
+    "name": "GPT-5.5",
+    "visibility": "list",
+    "supportedInApi": true,
+    "description": "Legacy coding model.",
+    "contextWindow": 272000,
+    "maxContextWindow": 272000,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "2911",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportsImageDetailOriginal": true,
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "defaultReasoningEffort": "medium",
+    "defaultReasoning": "medium",
+    "modelMessages": {
+      "guardian_v2": null
+    }
+  }
+]

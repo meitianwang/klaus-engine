@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{invalid_isolation}\\n{unknown_field}\")"
+---
+runtime codec invalid isolation: container at /isolation
+runtime codec UnknownField at /extra

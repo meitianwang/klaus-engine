@@ -1,0 +1,48 @@
+# Test execution policy.
+#
+# `cargo test` runs one test binary at a time: this workspace used to have 65 of
+# them, so the tail of every binary was dead time for the whole run. Nextest puts
+# every test from every binary into one global pool, so a slow suite overlaps
+# with the rest of the workspace instead of blocking it.
+#
+# Run it with `cargo nextest run`; the local profile is the same policy the
+# default profile applies, so a developer sees what the gate sees.
+
+[profile.default]
+# Per-test wall-clock budget. A test is marked SLOW at 30 seconds and killed at
+# 60, which makes "this test is slow" a failure instead of something nobody
+# notices: before this existed one test binary took 1385 seconds and no signal
+# ever said so. Tests that legitimately need longer must be registered below.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# One retry absorbs a single transient failure. Without it, any flake fails a
+# whole run and the run gets re-run by hand, which costs more than the retry.
+retries = 1
+
+[profile.local]
+inherits = "default"
+
+# Per-test durations in a machine-readable file. Without it the only record of
+# "what is slow" is whatever scrolled past in a terminal, which is how a 1385
+# second binary stayed invisible. Written to
+# `target/nextest/<profile>/junit.xml`.
+[profile.default.junit]
+path = "junit.xml"
+
+[[profile.default.overrides]]
+# The provider-behavior contract verifier replays complete scripted suites, so it
+# is over budget. It lives inside the aggregate `all_testing` target, so the
+# filter names its module rather than a binary. Measured: 4 cases exceed 60 s,
+# the slowest 79 s (`scripted_provider_full_emits_contract_complete_traces`).
+# Do not add new tests here.
+filter = 'package(klaus-agent-core) & binary(all_testing) & test(/^provider_behavior_trace::/)'
+slow-timeout = { period = "1m", terminate-after = 5 }
+
+[[profile.default.overrides]]
+# The provider-behavior unit tests each need the whole 103 row canonical contract
+# map. It is derived once per binary and cached beside the executable, but the
+# process that derives it pays around 35 seconds, and on a cold cache one of
+# these tests is that process while the others wait on its claim. Measured: 21
+# such tests finished in 44 s from a cold cache, the slowest single one at 30 s.
+# Do not add new tests here.
+filter = 'package(klaus-agent-core) & binary_id(klaus-agent-core) & test(/^testing::provider_behavior::/)'
+slow-timeout = { period = "1m", terminate-after = 3 }

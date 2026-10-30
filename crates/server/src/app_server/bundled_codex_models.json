@@ -1,0 +1,271 @@
+[
+  {
+    "id": "gpt-6.1-sol",
+    "name": "GPT-6.1-Sol",
+    "description": "Latest workhorse model for coding and everyday work.",
+    "defaultReasoning": "low",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "contextWindow": 800000,
+    "maxContextWindow": 872000,
+    "priority": 1.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": true,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "defaultReasoningEffort": "low",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-6-astra",
+    "name": "GPT-6-Astra",
+    "description": "Frontier intelligence for the most demanding work.",
+    "defaultReasoning": "medium",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 2.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": true,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "defaultReasoningEffort": "low",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-6-sol",
+    "name": "GPT-6-Sol",
+    "description": "Previous generation workhorse model.",
+    "defaultReasoning": "medium",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 3.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": true,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "defaultReasoningEffort": "medium",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-6-luna",
+    "name": "GPT-6-Luna",
+    "description": "Fast and affordable model for easier tasks.",
+    "defaultReasoning": "medium",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 4.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultReasoningEffort": "medium",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-5.6-sol",
+    "name": "GPT-5.6-Sol",
+    "description": "Older generation workhorse model.",
+    "defaultReasoning": "low",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 5.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "defaultReasoningEffort": "low",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-5.6-terra",
+    "name": "GPT-5.6-Terra",
+    "description": "Older balanced model for straightforward work.",
+    "defaultReasoning": "medium",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 8.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra"
+    ],
+    "defaultReasoningEffort": "medium",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "gpt-5.6-luna",
+    "name": "GPT-5.6-Luna",
+    "description": "Older fast and efficient model.",
+    "defaultReasoning": "medium",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "priority": 9.0,
+    "outputVerbosity": "low",
+    "supportedInApi": true,
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultReasoningEffort": "medium",
+    "supportsImageDetailOriginal": true
+  },
+  {
+    "id": "codex-auto-review",
+    "name": "Codex Auto Review",
+    "visibility": "hide",
+    "description": "Automatic approval review model for Codex.",
+    "defaultReasoning": "medium",
+    "contextWindow": 272000,
+    "maxContextWindow": 872000,
+    "outputVerbosity": "low",
+    "requiresSandboxedReview": false,
+    "nodeReplAutoReviewRequired": false,
+    "modelMessages": {
+      "guardian_v2": null
+    },
+    "compHash": "3000",
+    "supportsReasoningSummaryParameter": true,
+    "defaultReasoningSummary": "none",
+    "supportedReasoningLevels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "supportedInApi": true,
+    "supportedReasoningEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultReasoningEffort": "medium",
+    "supportsImageDetailOriginal": true
+  }
+]

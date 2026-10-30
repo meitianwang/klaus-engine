@@ -1,0 +1,25 @@
+{
+  "reason": "Conversation choices exclude dedicated generation, transcription, editor-task and internal models after any catalog read. Input modalities and account availability do not determine conversation purpose.",
+  "cases": [
+    { "source": "qoder", "dedicated": ["gpt-image-2"] },
+    { "source": "qwenwork", "dedicated": ["open-image-2", "banana-image-2", "seedance-2.0", "happy-horse-1.0", "minimax-music-2.5"] },
+    { "source": "qoderwork", "dedicated": ["gpt-image-2", "safety"] },
+    { "source": "workbuddy", "dedicated": ["gpt-image-2.5-sunburst", "seedance-2.5", "kling-v3-t2v", "codewise-completions", "codewise-rewrite", "codewise-nes-a4-027-aide", "codewise-jump", "deepseek-v3-0324-taco-completion"] },
+    { "source": "kimi", "dedicated": [] },
+    { "source": "bailian", "dedicated": ["wan3.0-video", "wan2.7-image", "wan9.1-video", "qwen-image-3.0-pro", "qwen-audio-3.0-asr-flash", "qwen-audio-3.0-tts-plus", "qwen-audio-3.0-realtime-plus", "decision-model-preview"] },
+    { "source": "minimax", "dedicated": ["image-01", "MiniMax-H3", "MiniMax-H3-Max", "speech-2.8-hd"] },
+    { "source": "zhipu", "dedicated": ["glm-tts"] },
+    { "source": "ark", "dedicated": ["doubao-seedance-2-0"] }
+  ],
+  "conversationRows": [
+    { "key": "vision-chat", "supportsImages": true, "supports_video_in": true, "available": false, "disabled": true },
+    { "key": "unmeasured-future-model" },
+    { "key": "completion-gf", "supportsToolCall": true }
+  ],
+  "dedicatedRows": [
+    { "key": "private-model", "visibility": "hide" },
+    { "key": "internal-model", "isInternalOnly": true },
+    { "key": "editor-model", "purpose": "completion" },
+    { "key": "image-output-model", "outputModalities": ["image"] }
+  ]
+}

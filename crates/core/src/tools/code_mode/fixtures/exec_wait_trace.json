@@ -1,0 +1,402 @@
+{
+  "scenario": "exec-wait-code-mode",
+  "metadata": {
+    "toolNames": [
+      "exec",
+      "wait"
+    ],
+    "exec": {
+      "name": "exec",
+      "description": "Execute JavaScript in code-mode. Pass raw JavaScript source.\n\nEvery other tool is available as an async function on the global `tools` object, e.g.\n`const r = await tools.read({ path: \"a.ts\" })`. Each call runs through the same permission,\nhook, and sandbox checks as a normal tool call. A tool returns a parsed object when its output\nis JSON, otherwise a string; a failing tool rejects (use try/catch).\n\nA tool with images returns {content, structuredContent}. Forward its media in order: for (const block of r.content) { if (block.type === 'text') text(block.text); else if (block.type === 'image') image(block); }. Saved paths remain model-visible text.\n\nGlobal helpers:\n- `text(value)`: append visible text output.\n- `image(value)`: append a data-URI or MCP image block output.\n- `store(key, value)` / `load(key)`: persist a JSON value across exec cells in this session.\n- `notify(value)`: surface a live status message while the program runs.\n- `yield_control()`: yield the current cell response and keep running in the background.\n- `exit()`: end the program successfully right now.\n- `setTimeout()` / `clearTimeout()`: schedule asynchronous JavaScript work.\n- `ALL_TOOLS`: array of `{ name, description }` for the available nested tools.\n\nEnvironment: plain JavaScript only; no Node, no require, no file system, no network, no console.",
+      "inputKind": {
+        "type": "freeform",
+        "format": "javascript"
+      },
+      "inputSchema": null,
+      "searchHint": null,
+      "exposure": "direct",
+      "maxResultSizeChars": null,
+      "mcpServer": null,
+      "isReadOnly": false,
+      "isConcurrencySafe": false,
+      "isDestructive": false,
+      "summarize": "executing JavaScript in code-mode"
+    },
+    "wait": {
+      "name": "wait",
+      "description": "Wait for additional output from a live exec cell, or terminate it. Input uses `cell_id`, with optional `yield_time_ms`, `max_output_tokens`, and `terminate`.",
+      "inputKind": {
+        "type": "json_schema"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cell_id": {
+            "type": "string",
+            "description": "The cell id returned by exec."
+          },
+          "yield_time_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How long to wait for new output before yielding again."
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Limit this observation's returned output without discarding the remainder."
+          },
+          "terminate": {
+            "type": "boolean",
+            "description": "Terminate the live cell instead of waiting for more output."
+          }
+        },
+        "required": [
+          "cell_id"
+        ],
+        "additionalProperties": false
+      },
+      "searchHint": null,
+      "exposure": "direct",
+      "maxResultSizeChars": null,
+      "mcpServer": null,
+      "isReadOnly": false,
+      "isConcurrencySafe": false,
+      "isDestructive": false,
+      "summarize": "waiting for exec cell"
+    },
+    "waitTerminate": {
+      "name": "wait",
+      "description": "Wait for additional output from a live exec cell, or terminate it. Input uses `cell_id`, with optional `yield_time_ms`, `max_output_tokens`, and `terminate`.",
+      "inputKind": {
+        "type": "json_schema"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cell_id": {
+            "type": "string",
+            "description": "The cell id returned by exec."
+          },
+          "yield_time_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How long to wait for new output before yielding again."
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Limit this observation's returned output without discarding the remainder."
+          },
+          "terminate": {
+            "type": "boolean",
+            "description": "Terminate the live cell instead of waiting for more output."
+          }
+        },
+        "required": [
+          "cell_id"
+        ],
+        "additionalProperties": false
+      },
+      "searchHint": null,
+      "exposure": "direct",
+      "maxResultSizeChars": null,
+      "mcpServer": null,
+      "isReadOnly": false,
+      "isConcurrencySafe": false,
+      "isDestructive": true,
+      "summarize": "terminating exec cell"
+    }
+  },
+  "calls": {
+    "immediate": {
+      "output": {
+        "type": "result",
+        "cellId": "1",
+        "contentItems": [
+          {
+            "type": "input_text",
+            "text": "hi"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\"type\":\"result\",\"cellId\":\"1\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "nested": {
+      "output": {
+        "type": "result",
+        "cellId": "2",
+        "contentItems": [
+          {
+            "type": "input_text",
+            "text": "{\"tools\":[{\"name\":\"echo\",\"description\":\"echo JSON\"}],\"echo\":{\"input\":{\"value\":\"x\"},\"name\":\"echo\",\"ok\":true}}"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\"type\":\"result\",\"cellId\":\"2\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"{\\\"tools\\\":[{\\\"name\\\":\\\"echo\\\",\\\"description\\\":\\\"echo JSON\\\"}],\\\"echo\\\":{\\\"input\\\":{\\\"value\\\":\\\"x\\\"},\\\"name\\\":\\\"echo\\\",\\\"ok\\\":true}}\"}]}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "store": {
+      "output": {
+        "type": "result",
+        "cellId": "3",
+        "contentItems": [
+          {
+            "type": "input_text",
+            "text": "stored"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\"type\":\"result\",\"cellId\":\"3\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"stored\"}]}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "load": {
+      "output": {
+        "type": "result",
+        "cellId": "4",
+        "contentItems": [
+          {
+            "type": "input_text",
+            "text": "{\"value\":42}"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\"type\":\"result\",\"cellId\":\"4\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"{\\\"value\\\":42}\"}]}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "pending": {
+      "initial": {
+        "output": {
+          "type": "yielded",
+          "cellId": "5",
+          "contentItems": [
+            {
+              "type": "input_text",
+              "text": "before"
+            }
+          ]
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"yielded\",\"cellId\":\"5\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"before\"}]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      },
+      "wait": {
+        "output": {
+          "type": "result",
+          "cellId": "5",
+          "contentItems": [
+            {
+              "type": "input_text",
+              "text": "after"
+            }
+          ]
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"result\",\"cellId\":\"5\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"after\"}]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      },
+      "secondWait": {
+        "output": {
+          "type": "result",
+          "cellId": "5",
+          "contentItems": [],
+          "errorText": "exec cell 5 not found"
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"result\",\"cellId\":\"5\",\"contentItems\":[],\"errorText\":\"exec cell 5 not found\"}"
+          }
+        ],
+        "isError": true,
+        "mcpMeta": null
+      }
+    },
+    "truncated": {
+      "initial": {
+        "output": {
+          "type": "yielded",
+          "cellId": "6",
+          "contentItems": [
+            {
+              "type": "input_text",
+              "text": "abc"
+            },
+            {
+              "type": "input_text",
+              "text": "[exec output truncated; call wait for more]"
+            }
+          ]
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"yielded\",\"cellId\":\"6\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"abc\"},{\"type\":\"input_text\",\"text\":\"[exec output truncated; call wait for more]\"}]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      },
+      "wait": {
+        "output": {
+          "type": "result",
+          "cellId": "6",
+          "contentItems": [
+            {
+              "type": "input_text",
+              "text": "defgh"
+            }
+          ]
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"result\",\"cellId\":\"6\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"defgh\"}]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      }
+    },
+    "terminate": {
+      "initial": {
+        "output": {
+          "type": "yielded",
+          "cellId": "7",
+          "contentItems": [
+            {
+              "type": "input_text",
+              "text": "live"
+            }
+          ]
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"yielded\",\"cellId\":\"7\",\"contentItems\":[{\"type\":\"input_text\",\"text\":\"live\"}]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      },
+      "wait": {
+        "output": {
+          "type": "terminated",
+          "cellId": "7",
+          "contentItems": []
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"terminated\",\"cellId\":\"7\",\"contentItems\":[]}"
+          }
+        ],
+        "isError": false,
+        "mcpMeta": null
+      }
+    },
+    "errors": {
+      "badExecInput": {
+        "output": {
+          "ok": false
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "exec expects raw JavaScript source text (freeform input) or the provider fallback object `{ \"source\": \"...\" }`."
+          }
+        ],
+        "isError": true,
+        "mcpMeta": null
+      },
+      "badWaitInput": {
+        "output": {
+          "ok": false
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "wait requires a string `cell_id`."
+          }
+        ],
+        "isError": true,
+        "mcpMeta": null
+      },
+      "thrown": {
+        "output": {
+          "type": "result",
+          "cellId": "8",
+          "contentItems": [],
+          "errorText": "Error: boom"
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"result\",\"cellId\":\"8\",\"contentItems\":[],\"errorText\":\"Error: boom\"}"
+          }
+        ],
+        "isError": true,
+        "mcpMeta": null
+      },
+      "missing": {
+        "output": {
+          "type": "result",
+          "cellId": "missing",
+          "contentItems": [],
+          "errorText": "exec cell missing not found"
+        },
+        "modelContent": [
+          {
+            "type": "text",
+            "text": "{\"type\":\"result\",\"cellId\":\"missing\",\"contentItems\":[],\"errorText\":\"exec cell missing not found\"}"
+          }
+        ],
+        "isError": true,
+        "mcpMeta": null
+      }
+    }
+  },
+  "nestedCalls": [
+    {
+      "name": "echo",
+      "input": {
+        "value": "x"
+      }
+    }
+  ],
+  "events": []
+}

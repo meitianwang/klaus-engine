@@ -1,0 +1,232 @@
+{
+  "scenario": "query-loop-scripted-provider",
+  "eventTypes": [
+    "thread.started",
+    "turn.started",
+    "stream.request_start",
+    "provider.decision",
+    "item.started",
+    "text.delta",
+    "item.started",
+    "item.completed",
+    "provider.decision",
+    "item.completed",
+    "stream.request_start",
+    "provider.decision",
+    "item.started",
+    "text.delta",
+    "item.completed",
+    "provider.decision",
+    "turn.completed"
+  ],
+  "events": [
+    {
+      "type": "thread.started",
+      "threadId": "thread-1"
+    },
+    {
+      "type": "turn.started",
+      "turnId": "turn-1"
+    },
+    {
+      "type": "stream.request_start"
+    },
+    {
+      "type": "provider.decision",
+      "event": {
+        "kind": "request_started",
+        "providerId": "test-provider",
+        "model": "fake-model",
+        "attempt": 1,
+        "debug": {}
+      }
+    },
+    {
+      "type": "item.started",
+      "item": {
+        "type": "agent_message",
+        "id": "id-0",
+        "text": ""
+      }
+    },
+    {
+      "type": "text.delta",
+      "text": "I will call echo.",
+      "messageId": "id-0"
+    },
+    {
+      "type": "item.started",
+      "item": {
+        "type": "tool_call",
+        "id": "tu_echo",
+        "toolName": "echo",
+        "arguments": {
+          "value": "alpha"
+        },
+        "status": "in_progress"
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "type": "agent_message",
+        "id": "id-0",
+        "text": "I will call echo."
+      }
+    },
+    {
+      "type": "provider.decision",
+      "event": {
+        "kind": "request_completed",
+        "providerId": "test-provider",
+        "model": "fake-model",
+        "attempt": 1,
+        "debug": {},
+        "usage": {
+          "inputTokens": 11,
+          "outputTokens": 2,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "totalTokens": 13,
+          "cacheHitRate": 0
+        }
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "type": "tool_call",
+        "id": "tu_echo",
+        "toolName": "echo",
+        "arguments": {
+          "value": "alpha"
+        },
+        "result": {
+          "echo": "alpha"
+        },
+        "status": "completed"
+      }
+    },
+    {
+      "type": "stream.request_start"
+    },
+    {
+      "type": "provider.decision",
+      "event": {
+        "kind": "request_started",
+        "providerId": "test-provider",
+        "model": "fake-model",
+        "attempt": 1,
+        "debug": {}
+      }
+    },
+    {
+      "type": "item.started",
+      "item": {
+        "type": "agent_message",
+        "id": "id-2",
+        "text": ""
+      }
+    },
+    {
+      "type": "text.delta",
+      "text": "Echo says alpha.",
+      "messageId": "id-2"
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "type": "agent_message",
+        "id": "id-2",
+        "text": "Echo says alpha."
+      }
+    },
+    {
+      "type": "provider.decision",
+      "event": {
+        "kind": "request_completed",
+        "providerId": "test-provider",
+        "model": "fake-model",
+        "attempt": 1,
+        "debug": {},
+        "usage": {
+          "inputTokens": 7,
+          "outputTokens": 4,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "totalTokens": 11,
+          "cacheHitRate": 0
+        }
+      }
+    },
+    {
+      "type": "turn.completed",
+      "turnId": "turn-1",
+      "usage": {
+        "inputTokens": 7,
+        "outputTokens": 4,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0
+      },
+      "stopReason": "completed"
+    }
+  ],
+  "persistedMessages": [
+    {
+      "type": "assistant",
+      "uuid": "id-0",
+      "content": [
+        {
+          "type": "text",
+          "text": "I will call echo.",
+          "messageId": "id-0"
+        },
+        {
+          "type": "tool_use",
+          "id": "tu_echo",
+          "name": "echo",
+          "input": {
+            "value": "alpha"
+          }
+        }
+      ],
+      "model": "fake-model",
+      "usage": {
+        "inputTokens": 11,
+        "outputTokens": 2,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0
+      }
+    },
+    {
+      "type": "tool_result",
+      "uuid": "id-1",
+      "toolUseId": "tu_echo",
+      "content": [
+        {
+          "type": "text",
+          "text": "echo-result: alpha"
+        }
+      ],
+      "isError": false
+    },
+    {
+      "type": "assistant",
+      "uuid": "id-2",
+      "content": [
+        {
+          "type": "text",
+          "text": "Echo says alpha.",
+          "messageId": "id-2"
+        }
+      ],
+      "model": "fake-model",
+      "usage": {
+        "inputTokens": 7,
+        "outputTokens": 4,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0
+      }
+    }
+  ]
+}

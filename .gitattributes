@@ -1,0 +1,5 @@
+crates/core/src/provider/apply_patch.lark text eol=lf
+crates/core/src/runtime_process/node20_path_case_data.rs text eol=lf
+crates/core/src/runtime_process/surface_bindings.rs text eol=lf
+crates/core/tests/fixtures/runtime/process-surface-contract.json text eol=lf
+crates/**/data/*.xz binary

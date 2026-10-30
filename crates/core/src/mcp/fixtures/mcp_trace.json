@@ -1,0 +1,443 @@
+{
+  "scenario": "mcp-resource-prompt-search-wrapper",
+  "metadata": [
+    {
+      "name": "list_mcp_resources",
+      "description": "List resources available from connected MCP servers.",
+      "searchHint": "enumerate resources exposed by connected MCP servers",
+      "exposure": "direct",
+      "maxResultSizeChars": 100000,
+      "mcpServer": null,
+      "isReadOnly": true,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": null
+    },
+    {
+      "name": "read_mcp_resource",
+      "description": "Read a specific resource from a connected MCP server by URI.",
+      "searchHint": "fetch one MCP resource by server and URI",
+      "exposure": "direct",
+      "maxResultSizeChars": 100000,
+      "mcpServer": null,
+      "isReadOnly": true,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": null
+    },
+    {
+      "name": "list_mcp_prompts",
+      "description": "List prompts available from connected MCP servers (name, description, arguments).",
+      "searchHint": "enumerate prompts exposed by connected MCP servers",
+      "exposure": "direct",
+      "maxResultSizeChars": 100000,
+      "mcpServer": null,
+      "isReadOnly": true,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": null
+    },
+    {
+      "name": "get_mcp_prompt",
+      "description": "Render a specific prompt from a connected MCP server, with optional arguments.",
+      "searchHint": "fetch and render one MCP prompt by server and name",
+      "exposure": "direct",
+      "maxResultSizeChars": 100000,
+      "mcpServer": null,
+      "isReadOnly": true,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": null
+    },
+    {
+      "name": "mcp_search",
+      "description": "Search the MCP server store for an installable server when a capability needed for the user's task is missing from the available tools, or when the user asks about server integrations. Returns matching servers (slug, name, description). Keep discovery relevant to the authorized task and avoid unrelated recommendations. If an exact result would materially help, explain why and use request_mcp_install; the user confirms installation, and search itself changes nothing.",
+      "searchHint": null,
+      "exposure": "direct",
+      "maxResultSizeChars": null,
+      "mcpServer": null,
+      "isReadOnly": true,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": "Searching MCP servers: github integration"
+    },
+    {
+      "name": "mcp__alpha__lookup",
+      "description": "Lookup facts.",
+      "searchHint": "lookup facts quickly",
+      "exposure": "deferred",
+      "maxResultSizeChars": null,
+      "mcpServer": "alpha",
+      "isReadOnly": false,
+      "isConcurrencySafe": true,
+      "isDestructive": false,
+      "summarize": null
+    }
+  ],
+  "resources": {
+    "listAll": {
+      "output": {
+        "resources": [
+          {
+            "uri": "res://note",
+            "name": "Note",
+            "mimeType": "text/plain",
+            "description": "A text note",
+            "server": "alpha"
+          },
+          {
+            "uri": "res://bin",
+            "name": "Binary",
+            "mimeType": "application/octet-stream",
+            "server": "alpha"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "[\n  {\n    \"uri\": \"res://note\",\n    \"name\": \"Note\",\n    \"mimeType\": \"text/plain\",\n    \"description\": \"A text note\",\n    \"server\": \"alpha\"\n  },\n  {\n    \"uri\": \"res://bin\",\n    \"name\": \"Binary\",\n    \"mimeType\": \"application/octet-stream\",\n    \"server\": \"alpha\"\n  }\n]"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "listFiltered": {
+      "output": {
+        "resources": [
+          {
+            "uri": "res://note",
+            "name": "Note",
+            "mimeType": "text/plain",
+            "description": "A text note",
+            "server": "alpha"
+          },
+          {
+            "uri": "res://bin",
+            "name": "Binary",
+            "mimeType": "application/octet-stream",
+            "server": "alpha"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "[\n  {\n    \"uri\": \"res://note\",\n    \"name\": \"Note\",\n    \"mimeType\": \"text/plain\",\n    \"description\": \"A text note\",\n    \"server\": \"alpha\"\n  },\n  {\n    \"uri\": \"res://bin\",\n    \"name\": \"Binary\",\n    \"mimeType\": \"application/octet-stream\",\n    \"server\": \"alpha\"\n  }\n]"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "listUnknown": {
+      "output": {
+        "resources": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Unknown MCP server \"missing\". Connected servers: alpha, beta"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    },
+    "readText": {
+      "output": {
+        "contents": [
+          {
+            "uri": "res://note",
+            "mimeType": "text/plain",
+            "text": "hello from alpha"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\n  \"contents\": [\n    {\n      \"uri\": \"res://note\",\n      \"mimeType\": \"text/plain\",\n      \"text\": \"hello from alpha\"\n    }\n  ]\n}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "readBlob": {
+      "output": {
+        "contents": [
+          {
+            "uri": "res://bin",
+            "mimeType": "application/octet-stream",
+            "blobSavedTo": "<MCP_BLOB>",
+            "text": "[binary resource from alpha at res://bin written to <MCP_BLOB>]"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "{\n  \"contents\": [\n    {\n      \"uri\": \"res://bin\",\n      \"mimeType\": \"application/octet-stream\",\n      \"blobSavedTo\": \"<MCP_BLOB>\",\n      \"text\": \"[binary resource from alpha at res://bin written to <MCP_BLOB>]\"\n    }\n  ]\n}"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "readUnknown": {
+      "output": {
+        "contents": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Unknown MCP server \"missing\". Connected servers: alpha, beta"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    }
+  },
+  "prompts": {
+    "listAll": {
+      "output": {
+        "prompts": [
+          {
+            "name": "brief",
+            "description": "Write a brief",
+            "arguments": [
+              {
+                "name": "topic",
+                "description": "Topic",
+                "required": true
+              }
+            ],
+            "server": "alpha"
+          }
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "[\n  {\n    \"name\": \"brief\",\n    \"description\": \"Write a brief\",\n    \"arguments\": [\n      {\n        \"name\": \"topic\",\n        \"description\": \"Topic\",\n        \"required\": true\n      }\n    ],\n    \"server\": \"alpha\"\n  }\n]"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "listNoPromptServer": {
+      "output": {
+        "prompts": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "The connected MCP server(s) expose no prompts (they may still expose tools and resources)."
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "listUnknown": {
+      "output": {
+        "prompts": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Unknown MCP server \"missing\". Connected servers: alpha, beta"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    },
+    "getRendered": {
+      "output": {
+        "prompt": "Prompt brief: rust"
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Prompt brief: rust"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "getEmpty": {
+      "output": {
+        "prompt": ""
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "(the prompt rendered to empty content)"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "getNoPromptServer": {
+      "output": {
+        "prompt": ""
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "MCP server \"beta\" does not expose prompts."
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    },
+    "getUnknown": {
+      "output": {
+        "prompt": ""
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Unknown MCP server \"missing\". Connected servers: alpha, beta"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    }
+  },
+  "search": {
+    "summarizeUtf16": "Searching MCP servers: A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀A😀",
+    "found": {
+      "output": {
+        "query": "github integration",
+        "count": 2,
+        "slugs": [
+          "github",
+          "linear"
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Found 2 MCP server(s) for \"github integration\". Add one with `mcp install <slug>` or the request_mcp_install tool:\n\n- github — GitHub (OFFICIAL)\n  Work with repositories and pull requests\n- linear — Linear (COMMUNITY)\n  Track issues from Linear"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "filtered": {
+      "output": {
+        "query": "github integration",
+        "count": 1,
+        "slugs": [
+          "github"
+        ]
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "Found 1 MCP server(s) for \"github integration\". Add one with `mcp install <slug>` or the request_mcp_install tool:\n\n- github — GitHub (OFFICIAL)\n  Work with repositories and pull requests"
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "none": {
+      "output": {
+        "query": "none",
+        "count": 0,
+        "slugs": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "No MCP servers found for \"none\"."
+        }
+      ],
+      "isError": false,
+      "mcpMeta": null
+    },
+    "error": {
+      "output": {
+        "query": "boom",
+        "count": 0,
+        "slugs": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "MCP store error: catalog unavailable"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    },
+    "noBackend": {
+      "output": {
+        "query": "github",
+        "count": 0,
+        "slugs": []
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "No MCP server store is configured in this build."
+        }
+      ],
+      "isError": true,
+      "mcpMeta": null
+    }
+  },
+  "wrappedTool": {
+    "progressEvents": [
+      {
+        "type": "status",
+        "message": "calling lookup:emoji"
+      }
+    ],
+    "result": {
+      "output": {
+        "content": [
+          {
+            "type": "text",
+            "text": "A😀BC"
+          },
+          {
+            "type": "image",
+            "data": "SU1H",
+            "mimeType": "image/png"
+          }
+        ],
+        "isError": true,
+        "_meta": {
+          "trace": "meta"
+        },
+        "structuredContent": {
+          "score": 7,
+          "ok": true
+        }
+      },
+      "modelContent": [
+        {
+          "type": "text",
+          "text": "A😀"
+        },
+        {
+          "type": "image",
+          "mimeType": "image/png",
+          "base64": "SU1H"
+        },
+        {
+          "type": "text",
+          "text": "\n[mcp: result truncated to 44 characters]"
+        }
+      ],
+      "isError": true,
+      "mcpMeta": {
+        "_meta": {
+          "trace": "meta"
+        },
+        "structuredContent": {
+          "score": 7,
+          "ok": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
+
+Modifications for Klaus:
+- Adapt filesystem policy and operating-system arguments to the engine runtime.
+- Embed the namespace launcher in the executable.
+- Integrate owned process supervision and the existing explicit proxy transport.

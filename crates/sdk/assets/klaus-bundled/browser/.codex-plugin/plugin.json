@@ -1,0 +1,43 @@
+{
+  "name": "browser",
+  "version": "0.2.0",
+  "displayName": "Browser",
+  "description": "Klaus bundled browser runtime with a Rust-owned pinned Playwright broker and authenticated Chrome extension bridge.",
+  "keywords": [
+    "browser",
+    "automation",
+    "playwright",
+    "cdp",
+    "chrome",
+    "extension",
+    "native-host",
+    "native-socket",
+    "local-bridge",
+    "chrome-diagnostics",
+    "file-upload",
+    "gif-recording",
+    "shortcuts",
+    "browser-selection",
+    "history",
+    "clipboard",
+    "content-export",
+    "download",
+    "dialogs",
+    "tabs",
+    "computer-use",
+    "browser-client",
+    "klaus-bundled"
+  ],
+  "runtimeCapabilities": [
+    "browser"
+  ],
+  "interface": {
+    "displayName": "Browser",
+    "shortDescription": "Control a host-managed browser runtime.",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ]
+  }
+}

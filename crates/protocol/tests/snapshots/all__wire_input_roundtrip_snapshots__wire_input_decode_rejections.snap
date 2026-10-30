@@ -1,0 +1,6 @@
+---
+source: crates/protocol/tests/wire_input_roundtrip_snapshots.rs
+expression: "format!(\"{bad_part}\\n{bad_shape}\")"
+---
+runtime codec UnknownEnumVariant at /op/input/0/type
+runtime codec NoMatchingUntaggedVariant at /op/input

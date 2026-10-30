@@ -1,0 +1,4 @@
+SPDX-FileCopyrightText: 2025 OpenAI
+SPDX-License-Identifier: Apache-2.0
+
+Policy contract vectors contain goal-instruction clauses modified for persistent-thread controls and conditional progress guidance.

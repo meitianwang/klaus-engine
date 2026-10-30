@@ -1,0 +1,9 @@
+/target
+.parity/
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+.claude/
+
+# Local Node-interop oracle deps for the cross-language lockfile tests.
+node_modules/

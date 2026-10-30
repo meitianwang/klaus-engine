@@ -1,0 +1,74 @@
+{
+  "scenario": "disk-discovery-save",
+  "dirs": [
+    "$ROOT/proj/pkg/.klaus/workflows",
+    "$ROOT/proj/.klaus/workflows",
+    "$ROOT/home/workflows"
+  ],
+  "loadedInner": [
+    {
+      "name": "only-inner",
+      "description": "from inner"
+    },
+    {
+      "name": "project-flow",
+      "description": "saved project"
+    },
+    {
+      "name": "shared",
+      "description": "from inner"
+    }
+  ],
+  "discovered": [
+    {
+      "name": "my-cool-flow",
+      "description": "saved user v2"
+    },
+    {
+      "name": "only-inner",
+      "description": "from inner"
+    },
+    {
+      "name": "only-outer",
+      "description": "from outer"
+    },
+    {
+      "name": "only-user",
+      "description": "from user"
+    },
+    {
+      "name": "project-flow",
+      "description": "saved project"
+    },
+    {
+      "name": "shared",
+      "description": "from inner"
+    }
+  ],
+  "slugCases": [
+    [
+      "Deep Research!",
+      "deep-research"
+    ],
+    [
+      "  ",
+      "workflow"
+    ],
+    [
+      "a__b--c",
+      "a-b-c"
+    ],
+    [
+      "@@@",
+      "workflow"
+    ]
+  ],
+  "save": {
+    "userPath": "$ROOT/home/workflows/my-cool-flow.js",
+    "userContent": "export const meta = { name: 'my-cool-flow', description: 'saved user v2' }\nreturn null",
+    "duplicateError": "workflow \"My Cool Flow!\" already exists at $ROOT/home/workflows/my-cool-flow.js — use a different name or overwrite",
+    "projectExistingPath": "$ROOT/proj/pkg/.klaus/workflows/project-flow.js",
+    "projectFallbackPath": "$ROOT/repo-no-workflows/.klaus/workflows/fallback-flow.js",
+    "invalidSaveError": "workflow script must begin with `export const meta = { ... }`"
+  }
+}

@@ -1,0 +1,358 @@
+{
+  "schemaVersion": 1,
+  "baselineRevision": "437d9d5fe669360becf7c1e08d4464af2c174ab0",
+  "decisionCommit": "10519175a0467629541698f2ac7d7959a6614098",
+  "sourceContractSha256": "90709e509c066ffd3f36cd677836883b29216cecd22ae108f7fec9564b227279",
+  "replacementFixture": {
+    "path": "crates/core/src/tools/code_mode/fixtures/exec_wait_trace.json",
+    "sha256": "6c2b491ff043273854484343cec52dc249d1ff1c859c6e0b7661a7d29d5df7c7"
+  },
+  "adaptations": [
+    {
+      "sourceTask": "code-mode",
+      "sourceTaskSha256": "30f7cb371442c109fc0dfb789eb95a44fe0f332c7e5db41eeb62ca9fee5c9ce8",
+      "replacement": {
+        "description": "Use exec to read three files and write a combined one",
+        "prompt": "Using exec, read a.txt, b.txt and c.txt and write their contents into combined.txt.",
+        "behaviorToolCounts": {
+          "exec": 1
+        },
+        "profiles": {
+          "anthropic": {
+            "scriptedTurns": [
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Orchestrating with exec."
+                },
+                {
+                  "type": "tool_use_start",
+                  "id": "c1",
+                  "name": "exec",
+                  "toolKind": "custom",
+                  "inputFormat": "raw"
+                },
+                {
+                  "type": "tool_use_input_delta",
+                  "id": "c1",
+                  "partialJson": "const parts = []\nfor (const n of ['a.txt', 'b.txt', 'c.txt']) { parts.push(await tools.read({ path: n })) }\nawait tools.write({ path: 'combined.txt', content: parts.join(' ') })\ntext('wrote combined.txt')"
+                },
+                {
+                  "type": "tool_use_stop",
+                  "id": "c1"
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "tool_use",
+                  "usage": {
+                    "inputTokens": 600,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 600
+                  }
+                }
+              ],
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Wrote combined.txt."
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "end_turn",
+                  "usage": {
+                    "inputTokens": 120,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 600,
+                    "cacheCreationInputTokens": 0
+                  }
+                }
+              ]
+            ]
+          },
+          "openai": {
+            "scriptedTurns": [
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Orchestrating with exec."
+                },
+                {
+                  "type": "tool_use_start",
+                  "id": "c1",
+                  "name": "exec",
+                  "toolKind": "custom",
+                  "inputFormat": "raw"
+                },
+                {
+                  "type": "tool_use_input_delta",
+                  "id": "c1",
+                  "partialJson": "const parts = []\nfor (const n of ['a.txt', 'b.txt', 'c.txt']) { parts.push(await tools.read({ path: n })) }\nawait tools.write({ path: 'combined.txt', content: parts.join(' ') })\ntext('wrote combined.txt')"
+                },
+                {
+                  "type": "tool_use_stop",
+                  "id": "c1"
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "tool_use",
+                  "usage": {
+                    "inputTokens": 600,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 600
+                  }
+                }
+              ],
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Wrote combined.txt."
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "end_turn",
+                  "usage": {
+                    "inputTokens": 120,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 600,
+                    "cacheCreationInputTokens": 0
+                  }
+                }
+              ]
+            ]
+          },
+          "generic": {
+            "scriptedTurns": [
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Orchestrating with exec."
+                },
+                {
+                  "type": "tool_use_start",
+                  "id": "c1",
+                  "name": "exec",
+                  "toolKind": "custom",
+                  "inputFormat": "raw"
+                },
+                {
+                  "type": "tool_use_input_delta",
+                  "id": "c1",
+                  "partialJson": "const parts = []\nfor (const n of ['a.txt', 'b.txt', 'c.txt']) { parts.push(await tools.read({ path: n })) }\nawait tools.write({ path: 'combined.txt', content: parts.join(' ') })\ntext('wrote combined.txt')"
+                },
+                {
+                  "type": "tool_use_stop",
+                  "id": "c1"
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "tool_use",
+                  "usage": {
+                    "inputTokens": 600,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 600
+                  }
+                }
+              ],
+              [
+                {
+                  "type": "message_start",
+                  "model": "fake-model"
+                },
+                {
+                  "type": "text_delta",
+                  "text": "Wrote combined.txt."
+                },
+                {
+                  "type": "message_stop",
+                  "stopReason": "end_turn",
+                  "usage": {
+                    "inputTokens": 120,
+                    "outputTokens": 120,
+                    "cacheReadInputTokens": 600,
+                    "cacheCreationInputTokens": 0
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "requestToolIncludes": [
+          "exec",
+          "wait"
+        ],
+        "requestToolExcludes": [
+          "code_exec"
+        ]
+      }
+    }
+  ],
+  "scriptedRequestMatchers": [
+    {
+      "sourceTask": "provider-parallel-subagents",
+      "sourceTaskSha256": "e615bf6fd951e7edfb6b2d2aee63c3592d28c10605e4b9feb0877d40ef3e8e45",
+      "profiles": {
+        "anthropic": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Read alpha.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Read beta.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          }
+        ],
+        "openai": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Read alpha.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Read beta.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          }
+        ],
+        "generic": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Read alpha.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Read beta.txt and report its keyword."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Use sub-agents in parallel to inspect alpha.txt and beta.txt independently, then report both keywords."
+          }
+        ]
+      }
+    },
+    {
+      "sourceTask": "provider-regression-subagents",
+      "sourceTaskSha256": "e469c487c815909fc20ba78db34341963fa9f389a2203a86497d4241fe8fe135",
+      "profiles": {
+        "anthropic": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Inspect north.txt and report its signal."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Inspect south.txt and report its signal."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          }
+        ],
+        "openai": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Inspect north.txt and report its signal."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Inspect south.txt and report its signal."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          }
+        ],
+        "generic": [
+          {
+            "scriptIndex": 0,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          },
+          {
+            "scriptIndex": 1,
+            "sessionRole": "child",
+            "firstUserText": "Inspect north.txt and report its signal."
+          },
+          {
+            "scriptIndex": 2,
+            "sessionRole": "child",
+            "firstUserText": "Inspect south.txt and report its signal."
+          },
+          {
+            "scriptIndex": 3,
+            "sessionRole": "main",
+            "firstUserText": "Delegate two independent sub-agents in parallel: one should inspect north.txt, the other south.txt. Then report both signals."
+          }
+        ]
+      }
+    }
+  ]
+}

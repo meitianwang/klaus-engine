@@ -1,0 +1,20 @@
+[package]
+name = "klaus-agent-icu-data"
+description = "Pinned full ICU 77.1 data for klaus-agent's embedded V8 runtime"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND Unicode-3.0"
+rust-version.workspace = true
+readme = "README.md"
+repository = "https://github.com/meitianwang/klaus-engine"
+include = [
+    "src/**",
+    "data/icudt77l.dat.xz",
+    "README.md",
+    "LICENSE-MIT",
+    "ICU-LICENSE.txt",
+]
+
+[dependencies]
+sha2 = { workspace = true }
+xz2 = { version = "=0.1.7", features = ["static"] }

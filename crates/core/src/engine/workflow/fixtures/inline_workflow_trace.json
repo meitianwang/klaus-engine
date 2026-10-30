@@ -1,0 +1,130 @@
+{
+  "scenario": "inline-basic",
+  "meta": {
+    "name": "inline-basic",
+    "phases": [
+      "Plan",
+      "Execute"
+    ]
+  },
+  "runs": [
+    {
+      "name": "fresh",
+      "statuses": [
+        "phase: Plan",
+        "planning topic",
+        "agent ▸ first",
+        "phase: Execute",
+        "agent ▸ branch-a",
+        "agent ▸ pipe",
+        "agent ▸ pipe"
+      ],
+      "agentCalls": [
+        {
+          "idx": 0,
+          "kind": "inline:first",
+          "prompt": "inline:first:topic",
+          "options": {
+            "agentType": null,
+            "model": "inline-model",
+            "isolation": null,
+            "outputSchema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        },
+        {
+          "idx": 1,
+          "kind": "inline:branch",
+          "prompt": "inline:branch:alpha",
+          "options": {
+            "agentType": "researcher",
+            "model": null,
+            "isolation": null,
+            "outputSchema": null
+          }
+        },
+        {
+          "idx": 2,
+          "kind": "inline:pipe:x",
+          "prompt": "inline:pipe:x",
+          "options": {
+            "agentType": null,
+            "model": null,
+            "isolation": "worktree",
+            "outputSchema": null
+          }
+        },
+        {
+          "idx": 3,
+          "kind": "inline:pipe:y",
+          "prompt": "inline:pipe:y",
+          "options": {
+            "agentType": null,
+            "model": null,
+            "isolation": "worktree",
+            "outputSchema": null
+          }
+        }
+      ],
+      "result": {
+        "first": {
+          "value": "alpha"
+        },
+        "branches": [
+          "branch-alpha",
+          null,
+          null
+        ],
+        "piped": [
+          "pipe-x:x",
+          "pipe-y:y"
+        ],
+        "spent": 28,
+        "remaining": 72
+      },
+      "agentsSpawned": 4,
+      "outputTokensSpent": 28,
+      "journal": [
+        {
+          "runId": "wf_inline_basic_trace",
+          "idx": 0,
+          "hash": "80bc206262284bb6",
+          "result": {
+            "value": "alpha"
+          },
+          "outputTokens": 4
+        },
+        {
+          "runId": "wf_inline_basic_trace",
+          "idx": 1,
+          "hash": "ff73d0d1edcaeea2",
+          "result": "branch-alpha",
+          "outputTokens": 6
+        },
+        {
+          "runId": "wf_inline_basic_trace",
+          "idx": 2,
+          "hash": "143339d46ed25e6c",
+          "result": "pipe-x",
+          "outputTokens": 8
+        },
+        {
+          "runId": "wf_inline_basic_trace",
+          "idx": 3,
+          "hash": "5949019ebc807795",
+          "result": "pipe-y",
+          "outputTokens": 10
+        }
+      ]
+    }
+  ]
+}

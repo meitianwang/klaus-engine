@@ -1,0 +1,2226 @@
+{
+  "scenario": "protocol-wire",
+  "protocolEvents": [
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "thread.started",
+        "threadId": "thread_1"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "turn.started",
+        "turnId": "turn_1"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "stream.request_start"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "text.delta",
+        "text": "hello"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "thinking.delta",
+        "text": "thinking"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.started",
+        "item": {
+          "type": "command_execution",
+          "id": "cmd_1",
+          "command": "echo hi",
+          "aggregatedOutput": "",
+          "status": "in_progress"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.updated",
+        "item": {
+          "type": "command_execution",
+          "id": "cmd_1",
+          "command": "echo hi",
+          "aggregatedOutput": "hi\n",
+          "exitCode": 0,
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "agent_message",
+          "id": "msg_1",
+          "text": "final answer"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "reasoning",
+          "id": "reason_1",
+          "text": "because"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "file_change",
+          "id": "file_1",
+          "changes": [
+            {
+              "path": "src/app.ts",
+              "kind": "modify",
+              "diff": "@@ -1 +1\n-old\n+new",
+              "added": 1,
+              "removed": 1
+            }
+          ],
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "tool_call",
+          "id": "tool_1",
+          "toolName": "read",
+          "arguments": {
+            "path": "src/app.ts"
+          },
+          "result": {
+            "ok": true
+          },
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "tool_call",
+          "id": "tool_2",
+          "toolName": "bash",
+          "arguments": {
+            "command": "false"
+          },
+          "error": {
+            "message": "failed"
+          },
+          "status": "failed"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "item.completed",
+        "item": {
+          "type": "error",
+          "id": "err_item_1",
+          "message": "visible item error"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_1",
+        "event": {
+          "type": "stdout",
+          "chunk": "out"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_1",
+        "event": {
+          "type": "stderr",
+          "chunk": "err"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_1",
+        "event": {
+          "type": "status",
+          "message": "running"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_1",
+        "event": {
+          "type": "file_change",
+          "change": {
+            "path": "src/app.ts",
+            "kind": "modify",
+            "diff": "@@ -1 +1\n-old\n+new",
+            "added": 1,
+            "removed": 1
+          }
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_2",
+        "event": {
+          "type": "agent_progress",
+          "agentId": "agent_child",
+          "event": {
+            "type": "text.delta",
+            "text": "child delta"
+          }
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tool.event",
+        "turnId": "turn_1",
+        "toolUseId": "tu_plan",
+        "event": {
+          "type": "plan_mode_changed",
+          "enabled": true
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "approval.requested",
+        "request": {
+          "id": "apr_1",
+          "kind": "tool",
+          "toolName": "write",
+          "input": {
+            "path": "src/app.ts",
+            "content": "new"
+          },
+          "message": "Allow write?",
+          "suggestions": [
+            {
+              "type": "addRules",
+              "rules": [
+                {
+                  "toolName": "bash",
+                  "argumentPrefix": "git status"
+                }
+              ],
+              "behavior": "allow",
+              "destination": "projectSettings"
+            },
+            {
+              "type": "setMode",
+              "mode": "acceptEdits",
+              "destination": "session"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "permission_update",
+        "destination": "projectSettings",
+        "update": {
+          "type": "addRules",
+          "rules": [
+            {
+              "toolName": "bash",
+              "argumentPrefix": "git status"
+            }
+          ],
+          "behavior": "allow",
+          "destination": "projectSettings"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "compaction",
+        "mode": "micro",
+        "freedTokens": 128
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "tombstone",
+        "uuid": "deadbeef"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "notification",
+        "level": "warn",
+        "message": "heads up"
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "turn.failed",
+        "error": {
+          "code": "provider_error",
+          "message": "provider down",
+          "requestId": "req_123"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_run",
+      "event": {
+        "type": "turn.completed",
+        "turnId": "turn_1",
+        "usage": {
+          "inputTokens": 12,
+          "outputTokens": 3,
+          "cacheReadInputTokens": 4,
+          "cacheCreationInputTokens": 5,
+          "totalTokens": 24
+        },
+        "stopReason": "completed"
+      }
+    },
+    {
+      "submissionId": "sub_elicit",
+      "elicitation": {
+        "requestId": "el_1",
+        "request": {
+          "prompt": "Pick one",
+          "options": [
+            "a",
+            "b"
+          ],
+          "multiSelect": true
+        }
+      }
+    },
+    {
+      "submissionId": "sub_mcp_elicit",
+      "mcpElicitation": {
+        "requestId": "mcp-elicit-public-1",
+        "serverName": "computer-use",
+        "request": {
+          "mode": "form",
+          "_meta": {
+            "persist": true
+          },
+          "message": "Allow access to Calendar?",
+          "requestedSchema": {
+            "type": "object",
+            "properties": {
+              "account": {
+                "type": "string",
+                "format": "email"
+              },
+              "remember": {
+                "type": "boolean",
+                "default": true
+              },
+              "scope": {
+                "type": "string",
+                "oneOf": [
+                  {
+                    "const": "read",
+                    "title": "Read only"
+                  },
+                  {
+                    "const": "write",
+                    "title": "Read and write"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "account",
+              "scope"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "submissionId": "sub_mcp_elicit_resolve",
+      "mcpElicitationResolved": {
+        "requestId": "mcp-elicit-public-1",
+        "action": "accept"
+      }
+    },
+    {
+      "submissionId": "",
+      "mcpAuthorization": {
+        "requestId": "mcp_auth_1",
+        "serverName": "remote-tools",
+        "authorizationUrl": "https://auth.example/authorize?client_id=client-a&state=state-a",
+        "redirectUri": "http://127.0.0.1/callback"
+      }
+    },
+    {
+      "submissionId": "sub_mcp_auth_resolve",
+      "mcpAuthorizationResolved": {
+        "requestId": "mcp_auth_1",
+        "accepted": true
+      }
+    },
+    {
+      "submissionId": "sub_mcp_auth_status",
+      "mcpAuthorizationStatus": {
+        "serverName": "remote-tools",
+        "authStatus": "oAuth"
+      }
+    },
+    {
+      "submissionId": "sub_mcp_auth_revoke",
+      "mcpAuthorizationRevoked": {
+        "serverName": "remote-tools",
+        "authStatus": "notLoggedIn",
+        "revoked": true
+      }
+    },
+    {
+      "submissionId": "sub_mcp_runtime",
+      "mcpRuntime": {
+        "runtime": {
+          "servers": [
+            {
+              "name": "remote-tools",
+              "state": "ready",
+              "authStatus": "oAuth",
+              "instructions": "Use the indexed docs.",
+              "serverInfo": {
+                "name": "remote-tools",
+                "version": "2.1.0"
+              },
+              "tools": [
+                {
+                  "name": "mcp__remote-tools__lookup",
+                  "exposure": "deferred",
+                  "searchHint": "Search indexed docs",
+                  "readOnly": true,
+                  "destructive": false
+                }
+              ],
+              "resources": [
+                {
+                  "uri": "docs://guide",
+                  "name": "Guide",
+                  "mimeType": "text/markdown",
+                  "description": "Product guide"
+                }
+              ],
+              "resourceTemplates": [
+                {
+                  "uriTemplate": "docs://{section}",
+                  "name": "Section",
+                  "mimeType": "text/markdown",
+                  "description": "One documentation section"
+                }
+              ],
+              "prompts": [
+                {
+                  "name": "summarize",
+                  "description": "Summarize a guide",
+                  "arguments": [
+                    {
+                      "name": "uri",
+                      "description": "Guide URI",
+                      "required": true
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "unavailable",
+              "state": "failed",
+              "authStatus": "notLoggedIn",
+              "failureReason": "reauthentication-required",
+              "error": "401 Unauthorized",
+              "tools": [],
+              "resources": [],
+              "resourceTemplates": [],
+              "prompts": []
+            }
+          ]
+        },
+        "activationScope": "activeSession"
+      }
+    },
+    {
+      "submissionId": "",
+      "mcpServerStatus": {
+        "serverName": "remote-tools",
+        "state": "connecting",
+        "authStatus": "oAuth"
+      }
+    },
+    {
+      "submissionId": "",
+      "mcpServerStatus": {
+        "serverName": "unavailable",
+        "state": "failed",
+        "authStatus": "notLoggedIn",
+        "failureReason": "reauthentication-required",
+        "error": "401 Unauthorized"
+      }
+    },
+    {
+      "submissionId": "sub_runtime_capabilities",
+      "runtimeCapabilities": {
+        "descriptors": [
+          {
+            "name": "browser",
+            "source": {
+              "kind": "plugin",
+              "id": "calendar",
+              "name": "calendar",
+              "version": "2.0.0",
+              "root": "/plugins/calendar",
+              "enabled": true
+            }
+          }
+        ],
+        "selectedRoots": [
+          {
+            "kind": "plugin",
+            "id": "calendar"
+          },
+          {
+            "kind": "plugin",
+            "id": "missing"
+          }
+        ],
+        "effectiveRoots": [
+          {
+            "selection": {
+              "kind": "plugin",
+              "id": "calendar"
+            },
+            "source": {
+              "kind": "plugin",
+              "id": "calendar",
+              "name": "calendar",
+              "version": "2.0.0",
+              "root": "/plugins/calendar",
+              "enabled": true
+            },
+            "capabilities": [
+              "browser"
+            ]
+          }
+        ],
+        "missingRoots": [
+          {
+            "kind": "plugin",
+            "id": "missing"
+          }
+        ]
+      }
+    },
+    {
+      "submissionId": "sub_extension_runtime",
+      "extensionRuntime": {
+        "agents": [
+          {
+            "name": "desktop-agent",
+            "source": {
+              "kind": "session"
+            }
+          }
+        ],
+        "skills": [
+          {
+            "name": "desktop-skill",
+            "source": {
+              "kind": "session"
+            }
+          }
+        ],
+        "outputStyles": [
+          {
+            "name": "formal",
+            "source": {
+              "kind": "session"
+            }
+          }
+        ],
+        "selectedOutputStyle": "formal",
+        "hooks": [
+          {
+            "event": "PreToolUse",
+            "matcher": "read",
+            "handlerKind": "command",
+            "isAsync": false,
+            "timeoutMs": 5000,
+            "source": {
+              "kind": "session"
+            }
+          }
+        ],
+        "pricing": {
+          "modelIds": [
+            "fake-model"
+          ],
+          "source": {
+            "kind": "session"
+          }
+        },
+        "suppressed": [],
+        "pluginRuntime": {
+          "entries": [],
+          "capabilitySummaries": [],
+          "disabled": [],
+          "errors": [],
+          "warnings": [],
+          "needsRefresh": false,
+          "pluginReconnectKey": 0
+        }
+      }
+    },
+    {
+      "submissionId": "sub_installed_plugins",
+      "installedPlugins": {
+        "version": 2,
+        "plugins": {
+          "docs@local": {
+            "name": "docs",
+            "pluginId": "docs@local",
+            "marketplace": "local",
+            "version": "1.0.0",
+            "installPath": "/plugins/docs",
+            "dataPath": "/plugin-data/docs",
+            "source": "marketplace:local",
+            "scope": "user",
+            "dependencies": [
+              "base@local"
+            ],
+            "installedAtMs": 10,
+            "enabled": true
+          }
+        }
+      }
+    },
+    {
+      "submissionId": "sub_plugin_runtime",
+      "pluginRuntime": {
+        "entries": [
+          {
+            "name": "docs",
+            "version": "1.0.0",
+            "displayName": "Docs",
+            "description": "Search product docs",
+            "pluginNamespace": "docs",
+            "keywords": [
+              "documentation"
+            ],
+            "dependencies": [
+              "base@local"
+            ],
+            "dir": "/plugins/docs",
+            "enabled": true,
+            "permissionScope": {
+              "mcpServers": [
+                "docs"
+              ],
+              "lspServers": []
+            },
+            "hasSkills": true,
+            "runtimeCapabilities": [
+              "browser"
+            ],
+            "interfaceCapabilities": [
+              "panel"
+            ],
+            "appConnectors": [
+              "connector-docs"
+            ]
+          }
+        ],
+        "capabilitySummaries": [
+          {
+            "name": "docs",
+            "displayName": "Docs",
+            "description": "Search product docs",
+            "hasSkills": true,
+            "mcpServerNames": [
+              "docs"
+            ],
+            "lspServerNames": [],
+            "runtimeCapabilities": [
+              "browser"
+            ],
+            "interfaceCapabilities": [
+              "panel"
+            ],
+            "appConnectors": [
+              "connector-docs"
+            ],
+            "dependencies": [
+              "base@local"
+            ]
+          }
+        ],
+        "disabled": [
+          {
+            "name": "legacy",
+            "dir": "/plugins/legacy",
+            "reason": "disabled by installed plugin state"
+          }
+        ],
+        "errors": [
+          {
+            "kind": "invalid_manifest",
+            "dir": "/plugins/broken",
+            "message": "installed plugin has no loadable manifest"
+          }
+        ],
+        "warnings": [
+          {
+            "kind": "duplicate_mcp_server_suppressed",
+            "dir": "/plugins/docs",
+            "message": "duplicate MCP server suppressed"
+          }
+        ],
+        "needsRefresh": false,
+        "pluginReconnectKey": 0
+      }
+    },
+    {
+      "submissionId": "sub_plugin_mutation",
+      "pluginMutation": {
+        "persisted": true,
+        "appliedToCurrentSession": false,
+        "activationScope": "endpoint_restart",
+        "restartRequired": true,
+        "plugin": {
+          "name": "docs",
+          "pluginId": "docs@local",
+          "marketplace": "local",
+          "version": "1.0.0",
+          "installPath": "/plugins/docs",
+          "dataPath": "/plugin-data/docs",
+          "source": "marketplace:local",
+          "scope": "user",
+          "dependencies": [
+            "base@local"
+          ],
+          "installedAtMs": 10,
+          "enabled": false
+        },
+        "installedPlugins": {
+          "version": 2,
+          "plugins": {
+            "docs@local": {
+              "name": "docs",
+              "pluginId": "docs@local",
+              "marketplace": "local",
+              "version": "1.0.0",
+              "installPath": "/plugins/docs",
+              "dataPath": "/plugin-data/docs",
+              "source": "marketplace:local",
+              "scope": "user",
+              "dependencies": [
+                "base@local"
+              ],
+              "installedAtMs": 10,
+              "enabled": false
+            }
+          }
+        },
+        "runtime": {
+          "entries": [
+            {
+              "name": "docs",
+              "version": "1.0.0",
+              "displayName": "Docs",
+              "description": "Search product docs",
+              "pluginNamespace": "docs",
+              "keywords": [
+                "documentation"
+              ],
+              "dependencies": [
+                "base@local"
+              ],
+              "dir": "/plugins/docs",
+              "enabled": true,
+              "permissionScope": {
+                "mcpServers": [
+                  "docs"
+                ],
+                "lspServers": []
+              },
+              "hasSkills": true,
+              "runtimeCapabilities": [
+                "browser"
+              ],
+              "interfaceCapabilities": [
+                "panel"
+              ],
+              "appConnectors": [
+                "connector-docs"
+              ]
+            }
+          ],
+          "capabilitySummaries": [
+            {
+              "name": "docs",
+              "displayName": "Docs",
+              "description": "Search product docs",
+              "hasSkills": true,
+              "mcpServerNames": [
+                "docs"
+              ],
+              "lspServerNames": [],
+              "runtimeCapabilities": [
+                "browser"
+              ],
+              "interfaceCapabilities": [
+                "panel"
+              ],
+              "appConnectors": [
+                "connector-docs"
+              ],
+              "dependencies": [
+                "base@local"
+              ]
+            }
+          ],
+          "disabled": [
+            {
+              "name": "legacy",
+              "dir": "/plugins/legacy",
+              "reason": "disabled by installed plugin state"
+            }
+          ],
+          "errors": [
+            {
+              "kind": "invalid_manifest",
+              "dir": "/plugins/broken",
+              "message": "installed plugin has no loadable manifest"
+            }
+          ],
+          "warnings": [
+            {
+              "kind": "duplicate_mcp_server_suppressed",
+              "dir": "/plugins/docs",
+              "message": "duplicate MCP server suppressed"
+            }
+          ],
+          "needsRefresh": false,
+          "pluginReconnectKey": 0
+        }
+      }
+    },
+    {
+      "submissionId": "sub_rewind",
+      "rewound": {
+        "scope": "files",
+        "droppedTurns": 1,
+        "remainingTurns": 2,
+        "filesRestored": true
+      }
+    },
+    {
+      "submissionId": "sub_result",
+      "result": {
+        "stopReason": "completed",
+        "usage": {
+          "inputTokens": 12,
+          "outputTokens": 3,
+          "cacheReadInputTokens": 4,
+          "cacheCreationInputTokens": 5,
+          "totalTokens": 24
+        },
+        "finalText": "{\"answer\":42}",
+        "finalMessageId": "assistant-final",
+        "structuredOutput": {
+          "answer": 42
+        }
+      }
+    },
+    {
+      "submissionId": "sub_history",
+      "history": [
+        {
+          "type": "user",
+          "uuid": "u1",
+          "content": [
+            {
+              "type": "text",
+              "text": "hi"
+            }
+          ]
+        },
+        {
+          "type": "assistant",
+          "uuid": "a1",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello"
+            }
+          ],
+          "model": "fake-model"
+        }
+      ]
+    },
+    {
+      "submissionId": "sub_cost",
+      "cost": {
+        "totalCostUsd": 0.01,
+        "cacheHitRate": 0.25,
+        "models": [
+          {
+            "model": "fake-model",
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 3,
+            "cacheCreationInputTokens": 2,
+            "costUsd": 0.01,
+            "requests": 1,
+            "cacheHitRate": 0.2
+          }
+        ]
+      }
+    },
+    {
+      "submissionId": "sub_subagents",
+      "subagents": [
+        {
+          "id": "agent_1",
+          "description": "research",
+          "status": "completed",
+          "teammate": true,
+          "idle": false,
+          "transcript": "partial",
+          "outputFile": "/tmp/out.txt"
+        }
+      ]
+    },
+    {
+      "submissionId": "sub_subagent_lifecycle",
+      "subagentLifecycle": {
+        "agents": [
+          {
+            "agentId": "agent_1",
+            "kind": "workflow",
+            "status": "failed",
+            "context": {
+              "sessionId": "session_1",
+              "parentAgentId": "parent_1",
+              "parentThreadId": "thread_1",
+              "agentType": "research",
+              "cwd": "/workspace",
+              "description": "research",
+              "depth": 2,
+              "resumeFrom": null,
+              "spawnTurnId": null
+            },
+            "startedAtMs": 10,
+            "updatedAtMs": 20,
+            "completedAtMs": 20,
+            "lastResult": null,
+            "lastError": "failed",
+            "cancellationRequested": false,
+            "model": null,
+            "modelSource": null
+          }
+        ]
+      }
+    },
+    {
+      "submissionId": "",
+      "memoryMaintenanceEvent": {
+        "kind": "auto_memory",
+        "run": {
+          "runId": "memory_run_1",
+          "sessionId": "session_1",
+          "trigger": "auto",
+          "scope": "project",
+          "targetDir": "/workspace/.klaus/memory",
+          "status": "failed",
+          "startedAt": 10,
+          "endedAt": 20,
+          "reason": "tool-failure",
+          "error": "write failed",
+          "messageCount": 2,
+          "filesTouched": [
+            "/workspace/.klaus/memory/MEMORY.md"
+          ],
+          "turnCount": 1
+        }
+      }
+    },
+    {
+      "submissionId": "",
+      "memoryMaintenanceEvent": {
+        "kind": "auto_dream",
+        "run": {
+          "dreamRunId": "dream_run_1",
+          "sessionId": "session_1",
+          "trigger": "auto",
+          "status": "completed",
+          "startedAt": 30,
+          "endedAt": 30,
+          "lastConsolidatedAt": 20,
+          "sessionsReviewing": 5,
+          "filesTouched": [
+            "/workspace/.klaus/memory/MEMORY.md"
+          ],
+          "turns": [
+            {
+              "text": "finished\n<dream-summary>the dream sharpened: durable constraints emerged</dream-summary>",
+              "toolUseCount": 1
+            }
+          ],
+          "turnCount": 2,
+          "summary": "the dream sharpened: durable constraints emerged"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_memory_maintenance",
+      "memoryMaintenance": {
+        "autoMemoryRuns": [
+          {
+            "runId": "memory_run_1",
+            "sessionId": "session_1",
+            "trigger": "auto",
+            "scope": "project",
+            "targetDir": "/workspace/.klaus/memory",
+            "status": "failed",
+            "startedAt": 10,
+            "endedAt": 20,
+            "reason": "tool-failure",
+            "error": "write failed",
+            "messageCount": 2,
+            "filesTouched": [
+              "/workspace/.klaus/memory/MEMORY.md"
+            ],
+            "turnCount": 1
+          }
+        ],
+        "autoDreamRuns": [
+          {
+            "dreamRunId": "dream_run_1",
+            "sessionId": "session_1",
+            "trigger": "auto",
+            "status": "completed",
+            "startedAt": 30,
+            "endedAt": 30,
+            "lastConsolidatedAt": 20,
+            "sessionsReviewing": 5,
+            "filesTouched": [
+              "/workspace/.klaus/memory/MEMORY.md"
+            ],
+            "turns": [
+              {
+                "text": "finished\n<dream-summary>the dream sharpened: durable constraints emerged</dream-summary>",
+                "toolUseCount": 1
+              }
+            ],
+            "turnCount": 2,
+            "summary": "the dream sharpened: durable constraints emerged"
+          }
+        ]
+      }
+    },
+    {
+      "submissionId": "sub_queued",
+      "queued": [
+        {
+          "value": "queued text",
+          "mode": "prompt",
+          "priority": "now",
+          "uuid": "q1",
+          "sessionId": "thread-queued",
+          "isMeta": true,
+          "origin": "host"
+        }
+      ]
+    },
+    {
+      "submissionId": "sub_pending",
+      "pending": [
+        {
+          "value": [
+            {
+              "type": "text",
+              "text": "pending text"
+            }
+          ],
+          "mode": "task-notification",
+          "priority": "later",
+          "sessionId": "thread-pending",
+          "agentId": "agent_1"
+        }
+      ]
+    },
+    {
+      "submissionId": "",
+      "queueSnapshot": {
+        "revision": 7,
+        "items": [
+          {
+            "message": {
+              "value": "editable queued text",
+              "mode": "prompt",
+              "priority": "next",
+              "uuid": "q-editable",
+              "sessionId": "thread-queue",
+              "origin": "host"
+            },
+            "state": "pending",
+            "mutable": true
+          }
+        ],
+        "status": "authoritative"
+      }
+    },
+    {
+      "submissionId": "sub_queue_remove",
+      "queueMutation": {
+        "mutationId": "mutation-remove-1",
+        "status": "applied",
+        "snapshot": {
+          "revision": 8,
+          "items": [],
+          "status": "authoritative"
+        },
+        "terminalState": "removed"
+      }
+    },
+    {
+      "submissionId": "sub_queue_interrupted",
+      "queueMutation": {
+        "mutationId": "mutation-after-interrupt",
+        "status": "missing",
+        "snapshot": {
+          "revision": 9,
+          "items": [],
+          "status": "authoritative"
+        },
+        "terminalState": "interrupted",
+        "error": "queued continuation was interrupted"
+      }
+    },
+    {
+      "submissionId": "sub_unarchive",
+      "unarchived": {
+        "threadId": "thread-restored",
+        "status": "restored",
+        "thread": {
+          "id": "thread-restored",
+          "createdAt": 1700000000,
+          "updatedAt": 1700000100,
+          "cwd": "/workspace",
+          "model": "fake-model",
+          "title": "Restored",
+          "role": "main",
+          "archived": false
+        }
+      }
+    },
+    {
+      "submissionId": "sub_setup",
+      "setup": {
+        "requestId": "setup-init-1",
+        "trigger": "init",
+        "status": "completed",
+        "startedAt": 1700000100,
+        "endedAt": 1700000101,
+        "hookCount": 1,
+        "additionalContext": [
+          "workspace initialized"
+        ],
+        "systemMessages": []
+      }
+    },
+    {
+      "submissionId": "sub_setup_lifecycle",
+      "setupLifecycle": {
+        "runs": [
+          {
+            "requestId": "setup-init-1",
+            "sessionId": "thread-setup",
+            "trigger": "init",
+            "status": "completed",
+            "startedAt": 1700000100,
+            "endedAt": 1700000101,
+            "hookCount": 1,
+            "additionalContext": [
+              "workspace initialized"
+            ],
+            "systemMessages": []
+          }
+        ],
+        "idempotencyResults": {
+          "setup-maintenance-evicted": {
+            "requestId": "setup-maintenance-evicted",
+            "trigger": "maintenance",
+            "status": "completed",
+            "startedAt": 1700000090,
+            "endedAt": 1700000091,
+            "hookCount": 1,
+            "additionalContext": [
+              "maintenance context"
+            ],
+            "systemMessages": []
+          }
+        },
+        "initClosedAt": 1700000102,
+        "contextAdmission": {
+          "admissionId": "setup-context-1",
+          "requestId": "setup-init-1",
+          "sessionId": "thread-setup",
+          "status": "consumed",
+          "startedAt": 1700000102,
+          "endedAt": 1700000102
+        },
+        "contextConsumedRequestId": "setup-init-1",
+        "contextConsumedAt": 1700000102
+      }
+    },
+    {
+      "submissionId": "sub_task_list",
+      "taskList": {
+        "sessionId": "thread-tasks",
+        "taskListId": "thread-tasks",
+        "planKind": "tasks",
+        "generation": "task-generation-1",
+        "revision": 4,
+        "fingerprint": "sha256:task-list",
+        "tasks": [
+          {
+            "id": "1",
+            "subject": "Wire task",
+            "description": "Exercise TodoV2 protocol wire format",
+            "activeForm": "Testing TodoV2",
+            "status": "in_progress",
+            "blocks": [],
+            "blockedBy": []
+          }
+        ],
+        "nextCursor": "todo-v2-v1.4.1.cursor.identity",
+        "total": 2,
+        "cursorStatus": "current"
+      }
+    },
+    {
+      "submissionId": "",
+      "taskListChange": {
+        "sessionId": "thread-tasks",
+        "taskListId": "thread-tasks",
+        "planKind": "tasks",
+        "generation": "task-generation-1",
+        "revision": 5,
+        "fingerprint": "sha256:task-list-next",
+        "tasks": [
+          {
+            "id": "1",
+            "subject": "Wire task",
+            "description": "Exercise TodoV2 protocol wire format",
+            "activeForm": "Testing TodoV2",
+            "status": "in_progress",
+            "blocks": [],
+            "blockedBy": []
+          }
+        ]
+      }
+    },
+    {
+      "submissionId": "",
+      "agentMemorySnapshotDecision": {
+        "request": {
+          "requestId": "snapshot-decision-1",
+          "agentType": "planner",
+          "scope": "user",
+          "snapshotTimestamp": "2026-07-18T01:02:03Z",
+          "snapshotId": "snapshot-sha256-1",
+          "localStateId": "local-sha256-1",
+          "diff": {
+            "addedCount": 1,
+            "modifiedCount": 1,
+            "removedCount": 1,
+            "entries": [
+              {
+                "path": "MEMORY.md",
+                "kind": "modified"
+              },
+              {
+                "path": "notes/added.md",
+                "kind": "added"
+              },
+              {
+                "path": "notes/removed.md",
+                "kind": "removed"
+              }
+            ],
+            "truncated": false
+          },
+          "firstUse": false,
+          "requestedAt": 1721264523000,
+          "deadlineAt": 1721264583000
+        },
+        "status": "failed",
+        "decision": "merge",
+        "source": "host",
+        "decidedAt": 1721264530000,
+        "endedAt": 1721264531000,
+        "error": "merge tool failed"
+      }
+    },
+    {
+      "submissionId": "sub_snapshot_decisions",
+      "agentMemorySnapshotDecisions": [
+        {
+          "request": {
+            "requestId": "snapshot-decision-1",
+            "agentType": "planner",
+            "scope": "user",
+            "snapshotTimestamp": "2026-07-18T01:02:03Z",
+            "snapshotId": "snapshot-sha256-1",
+            "localStateId": "local-sha256-1",
+            "diff": {
+              "addedCount": 1,
+              "modifiedCount": 1,
+              "removedCount": 1,
+              "entries": [
+                {
+                  "path": "MEMORY.md",
+                  "kind": "modified"
+                },
+                {
+                  "path": "notes/added.md",
+                  "kind": "added"
+                },
+                {
+                  "path": "notes/removed.md",
+                  "kind": "removed"
+                }
+              ],
+              "truncated": false
+            },
+            "firstUse": false,
+            "requestedAt": 1721264523000,
+            "deadlineAt": 1721264583000
+          },
+          "status": "failed",
+          "decision": "merge",
+          "source": "host",
+          "decidedAt": 1721264530000,
+          "endedAt": 1721264531000,
+          "error": "merge tool failed"
+        }
+      ]
+    },
+    {
+      "submissionId": "sub_snapshot_decision_query",
+      "agentMemorySnapshotDecisionQuery": {
+        "requestId": "snapshot-decision-1",
+        "audit": {
+          "request": {
+            "requestId": "snapshot-decision-1",
+            "agentType": "planner",
+            "scope": "user",
+            "snapshotTimestamp": "2026-07-18T01:02:03Z",
+            "snapshotId": "snapshot-sha256-1",
+            "localStateId": "local-sha256-1",
+            "diff": {
+              "addedCount": 1,
+              "modifiedCount": 1,
+              "removedCount": 1,
+              "entries": [
+                {
+                  "path": "MEMORY.md",
+                  "kind": "modified"
+                },
+                {
+                  "path": "notes/added.md",
+                  "kind": "added"
+                },
+                {
+                  "path": "notes/removed.md",
+                  "kind": "removed"
+                }
+              ],
+              "truncated": false
+            },
+            "firstUse": false,
+            "requestedAt": 1721264523000,
+            "deadlineAt": 1721264583000
+          },
+          "status": "failed",
+          "decision": "merge",
+          "source": "host",
+          "decidedAt": 1721264530000,
+          "endedAt": 1721264531000,
+          "error": "merge tool failed"
+        }
+      }
+    },
+    {
+      "submissionId": "sub_steer",
+      "steered": {
+        "applied": true
+      }
+    },
+    {
+      "submissionId": "sub_input_error",
+      "error": "model text-only does not support native PDF input",
+      "errorDetail": {
+        "code": "unsupported_input",
+        "feature": "native_pdf",
+        "provider": "openai",
+        "model": "text-only"
+      }
+    },
+    {
+      "submissionId": "sub_memory_maintenance_error",
+      "error": "memory maintenance persistence is inconsistent",
+      "errorDetail": {
+        "code": "memory_maintenance_persistence_inconsistent",
+        "runKind": "auto_dream",
+        "runId": "dream-terminal-failure"
+      }
+    },
+    {
+      "submissionId": "sub_error",
+      "error": "bad op"
+    },
+    {
+      "submissionId": "sub_shutdown",
+      "shutdownCompleted": {
+        "ok": true,
+        "flushCompleted": true,
+        "cleanupCompleted": true,
+        "timedOut": false
+      }
+    }
+  ],
+  "opValidation": [
+    {
+      "name": "init-provider-oauth-token",
+      "accepted": true,
+      "normalized": {
+        "id": "op_init_oauth_token",
+        "op": {
+          "type": "init_session",
+          "init": {
+            "provider": {
+              "type": "openai"
+            },
+            "auth": {
+              "type": "oauth_token",
+              "accessToken": "<redacted>",
+              "refreshToken": "<redacted>",
+              "oauth": {
+                "clientId": "client-a"
+              },
+              "credentialId": "desktop-account-a",
+              "replaceStored": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "init-provider-oauth-stored",
+      "accepted": true,
+      "normalized": {
+        "id": "op_init_oauth_stored",
+        "op": {
+          "type": "init_session",
+          "init": {
+            "provider": {
+              "type": "openai"
+            },
+            "auth": {
+              "type": "oauth_stored",
+              "credentialId": "desktop-account-a",
+              "oauth": {
+                "clientId": "client-a"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "init-openai-gateway-compatibility",
+      "accepted": true,
+      "normalized": {
+        "id": "op_init_openai_gateway",
+        "op": {
+          "type": "init_session",
+          "init": {
+            "provider": {
+              "type": "openai",
+              "model": "qwen3.7-max",
+              "api": "chat",
+              "baseUrl": "https://gateway.example/v1",
+              "compatibility": {
+                "extraHeaders": {
+                  "X-Caller-App": "<redacted-caller>",
+                  "X-Device-Id": "<redacted-device>",
+                  "X-Endpoint": "<redacted-endpoint>",
+                  "X-User-Id": "<redacted-user>"
+                },
+                "requestIdentity": {
+                  "sessionId": "<redacted-session>"
+                }
+              }
+            },
+            "auth": {
+              "type": "api_key",
+              "key": "<redacted>"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "init-extensions",
+      "accepted": true,
+      "normalized": {
+        "id": "op_init_extensions",
+        "op": {
+          "type": "init_session",
+          "init": {
+            "agentMemorySnapshotPolicy": {
+              "timeoutMs": 45000,
+              "firstUse": "initialize",
+              "timeout": "keep",
+              "disconnect": "merge",
+              "noHandler": "replace"
+            },
+            "agents": [
+              {
+                "name": "desktop-agent",
+                "description": "Desktop specialist",
+                "prompt": "Work from the desktop context."
+              }
+            ],
+            "skills": [
+              {
+                "name": "desktop-skill",
+                "description": "Desktop workflow",
+                "body": "Run the workflow.",
+                "path": "/desktop/skills/desktop-skill/SKILL.md"
+              }
+            ],
+            "outputStyles": [
+              {
+                "name": "formal",
+                "description": "Formal prose",
+                "body": "Use formal prose."
+              }
+            ],
+            "selectedOutputStyle": "formal",
+            "commandHooks": [
+              {
+                "event": "PreToolUse",
+                "matcher": "read",
+                "command": "validate-read",
+                "timeoutMs": 5000
+              }
+            ],
+            "pricing": [
+              {
+                "model": "fake-model",
+                "inputPerMTok": 7.5,
+                "outputPerMTok": 0.25,
+                "cacheReadPerMTok": 0.1,
+                "cacheWritePerMTok": 0.2
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "run-string",
+      "accepted": true,
+      "normalized": {
+        "id": "op_run_string",
+        "op": {
+          "type": "run",
+          "input": "hello",
+          "options": {
+            "model": "model-a",
+            "permissionMode": "acceptEdits",
+            "outputSchema": {
+              "type": "object"
+            },
+            "systemPromptAppend": "extra",
+            "displayMetadata": {
+              "displayText": "/push-code",
+              "slashCommand": {
+                "name": "push-code",
+                "kind": "skill"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "run-effort-level",
+      "accepted": true,
+      "normalized": {
+        "id": "op_run_effort_level",
+        "op": {
+          "type": "run",
+          "input": "hello",
+          "options": {
+            "effort": "high"
+          }
+        }
+      }
+    },
+    {
+      "name": "run-effort-number",
+      "accepted": true,
+      "normalized": {
+        "id": "op_run_effort_number",
+        "op": {
+          "type": "run",
+          "input": "hello",
+          "options": {
+            "effort": 42
+          }
+        }
+      }
+    },
+    {
+      "name": "run-parts",
+      "accepted": true,
+      "normalized": {
+        "id": "op_run_parts",
+        "op": {
+          "type": "run",
+          "input": [
+            {
+              "type": "text",
+              "text": "hi"
+            },
+            {
+              "type": "image",
+              "base64": "AAAA",
+              "mimeType": "image/png"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "run-document",
+      "accepted": true,
+      "normalized": {
+        "id": "op_run_document",
+        "op": {
+          "type": "run",
+          "input": [
+            {
+              "type": "document",
+              "base64": "JVBERi0xLjcK",
+              "mimeType": "application/pdf",
+              "filename": "report.pdf"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "approve-allow",
+      "accepted": true,
+      "normalized": {
+        "id": "op_approve",
+        "op": {
+          "type": "approve",
+          "requestId": "apr_1",
+          "response": {
+            "decision": "allow",
+            "updatedInput": {
+              "path": "src/app.ts"
+            },
+            "updatedPermissions": [
+              {
+                "type": "addRules",
+                "rules": [
+                  {
+                    "toolName": "bash",
+                    "argumentPrefix": "git status"
+                  }
+                ],
+                "behavior": "allow",
+                "destination": "projectSettings"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "resolve-elicitation",
+      "accepted": true,
+      "normalized": {
+        "id": "op_elicit",
+        "op": {
+          "type": "resolve_elicitation",
+          "requestId": "el_1",
+          "response": {
+            "kind": "decline",
+            "reason": "later"
+          }
+        }
+      }
+    },
+    {
+      "name": "resolve-mcp-elicitation",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_elicit",
+        "op": {
+          "type": "resolve_mcp_elicitation",
+          "requestId": "mcp-elicit-public-1",
+          "response": {
+            "action": "accept",
+            "content": {
+              "account": "person@example.com",
+              "remember": true,
+              "scope": "read"
+            },
+            "_meta": {
+              "persist": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "resolve-mcp-authorization",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_auth_resolve",
+        "op": {
+          "type": "resolve_mcp_authorization",
+          "requestId": "mcp_auth_1",
+          "response": {
+            "kind": "code",
+            "code": "<redacted>",
+            "state": "state-a"
+          }
+        }
+      }
+    },
+    {
+      "name": "get-mcp-authorization-status",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_auth_status",
+        "op": {
+          "type": "get_mcp_authorization_status",
+          "serverName": "remote-tools"
+        }
+      }
+    },
+    {
+      "name": "revoke-mcp-authorization",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_auth_revoke",
+        "op": {
+          "type": "revoke_mcp_authorization",
+          "serverName": "remote-tools"
+        }
+      }
+    },
+    {
+      "name": "get-mcp-runtime",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_runtime",
+        "op": {
+          "type": "get_mcp_runtime"
+        }
+      }
+    },
+    {
+      "name": "reconnect-mcp-server",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_reconnect",
+        "op": {
+          "type": "reconnect_mcp_server",
+          "serverName": "remote-tools"
+        }
+      }
+    },
+    {
+      "name": "upsert-mcp-server",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_upsert",
+        "op": {
+          "type": "upsert_mcp_server",
+          "server": {
+            "transport": "http",
+            "name": "remote-tools",
+            "url": "https://mcp.example.test/mcp",
+            "oauth": true
+          }
+        }
+      }
+    },
+    {
+      "name": "remove-mcp-server",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_remove",
+        "op": {
+          "type": "remove_mcp_server",
+          "serverName": "remote-tools"
+        }
+      }
+    },
+    {
+      "name": "reload-mcp-servers",
+      "accepted": true,
+      "normalized": {
+        "id": "op_mcp_reload",
+        "op": {
+          "type": "reload_mcp_servers",
+          "servers": [
+            {
+              "transport": "stdio",
+              "name": "local-tools",
+              "command": "local-mcp",
+              "args": [
+                "--stdio"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "get-runtime-capabilities",
+      "accepted": true,
+      "normalized": {
+        "id": "op_runtime_capabilities",
+        "op": {
+          "type": "get_runtime_capabilities"
+        }
+      }
+    },
+    {
+      "name": "get-extension-runtime",
+      "accepted": true,
+      "normalized": {
+        "id": "op_extension_runtime",
+        "op": {
+          "type": "get_extension_runtime"
+        }
+      }
+    },
+    {
+      "name": "list-installed-plugins",
+      "accepted": true,
+      "normalized": {
+        "id": "op_plugins_list",
+        "op": {
+          "type": "list_installed_plugins"
+        }
+      }
+    },
+    {
+      "name": "get-plugin-runtime",
+      "accepted": true,
+      "normalized": {
+        "id": "op_plugin_runtime",
+        "op": {
+          "type": "get_plugin_runtime"
+        }
+      }
+    },
+    {
+      "name": "disable-installed-plugin",
+      "accepted": true,
+      "normalized": {
+        "id": "op_plugin_disable",
+        "op": {
+          "type": "set_installed_plugin_enabled",
+          "name": "docs@local",
+          "enabled": false
+        }
+      }
+    },
+    {
+      "name": "uninstall-plugin",
+      "accepted": true,
+      "normalized": {
+        "id": "op_plugin_uninstall",
+        "op": {
+          "type": "uninstall_plugin",
+          "name": "docs@local",
+          "removeFiles": true
+        }
+      }
+    },
+    {
+      "name": "rewind-files",
+      "accepted": true,
+      "normalized": {
+        "id": "op_rewind",
+        "op": {
+          "type": "rewind",
+          "numTurns": 2,
+          "scope": "files"
+        }
+      }
+    },
+    {
+      "name": "steer-now",
+      "accepted": true,
+      "normalized": {
+        "id": "op_steer",
+        "op": {
+          "type": "steer",
+          "input": "nudge",
+          "priority": "now"
+        }
+      }
+    },
+    {
+      "name": "set-model",
+      "accepted": true,
+      "normalized": {
+        "id": "op_model",
+        "op": {
+          "type": "set_model",
+          "model": "model-b"
+        }
+      }
+    },
+    {
+      "name": "set-permission-mode",
+      "accepted": true,
+      "normalized": {
+        "id": "op_perm",
+        "op": {
+          "type": "set_permission_mode",
+          "mode": "dontAsk"
+        }
+      }
+    },
+    {
+      "name": "get-history",
+      "accepted": true,
+      "normalized": {
+        "id": "op_history",
+        "op": {
+          "type": "get_history"
+        }
+      }
+    },
+    {
+      "name": "get-cost",
+      "accepted": true,
+      "normalized": {
+        "id": "op_cost",
+        "op": {
+          "type": "get_cost"
+        }
+      }
+    },
+    {
+      "name": "get-subagents",
+      "accepted": true,
+      "normalized": {
+        "id": "op_subagents",
+        "op": {
+          "type": "get_subagents"
+        }
+      }
+    },
+    {
+      "name": "get-subagent-lifecycle",
+      "accepted": true,
+      "normalized": {
+        "id": "op_subagent_lifecycle",
+        "op": {
+          "type": "get_subagent_lifecycle"
+        }
+      }
+    },
+    {
+      "name": "get-memory-maintenance",
+      "accepted": true,
+      "normalized": {
+        "id": "op_memory_maintenance",
+        "op": {
+          "type": "get_memory_maintenance"
+        }
+      }
+    },
+    {
+      "name": "get-queued",
+      "accepted": true,
+      "normalized": {
+        "id": "op_queued",
+        "op": {
+          "type": "get_queued"
+        }
+      }
+    },
+    {
+      "name": "take-pending",
+      "accepted": true,
+      "normalized": {
+        "id": "op_pending",
+        "op": {
+          "type": "take_pending"
+        }
+      }
+    },
+    {
+      "name": "get-queue-snapshot",
+      "accepted": true,
+      "normalized": {
+        "id": "op_queue_snapshot",
+        "op": {
+          "type": "get_queue_snapshot"
+        }
+      }
+    },
+    {
+      "name": "edit-queued",
+      "accepted": true,
+      "normalized": {
+        "id": "op_queue_edit",
+        "op": {
+          "type": "edit_queued",
+          "mutationId": "mutation-edit-1",
+          "uuid": "q1",
+          "expectedRevision": 7,
+          "edit": {
+            "value": "edited",
+            "priority": "next"
+          }
+        }
+      }
+    },
+    {
+      "name": "remove-queued",
+      "accepted": true,
+      "normalized": {
+        "id": "op_queue_remove",
+        "op": {
+          "type": "remove_queued",
+          "mutationId": "mutation-remove-1",
+          "uuid": "q1",
+          "expectedRevision": 8
+        }
+      }
+    },
+    {
+      "name": "reorder-queued",
+      "accepted": true,
+      "normalized": {
+        "id": "op_queue_reorder",
+        "op": {
+          "type": "reorder_queued",
+          "mutationId": "mutation-reorder-1",
+          "uuid": "q2",
+          "beforeUuid": "q1",
+          "expectedRevision": 9
+        }
+      }
+    },
+    {
+      "name": "unarchive-session",
+      "accepted": true,
+      "normalized": {
+        "id": "op_unarchive",
+        "op": {
+          "type": "unarchive_session",
+          "threadId": "thread-restored"
+        }
+      }
+    },
+    {
+      "name": "run-setup",
+      "accepted": true,
+      "normalized": {
+        "id": "op_setup",
+        "op": {
+          "type": "run_setup",
+          "request": {
+            "requestId": "setup-init-1",
+            "trigger": "init"
+          }
+        }
+      }
+    },
+    {
+      "name": "get-setup-lifecycle",
+      "accepted": true,
+      "normalized": {
+        "id": "op_setup_lifecycle",
+        "op": {
+          "type": "get_setup_lifecycle"
+        }
+      }
+    },
+    {
+      "name": "get-task-list",
+      "accepted": true,
+      "normalized": {
+        "id": "op_task_list",
+        "op": {
+          "type": "get_task_list",
+          "options": {
+            "cursor": "todo-v2-v1.4.1.cursor.identity",
+            "limit": 25
+          }
+        }
+      }
+    },
+    {
+      "name": "resolve-agent-memory-snapshot-decision",
+      "accepted": true,
+      "normalized": {
+        "id": "op_snapshot_resolve",
+        "op": {
+          "type": "resolve_agent_memory_snapshot_decision",
+          "requestId": "snapshot-decision-1",
+          "decision": "merge"
+        }
+      }
+    },
+    {
+      "name": "settle-agent-memory-snapshot-unavailable",
+      "accepted": true,
+      "normalized": {
+        "id": "op_snapshot_unavailable",
+        "op": {
+          "type": "settle_agent_memory_snapshot_unavailable",
+          "requestId": "snapshot-decision-2",
+          "reason": "no-handler",
+          "error": "host has no snapshot decision handler"
+        }
+      }
+    },
+    {
+      "name": "get-agent-memory-snapshot-decision",
+      "accepted": true,
+      "normalized": {
+        "id": "op_snapshot_query",
+        "op": {
+          "type": "get_agent_memory_snapshot_decision",
+          "requestId": "snapshot-decision-1"
+        }
+      }
+    },
+    {
+      "name": "get-agent-memory-snapshot-decisions",
+      "accepted": true,
+      "normalized": {
+        "id": "op_snapshot_queries",
+        "op": {
+          "type": "get_agent_memory_snapshot_decisions"
+        }
+      }
+    },
+    {
+      "name": "interrupt",
+      "accepted": true,
+      "normalized": {
+        "id": "op_interrupt",
+        "op": {
+          "type": "interrupt"
+        }
+      }
+    },
+    {
+      "name": "shutdown",
+      "accepted": true,
+      "normalized": {
+        "id": "op_shutdown",
+        "op": {
+          "type": "shutdown"
+        }
+      }
+    },
+    {
+      "name": "invalid-op",
+      "accepted": false
+    },
+    {
+      "name": "invalid-permission-mode",
+      "accepted": false
+    },
+    {
+      "name": "invalid-rewind-zero",
+      "accepted": false
+    },
+    {
+      "name": "invalid-run-input",
+      "accepted": false
+    }
+  ]
+}

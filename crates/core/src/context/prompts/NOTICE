@@ -1,0 +1,4 @@
+Instruction policy text
+Copyright 2025 OpenAI
+
+Portions of base.md, plan.md, compact.md, and the memory policy templates in ../../memory/prompts/ are derived from OpenAI Codex, licensed under the Apache License, Version 2.0. These texts have been modified for the available identity, tools, channels, skills, connectors, planning documents, and memory storage contracts. The accompanying LICENSE applies to those portions.

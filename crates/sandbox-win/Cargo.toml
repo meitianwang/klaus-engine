@@ -1,0 +1,141 @@
+[package]
+name = "klaus-sandbox-win"
+description = "Windows native sandbox preparation, restricted tokens, filesystem permissions, managed networking, and process trees"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND Apache-2.0"
+rust-version.workspace = true
+# Published with the rest of the engine, because `klaus-agent-core` depends on it by
+# path and cargo refuses to publish a crate whose path dependency is unpublished.
+# Nobody is expected to consume this from a registry on its own.
+
+[lib]
+name = "klaus_sandbox_win"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+anyhow = "1"
+rand = { version = "0.8", default-features = false, features = ["std", "small_rng"] }
+dirs-next = "2"
+wxc_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
+# Path handling only. `dunce` maps the verbatim `\\?\` forms Windows APIs return
+# back onto ordinary paths, which is what the boundary comparisons need in order
+# to compare a caller's `C:\ws` against a canonicalized `\\?\C:\ws`.
+dunce = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+appcontainer_common = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
+learning_mode_windows = { git = "https://github.com/microsoft/mxc", rev = "6cd3d58f05d3447e67109cfb75e042803b843ca4" }
+tracelogging = "=1.2.3"
+base64 = "0.22"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+glob = "0.3"
+tempfile = "3"
+tokio = { version = "=1.52.3", features = ["sync", "rt", "macros", "signal", "time", "io-util", "net"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+
+# Existing AppContainer bindings retain their ABI. Native token adapters use the
+# separate alias below and convert owned handles only at the launch boundary.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = [
+  "Win32_Foundation",
+  # AppContainer profiles and the capability SIDs a profile is derived from.
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  # ACEs on the allowed roots.
+  "Win32_Storage_FileSystem",
+  # The job object the process tree is assigned to.
+  "Win32_System_JobObjects",
+  # CreateProcess with the AppContainer attribute, plus wait/exit-code.
+  "Win32_System_Threading",
+  # ConPTY for the tty path.
+  "Win32_System_Console",
+  "Win32_System_Pipes",
+  "Win32_System_IO",
+  # Loopback exemption for AppContainers, plus WFP filters keyed on the
+  # package SID.
+  "Win32_NetworkManagement_WindowsFirewall",
+  "Win32_NetworkManagement_WindowsFilteringPlatform",
+  "Win32_Networking_WinSock",
+  "Win32_System_Rpc",
+  "Win32_System_Memory",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemServices",
+  # Per-user, host-owned ACL transaction storage.
+  "Win32_UI_Shell",
+  "Win32_System_Com",
+]
+
+# The live-Windows integration test reads DACLs back to prove an applied ACE really
+# grants what the mask said, and captures a sandboxed target's output through a pipe
+# so a refusal can be told apart from a broken launch. Same bindings the crate uses.
+[target.'cfg(windows)'.dev-dependencies.windows-sys]
+version = "0.52"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Pipes",
+]
+
+[target.'cfg(windows)'.dependencies.native-windows-sys]
+package = "windows-sys"
+version = "0.61"
+
+features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinSock",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_Rpc",
+    "Win32_Graphics_Gdi",
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+]
+
+[[bin]]
+name = "klaus-windows-sandbox-setup"
+path = "src/bin/windows_sandbox_setup.rs"
+
+[[bin]]
+name = "klaus-command-runner"
+path = "src/bin/windows_command_runner.rs"
+
+[[bin]]
+name = "klaus-windows-managed-deny-probe"
+path = "src/bin/windows_managed_deny_probe.rs"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Foundation", "Win32_NetworkManagement_WindowsFirewall", "Win32_System_Com", "Win32_System_Variant"]
