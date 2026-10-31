@@ -11342,17 +11342,17 @@ impl Tool for DynamicToolAdapter {
         self.exposure
     }
 
-    /// Host tools a scoped friend task may call. Results, progress, questions
-    /// and directory requests are bound by the host to the task's own requester
-    /// or owner; starting a collaboration with another friend always waits for
-    /// the owner's confirmation. None of them widens the task's resource scope.
+    /// Host tools a scoped friend task may call. Results, questions and
+    /// directory requests are bound by the host to the task's own requester or
+    /// owner; starting a collaboration with another friend goes through the
+    /// task's permission mode like any other tool. None of them widens the
+    /// task's resource scope.
     fn task_scope_host_capability(&self) -> bool {
         [
             "list_friends",
             "send_message_to_friend",
             "web_search",
             "reply_to_friend",
-            "send_friend_progress",
             "ask_friend_for_information",
             "request_directory_access",
         ]

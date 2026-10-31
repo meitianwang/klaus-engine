@@ -4169,6 +4169,11 @@ impl Session {
     /// model. Friend conversations park inbound messages while the owner
     /// decides whether the task may run, so they cannot start a turn, yet their
     /// content has to live in the same history as every other message.
+    ///
+    /// The message joins the live history as well as the rollout, so the next
+    /// turn of a session that stays open reads the same context a resumed one
+    /// would. The op runs on the session's serial chain, never inside a turn,
+    /// so it cannot split a tool call from its result.
     pub async fn append_display_message(
         &self,
         message_id: RuntimeString,
@@ -4196,21 +4201,34 @@ impl Session {
                 writable_roots: None,
             })
             .await;
-        rollout
-            .append_message(Message::User(UserMessage {
-                question_answer: None,
-                uuid: message_id.clone(),
-                content: to_content_blocks(&input),
-                is_meta: None,
-            }))
-            .await;
-        rollout
-            .append_message(crate::engine::session::user_display_message(
-                message_id,
-                &display_metadata,
-                (self.deps.uuid)().into(),
-            ))
-            .await;
+        let message = Message::User(UserMessage {
+            question_answer: None,
+            uuid: message_id.clone(),
+            content: to_content_blocks(&input),
+            is_meta: None,
+        });
+        let display = crate::engine::session::user_display_message(
+            message_id.clone(),
+            &display_metadata,
+            (self.deps.uuid)().into(),
+        );
+        rollout.append_message(message.clone()).await;
+        rollout.append_message(display.clone()).await;
+        // A host retry with the same message id is already in the live history.
+        let known = self
+            .history_snapshot()
+            .iter()
+            .any(|existing| matches!(existing, Message::User(user) if user.uuid == message_id));
+        if !known {
+            for item in [message, display] {
+                let uuid = super::message_uuid(&item).clone();
+                self.turn_index
+                    .lock_recover()
+                    .message_turn
+                    .insert(uuid, turn_id.clone());
+                self.push_history(item);
+            }
+        }
         let mut payload = crate::runtime_values::RuntimeObject::new();
         payload.insert("status", RuntimeJson::String("completed".into()));
         payload.insert(

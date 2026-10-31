@@ -353,7 +353,6 @@ fn a_dynamic_tool_reports_the_hosts_read_only_declaration() {
     assert!(adapter(spec("web_search", true)).task_scope_host_capability());
     for name in [
         "reply_to_friend",
-        "send_friend_progress",
         "ask_friend_for_information",
         "request_directory_access",
     ] {
@@ -362,8 +361,8 @@ fn a_dynamic_tool_reports_the_hosts_read_only_declaration() {
             "{name} answers the task's own requester or owner"
         );
     }
-    // A task may start a collaboration with another friend; the host holds it
-    // for the receiving owner's confirmation before anything is sent.
+    // A task may start a collaboration with another friend; the task's
+    // permission mode decides whether the owner approves it first.
     assert!(adapter(spec("send_message_to_friend", false)).task_scope_host_capability());
     assert!(!adapter(spec("arbitrary_host_command", true)).task_scope_host_capability());
 }
