@@ -1437,6 +1437,138 @@ async fn never_policy_denies_network_escalation_without_prompting() {
     )));
 }
 
+struct NoopBrowserExecutor;
+
+#[async_trait]
+unsafe impl crate::browser::BrowserExecutor for NoopBrowserExecutor {
+    async fn execute(
+        &self,
+        _request: crate::browser::BrowserRuntimeRequest,
+        _signal: AbortSignal,
+        _emit: crate::browser::BrowserEventSink,
+    ) -> Result<crate::browser::BrowserRuntimeResponse, crate::browser::BrowserRuntimeError> {
+        Ok(crate::browser::BrowserRuntimeResponse::default())
+    }
+}
+
+fn browser_write_query(
+    sandbox_mode: crate::types::permission::SandboxMode,
+    approval_policy: crate::types::permission::ApprovalPolicy,
+) -> (QueryParams, EngineDeps) {
+    let mut first = vec![ev::message_start(None)];
+    first.extend(exact_tool_use_events(
+        "click-1",
+        "browser_click",
+        &runtime_json!({ "selector": "#buy" }),
+    ));
+    first.extend(exact_tool_use_events(
+        "resize-1",
+        "browser_resize",
+        &runtime_json!({ "viewport": { "width": 800, "height": 600 } }),
+    ));
+    first.extend(exact_tool_use_events(
+        "tabs-1",
+        "browser_tabs",
+        &runtime_json!({ "action": "new", "url": "https://example.com/" }),
+    ));
+    first.push(ev::stop(Some(ModelStopReason::ToolUse), None));
+    let deps = deps_with(scripted_call_model(vec![
+        first,
+        vec![
+            ev::message_start(None),
+            ev::text("done"),
+            ev::stop(None, None),
+        ],
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = crate::tools::builtins::browser::create_browser_tools()
+        .into_iter()
+        .filter(|tool| {
+            ["browser_click", "browser_resize", "browser_tabs"]
+                .iter()
+                .any(|name| tool.name() == *name)
+        })
+        .collect();
+    let mut params = mk_params(vec![user_msg("do browser writes")], tools);
+    params.permission_engine = Arc::new(StaticPermissionEngine::new(&params.config));
+    params.tool_context_base = Arc::new(move || {
+        let mut ctx = make_test_ctx("/tmp");
+        ctx.sandbox_mode = Some(sandbox_mode);
+        ctx.approval_policy = Some(approval_policy);
+        ctx.network_allowed = Some(true);
+        ctx.browser =
+            Some(unsafe { crate::browser::attest_spawn_free(Arc::new(NoopBrowserExecutor)) });
+        ctx
+    });
+    (params, deps)
+}
+
+fn assert_browser_writes_completed_without_approval_error(evs: &[EngineEvent]) {
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, EngineEvent::ApprovalRequested { .. })),
+        "a bypass session must not raise an approval card: {evs:?}"
+    );
+    for tool_name in ["browser_click", "browser_resize", "browser_tabs"] {
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                EngineEvent::ItemCompleted {
+                    item: ThreadItem::ToolCall { tool_name: name, .. },
+                    ..
+                } if name == tool_name
+            )),
+            "{tool_name} did not complete: {evs:?}"
+        );
+    }
+    assert!(
+        !evs.iter().any(|e| matches!(
+            e,
+            EngineEvent::ItemUpdated {
+                item: ThreadItem::ToolCall {
+                    error: Some(ItemError { message, .. }),
+                    ..
+                },
+                ..
+            } if message.contains("approval policy is never")
+        )),
+        "the bypass session must not be rejected by the approval policy: {evs:?}"
+    );
+}
+
+#[tokio::test]
+async fn bypass_permissions_grants_browser_writes_without_prompting() {
+    let (params, deps) = browser_write_query(
+        crate::types::permission::SandboxMode::DangerFullAccess,
+        crate::types::permission::ApprovalPolicy::Never,
+    );
+    let evs: Vec<EngineEvent> = query(params, deps).collect().await;
+    assert_browser_writes_completed_without_approval_error(&evs);
+}
+
+#[tokio::test]
+async fn default_permissions_still_prompt_for_browser_writes() {
+    let (mut params, deps) = browser_write_query(
+        crate::types::permission::SandboxMode::WorkspaceWrite,
+        crate::types::permission::ApprovalPolicy::OnRequest,
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    params.approval_handler = Some(Arc::new(CountingApprovalHandler {
+        calls: calls.clone(),
+    }));
+    let evs: Vec<EngineEvent> = query(params, deps).collect().await;
+
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, EngineEvent::ApprovalRequested { .. })),
+        "the default preset must still show the approval card: {evs:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "each browser write must reach the approval handler"
+    );
+}
+
 struct EchoTool {
     schema: JsonSchema,
 }

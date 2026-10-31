@@ -2082,6 +2082,17 @@ async fn resolve_approval_request(
     let permission_stamp =
         RuntimePermissionStamp::capture(&context, shared.params.permission_engine.as_ref());
     if context.approval_policy == Some(crate::types::permission::ApprovalPolicy::Never) {
+        // `never` disables prompts. When the session also has unrestricted
+        // filesystem access -- the engine side of the bypass-permissions preset
+        // -- an action that would otherwise prompt is granted instead of
+        // failing. Hard denials are decided by the permission engine before
+        // this function runs, so they still block.
+        if context.sandbox_mode == Some(crate::types::permission::SandboxMode::DangerFullAccess) {
+            return Ok(ApprovalResponse::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            });
+        }
         return Err(
             "This action requires approval, but the current approval policy is never.".into(),
         );
