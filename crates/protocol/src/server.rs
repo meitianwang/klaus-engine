@@ -3771,7 +3771,9 @@ impl ServerInner {
                 || update.model_verbosity.is_some()
                 || update.reasoning_summary.is_some()
                 || update.web_search_access.is_some()
-                || update.approval_review.is_some());
+                || update.approval_review.is_some()
+                || update.subagent_model_catalog.is_some()
+                || update.subagent_model_options.is_some());
         if is_secondary {
             Box::pin(self.dispatch_secondary(submission_id, op, busy_guard)).await;
         } else {

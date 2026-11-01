@@ -2024,6 +2024,8 @@ async fn feed_acked_op(
                 "reasoningSummary",
                 "webSearchAccess",
                 "approvalReview",
+                "subagentModelCatalog",
+                "subagentModelOptions",
             ]
             .iter()
             .any(|key| config_update.get(*key).is_some()));

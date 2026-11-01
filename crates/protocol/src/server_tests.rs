@@ -13118,6 +13118,192 @@ async fn update_session_config_changes_only_mutable_fields_on_the_next_turn() {
     );
 }
 
+/// A live subagent-model directory update must settle while an earlier turn is
+/// still holding its provider stream, and the next captured step must observe
+/// it. This update used to ride the serial turn chain, so its applied
+/// acknowledgement arrived only after the running turn finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_session_config_subagent_model_applies_while_turn_is_running() {
+    let requests = Arc::new(StdMutex::new(Vec::<ModelRequest>::new()));
+    let provider_started = Arc::new(Notify::new());
+    let release_provider = Arc::new(tokio::sync::Semaphore::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let captured = requests.clone();
+    let started = provider_started.clone();
+    let gate = release_provider.clone();
+    let seen_calls = calls.clone();
+    let call_model: klaus_agent_core::types::provider::CallModel =
+        Box::new(move |request, signal| {
+            captured.lock().unwrap().push(request);
+            if seen_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                started.notify_one();
+                let gate = gate.clone();
+                Box::pin(
+                    futures::stream::once(async move {
+                        tokio::select! {
+                            _ = signal.cancelled() => Vec::new(),
+                            _permit = gate.acquire() => text_turn("first"),
+                        }
+                    })
+                    .flat_map(futures::stream::iter),
+                )
+            } else {
+                Box::pin(futures::stream::iter(text_turn("second")))
+            }
+        });
+    let agent = Arc::new(Agent::new(AgentOptions {
+        process_context: test_process_context(),
+        provider: Arc::new(fake_provider()) as Arc<dyn ModelProvider>,
+        config: None,
+        tools: None,
+        web_fetch_page: None,
+        browser_runtime: None,
+        capability_roots: Vec::new(),
+        cwd: Some(".".to_string()),
+        deps: EngineDepsOverrides {
+            call_model: Some(call_model),
+            estimate_tokens: None,
+            compactor: None,
+            uuid: None,
+            now: None,
+        },
+        compactor: None,
+        approval_handler: None,
+        approval_reviewer: None,
+        elicit_handler: None,
+        credential_store: None,
+        hooks: vec![],
+        observer: None,
+        logger: None,
+        pricing: None,
+        agents: None,
+        include_default_agents: None,
+        skills: None,
+        output_styles: None,
+        workflows: None,
+        mcp_catalog: None,
+        plugin_catalog: None,
+        lsp_servers: None,
+        agent_memory: None,
+        mcp_clients: None,
+        mcp_server_configs: Vec::new(),
+        mcp_tools: None,
+        refresh_tools: None,
+        system_prompt_provider: None,
+        plugins: Vec::new(),
+        plugin_load_report: None,
+    }));
+    let ((sr, sw), (cr, cw)) = duplex_pair();
+    let (server, done) = start_server(
+        make_create_session(agent, Some(ExternalPermissionMode::BypassPermissions)),
+        sr,
+        sw,
+    );
+    let client = Arc::new(ProtocolClient::new(ProtocolClientOptions {
+        input: cr,
+        output: cw,
+    }));
+
+    timeout(CROSS_TASK_LIVENESS_TIMEOUT, async {
+        let running = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .run_to_completion(Input::Text("first".into()), None)
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), provider_started.notified())
+            .await
+            .expect("the first provider request stays held");
+
+        // Turn the catalog ON while the provider is still held.
+        let on_start = std::time::Instant::now();
+        let updated_on = timeout(
+            Duration::from_secs(2),
+            client.update_session_config(ProtocolSessionConfigUpdate {
+                subagent_model_catalog: Some(true),
+                subagent_model_options: Some(vec![
+                    klaus_agent_core::schemas::config::SubagentModelOption {
+                        value: "custom:available".into(),
+                        label: "Available model".into(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the subagent directory update must not wait for the running turn")
+        .expect("config update");
+        let on_elapsed = on_start.elapsed();
+        assert_eq!(updated_on.subagent_model_catalog, Some(true));
+        assert_eq!(
+            updated_on.subagent_model_options.as_ref().unwrap()[0].value,
+            "custom:available"
+        );
+        assert!(
+            !running.is_finished(),
+            "the turn is still held by its provider when the ON update settles"
+        );
+
+        // Turn the catalog OFF while the same provider call is still held.
+        let off_start = std::time::Instant::now();
+        let updated_off = timeout(
+            Duration::from_secs(2),
+            client.update_session_config(ProtocolSessionConfigUpdate {
+                subagent_model_catalog: Some(false),
+                subagent_model_options: Some(vec![]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("the subagent directory update must not wait for the running turn")
+        .expect("config update");
+        let off_elapsed = off_start.elapsed();
+        assert_eq!(updated_off.subagent_model_catalog, Some(false));
+        assert!(updated_off
+            .subagent_model_options
+            .as_ref()
+            .unwrap()
+            .is_empty());
+        assert!(
+            !running.is_finished(),
+            "the turn is still held by its provider when the OFF update settles"
+        );
+        eprintln!(
+            "subagent-model-toggle-timing: on={:?} off={:?} while turn held",
+            on_elapsed, off_elapsed
+        );
+
+        release_provider.add_permits(1);
+        running.await.expect("run task").expect("first turn");
+        let _ = client
+            .run_to_completion(Input::Text("second".into()), None)
+            .await;
+    })
+    .await
+    .expect("timed out");
+
+    server.stop();
+    done.await.ok();
+
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "captured requests: {}", requests.len());
+    let last = requests.last().unwrap();
+    let tool = last
+        .tools
+        .iter()
+        .find(|tool| tool.name == "task" || tool.name == "spawn_agent" || tool.name == "Task")
+        .expect("the next captured step carries the subagent tool");
+    assert_eq!(
+        tool.input_schema["properties"]["model"]["enum"],
+        klaus_agent_core::runtime_values::runtime_json::parse(&r#"["low","medium","high"]"#.into())
+            .unwrap(),
+        "the captured OFF directory takes effect on the next step"
+    );
+}
+
 // This path runs two full protocol session creations. Its worker frames exceed
 // Tokio's 2 MiB default in debug builds, so give the test runtime the same
 // explicit stack budget used by the other full-session round-trip tests.
