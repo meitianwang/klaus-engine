@@ -13,6 +13,16 @@
 //! Fixed by: pushing both records into the live history (once per message id)
 //! and indexing them under the appended turn. Fixing change: 2026-10-31
 //! working change; no separate tracker item.
+//!
+//! Second defect, same entry point: the composer never offered a suggestion
+//! after an appended row. A conversation holding only friend messages had no
+//! suggestion source at all, and an older conversation kept suggesting from
+//! the turn before the friend message. Root cause: the appended turn had no
+//! live `turn_status` and did not move the prediction source checkpoint, which
+//! only real turn admission advanced. Fixed by marking the appended turn
+//! completed and admitting it as the prediction source (persisted, so a
+//! resumed session agrees) while no turn is running. Fixing change:
+//! 2026-10-31 working change; no separate tracker item.
 use super::context_fixture;
 use super::r7c876d49_spec_restores_latest_permission_policy::{agent_options, process_supervisor};
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};
@@ -97,10 +107,16 @@ async fn an_appended_message_is_in_the_open_session_and_after_a_resume() {
     let live = session.history();
     assert_eq!(user_texts(&live), vec![text.to_string()]);
     assert!(live.iter().any(|message| matches!(message, Message::System(system) if system.subtype == SystemSubtype::UserDisplay)));
-    assert!(session
+    let appended_turn = session
         .turn_index_snapshot()
         .message_turn
-        .contains_key(&RuntimeString::from("friend-message-1")));
+        .get(&RuntimeString::from("friend-message-1"))
+        .cloned()
+        .expect("appended message is indexed under its turn");
+    // The composer suggests a reply to the appended row right away.
+    let context = session.prediction_context().await.unwrap();
+    assert_eq!(context.turn_id, Some(appended_turn.clone()));
+    assert!(!context.running);
     // A host retry with the same id is not added twice.
     session
         .append_display_message(
@@ -118,6 +134,9 @@ async fn an_appended_message_is_in_the_open_session_and_after_a_resume() {
         user_texts(&resumed.history()).first(),
         Some(&text.to_string())
     );
+    let context = resumed.prediction_context().await.unwrap();
+    assert_eq!(context.turn_id, Some(appended_turn));
+    assert!(!context.running);
     resumed.shutdown_and_wait().await.unwrap();
     let reopened = store
         .resume_runtime_for_write("display-live")

@@ -4220,13 +4220,44 @@ impl Session {
             .iter()
             .any(|existing| matches!(existing, Message::User(user) if user.uuid == message_id));
         if !known {
+            {
+                let mut index = self.turn_index.lock_recover();
+                for item in [&message, &display] {
+                    index
+                        .message_turn
+                        .insert(super::message_uuid(item).clone(), turn_id.clone());
+                }
+                // The appended row is a finished turn of its own. Without a live
+                // status the composer treats it as unknown and offers no
+                // suggestion until the session is reopened.
+                index
+                    .turn_status
+                    .insert(turn_id.clone(), RuntimeString::from("completed"));
+            }
             for item in [message, display] {
-                let uuid = super::message_uuid(&item).clone();
-                self.turn_index
-                    .lock_recover()
-                    .message_turn
-                    .insert(uuid, turn_id.clone());
                 self.push_history(item);
+            }
+            // The newest row is now the source the composer suggests from. A
+            // running turn keeps that role: it already sees this row and ends
+            // after it, so the checkpoint only moves while the session is idle.
+            // The generation is reserved first, so a turn admitted after this
+            // point still outranks the display row.
+            if let Some(generation) = self.turn.reserve_generation() {
+                if self.turn.is_stack_empty() {
+                    if let crate::schemas::rollout::RolloutItem::Event(event) =
+                        self.admit_prediction_source_checkpoint(generation, Some(turn_id.clone()))
+                    {
+                        rollout
+                            .append_event(
+                                event.event,
+                                Some(crate::store::session_store::AppendEventOptions {
+                                    turn_id: event.turn_id,
+                                    payload: event.payload,
+                                }),
+                            )
+                            .await;
+                    }
+                }
             }
         }
         let mut payload = crate::runtime_values::RuntimeObject::new();
