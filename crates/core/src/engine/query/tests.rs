@@ -1451,11 +1451,29 @@ unsafe impl crate::browser::BrowserExecutor for NoopBrowserExecutor {
     }
 }
 
+const BROWSER_WRITE_TOOLS: [&str; 5] = [
+    "browser_select_browser",
+    "browser_claim_tab",
+    "browser_click",
+    "browser_resize",
+    "browser_tabs",
+];
+
 fn browser_write_query(
     sandbox_mode: crate::types::permission::SandboxMode,
     approval_policy: crate::types::permission::ApprovalPolicy,
 ) -> (QueryParams, EngineDeps) {
     let mut first = vec![ev::message_start(None)];
+    first.extend(exact_tool_use_events(
+        "select-1",
+        "browser_select_browser",
+        &runtime_json!({ "deviceId": "chrome:test" }),
+    ));
+    first.extend(exact_tool_use_events(
+        "claim-1",
+        "browser_claim_tab",
+        &runtime_json!({ "browserId": "chrome:test", "tabId": 1 }),
+    ));
     first.extend(exact_tool_use_events(
         "click-1",
         "browser_click",
@@ -1482,11 +1500,7 @@ fn browser_write_query(
     ]));
     let tools: Vec<Arc<dyn Tool>> = crate::tools::builtins::browser::create_browser_tools()
         .into_iter()
-        .filter(|tool| {
-            ["browser_click", "browser_resize", "browser_tabs"]
-                .iter()
-                .any(|name| tool.name() == *name)
-        })
+        .filter(|tool| BROWSER_WRITE_TOOLS.iter().any(|name| tool.name() == *name))
         .collect();
     let mut params = mk_params(vec![user_msg("do browser writes")], tools);
     params.permission_engine = Arc::new(StaticPermissionEngine::new(&params.config));
@@ -1508,16 +1522,21 @@ fn assert_browser_writes_completed_without_approval_error(evs: &[EngineEvent]) {
             .any(|e| matches!(e, EngineEvent::ApprovalRequested { .. })),
         "a bypass session must not raise an approval card: {evs:?}"
     );
-    for tool_name in ["browser_click", "browser_resize", "browser_tabs"] {
+    for tool_name in BROWSER_WRITE_TOOLS {
         assert!(
             evs.iter().any(|e| matches!(
                 e,
                 EngineEvent::ItemCompleted {
-                    item: ThreadItem::ToolCall { tool_name: name, .. },
+                    item: ThreadItem::ToolCall {
+                        tool_name: name,
+                        status: ItemStatus::Completed,
+                        error: None,
+                        ..
+                    },
                     ..
                 } if name == tool_name
             )),
-            "{tool_name} did not complete: {evs:?}"
+            "{tool_name} did not complete successfully: {evs:?}"
         );
     }
     assert!(
@@ -1564,7 +1583,7 @@ async fn default_permissions_still_prompt_for_browser_writes() {
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        3,
+        BROWSER_WRITE_TOOLS.len(),
         "each browser write must reach the approval handler"
     );
 }
