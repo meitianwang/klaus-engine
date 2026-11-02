@@ -1602,10 +1602,7 @@ fn input_schema(kind: BrowserToolKind) -> JsonSchema {
                 "refId".to_string(),
                 string_prop("Element reference for scroll_to or target-aware actions"),
             );
-            props.insert(
-                "ref".to_string(),
-                string_prop("Alias for refId"),
-            );
+            props.insert("ref".to_string(), string_prop("Alias for refId"));
             props.insert(
                 "save".to_string(),
                 bool_prop("Save screenshot/zoom as artifact"),
@@ -1779,10 +1776,7 @@ fn input_schema(kind: BrowserToolKind) -> JsonSchema {
                 "refId".to_string(),
                 string_prop("Optional element reference for the file input"),
             );
-            props.insert(
-                "ref".to_string(),
-                string_prop("Alias for refId"),
-            );
+            props.insert("ref".to_string(), string_prop("Alias for refId"));
             vec!["paths"]
         }
         BrowserToolKind::ShortcutsList => {
