@@ -135,7 +135,10 @@ async fn fixture() -> Fixture {
                 let (status, content_type, response) = if (body["project"] == "stale-project"
                     && (path.contains(":streamGenerateContent")
                         || path.contains(":fetchAvailableModels")))
-                    || matches!(model, "fixture-notfound" | "fixture-notfound-listed")
+                    || matches!(
+                        model,
+                        "fixture-notfound" | "fixture-notfound-listed" | "fixture-vanished"
+                    )
                 {
                     (404, "application/json", not_found.to_string())
                 } else if model.starts_with("fixture-stream-") {
@@ -907,7 +910,7 @@ async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_mo
     assert!(
         unlisted
             .message
-            .starts_with("antigravity_model_not_offered [NOT_FOUND]"),
+            .starts_with("antigravity_model_unlisted [NOT_FOUND]"),
         "{}",
         unlisted.message
     );
@@ -935,7 +938,55 @@ async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_mo
     }
     assert_eq!(
         client.error_details(&unlisted).code.as_deref(),
-        Some("antigravity_model_not_offered")
+        Some("antigravity_model_unlisted")
+    );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
+async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
+    use klaus_agent_core::provider::gemini::GeminiClient;
+    let fixture = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    auth::adopt(auth::Credential {
+        access_token: "fixture".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: None,
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let generation = auth::generation().unwrap();
+    let snapshot = json!({
+        "generation": generation,
+        "payload": {"models": {"fixture-vanished": {"displayName": "Vanished Model"}}},
+        "fetchedAt": 1,
+    });
+    std::fs::write(root.path().join("antigravity-models.json"), snapshot.to_string()).unwrap();
+    let client = cloud::CloudClient { generation };
+    let error = client
+        .generate_content_stream(
+            decode(json!({"model":"fixture-vanished","contents":[],"config":{"maxOutputTokens":100}})),
+            None,
+            Vec::new(),
+            AbortSignal::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .message
+            .starts_with("antigravity_model_not_offered [NOT_FOUND]"),
+        "{}",
+        error.message
     );
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");

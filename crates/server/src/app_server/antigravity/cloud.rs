@@ -88,9 +88,10 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 8] = [
+const ERROR_TAGS: [&str; 9] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
+    "antigravity_model_unlisted",
     "antigravity_quota_exhausted",
     "antigravity_request_rejected",
     "antigravity_auth_required",
@@ -444,22 +445,42 @@ fn retag(error: GeminiApiError, tag: &str) -> GeminiApiError {
     error
 }
 
-/// A NOT_FOUND refusal that survives a fresh project resolution is an account
-/// verdict when the refreshed catalog does not list the model; otherwise the
-/// original refusal stays the truthful report.
+/// A NOT_FOUND refusal that survives a fresh project resolution is read against
+/// the live account catalog only: a model the service listed before and no
+/// longer lists is an entitlement verdict, while an identity the live catalog
+/// never carried is a stale selection the picker must re-resolve, not an
+/// account limitation. The hardcoded known-model inventory must not count as
+/// listing, or every stale identity would read as entitled.
 async fn not_offered_or_original(
     generation: &str,
     model: &str,
     error: GeminiApiError,
 ) -> GeminiApiError {
-    let listed = match super::refresh_catalog(generation).await {
-        Ok(payload) => super::catalog::model_details(&payload, model).is_some(),
+    let was_listed = super::cached_payload(generation).is_some_and(|cached| {
+        cached
+            .payload
+            .get("models")
+            .and_then(|models| models.get(model))
+            .is_some()
+    });
+    let listed_now = match super::refresh_catalog(generation).await {
+        Ok(payload) => payload
+            .get("models")
+            .and_then(|models| models.get(model))
+            .is_some(),
         Err(_) => return error,
     };
-    if listed {
+    if listed_now {
         return error;
     }
-    retag(error, "antigravity_model_not_offered")
+    retag(
+        error,
+        if was_listed {
+            "antigravity_model_not_offered"
+        } else {
+            "antigravity_model_unlisted"
+        },
+    )
 }
 
 #[derive(Clone)]
