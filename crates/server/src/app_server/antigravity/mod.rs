@@ -199,10 +199,7 @@ pub(super) fn is_not_found_message(message: &str) -> bool {
 }
 
 /// Drop the cached project and resolve a fresh one from the service.
-pub(super) async fn heal_project(
-    generation: &str,
-    signal: &AbortSignal,
-) -> Result<String, String> {
+pub(super) async fn heal_project(generation: &str, signal: &AbortSignal) -> Result<String, String> {
     auth::clear_project(generation).await?;
     project(Some(generation), signal).await
 }

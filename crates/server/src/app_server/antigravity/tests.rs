@@ -138,8 +138,7 @@ async fn fixture() -> Fixture {
                     || matches!(
                         model,
                         "fixture-notfound" | "fixture-notfound-listed" | "fixture-vanished"
-                    )
-                {
+                    ) {
                     (404, "application/json", not_found.to_string())
                 } else if model.starts_with("fixture-stream-") {
                     (200, "text/event-stream", format!("data: {refusal}\n\n"))
@@ -969,11 +968,17 @@ async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
         "payload": {"models": {"fixture-vanished": {"displayName": "Vanished Model"}}},
         "fetchedAt": 1,
     });
-    std::fs::write(root.path().join("antigravity-models.json"), snapshot.to_string()).unwrap();
+    std::fs::write(
+        root.path().join("antigravity-models.json"),
+        snapshot.to_string(),
+    )
+    .unwrap();
     let client = cloud::CloudClient { generation };
     let error = client
         .generate_content_stream(
-            decode(json!({"model":"fixture-vanished","contents":[],"config":{"maxOutputTokens":100}})),
+            decode(
+                json!({"model":"fixture-vanished","contents":[],"config":{"maxOutputTokens":100}}),
+            ),
             None,
             Vec::new(),
             AbortSignal::new(),
