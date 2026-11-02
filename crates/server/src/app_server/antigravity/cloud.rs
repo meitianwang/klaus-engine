@@ -88,8 +88,9 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 7] = [
+const ERROR_TAGS: [&str; 8] = [
     "antigravity_model_access_denied",
+    "antigravity_model_not_offered",
     "antigravity_quota_exhausted",
     "antigravity_request_rejected",
     "antigravity_auth_required",
@@ -428,6 +429,39 @@ fn api_error(message: impl Into<String>) -> GeminiApiError {
     }
 }
 
+fn is_not_found(error: &GeminiApiError) -> bool {
+    error.status == Some(404) && error.message.contains("[NOT_FOUND]")
+}
+
+fn retag(error: GeminiApiError, tag: &str) -> GeminiApiError {
+    let mut error = error;
+    for known in ERROR_TAGS {
+        if let Some(suffix) = error.message.strip_prefix(known) {
+            error.message = format!("{tag}{suffix}");
+            return error;
+        }
+    }
+    error
+}
+
+/// A NOT_FOUND refusal that survives a fresh project resolution is an account
+/// verdict when the refreshed catalog does not list the model; otherwise the
+/// original refusal stays the truthful report.
+async fn not_offered_or_original(
+    generation: &str,
+    model: &str,
+    error: GeminiApiError,
+) -> GeminiApiError {
+    let listed = match super::refresh_catalog(generation).await {
+        Ok(payload) => super::catalog::model_details(&payload, model).is_some(),
+        Err(_) => return error,
+    };
+    if listed {
+        return error;
+    }
+    retag(error, "antigravity_model_not_offered")
+}
+
 #[derive(Clone)]
 pub(super) struct CloudClient {
     pub generation: String,
@@ -611,35 +645,65 @@ impl GeminiClient for CloudClient {
         if let Some(headers) = headers {
             extra_headers.extend(headers);
         }
-        let project = super::project(Some(&self.generation), &signal)
-            .await
-            .map_err(api_error)?;
         let model = params
             .model
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
-        let mut body: RuntimeJson = runtime_codec::decode_text(&RuntimeString::from(
-            envelope(&project, &model, Value::Null, "agent").to_string(),
-        ))
-        .map_err(|_| api_error("antigravity_request_invalid"))?;
-        let mut request = generate_content_request(&params);
-        if let Some(details) = super::model_details(&self.generation, &model) {
-            adapt_model_request(&mut request, &details)?;
-        }
-        body.as_object_mut()
-            .ok_or_else(|| api_error("antigravity_request_invalid"))?
-            .insert("request", request);
-        let mut bytes = Vec::new();
-        runtime_json::write_to(&body, &mut bytes)
+        let build_body = |project: &str| -> Result<Vec<u8>, GeminiApiError> {
+            let mut request = generate_content_request(&params);
+            if let Some(details) = super::model_details(&self.generation, &model) {
+                adapt_model_request(&mut request, &details)?;
+            }
+            let mut body: RuntimeJson = runtime_codec::decode_text(&RuntimeString::from(
+                envelope(project, &model, Value::Null, "agent").to_string(),
+            ))
             .map_err(|_| api_error("antigravity_request_invalid"))?;
-        let response = send(
+            body.as_object_mut()
+                .ok_or_else(|| api_error("antigravity_request_invalid"))?
+                .insert("request", request);
+            let mut bytes = Vec::new();
+            runtime_json::write_to(&body, &mut bytes)
+                .map_err(|_| api_error("antigravity_request_invalid"))?;
+            Ok(bytes)
+        };
+        let project = super::project(Some(&self.generation), &signal)
+            .await
+            .map_err(api_error)?;
+        let response = match send(
             "streamGenerateContent",
-            bytes,
+            build_body(&project)?,
             Some(&self.generation),
             &signal,
-            extra_headers,
+            extra_headers.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            // A NOT_FOUND refusal can mean the cached project no longer resolves
+            // rather than the request being wrong; resolve a fresh project and
+            // replay the request once before trusting the refusal.
+            Err(first) if is_not_found(&first) => {
+                let healed = super::heal_project(&self.generation, &signal)
+                    .await
+                    .map_err(api_error)?;
+                match send(
+                    "streamGenerateContent",
+                    build_body(&healed)?,
+                    Some(&self.generation),
+                    &signal,
+                    extra_headers,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(second) if is_not_found(&second) => {
+                        return Err(not_offered_or_original(&self.generation, &model, second).await)
+                    }
+                    Err(second) => return Err(second),
+                }
+            }
+            Err(first) => return Err(first),
+        };
         let generation = self.generation.clone();
         Ok(Box::pin(async_stream::stream! {
             let mut stream = response.bytes_stream();

@@ -91,6 +91,7 @@ async fn fixture() -> Fixture {
                             "fixture-stream-locked":{"displayName":"Stream Locked Model","disabled":true},
                             "fixture-stream-quota":{"displayName":"Stream Quota Model"},
                             "fixture-http-quota":{"displayName":"HTTP Quota Model"},
+                            "fixture-notfound-listed":{"displayName":"Listed NotFound Model"},
                             "fixture-image":{"displayName":"Image Model"},
                             "fixture-completion":{"displayName":"Completion Model"},
                         },
@@ -125,12 +126,19 @@ async fn fixture() -> Fixture {
                     ("application/json", payload.to_string())
                 };
                 let model = body["model"].as_str().unwrap_or("");
+                let not_found = json!({"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found."}});
                 let refusal = if model.contains("quota") {
                     json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Your model quota is exhausted.","requestId":"fixture-request-123","details":[{"reason":"QUOTA_EXHAUSTED"},{"retryDelay":"2s"}]},"privatePrompt":"not-public"})
                 } else {
                     json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"Your subscription does not permit access to this model.","details":[{"reason":"MODEL_ACCESS_DENIED"}]},"privatePrompt":"not-public"})
                 };
-                let (status, content_type, response) = if model.starts_with("fixture-stream-") {
+                let (status, content_type, response) = if (body["project"] == "stale-project"
+                    && (path.contains(":streamGenerateContent")
+                        || path.contains(":fetchAvailableModels")))
+                    || matches!(model, "fixture-notfound" | "fixture-notfound-listed")
+                {
+                    (404, "application/json", not_found.to_string())
+                } else if model.starts_with("fixture-stream-") {
                     (200, "text/event-stream", format!("data: {refusal}\n\n"))
                 } else if matches!(
                     model,
@@ -799,4 +807,136 @@ async fn logout_invalidates_a_refresh_without_waiting_for_the_network() {
     assert!(!auth::path().exists());
     server.await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL");
+}
+
+#[tokio::test]
+async fn a_stale_cached_project_heals_before_a_not_found_refusal_is_trusted() {
+    use klaus_agent_core::provider::gemini::GeminiClient;
+    let fixture = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    auth::adopt(auth::Credential {
+        access_token: "fixture".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: None,
+        auth_method: "consumer".into(),
+        project: Some("stale-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let client = cloud::CloudClient {
+        generation: auth::generation().unwrap(),
+    };
+    let events: Vec<_> = client
+        .generate_content_stream(
+            decode(json!({"model":"fixture-level","contents":[],"config":{"maxOutputTokens":100}})),
+            None,
+            Vec::new(),
+            AbortSignal::new(),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(
+        events.iter().all(|event| event.is_ok()),
+        "the healed replay must stream every frame"
+    );
+    let (paths, first_project, replay_project) = {
+        let requests = fixture.requests.lock().unwrap();
+        let paths: Vec<String> = requests
+            .iter()
+            .map(|request| request["path"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let first = requests[0]["body"]["project"].as_str().map(str::to_string);
+        let replay = requests[2]["body"]["project"].as_str().map(str::to_string);
+        (paths, first, replay)
+    };
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert!(paths[0].contains(":streamGenerateContent"));
+    assert!(paths[1].ends_with(":loadCodeAssist"));
+    assert!(paths[2].contains(":streamGenerateContent"));
+    assert_eq!(first_project.as_deref(), Some("stale-project"));
+    assert_eq!(replay_project.as_deref(), Some("fixture-project"));
+    let healed = auth::credential(None).await.unwrap();
+    assert_eq!(healed.project.as_deref(), Some("fixture-project"));
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
+async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_models() {
+    use klaus_agent_core::provider::classify::classify_error;
+    use klaus_agent_core::provider::gemini::GeminiClient;
+    use klaus_agent_core::types::errors::ProviderErrorKind;
+    let fixture = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    auth::adopt(auth::Credential {
+        access_token: "fixture".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: None,
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let client = cloud::CloudClient {
+        generation: auth::generation().unwrap(),
+    };
+    let params =
+        |model: &str| decode(json!({"model":model,"contents":[],"config":{"maxOutputTokens":100}}));
+    let unlisted = client
+        .generate_content_stream(
+            params("fixture-notfound"),
+            None,
+            Vec::new(),
+            AbortSignal::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        unlisted
+            .message
+            .starts_with("antigravity_model_not_offered [NOT_FOUND]"),
+        "{}",
+        unlisted.message
+    );
+    let listed = client
+        .generate_content_stream(
+            params("fixture-notfound-listed"),
+            None,
+            Vec::new(),
+            AbortSignal::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        listed
+            .message
+            .starts_with("antigravity_request_rejected [NOT_FOUND]"),
+        "{}",
+        listed.message
+    );
+    for error in [&unlisted, &listed] {
+        let classified = classify_error(&client.error_details(error));
+        assert_eq!(classified.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(classified.status, Some(404));
+    }
+    assert_eq!(
+        client.error_details(&unlisted).code.as_deref(),
+        Some("antigravity_model_not_offered")
+    );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }

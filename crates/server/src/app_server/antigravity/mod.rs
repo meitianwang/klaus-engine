@@ -169,15 +169,7 @@ fn platform_id() -> &'static str {
 async fn refresh_catalog(generation: &str) -> Result<Value, String> {
     let signal = AbortSignal::new();
     let project = project(Some(generation), &signal).await?;
-    let payload = cloud::rpc(
-        "fetchAvailableModels",
-        json!({
-            "project":project,"requestId":uuid::Uuid::new_v4().to_string(),
-        }),
-        Some(generation),
-        &signal,
-    )
-    .await?;
+    let payload = fetch_available_models(generation, &project, &signal).await?;
     if !payload.get("models").is_some_and(Value::is_object) {
         return Err("antigravity_catalog_invalid".into());
     }
@@ -197,6 +189,49 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
         let _ = std::fs::write(path, bytes);
     }
     Ok(payload)
+}
+
+/// A NOT_FOUND refusal names an entity the service no longer resolves. The cached
+/// project is the only identity kept without revalidation, so it is the first
+/// suspect whenever an otherwise authenticated request hits that verdict.
+pub(super) fn is_not_found_message(message: &str) -> bool {
+    message.contains("[NOT_FOUND]")
+}
+
+/// Drop the cached project and resolve a fresh one from the service.
+pub(super) async fn heal_project(
+    generation: &str,
+    signal: &AbortSignal,
+) -> Result<String, String> {
+    auth::clear_project(generation).await?;
+    project(Some(generation), signal).await
+}
+
+async fn fetch_available_models(
+    generation: &str,
+    project: &str,
+    signal: &AbortSignal,
+) -> Result<Value, String> {
+    let body = json!({
+        "project":project,"requestId":uuid::Uuid::new_v4().to_string(),
+    });
+    match cloud::rpc("fetchAvailableModels", body, Some(generation), signal).await {
+        // A dead cached project would pin the catalog to its last good snapshot
+        // forever; resolve a fresh project and ask once more.
+        Err(message) if is_not_found_message(&message) => {
+            let healed = heal_project(generation, signal).await?;
+            cloud::rpc(
+                "fetchAvailableModels",
+                json!({
+                    "project":healed,"requestId":uuid::Uuid::new_v4().to_string(),
+                }),
+                Some(generation),
+                signal,
+            )
+            .await
+        }
+        result => result,
+    }
 }
 
 async fn catalog_payload(warm: bool) -> Result<Value, String> {

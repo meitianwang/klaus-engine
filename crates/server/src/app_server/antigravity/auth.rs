@@ -383,6 +383,21 @@ pub(super) async fn set_project(generation: &str, project: &str) -> Result<(), S
     write(&stored)
 }
 
+/// Drop a cached project so the next resolution asks the service again. A project
+/// is the one identity kept without revalidation; a NOT_FOUND refusal is the
+/// signal that it may no longer resolve.
+pub(super) async fn clear_project(generation: &str) -> Result<(), String> {
+    let _guard = credential_lock().lock().await;
+    let mut stored = read().ok_or("antigravity_not_signed_in")?;
+    if stored.generation != generation {
+        return Err("antigravity_credential_changed".into());
+    }
+    if stored.credential.project.take().is_none() {
+        return Ok(());
+    }
+    write(&stored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

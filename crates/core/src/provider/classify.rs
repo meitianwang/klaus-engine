@@ -327,6 +327,7 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
     match signal {
         Some(
             "antigravity_model_access_denied"
+            | "antigravity_model_not_offered"
             | "antigravity_request_rejected"
             | "image_preprocessing_failed",
         ) => Some(ProviderErrorKind::InvalidRequest),
@@ -1086,6 +1087,11 @@ mod tests {
             (
                 400,
                 "antigravity_request_rejected",
+                ProviderErrorKind::InvalidRequest,
+            ),
+            (
+                404,
+                "antigravity_model_not_offered",
                 ProviderErrorKind::InvalidRequest,
             ),
             (
