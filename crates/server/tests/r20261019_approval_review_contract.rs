@@ -87,12 +87,31 @@ fn approval_review_schema_publishes_exact_actions_and_product_lifecycle_states()
             .get("modelContext")
             .is_none()
     );
+    let browser_action = request["params"]["definitions"]["ApprovalReviewActionSchema"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["properties"]["type"]["enum"] == json!(["browser_tool_call"]))
+        .unwrap();
+    assert_eq!(browser_action["properties"]["toolName"]["type"], "string");
+    assert!(browser_action["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("toolName")));
     for (method, terminal) in [
         ("item/autoApprovalReview/started", false),
         ("item/autoApprovalReview/completed", true),
     ] {
         let notification = &bundle["notifications"][method];
         assert_eq!(notification["requiresCapability"], "productEvents");
+        let browser_action = notification["params"]["definitions"]
+            ["ProductApprovalReviewActionSchema"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["properties"]["type"]["enum"] == json!(["browserToolCall"]))
+            .unwrap();
+        assert_eq!(browser_action["properties"]["toolName"]["type"], "string");
         assert_eq!(
             notification["params"]["properties"]["reviewId"]["type"],
             "string"
@@ -153,6 +172,48 @@ fn approval_review_product_projection_preserves_action_and_distinguishes_timeout
             projected.get("completedAtMs").is_some(),
             status != "in_progress"
         );
+    }
+}
+
+#[test]
+fn browser_approval_review_projection_retains_native_action_identity() {
+    for tool_name in ["browser_select_browser", "browser_claim_tab"] {
+        for (status, method) in [
+            ("in_progress", "item/autoApprovalReview/started"),
+            ("approved", "item/autoApprovalReview/completed"),
+            ("denied", "item/autoApprovalReview/completed"),
+        ] {
+            let mut value = denied_review();
+            value["status"] = json!(status);
+            value["action"] = json!({"type":"browser_tool_call","toolName":tool_name});
+            let decoded: crate::app_server::approval_review_wire::ApprovalReviewEventSchema =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap()["action"],
+                value["action"]
+            );
+            let runtime = RawJson::from_serialize(&value)
+                .unwrap()
+                .to_runtime()
+                .unwrap()
+                .0;
+            let (actual_method, projected) =
+                super::super::service::approval_review_product_notification("session-1", &runtime)
+                    .unwrap();
+            assert_eq!(actual_method, method);
+            let projected_text =
+                klaus_agent_core::runtime_values::runtime_codec::encode_text(&projected)
+                    .unwrap()
+                    .try_to_utf8()
+                    .unwrap();
+            let projected: Value = serde_json::from_str(&projected_text).unwrap();
+            assert_eq!(
+                projected["action"],
+                json!({"type":"browserToolCall","toolName":tool_name})
+            );
+            assert_eq!(projected["targetItemId"], "tool-1");
+            assert_eq!(projected["reviewId"], "review-1");
+        }
     }
 }
 

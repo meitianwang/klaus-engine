@@ -912,6 +912,25 @@ impl Tool for BrowserTool {
         Some(self.kind.search_hint())
     }
 
+    fn approval_metadata(&self) -> Option<crate::types::permission::ApprovalActionMetadata> {
+        use crate::types::permission::{
+            ApprovalActionCallSource, ApprovalActionInputKind, ApprovalActionMetadata,
+            ApprovalActionSource,
+        };
+        Some(ApprovalActionMetadata {
+            registered_tool_name: self.name(),
+            source: ApprovalActionSource::Builtin,
+            call_source: ApprovalActionCallSource::Direct,
+            originating_item_id: None,
+            input_kind: ApprovalActionInputKind::Function,
+            paths: Vec::new(),
+            path_kind: None,
+            cwd: None,
+            terminal_launch: None,
+            network_trigger: None,
+        })
+    }
+
     fn max_result_size_chars(&self) -> Option<u64> {
         Some(200_000)
     }

@@ -525,8 +525,27 @@ fn initial_history(many_users: bool) -> Vec<Message> {
     history
 }
 
+struct RecordingBrowser(Arc<AtomicUsize>);
+
+#[async_trait]
+unsafe impl klaus_agent_core::browser::BrowserExecutor for RecordingBrowser {
+    async fn execute(
+        &self,
+        _request: klaus_agent_core::browser::BrowserRuntimeRequest,
+        _signal: AbortSignal,
+        _emit: klaus_agent_core::browser::BrowserEventSink,
+    ) -> Result<
+        klaus_agent_core::browser::BrowserRuntimeResponse,
+        klaus_agent_core::browser::BrowserRuntimeError,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Default::default())
+    }
+}
+
 struct Rig {
     directory: Directory,
+    browser_calls: Arc<AtomicUsize>,
     process: RuntimeProcessContext,
     provider: Arc<Provider>,
     human: Arc<Human>,
@@ -546,6 +565,16 @@ impl Rig {
         many_users: bool,
         required_review: bool,
     ) -> Self {
+        Self::with_browser_options(reply, shell, many_users, required_review, None).await
+    }
+
+    async fn with_browser_options(
+        reply: Reply,
+        shell: bool,
+        many_users: bool,
+        required_review: bool,
+        browser: Option<(&str, bool)>,
+    ) -> Self {
         let directory = Directory::new();
         std::fs::write(directory.0.join("workspace/sentinel.txt"), SENTINEL).unwrap();
         let process = RuntimeProcessContext::initialize(
@@ -560,7 +589,13 @@ impl Rig {
         };
         let output = directory.0.join("outside/result.txt");
         let restricted_parent = reply == Reply::TwoInspections;
-        let main_input = if shell {
+        let main_input = if let Some((tool, _)) = browser {
+            if tool == "browser_select_browser" {
+                value(json!({"deviceId":"chrome:fixture"}))
+            } else {
+                value(json!({"browserId":"chrome:fixture","tabId":1}))
+            }
+        } else if shell {
             value(json!({
                 "command":format!("printf approved > '{}'", output.display()),
                 "yieldMs":1000,
@@ -596,7 +631,10 @@ impl Rig {
             },
             reply,
             main_input,
-            main_tool: if shell { "exec_command" } else { "write" }.into(),
+            main_tool: browser
+                .map(|(tool, _)| tool)
+                .unwrap_or(if shell { "exec_command" } else { "write" })
+                .into(),
             inspection_command,
             requests: Mutex::new(Vec::new()),
             main_calls: AtomicUsize::new(0),
@@ -610,13 +648,27 @@ impl Rig {
         let human = Arc::new(Human::default());
         let mut options = agent_options(process.clone());
         options.provider = provider.clone();
-        options.tools = Some(vec![create_write_tool(), create_exec_command_tool()]);
+        options.tools = Some(if browser.is_some() {
+            klaus_agent_core::tools::builtins::browser::create_browser_tools()
+        } else {
+            vec![create_write_tool(), create_exec_command_tool()]
+        });
+        let browser_calls = Arc::new(AtomicUsize::new(0));
+        if browser.is_some() {
+            // SAFETY: the fixture only records browser calls and cannot spawn processes.
+            options.browser_runtime = Some(unsafe {
+                klaus_agent_core::browser::attest_spawn_free(Arc::new(RecordingBrowser(
+                    browser_calls.clone(),
+                )))
+            });
+        }
         options.approval_handler = Some(human.clone());
         options.include_default_agents = Some(false);
         options.cwd = Some(directory.0.join("workspace").to_string_lossy().into_owned());
         options.config = Some(json!({
-            "model":MODEL,"permissionMode":"default", "approvalPolicy":"on-request",
-            "sandboxMode":"workspace-write","approvalsReviewer":if required_review { "user" } else { "automatic" },
+            "model":MODEL,"permissionMode":"default", "approvalPolicy":if browser.is_some() { "never" } else { "on-request" },
+            "sandboxMode":if browser.is_some_and(|(_, full)| full) { "danger-full-access" } else { "workspace-write" },
+            "approvalsReviewer":if required_review { "user" } else { "automatic" },
             "sandbox_workspace_write":{"exclude_tmpdir_env_var":true,"exclude_slash_tmp":true},
             "sandbox":"auto","requireRealSandbox":true,"sandboxNetworkAllowed":false,"sandboxRetryOnDenial":true,
             "maxOutputTokens":4096,"useStoredPermissionRules":false,
@@ -660,6 +712,7 @@ impl Rig {
         );
         Self {
             directory,
+            browser_calls,
             process,
             provider,
             human,
@@ -767,6 +820,75 @@ impl Rig {
         self.session.shutdown_and_wait().await.unwrap();
         self.process.shutdown().await.unwrap();
     }
+}
+
+pub(super) struct ManagedBrowserOutcome {
+    pub policy: klaus_agent_core::engine::session::RuntimePolicyState,
+    pub executions: usize,
+    pub human_prompts: usize,
+    pub reviews: usize,
+    pub status: Option<ApprovalReviewStatus>,
+    pub tool_error: bool,
+}
+
+pub(super) async fn managed_browser_outcome(
+    tool: &str,
+    full_access: bool,
+    deny: bool,
+) -> ManagedBrowserOutcome {
+    let rig = Rig::with_browser_options(
+        if deny { Reply::Deny } else { Reply::Allow },
+        false,
+        false,
+        true,
+        Some((tool, full_access)),
+    )
+    .await;
+    let result = rig
+        .session
+        .run(
+            Input::Text(
+                "Select my connected browser and claim its tab for the requested draft.".into(),
+            ),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(
+        result.error.is_none(),
+        "the scripted browser turn must finish: {:?}",
+        result.error
+    );
+    let tool_error = rig
+        .session
+        .history()
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResult(result) if result.tool_use_id == CALL_ID => Some(result.is_error),
+            _ => None,
+        })
+        .expect("the browser call must produce a result");
+    if tool_error {
+        eprintln!(
+            "browser policy: {:?}; tool history: {:?}; reviews: {:?}",
+            rig.session.runtime_policy_state(),
+            rig.session.history(),
+            rig.session.approval_review_history(),
+        );
+    }
+    let outcome = ManagedBrowserOutcome {
+        policy: rig.session.runtime_policy_state(),
+        executions: rig.browser_calls.load(Ordering::SeqCst),
+        human_prompts: rig.human.calls.load(Ordering::SeqCst),
+        reviews: rig.provider.review_calls.load(Ordering::SeqCst),
+        status: rig
+            .session
+            .approval_review_history()
+            .last()
+            .map(|event| event.status),
+        tool_error,
+    };
+    rig.close().await;
+    outcome
 }
 
 #[tokio::test]

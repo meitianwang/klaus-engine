@@ -137,6 +137,8 @@ impl ApprovalActionMetadata {
                 .any(|candidate| name == *candidate)
                 {
                     Some(ReviewScope::FileChanges)
+                } else if name.starts_with("browser_") {
+                    Some(ReviewScope::ComputerUse)
                 } else if name == "request_permissions" {
                     Some(ReviewScope::Permissions)
                 } else {
@@ -324,6 +326,15 @@ pub(crate) fn prepare_action(
         );
         (
             ApprovalReviewAction::ApplyPatch { cwd, files },
+            PreparedActionKind::Command,
+        )
+    } else if name.starts_with("browser_") {
+        // The native registration was checked above. Preserve every argument,
+        // including the browser and tab target, for the reviewer's assessment.
+        (
+            ApprovalReviewAction::BrowserToolCall {
+                tool_name: name.clone(),
+            },
             PreparedActionKind::Command,
         )
     } else if name == "request_permissions" {

@@ -331,6 +331,35 @@ fn network_review_uses_typed_endpoint_and_only_dispatch_captured_trigger() {
 }
 
 #[test]
+fn browser_review_uses_registered_identity_and_preserves_complete_arguments() {
+    let tools = crate::tools::builtins::browser::create_browser_tools();
+    for name in [
+        "browser_select_browser",
+        "browser_claim_tab",
+        "browser_click",
+    ] {
+        let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
+        let input = value(
+            r##"{"browserId":"chrome:fixture","tabId":42,"selector":"#save","server":"spoofed","tool_name":"spoofed"}"##,
+        );
+        let metadata = metadata_for_tool(tool.as_ref(), &input, &make_ctx("/workspace")).unwrap();
+        assert_eq!(metadata.source, ApprovalActionSource::Builtin);
+        assert_eq!(metadata.review_scope(), Some(ReviewScope::ComputerUse));
+        let approval = request(name, input.clone());
+        let prepared = prepare_action(&approval, &metadata, &"/workspace".into()).unwrap();
+        assert!(
+            matches!(prepared.action, ApprovalReviewAction::BrowserToolCall {tool_name} if tool_name == name)
+        );
+        for key in ["browserId", "tabId", "selector", "server", "tool_name"] {
+            assert_eq!(prepared.planned_action.get(key), input.get(key));
+        }
+        let mut external = metadata;
+        external.source = ApprovalActionSource::External;
+        assert!(prepare_action(&approval, &external, &"/workspace".into()).is_err());
+    }
+}
+
+#[test]
 fn unknown_or_mismatched_registered_tool_has_no_invented_permission_action() {
     let mut metadata = builtin("unknown");
     let approval = request(

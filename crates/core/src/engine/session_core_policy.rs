@@ -146,6 +146,12 @@ pub(super) fn apply_startup_review_requirements(
     if requirements.requires_review_for_model(&model) {
         if config.sandbox_mode == Some(SandboxMode::DangerFullAccess) {
             requirements.validate_sandbox_mode(SandboxMode::WorkspaceWrite)?;
+            if policy == ApprovalPolicy::Never {
+                // Narrowing full access must also replace its no-prompt routing;
+                // otherwise tool self-checks fail before required review can run.
+                requirements.validate_approval_policy(ApprovalPolicy::OnRequest)?;
+                config.approval_policy = Some(ApprovalPolicy::OnRequest);
+            }
             config.sandbox_mode = Some(SandboxMode::WorkspaceWrite);
             config.sandbox_workspace_write.network_access = false;
         }
@@ -2690,6 +2696,7 @@ mod managed_requirement_tests {
         };
         let mut config = crate::schemas::config::default_config();
         config.model = "protected".into();
+        config.approval_policy = Some(ApprovalPolicy::Never);
         config.sandbox_mode = Some(SandboxMode::DangerFullAccess);
         // This historical input is consumed later by session planning admission.
         config.permission_mode = ExternalPermissionMode::Plan;
@@ -2700,6 +2707,7 @@ mod managed_requirement_tests {
             Some(ApprovalsReviewer::Automatic)
         );
         assert_eq!(config.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
+        assert_eq!(config.approval_policy, Some(ApprovalPolicy::OnRequest));
         assert_eq!(
             config.permission_mode,
             ExternalPermissionMode::Plan,
@@ -2711,6 +2719,23 @@ mod managed_requirement_tests {
             ..requirements
         };
         assert!(apply_startup_review_requirements(&mut config, &user_only).is_err());
+    }
+
+    #[test]
+    fn protected_full_access_rejects_a_managed_policy_that_disallows_review_routing() {
+        let requirements = ManagedReviewRequirements {
+            required_models: vec!["protected".into()],
+            allowed_approval_policies: Some(vec![ManagedApprovalPolicy::Never]),
+            ..Default::default()
+        };
+        let mut config = crate::schemas::config::default_config();
+        config.model = "protected".into();
+        config.approval_policy = Some(ApprovalPolicy::Never);
+        config.sandbox_mode = Some(SandboxMode::DangerFullAccess);
+        let error = apply_startup_review_requirements(&mut config, &requirements).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(config.sandbox_mode, Some(SandboxMode::DangerFullAccess));
+        assert_eq!(config.approval_policy, Some(ApprovalPolicy::Never));
     }
 
     #[test]

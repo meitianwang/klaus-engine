@@ -141,6 +141,9 @@ pub enum ApprovalReviewAction {
         reason: Option<RuntimeString>,
         permissions: ApprovalReviewPermissionProfile,
     },
+    BrowserToolCall {
+        tool_name: RuntimeString,
+    },
 }
 
 impl RuntimeEncode for ApprovalReviewAction {
@@ -212,6 +215,10 @@ impl RuntimeEncode for ApprovalReviewAction {
                 object.field("connectorName", connector_name)?;
                 object.field("toolTitle", tool_title)?;
             }
+            Self::BrowserToolCall { tool_name } => {
+                object.field("type", &RuntimeString::from("browser_tool_call"))?;
+                object.field("toolName", tool_name)?;
+            }
             Self::RequestPermissions {
                 reason,
                 permissions,
@@ -268,6 +275,10 @@ impl RuntimeDecode for ApprovalReviewAction {
                     connector_id: object.optional("connectorId", &[])?,
                     connector_name: object.optional("connectorName", &[])?,
                     tool_title: object.optional("toolTitle", &[])?,
+                })
+            } else if kind == "browser_tool_call" {
+                Ok(Self::BrowserToolCall {
+                    tool_name: object.required("toolName", &[])?,
                 })
             } else if kind == "request_permissions" {
                 Ok(Self::RequestPermissions {
@@ -457,6 +468,7 @@ mod tests {
             r#"{"type":"apply_patch","cwd":"/tmp","files":["/tmp/a"]}"#,
             r#"{"type":"network_access","target":"https://example.test","host":"example.test","protocol":"https","port":443}"#,
             r#"{"type":"mcp_tool_call","server":"documents","toolName":"read","connectorId":null,"connectorName":"Documents","toolTitle":null}"#,
+            r#"{"type":"browser_tool_call","toolName":"browser_claim_tab"}"#,
             r#"{"type":"request_permissions","reason":"read a file","permissions":{"network":{"enabled":false},"fileSystem":{"entries":[],"globScanMaxDepth":null}}}"#,
         ] {
             let value = parse(source);

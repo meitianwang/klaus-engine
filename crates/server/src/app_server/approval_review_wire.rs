@@ -168,6 +168,8 @@ pub enum ApprovalReviewActionSchema {
         tool_title: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
+    BrowserToolCall { tool_name: String },
+    #[serde(rename_all = "camelCase")]
     RequestPermissions {
         reason: Option<String>,
         permissions: ApprovalReviewPermissionProfileSchema,
@@ -214,6 +216,8 @@ pub enum ProductApprovalReviewActionSchema {
         connector_name: Option<String>,
         tool_title: Option<String>,
     },
+    #[serde(rename_all = "camelCase")]
+    BrowserToolCall { tool_name: String },
     #[serde(rename_all = "camelCase")]
     RequestPermissions {
         reason: Option<String>,

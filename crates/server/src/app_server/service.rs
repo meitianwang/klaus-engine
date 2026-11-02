@@ -10036,6 +10036,7 @@ pub(super) fn approval_review_product_notification(
             "apply_patch" => "applyPatch",
             "network_access" => "networkAccess",
             "mcp_tool_call" => "mcpToolCall",
+            "browser_tool_call" => "browserToolCall",
             "request_permissions" => "requestPermissions",
             "command" => "command",
             "execve" => "execve",

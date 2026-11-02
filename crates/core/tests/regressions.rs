@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261102_managed_browser_approval.rs"]
+mod r20261102_managed_browser_approval;
+
 #[cfg(unix)]
 #[path = "regressions/r20261028_background_output_wait.rs"]
 mod r20261028_background_output_wait;
