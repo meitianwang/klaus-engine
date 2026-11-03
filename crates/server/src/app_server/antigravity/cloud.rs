@@ -336,7 +336,29 @@ async fn read_refusal_body(
     Ok(bytes)
 }
 
+/// A connect-stage transport failure is usually a transient network blip;
+/// replay the request once before surfacing it as a terminal turn failure.
 async fn send(
+    method: &str,
+    body: Vec<u8>,
+    generation: Option<&str>,
+    signal: &AbortSignal,
+    extra_headers: Vec<(String, String)>,
+) -> Result<reqwest::Response, GeminiApiError> {
+    let first = send_once(method, body.clone(), generation, signal, extra_headers.clone()).await;
+    let Err(error) = first else { return first };
+    if error.status.is_some() || error.message != "antigravity_transport_unavailable" {
+        return Err(error);
+    }
+    tokio::select! {
+        _ = signal.cancelled() => Err(api_error("antigravity_request_cancelled")),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {
+            send_once(method, body, generation, signal, extra_headers).await
+        }
+    }
+}
+
+async fn send_once(
     method: &str,
     body: Vec<u8>,
     generation: Option<&str>,

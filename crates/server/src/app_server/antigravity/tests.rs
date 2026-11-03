@@ -996,3 +996,83 @@ async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
+
+#[tokio::test]
+async fn a_connect_stage_transport_failure_replays_the_request_once() {
+    for dropped in [1usize, 2] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0usize));
+        let counted = connections.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let count = socket.read(&mut chunk).await.unwrap_or(0);
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let drop_this = {
+                        let mut seen = counted.lock().unwrap();
+                        *seen += 1;
+                        *seen <= dropped
+                    };
+                    if drop_this {
+                        drop(socket);
+                        return;
+                    }
+                    let payload = r#"{"models":{}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        set_config_root(root.path());
+        set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+        auth::adopt(auth::Credential {
+            access_token: "fixture".into(),
+            refresh_token: None,
+            expires_at: None,
+            account: None,
+            auth_method: "consumer".into(),
+            project: Some("fixture-project".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .await
+        .unwrap();
+        let generation = auth::generation().unwrap();
+        let result = cloud::rpc(
+            "fetchAvailableModels",
+            json!({"requestId": "fixture"}),
+            Some(&generation),
+            &AbortSignal::new(),
+        )
+        .await;
+        if dropped == 1 {
+            assert!(result.is_ok(), "replayed request must succeed: {result:?}");
+        } else {
+            assert!(
+                matches!(&result, Err(message) if message.contains("antigravity_transport_unavailable")),
+                "an exhausted replay must keep the transport verdict: {result:?}"
+            );
+        }
+        assert_eq!(*connections.lock().unwrap(), 2);
+        server.abort();
+        remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+        auth::logout().await.unwrap();
+    }
+}
