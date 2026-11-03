@@ -250,6 +250,8 @@ struct CodeAssistConfig {
 pub struct GeminiAdapterPolicy {
     /// Replay retained signed parts only on outgoing requests; stream metadata remains canonical.
     pub replay_signed_parts: bool,
+    /// Keep signatures only when replaying messages from the current model.
+    pub scope_signatures_to_model: bool,
     pub honor_tools_capability: bool,
     pub model_tool_budget: bool,
 }
@@ -494,6 +496,9 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn stream(&self, mut req: ModelRequest, signal: AbortSignal) -> ModelStream {
+        if self.adapter_policy.scope_signatures_to_model {
+            clear_foreign_model_signatures(&mut req);
+        }
         if crate::provider::native_compaction::contains_native_checkpoint(&req.messages) {
             return crate::provider::native_compaction::rejected_checkpoint_stream();
         }
@@ -525,6 +530,10 @@ impl ModelProvider for GeminiProvider {
         let interceptor = self.interceptor.clone();
         let stream_admission = self.stream_admission.clone();
         let replay_signed_parts = self.adapter_policy.replay_signed_parts;
+        let signature_model = self
+            .adapter_policy
+            .scope_signatures_to_model
+            .then(|| req.model.clone());
         let capabilities = self.capabilities_for(&req.model);
         let thinking_dialect = req
             .model
@@ -564,7 +573,7 @@ impl ModelProvider for GeminiProvider {
                             return;
                         }
                         emitted_any = true;
-                        yield ev;
+                        yield signed_model_identity(ev, signature_model.as_ref());
                     }
                     Err(pe) => {
                         established_error = Some(pe);
@@ -620,7 +629,7 @@ impl ModelProvider for GeminiProvider {
                                 yield ModelStreamEvent::Error {error:stream_ownership_error()};
                                 return;
                             }
-                            yield ev;
+                            yield signed_model_identity(ev, signature_model.as_ref());
                         },
                         Err(pe2) => {
                             err2 = Some(pe2);
@@ -1494,6 +1503,41 @@ fn map_finish_reason(reason: &RuntimeString) -> ModelStopReason {
 }
 
 // ---- request building ----
+
+/// A service may report a family version rather than the selected concrete
+/// member. Adapters that scope signatures keep the requested identity in stored
+/// messages so a same-model tool continuation is not mistaken for a switch.
+fn signed_model_identity(
+    event: ModelStreamEvent,
+    model: Option<&RuntimeString>,
+) -> ModelStreamEvent {
+    match (event, model) {
+        (ModelStreamEvent::MessageStart { .. }, Some(model)) => ModelStreamEvent::MessageStart {
+            model: model.clone(),
+        },
+        (event, _) => event,
+    }
+}
+
+/// Signatures are bound to the model that produced them. Alter only this
+/// outgoing request so switching back can still replay the original history.
+fn clear_foreign_model_signatures(request: &mut ModelRequest) {
+    for message in &mut request.messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        if assistant.model == request.model {
+            continue;
+        }
+        for block in &mut assistant.content {
+            match block {
+                ContentBlock::Thinking(thinking) => thinking.signature = None,
+                ContentBlock::ToolUse(call) => call.thought_signature = None,
+                _ => {}
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 fn build_gemini_request(

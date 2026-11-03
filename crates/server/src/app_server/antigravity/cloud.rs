@@ -37,7 +37,7 @@ pub(super) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn http_client() -> Result<reqwest::Client, String> {
+pub(super) fn client_identity() -> String {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         other => other,
@@ -47,14 +47,16 @@ pub(super) fn http_client() -> Result<reqwest::Client, String> {
         "x86_64" => "amd64",
         other => other,
     };
-    // Consumer cloud authorization requires this source protocol identity.
-    let user_agent =
-        format!("antigravity/2.24.0 (os_type={os}; arch={arch}; auth_method=consumer)");
+    format!("antigravity/hub/2.24.0 (aidev_client; os_type={os}; arch={arch})")
+}
+
+pub(super) fn http_client() -> Result<reqwest::Client, String> {
+    // Model discovery and inference share the hub protocol identity.
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(user_agent)
+        .user_agent(client_identity())
         .build()
         .map_err(|_| "antigravity_transport_unavailable".into())
 }
@@ -336,8 +338,38 @@ async fn read_refusal_body(
     Ok(bytes)
 }
 
-/// A connect-stage transport failure is usually a transient network blip;
-/// replay the request once before surfacing it as a terminal turn failure.
+/// Where a transport failure happened. Only `Connect` proves the request
+/// bytes never left the client, so it is the only stage a bounded replay may
+/// trust: a failure after upload may already have reached the service, and
+/// replaying it could duplicate an inference generation or a quota charge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransportStage {
+    Connect,
+    Sent,
+}
+
+impl TransportStage {
+    /// Safe diagnostic suffix: names the stage without echoing the URL.
+    fn label(self) -> &'static str {
+        match self {
+            TransportStage::Connect => "connect",
+            TransportStage::Sent => "sent",
+        }
+    }
+}
+
+fn transport_error(stage: TransportStage) -> GeminiApiError {
+    api_error(format!(
+        "antigravity_transport_unavailable ({})",
+        stage.label()
+    ))
+}
+
+/// Replays the request once, and only for a connect-stage transport failure —
+/// the one stage that proves the request bytes never reached the service.
+/// Post-upload failures surface immediately so an inference request is never
+/// duplicated, and the stage stays in the error message as a URL-free
+/// diagnostic so callers can classify the network verdict correctly.
 async fn send(
     method: &str,
     body: Vec<u8>,
@@ -345,9 +377,18 @@ async fn send(
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
 ) -> Result<reqwest::Response, GeminiApiError> {
-    let first = send_once(method, body.clone(), generation, signal, extra_headers.clone()).await;
+    let first = send_once(
+        method,
+        body.clone(),
+        generation,
+        signal,
+        extra_headers.clone(),
+    )
+    .await;
     let Err(error) = first else { return first };
-    if error.status.is_some() || error.message != "antigravity_transport_unavailable" {
+    let replayable =
+        error.status.is_none() && error.message == transport_error(TransportStage::Connect).message;
+    if !replayable {
         return Err(error);
     }
     tokio::select! {
@@ -387,7 +428,20 @@ async fn send_once(
     request = request.bearer_auth(&credential.access_token);
     let response = tokio::select! {
         _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
-        response = request.send() => response.map_err(|_| api_error("antigravity_transport_unavailable"))?,
+        response = request.send() => match response {
+            Ok(response) => response,
+            // A connect error is the only reqwest stage that proves the
+            // request was never uploaded; every other transport failure is
+            // treated as possibly delivered and must not be replayed.
+            Err(error) => {
+                let stage = if error.is_connect() {
+                    TransportStage::Connect
+                } else {
+                    TransportStage::Sent
+                };
+                return Err(transport_error(stage));
+            }
+        },
     };
     if generation.is_some_and(|generation| !auth::is_current(generation)) {
         return Err(api_error("antigravity_credential_changed"));

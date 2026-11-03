@@ -86,7 +86,7 @@ fn chunk(value: Value) -> GenerateContentResponse {
     runtime_codec::decode_text(&RuntimeString::from(value.to_string())).unwrap()
 }
 
-async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
+async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy, switch_model: bool) {
     let directory = FixtureDirectory::new();
     let file = directory.path.join("fixture.txt");
     std::fs::write(&file, "PONG").unwrap();
@@ -94,7 +94,7 @@ async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
     let mut first = Vec::new();
     for text in ["The", " user wants"] {
         first.push(chunk(
-            json!({"candidates":[{"content":{"parts":[{"thought":true,"text":text}]}}]}),
+            json!({"modelVersion":"service-family-version","candidates":[{"content":{"parts":[{"thought":true,"text":text}]}}]}),
         ));
     }
     first.push(chunk(json!({"candidates":[{"content":{"parts":[
@@ -106,6 +106,9 @@ async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
             first,
             vec![chunk(
                 json!({"candidates":[{"content":{"parts":[{"text":"PONG"}]},"finishReason":"STOP"}]}),
+            )],
+            vec![chunk(
+                json!({"candidates":[{"content":{"parts":[{"text":"SWITCHED"}]},"finishReason":"STOP"}]}),
             )],
         ])),
         requests: requests.clone(),
@@ -146,8 +149,18 @@ async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
         )
         .await;
     assert!(result.error.is_none(), "{:?}", result.error);
+    if switch_model {
+        session.set_model("other-model-fixture").unwrap();
+        let switched = session
+            .run(
+                Input::Text("Reply SWITCHED.".into()),
+                TurnOptions::default(),
+            )
+            .await;
+        assert!(switched.error.is_none(), "{:?}", switched.error);
+    }
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), if switch_model { 3 } else { 2 });
     let replay = requests[1]
         .contents
         .iter()
@@ -183,6 +196,30 @@ async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
             .unwrap(),
         "fixture-call"
     );
+    if switch_model {
+        let switched = requests[2]
+            .contents
+            .iter()
+            .find(|content| content.role == "model")
+            .expect("original tool exchange remains in history");
+        let call = switched
+            .parts
+            .iter()
+            .find(|part| part.function_call.is_some())
+            .unwrap();
+        if adapter_policy.scope_signatures_to_model {
+            assert!(switched.parts.iter().all(|part| part.thought != Some(true)));
+            assert_eq!(
+                call.thought_signature.as_ref().unwrap(),
+                "skip_thought_signature_validator"
+            );
+        } else {
+            assert_eq!(
+                call.thought_signature.as_ref().unwrap(),
+                "opaque-call-signature"
+            );
+        }
+    }
     assert!(requests[1]
         .contents
         .iter()
@@ -195,15 +232,36 @@ async fn run_signed_thought_tool_loop(adapter_policy: GeminiAdapterPolicy) {
 
 #[tokio::test]
 async fn public_tool_loop_preserves_original_signed_thought_parts_before_the_call() {
-    run_signed_thought_tool_loop(GeminiAdapterPolicy {
-        replay_signed_parts: true,
-        honor_tools_capability: true,
-        model_tool_budget: true,
-    })
+    run_signed_thought_tool_loop(
+        GeminiAdapterPolicy {
+            replay_signed_parts: true,
+            scope_signatures_to_model: true,
+            honor_tools_capability: true,
+            model_tool_budget: true,
+        },
+        false,
+    )
     .await;
 }
 
 #[tokio::test]
 async fn public_default_tool_loop_drops_thought_parts_but_preserves_call_signature() {
-    run_signed_thought_tool_loop(GeminiAdapterPolicy::default()).await;
+    run_signed_thought_tool_loop(GeminiAdapterPolicy::default(), false).await;
+}
+
+// A signature from one cloud model was sent to another model after a tool loop,
+// causing the next request to fail with a corrupted-signature verdict.
+#[tokio::test]
+async fn public_model_switch_scopes_signatures_only_when_the_adapter_requests_it() {
+    for scope_signatures_to_model in [false, true] {
+        run_signed_thought_tool_loop(
+            GeminiAdapterPolicy {
+                replay_signed_parts: true,
+                scope_signatures_to_model,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+    }
 }

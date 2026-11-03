@@ -107,7 +107,9 @@ fn cached_payload(generation: &str) -> Option<CachedCatalog> {
         return None;
     }
     let snapshot: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    if snapshot["generation"].as_str()? != generation {
+    if snapshot["generation"].as_str()? != generation
+        || snapshot["clientIdentity"].as_str()? != cloud::client_identity()
+    {
         return None;
     }
     Some(CachedCatalog {
@@ -183,7 +185,10 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
         payload: payload.clone(),
         fetched_at,
     });
-    let snapshot = json!({"generation":generation,"payload":payload,"fetchedAt":fetched_at});
+    let snapshot = json!({
+        "generation":generation,"payload":payload,"fetchedAt":fetched_at,
+        "clientIdentity":cloud::client_identity(),
+    });
     let path = config_root().join("antigravity-models.json");
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(path, bytes);
@@ -609,6 +614,7 @@ pub(super) fn decorate(
         thinking_dialects_by_model: Some(thinking_dialects_by_model),
         adapter_policy: GeminiAdapterPolicy {
             replay_signed_parts: true,
+            scope_signatures_to_model: true,
             honor_tools_capability: true,
             model_tool_budget: true,
         },

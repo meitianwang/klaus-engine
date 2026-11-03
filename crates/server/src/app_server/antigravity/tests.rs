@@ -75,7 +75,7 @@ async fn fixture() -> Fixture {
                 captured
                     .lock()
                     .unwrap()
-                    .push(json!({"path":path,"body":body}));
+                    .push(json!({"path":path,"body":body,"userAgent":header.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("user-agent:").map(|value|value.trim().to_string()))}));
                 let payload = if path == "/token" {
                     json!({"access_token":"fixture-renewed","refresh_token":"fixture-rotated","expires_in":3600})
                 } else if path.ends_with(":loadCodeAssist") {
@@ -944,6 +944,58 @@ async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_mo
 }
 
 #[tokio::test]
+async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selection() {
+    let fixture = fixture().await;
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    for old_identity in [None, Some("legacy-client")] {
+        let root = tempfile::tempdir().unwrap();
+        set_config_root(root.path());
+        auth::adopt(auth::Credential {
+            access_token: "fixture".into(),
+            refresh_token: None,
+            expires_at: None,
+            account: None,
+            auth_method: "consumer".into(),
+            project: Some("fixture-project".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .await
+        .unwrap();
+        let mut snapshot = json!({
+            "generation":auth::generation().unwrap(),
+            "payload":{"models":{"legacy-only":{"displayName":"Legacy snapshot"}}},
+            "fetchedAt":chrono::Utc::now().timestamp_millis(),
+        });
+        if let Some(identity) = old_identity {
+            snapshot["clientIdentity"] = json!(identity);
+        }
+        let snapshot_path = root.path().join("antigravity-models.json");
+        std::fs::write(&snapshot_path, snapshot.to_string()).unwrap();
+        let result = models(true).await.unwrap();
+        let rows = result["models"].as_array().unwrap();
+        assert!(rows.iter().any(|row| row["id"] == "fixture-level"));
+        assert!(!rows.iter().any(|row| row["id"] == "legacy-only"));
+        let refreshed: Value =
+            serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
+        assert_eq!(refreshed["clientIdentity"], cloud::client_identity());
+        auth::logout().await.unwrap();
+    }
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            request["userAgent"]
+                .as_str()
+                .unwrap()
+                .starts_with("antigravity/hub/2.24.0 (aidev_client; "),
+            "the service catalog is scoped to the hub protocol"
+        );
+    }
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
 async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
     use klaus_agent_core::provider::gemini::GeminiClient;
     let fixture = fixture().await;
@@ -967,6 +1019,7 @@ async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
         "generation": generation,
         "payload": {"models": {"fixture-vanished": {"displayName": "Vanished Model"}}},
         "fetchedAt": 1,
+        "clientIdentity": cloud::client_identity(),
     });
     std::fs::write(
         root.path().join("antigravity-models.json"),
@@ -997,9 +1050,11 @@ async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
 
+/// A transport failure after the request was uploaded may already have
+/// reached the service, so neither catalog reads nor inference may replay it.
 #[tokio::test]
-async fn a_connect_stage_transport_failure_replays_the_request_once() {
-    for dropped in [1usize, 2] {
+async fn a_post_upload_transport_failure_is_never_replayed() {
+    for mode in ["catalog", "inference"] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let connections = Arc::new(Mutex::new(0usize));
@@ -1011,6 +1066,8 @@ async fn a_connect_stage_transport_failure_replays_the_request_once() {
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let mut chunk = [0u8; 4096];
+                    // Read until the full request arrived, then close without a
+                    // response: the client has provably uploaded the request.
                     loop {
                         let count = socket.read(&mut chunk).await.unwrap_or(0);
                         if count == 0 {
@@ -1021,21 +1078,8 @@ async fn a_connect_stage_transport_failure_replays_the_request_once() {
                             break;
                         }
                     }
-                    let drop_this = {
-                        let mut seen = counted.lock().unwrap();
-                        *seen += 1;
-                        *seen <= dropped
-                    };
-                    if drop_this {
-                        drop(socket);
-                        return;
-                    }
-                    let payload = r#"{"models":{}}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                        payload.len()
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
+                    *counted.lock().unwrap() += 1;
+                    drop(socket);
                 });
             }
         });
@@ -1055,23 +1099,116 @@ async fn a_connect_stage_transport_failure_replays_the_request_once() {
         .await
         .unwrap();
         let generation = auth::generation().unwrap();
-        let result = cloud::rpc(
-            "fetchAvailableModels",
-            json!({"requestId": "fixture"}),
-            Some(&generation),
-            &AbortSignal::new(),
-        )
-        .await;
-        if dropped == 1 {
-            assert!(result.is_ok(), "replayed request must succeed: {result:?}");
+        let message = if mode == "catalog" {
+            cloud::rpc(
+                "fetchAvailableModels",
+                json!({"requestId": "fixture"}),
+                Some(&generation),
+                &AbortSignal::new(),
+            )
+            .await
+            .err()
+            .unwrap()
         } else {
-            assert!(
-                matches!(&result, Err(message) if message.contains("antigravity_transport_unavailable")),
-                "an exhausted replay must keep the transport verdict: {result:?}"
-            );
-        }
-        assert_eq!(*connections.lock().unwrap(), 2);
+            use klaus_agent_core::provider::gemini::GeminiClient;
+            let client = cloud::CloudClient {
+                generation: generation.clone(),
+            };
+            client
+                .generate_content_stream(
+                    decode(json!({"model":"fixture-model","contents":[],"config":{"maxOutputTokens":100}})),
+                    None,
+                    Vec::new(),
+                    AbortSignal::new(),
+                )
+                .await
+                .err()
+                .unwrap()
+                .message
+        };
+        assert!(
+            message.contains("antigravity_transport_unavailable (sent)"),
+            "{mode}: {message}"
+        );
+        // No replay: the connection count stays at one, and the error keeps the
+        // sent-stage diagnostic. (No wall-clock assert here — a loaded parallel
+        // suite can stretch one localhost request past any tight bound.)
+        assert_eq!(
+            *connections.lock().unwrap(),
+            1,
+            "{mode}: the uploaded request must not be replayed, message {message}"
+        );
         server.abort();
+        remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+        auth::logout().await.unwrap();
+    }
+}
+
+/// A connect-stage failure is the one transport stage that proves the request
+/// bytes never left the client, so the replay runs once and the final error
+/// keeps the connect diagnostic for correct network classification.
+#[tokio::test]
+async fn a_connect_stage_failure_replays_once_and_reports_the_stage() {
+    for mode in ["catalog", "inference"] {
+        // Bind a port to learn a free one, then drop it so connections are
+        // refused: the canonical connect-stage failure.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", probe.local_addr().unwrap());
+        drop(probe);
+        let root = tempfile::tempdir().unwrap();
+        set_config_root(root.path());
+        set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+        auth::adopt(auth::Credential {
+            access_token: "fixture".into(),
+            refresh_token: None,
+            expires_at: None,
+            account: None,
+            auth_method: "consumer".into(),
+            project: Some("fixture-project".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .await
+        .unwrap();
+        let generation = auth::generation().unwrap();
+        let started = std::time::Instant::now();
+        let message = if mode == "catalog" {
+            cloud::rpc(
+                "fetchAvailableModels",
+                json!({"requestId": "fixture"}),
+                Some(&generation),
+                &AbortSignal::new(),
+            )
+            .await
+            .err()
+            .unwrap()
+        } else {
+            use klaus_agent_core::provider::gemini::GeminiClient;
+            let client = cloud::CloudClient {
+                generation: generation.clone(),
+            };
+            client
+                .generate_content_stream(
+                    decode(json!({"model":"fixture-model","contents":[],"config":{"maxOutputTokens":100}})),
+                    None,
+                    Vec::new(),
+                    AbortSignal::new(),
+                )
+                .await
+                .err()
+                .unwrap()
+                .message
+        };
+        assert!(
+            message.contains("antigravity_transport_unavailable (connect)"),
+            "{mode}: {message}"
+        );
+        // Both attempts refuse instantly, so the replay's 800 ms wait dominates
+        // the elapsed time and proves the second attempt actually ran.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(700),
+            "{mode}: the connect-stage replay must have waited before the second attempt"
+        );
         remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
         auth::logout().await.unwrap();
     }
