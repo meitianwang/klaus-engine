@@ -301,6 +301,9 @@ mod r01a16397_model_picker_visibility;
 #[path = "../../../core/tests/regressions/r01a16397_conversation_model_purpose.rs"]
 mod r01a16397_conversation_model_purpose;
 
+#[path = "antigravity/local_first_tests.rs"]
+mod antigravity_local_first_tests;
+
 impl TestClient {
     fn start(create_session: CreateSession) -> Self {
         Self::start_with(create_session, None)

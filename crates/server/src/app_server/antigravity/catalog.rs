@@ -1,5 +1,6 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 /// Keep only model-selection metadata; server agent configuration is private.
 pub fn public_payload(payload: &Value) -> Value {
@@ -259,6 +260,21 @@ pub fn normalize_models(payload: &Value) -> Vec<Value> {
 /// Preserve account availability while including the known model inventory.
 pub fn models_with_unavailable_paid(payload: &Value) -> Vec<Value> {
     let mut models = normalize_models(payload);
+    // A bundled snapshot carries identities and capabilities, never a local
+    // account's entitlement decision. Keep every known chat model selectable so
+    // the service decides access while the first live catalog is in flight.
+    if payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true) {
+        for model in &mut models {
+            if is_chat_model(model) && model.get("disabled").and_then(Value::as_bool) != Some(true)
+            {
+                model["available"] = json!(false);
+                model["entitlementUnknown"] = json!(true);
+                model["unavailableReason"] = json!(
+                    "Account access is confirmed when the model service answers. The model remains selectable."
+                );
+            }
+        }
+    }
     let dynamic_ids: BTreeSet<String> = payload
         .get("models")
         .and_then(Value::as_object)
@@ -281,6 +297,27 @@ pub fn models_with_unavailable_paid(payload: &Value) -> Vec<Value> {
         models.push(model);
     }
     models
+}
+
+/// The sanitized catalog shipped with the build.
+///
+/// It contains only model identities, protocol metadata and capability
+/// declarations. Account quotas, project identifiers, credential state and
+/// per-account entitlement flags are deliberately absent: the baseline is a
+/// local answer while the credential-scoped catalog is being revalidated, not a
+/// substitute for the service's account decision.
+pub(super) fn bundled_payload() -> Value {
+    static BUNDLED: OnceLock<Value> = OnceLock::new();
+    BUNDLED
+        .get_or_init(|| {
+            let mut payload: Value =
+                serde_json::from_str(include_str!("bundled_catalog.json")).unwrap_or(Value::Null);
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("catalogBaseline".into(), json!(true));
+            }
+            payload
+        })
+        .clone()
 }
 
 /// Resolve exact declared identities independently of account availability.
@@ -646,10 +683,12 @@ fn model_sort_groups(payload: &Value, id: &str) -> Vec<Value> {
 
 fn usage_window(source: &str, group: Option<&Value>, bucket: &Value) -> Option<Value> {
     bucket.as_object()?;
-    let mut identity = vec![group
-        .and_then(|group| first_string(group, &["groupId", "id", "displayName"]))
-        .map(|value| json!(value))
-        .unwrap_or(Value::Null)];
+    let mut identity = vec![
+        group
+            .and_then(|group| first_string(group, &["groupId", "id", "displayName"]))
+            .map(|value| json!(value))
+            .unwrap_or(Value::Null),
+    ];
     identity.extend(
         ["bucketId", "modelId", "tokenType", "window", "displayName"]
             .into_iter()
@@ -858,9 +897,11 @@ mod tests {
         assert_eq!(completion["available"], false);
         assert_eq!(completion["disabled"], true);
         assert_eq!(completion["purpose"], "completion");
-        assert!(!rows
-            .iter()
-            .any(|row| row.to_string().contains("systemPrompt")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.to_string().contains("systemPrompt"))
+        );
     }
 
     #[test]
@@ -996,7 +1037,7 @@ mod tests {
 
     #[test]
     fn declared_capabilities_decode_through_the_engine_contract() {
-        use klaus_agent_core::runtime_values::{runtime_codec, RuntimeString};
+        use klaus_agent_core::runtime_values::{RuntimeString, runtime_codec};
         use klaus_agent_protocol::types::ModelCapabilitiesInit;
 
         let capabilities = model_capabilities(&json!({"maxTokens":1048576,
@@ -1112,8 +1153,10 @@ mod tests {
             assert_eq!(model["unavailable"], true);
             assert_eq!(model["available"], false);
             assert_eq!(model["entitlementUnknown"], true);
-            assert_eq!(model["unavailableReason"],
-                "This model is not offered to the connected account. It becomes available when the service includes it in your model catalog.");
+            assert_eq!(
+                model["unavailableReason"],
+                "This model is not offered to the connected account. It becomes available when the service includes it in your model catalog."
+            );
             assert_eq!(model["isDefault"], false);
             assert!(model.get("vertexModelId").is_none());
             assert!(model["providerMetadata"].get("vertexModelId").is_none());
@@ -1135,15 +1178,51 @@ mod tests {
         assert_eq!(inventory[0]["available"], true);
         assert!(inventory[0].get("entitlementUnknown").is_none());
         assert!(inventory[0]["capabilities"].get("thinking").is_none());
-        assert!(inventory
+        assert!(
+            inventory
+                .iter()
+                .skip(1)
+                .all(|model| model["available"] == false)
+        );
+    }
+
+    #[test]
+    fn bundled_catalog_has_no_account_state_and_never_claims_entitlement() {
+        let payload = bundled_payload();
+        for private in ["quotaInfo", "project", "account", "email", "credential"] {
+            assert!(
+                !contains_key(&payload, private),
+                "bundled catalog leaked {private}"
+            );
+        }
+        assert_eq!(payload["catalogBaseline"], true);
+        let rows = models_with_unavailable_paid(&payload);
+        let chat = rows
             .iter()
-            .skip(1)
-            .all(|model| model["available"] == false));
+            .find(|row| row["key"] == "gemini-4-argon-medium")
+            .unwrap();
+        assert_eq!(chat["disabled"], false);
+        assert_eq!(chat["available"], false);
+        assert_eq!(chat["entitlementUnknown"], true);
+        assert_eq!(
+            chat["unavailableReason"],
+            "Account access is confirmed when the model service answers. The model remains selectable."
+        );
+    }
+
+    fn contains_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key(key) || object.values().any(|value| contains_key(value, key))
+            }
+            Value::Array(values) => values.iter().any(|value| contains_key(value, key)),
+            _ => false,
+        }
     }
 
     #[test]
     fn paid_families_keep_declared_level_and_adaptive_capabilities_without_numeric_budgets() {
-        use klaus_agent_core::runtime_values::{runtime_codec, RuntimeString};
+        use klaus_agent_core::runtime_values::{RuntimeString, runtime_codec};
         use klaus_agent_protocol::types::ModelCapabilitiesInit;
 
         let models = models_with_unavailable_paid(&json!({"models":{}}));

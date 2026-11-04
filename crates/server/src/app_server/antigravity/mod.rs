@@ -13,21 +13,29 @@ use klaus_agent_core::runtime_values::RuntimeString;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::provider::ModelProvider;
 use klaus_agent_protocol::types::{GeminiThinkingInit, ProtocolSessionInit};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 static CONFIG_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+static CATALOG_PUBLISH_FENCE: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static REFRESH_COMPLETIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const CATALOG_TTL_MS: i64 = 5 * 60 * 1000;
+const CATALOG_RETRY_COOLDOWN_MS: i64 = 60 * 1000;
 
 pub fn set_config_root(root: &Path) {
+    let _publish = CATALOG_PUBLISH_FENCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let mut current = CONFIG_ROOT.write().unwrap_or_else(|p| p.into_inner());
     if current.as_deref() != Some(root) {
         *current = Some(root.to_path_buf());
         drop(current);
         login::invalidate_pending();
         *cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *refresh_state().lock().unwrap_or_else(|p| p.into_inner()) = CatalogRefreshState::default();
     }
 }
 
@@ -52,6 +60,7 @@ struct CachedCatalog {
     generation: String,
     payload: Value,
     fetched_at: i64,
+    from_disk: bool,
 }
 
 fn cache() -> &'static Mutex<Option<CachedCatalog>> {
@@ -63,6 +72,17 @@ fn refresh_lock() -> Arc<tokio::sync::Mutex<()>> {
     static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
     LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+#[derive(Default)]
+struct CatalogRefreshState {
+    generation: Option<String>,
+    retry_at: i64,
+}
+
+fn refresh_state() -> &'static Mutex<CatalogRefreshState> {
+    static STATE: OnceLock<Mutex<CatalogRefreshState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(CatalogRefreshState::default()))
 }
 
 fn credit_cache() -> &'static Mutex<Option<(String, Value)>> {
@@ -87,7 +107,11 @@ pub(super) fn record_credits(generation: &str, payload: &Value) {
 }
 
 fn forget_catalog() {
+    let _publish = CATALOG_PUBLISH_FENCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     *cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *refresh_state().lock().unwrap_or_else(|p| p.into_inner()) = CatalogRefreshState::default();
     *credit_cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
     let _ = std::fs::remove_file(config_root().join("antigravity-models.json"));
 }
@@ -116,7 +140,13 @@ fn cached_payload(generation: &str) -> Option<CachedCatalog> {
         generation: generation.to_string(),
         payload: snapshot.get("payload")?.clone(),
         fetched_at: snapshot.get("fetchedAt")?.as_i64()?,
+        from_disk: true,
     })
+}
+
+#[cfg(test)]
+pub(super) fn cloud_test_identity() -> String {
+    cloud::client_identity()
 }
 
 pub(super) async fn project(
@@ -169,6 +199,7 @@ fn platform_id() -> &'static str {
 }
 
 async fn refresh_catalog(generation: &str) -> Result<Value, String> {
+    let root = config_root();
     let signal = AbortSignal::new();
     let project = project(Some(generation), &signal).await?;
     let payload = fetch_available_models(generation, &project, &signal).await?;
@@ -176,7 +207,17 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
         return Err("antigravity_catalog_invalid".into());
     }
     let payload = catalog::public_payload(&payload);
+    // Publishing is fenced by the same lock credential adoption and logout use:
+    // a refresh that finishes after either event must not recreate the snapshot
+    // they just invalidated or write it under a different configuration root.
+    let _credential = auth::credential_lock().lock().await;
+    let _publish = CATALOG_PUBLISH_FENCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if !auth::is_current(generation) {
+        return Err("antigravity_credential_changed".into());
+    }
+    if config_root() != root {
         return Err("antigravity_credential_changed".into());
     }
     let fetched_at = chrono::Utc::now().timestamp_millis();
@@ -184,12 +225,13 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
         generation: generation.to_string(),
         payload: payload.clone(),
         fetched_at,
+        from_disk: false,
     });
     let snapshot = json!({
         "generation":generation,"payload":payload,"fetchedAt":fetched_at,
         "clientIdentity":cloud::client_identity(),
     });
-    let path = config_root().join("antigravity-models.json");
+    let path = root.join("antigravity-models.json");
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = std::fs::write(path, bytes);
     }
@@ -236,37 +278,100 @@ async fn fetch_available_models(
     }
 }
 
-async fn catalog_payload(warm: bool) -> Result<Value, String> {
-    let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-    if let Some(cached) = cached_payload(&generation) {
-        if chrono::Utc::now().timestamp_millis() - cached.fetched_at > CATALOG_TTL_MS {
-            if let Ok(permit) = refresh_lock().try_lock_owned() {
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = refresh_catalog(&generation).await;
-                });
-            }
-        }
-        return Ok(cached.payload);
+fn refresh_allowed(generation: &str, now: i64) -> bool {
+    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
+    if state.generation.as_deref() != Some(generation) {
+        state.generation = Some(generation.to_string());
+        state.retry_at = 0;
     }
-    let lock = refresh_lock();
-    let _permit = lock.lock().await;
-    if let Some(cached) = cached_payload(&generation) {
-        return Ok(cached.payload);
+    state.retry_at <= now
+}
+
+fn record_refresh_failure(generation: &str, now: i64) {
+    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
+    if state.generation.as_deref() == Some(generation) {
+        state.retry_at = now.saturating_add(CATALOG_RETRY_COOLDOWN_MS);
     }
-    if warm {
+}
+
+fn record_refresh_success(generation: &str) {
+    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
+    if state.generation.as_deref() == Some(generation) {
+        state.retry_at = 0;
+    }
+}
+
+/// Revalidate behind the caller. A catalog read never waits for this task, and
+/// the refresh lock makes concurrent picker reads share one request. A failed
+/// fetch is not retried until the cooldown passes, so an offline machine does
+/// not start one request per read.
+fn schedule_refresh(generation: String) {
+    if !refresh_allowed(&generation, chrono::Utc::now().timestamp_millis()) {
+        return;
+    }
+    let Ok(permit) = refresh_lock().try_lock_owned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),
             refresh_catalog(&generation),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err("antigravity_catalog_timeout".into()),
+            Ok(Ok(_)) => record_refresh_success(&generation),
+            Err(_) => record_refresh_failure(&generation, chrono::Utc::now().timestamp_millis()),
+            Ok(Err(_)) => {
+                record_refresh_failure(&generation, chrono::Utc::now().timestamp_millis())
+            }
         }
-    } else {
-        refresh_catalog(&generation).await
+        #[cfg(test)]
+        REFRESH_COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn refresh_blocked(generation: &str) -> bool {
+    let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
+    state.generation.as_deref() == Some(generation)
+        && state.retry_at > chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+pub(super) fn refresh_completions() -> usize {
+    REFRESH_COMPLETIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A local-first catalog read.
+///
+/// Memory is used only for the current credential generation. A disk snapshot
+/// is accepted when it belongs to the same credential generation and client
+/// identity; its age decides whether a background revalidation is needed, not
+/// whether the picker may use it. With neither local source, the sanitized
+/// bundled catalog supplies model identities and their capabilities while the
+/// account's entitlement remains unknown until the service answers.
+async fn catalog_payload(_warm: bool) -> Result<Value, String> {
+    let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
+    if let Some(cached) = cached_payload(&generation) {
+        if cached.from_disk
+            || chrono::Utc::now().timestamp_millis() - cached.fetched_at > CATALOG_TTL_MS
+        {
+            schedule_refresh(generation);
+        }
+        return Ok(cached.payload);
     }
+    let bundled = catalog::bundled_payload();
+    if bundled
+        .get("models")
+        .and_then(Value::as_object)
+        .is_none_or(|models| models.is_empty())
+    {
+        schedule_refresh(generation);
+        return Err("antigravity_catalog_not_ready".into());
+    }
+    schedule_refresh(generation);
+    Ok(bundled)
 }
 
 pub async fn models(warm: bool) -> Result<Value, String> {
@@ -275,10 +380,13 @@ pub async fn models(warm: bool) -> Result<Value, String> {
     if !auth::is_current(&generation) {
         return Err("antigravity_credential_changed".into());
     }
-    Ok(super::conversation_catalog::response(
+    let mut reply = super::conversation_catalog::response(
         "antigravity",
         catalog::models_with_unavailable_paid(&payload),
-    ))
+    );
+    reply["catalogBaseline"] =
+        json!(payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true));
+    Ok(reply)
 }
 
 pub async fn capabilities() -> Result<Value, String> {

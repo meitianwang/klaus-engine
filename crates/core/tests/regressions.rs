@@ -16,6 +16,9 @@ mod r20261104_native_compaction_retry;
 #[path = "regressions/r20261102_managed_browser_approval.rs"]
 mod r20261102_managed_browser_approval;
 
+#[path = "regressions/r20261104_antigravity_catalog_local_first.rs"]
+mod r20261104_antigravity_catalog_local_first;
+
 #[cfg(unix)]
 #[path = "regressions/r20261028_background_output_wait.rs"]
 mod r20261028_background_output_wait;

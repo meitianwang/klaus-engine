@@ -157,7 +157,10 @@ async fn fixture() -> Fixture {
                 } else {
                     (200, content_type, response)
                 };
-                let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len());
+                let reply = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
                 let _ = socket.write_all(reply.as_bytes()).await;
             });
         }
@@ -191,7 +194,10 @@ async fn oauth_fixture(status: u16, payload: &'static str) -> OAuthFixture {
         let _ = socket.read(&mut request).await.unwrap();
         let _ = started_tx.send(());
         let _ = released.await;
-        let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len());
+        let response = format!(
+            "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
         let _ = socket.write_all(response.as_bytes()).await;
     });
     OAuthFixture {
@@ -330,6 +336,7 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
     })
     .await
     .unwrap();
+    refresh_catalog(&auth::generation().unwrap()).await.unwrap();
     assert_eq!(adopted["ok"], true);
     assert_eq!(adopted["loggedIn"], true);
     assert!(!adopted.to_string().contains("fixture-expired"));
@@ -340,11 +347,13 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         "fixture-level"
     );
     let allowance = usage().await.unwrap();
-    assert!(allowance["windows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|window| window["usedPercent"] == 25.0));
+    assert!(
+        allowance["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|window| window["usedPercent"] == 25.0)
+    );
     let available = capabilities().await.unwrap();
     assert_eq!(available["image"]["available"], true);
     assert_eq!(available["imageEdit"]["available"], true);
@@ -421,13 +430,17 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
                 ));
         }
         let events: Vec<_> = provider.stream(request, AbortSignal::new()).collect().await;
-        assert!(events
-            .iter()
-            .any(|event| matches!(event,ModelStreamEvent::TextDelta {text} if text=="OK")));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event,ModelStreamEvent::TextDelta {text} if text=="OK"))
+        );
         assert!(events.iter().any(|event| matches!(event,ModelStreamEvent::ThinkingBlock {signature:Some(signature),..} if signature.starts_with("gemini-thought:"))));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, ModelStreamEvent::Error { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::Error { .. }))
+        );
     }
     let auxiliary = resolve("fixture-budget", &serde_json::Map::new())
         .await
@@ -447,9 +460,11 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         .stream(request, AbortSignal::new())
         .collect()
         .await;
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, ModelStreamEvent::Error { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Error { .. }))
+    );
     let locked = resolve("fixture-locked", &serde_json::Map::new())
         .await
         .unwrap();
@@ -472,8 +487,7 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         );
         let auxiliary_request = streams.last().unwrap();
         assert_eq!(
-            auxiliary_request["body"]["request"]["generationConfig"]["thinkingConfig"]
-                ["thinkingBudget"],
+            auxiliary_request["body"]["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4000
         );
         assert!(
@@ -516,6 +530,7 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
     )
     .await
     .unwrap();
+    refresh_catalog(&auth::generation().unwrap()).await.unwrap();
     let listed = models(true).await.unwrap();
     let paid = listed["models"]
         .as_array()
@@ -621,9 +636,11 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
             .unwrap();
         assert!(public.contains(code));
         assert!(public.contains("providerError"));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, ModelStreamEvent::MessageStop { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::MessageStop { .. }))
+        );
     }
     assert_eq!(auth::status()["loggedIn"], true);
     assert_eq!(auth::status()["needsLogin"], false);
@@ -684,9 +701,11 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
         "transcribeAudio",
         "cancelOperation",
     ] {
-        assert!(bundle["requests"]
-            .get(format!("antigravity/{method}"))
-            .is_some());
+        assert!(
+            bundle["requests"]
+                .get(format!("antigravity/{method}"))
+                .is_some()
+        );
     }
     assert!(serde_json::from_value::<super::super::wire::AntigravityAdoptParams>(json!({
         "credential":{"accessToken":"fixture","authMethod":"consumer","unexpectedSecret":"refuse"}
@@ -780,7 +799,10 @@ async fn logout_invalidates_a_refresh_without_waiting_for_the_network() {
         let _ = started_tx.send(());
         let _ = finish_rx.await;
         let payload = r#"{"access_token":"late-token","expires_in":3600}"#;
-        let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len());
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
         let _ = socket.write_all(response.as_bytes()).await;
     });
     let root = tempfile::tempdir().unwrap();
@@ -974,8 +996,20 @@ async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selectio
         std::fs::write(&snapshot_path, snapshot.to_string()).unwrap();
         let result = models(true).await.unwrap();
         let rows = result["models"].as_array().unwrap();
-        assert!(rows.iter().any(|row| row["id"] == "fixture-level"));
+        assert!(rows.iter().any(|row| row["id"] == "gemini-4-argon-medium"));
         assert!(!rows.iter().any(|row| row["id"] == "legacy-only"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let refreshed: Value =
+                    serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+                if refreshed["payload"]["models"]["fixture-level"].is_object() {
+                    return refreshed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the rejected snapshot must revalidate in the background");
         let refreshed: Value =
             serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
         assert_eq!(refreshed["clientIdentity"], cloud::client_identity());
