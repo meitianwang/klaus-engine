@@ -304,9 +304,22 @@ fn error_details(error: &GeminiApiError) -> RawProviderError {
         .and_then(|suffix| suffix.split_once(']'))
         .map(|(code, _)| code)
         .filter(|code| safe_machine_code(code));
+    // Preserve the localized key while exposing a transport signal understood
+    // by the engine's bounded stream recovery. Local refusals remain terminal.
+    let message = match (error.status, error.message.as_str()) {
+        (None, "antigravity_stream_incomplete") => format!(
+            "{}: network stream ended before its terminal event",
+            error.message
+        ),
+        (None, "antigravity_stream_interrupted") => format!(
+            "{}: network stream interrupted while reading response",
+            error.message
+        ),
+        _ => error.message.clone(),
+    };
     RawProviderError {
         status: error.status,
-        message: error.message.clone(),
+        message,
         code: code.map(str::to_string),
         error_type: error_type.map(str::to_string),
         headers: error.headers.clone().unwrap_or_default(),
@@ -881,6 +894,38 @@ impl GeminiClient for CloudClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A truncated cloud response was classified as Unknown and skipped the
+    // engine's bounded stream recovery. Only response-read failures are transient.
+    #[test]
+    fn interrupted_streams_enter_recovery_without_retrying_local_refusals() {
+        use klaus_agent_core::provider::classify::classify_error;
+        use klaus_agent_core::provider::retry::is_retryable;
+        use klaus_agent_core::types::errors::ProviderErrorKind;
+
+        for key in [
+            "antigravity_stream_incomplete",
+            "antigravity_stream_interrupted",
+        ] {
+            let classified = classify_error(&error_details(&api_error(key)));
+            assert_eq!(classified.kind, ProviderErrorKind::Network, "{key}");
+            assert_eq!(classified.status, None);
+            assert!(classified.message.starts_with(key));
+            assert!(is_retryable(&classified));
+        }
+        for key in [
+            "antigravity_credential_changed",
+            "antigravity_request_cancelled",
+            "antigravity_stream_invalid",
+            "antigravity_stream_response_too_large",
+            "antigravity_stream_frame_too_large",
+            "antigravity_transport_unavailable (sent)",
+        ] {
+            let classified = classify_error(&error_details(&api_error(key)));
+            assert!(!is_retryable(&classified), "{key}");
+            assert_eq!(classified.message, key);
+        }
+    }
 
     #[test]
     fn service_failures_preserve_bounded_details_and_context_classification() {

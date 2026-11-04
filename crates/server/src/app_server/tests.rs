@@ -304,6 +304,10 @@ mod r01a16397_conversation_model_purpose;
 #[path = "antigravity/local_first_tests.rs"]
 mod antigravity_local_first_tests;
 
+#[cfg(unix)]
+#[path = "../../../core/tests/regressions/r20261104_antigravity_stream_recovery.rs"]
+mod r20261104_antigravity_stream_recovery;
+
 impl TestClient {
     fn start(create_session: CreateSession) -> Self {
         Self::start_with(create_session, None)
