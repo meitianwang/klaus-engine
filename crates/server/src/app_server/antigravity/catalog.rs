@@ -1,4 +1,4 @@
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -683,12 +683,10 @@ fn model_sort_groups(payload: &Value, id: &str) -> Vec<Value> {
 
 fn usage_window(source: &str, group: Option<&Value>, bucket: &Value) -> Option<Value> {
     bucket.as_object()?;
-    let mut identity = vec![
-        group
-            .and_then(|group| first_string(group, &["groupId", "id", "displayName"]))
-            .map(|value| json!(value))
-            .unwrap_or(Value::Null),
-    ];
+    let mut identity = vec![group
+        .and_then(|group| first_string(group, &["groupId", "id", "displayName"]))
+        .map(|value| json!(value))
+        .unwrap_or(Value::Null)];
     identity.extend(
         ["bucketId", "modelId", "tokenType", "window", "displayName"]
             .into_iter()
@@ -897,11 +895,9 @@ mod tests {
         assert_eq!(completion["available"], false);
         assert_eq!(completion["disabled"], true);
         assert_eq!(completion["purpose"], "completion");
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.to_string().contains("systemPrompt"))
-        );
+        assert!(!rows
+            .iter()
+            .any(|row| row.to_string().contains("systemPrompt")));
     }
 
     #[test]
@@ -1037,7 +1033,7 @@ mod tests {
 
     #[test]
     fn declared_capabilities_decode_through_the_engine_contract() {
-        use klaus_agent_core::runtime_values::{RuntimeString, runtime_codec};
+        use klaus_agent_core::runtime_values::{runtime_codec, RuntimeString};
         use klaus_agent_protocol::types::ModelCapabilitiesInit;
 
         let capabilities = model_capabilities(&json!({"maxTokens":1048576,
@@ -1178,12 +1174,10 @@ mod tests {
         assert_eq!(inventory[0]["available"], true);
         assert!(inventory[0].get("entitlementUnknown").is_none());
         assert!(inventory[0]["capabilities"].get("thinking").is_none());
-        assert!(
-            inventory
-                .iter()
-                .skip(1)
-                .all(|model| model["available"] == false)
-        );
+        assert!(inventory
+            .iter()
+            .skip(1)
+            .all(|model| model["available"] == false));
     }
 
     #[test]
@@ -1222,7 +1216,7 @@ mod tests {
 
     #[test]
     fn paid_families_keep_declared_level_and_adaptive_capabilities_without_numeric_budgets() {
-        use klaus_agent_core::runtime_values::{RuntimeString, runtime_codec};
+        use klaus_agent_core::runtime_values::{runtime_codec, RuntimeString};
         use klaus_agent_protocol::types::ModelCapabilitiesInit;
 
         let models = models_with_unavailable_paid(&json!({"models":{}}));

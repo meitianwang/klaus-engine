@@ -13,7 +13,7 @@ use klaus_agent_core::runtime_values::RuntimeString;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::provider::ModelProvider;
 use klaus_agent_protocol::types::{GeminiThinkingInit, ProtocolSessionInit};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};

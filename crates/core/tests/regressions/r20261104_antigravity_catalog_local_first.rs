@@ -6,7 +6,7 @@
 //! is named explicitly with `KLAUS_TEST_APP_SERVER_BIN`; its `--version` output
 //! is verified before the facade is used.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -264,10 +264,9 @@ fn local_first_catalog_facade_does_not_wait_for_an_offline_refresh() {
         .unwrap_or_else(|| panic!("bundled catalog missing default: {rows:?}"));
     assert_eq!(baseline["available"], false);
     assert_eq!(baseline["entitlementUnknown"], true);
-    assert!(
-        rows.iter()
-            .any(|row| row["id"] == "gemini-3.8-flash-medium")
-    );
+    assert!(rows
+        .iter()
+        .any(|row| row["id"] == "gemini-3.8-flash-medium"));
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while server.request_count() == 0 && Instant::now() < deadline {

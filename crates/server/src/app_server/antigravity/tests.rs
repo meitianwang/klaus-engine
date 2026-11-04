@@ -347,13 +347,11 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         "fixture-level"
     );
     let allowance = usage().await.unwrap();
-    assert!(
-        allowance["windows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|window| window["usedPercent"] == 25.0)
-    );
+    assert!(allowance["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|window| window["usedPercent"] == 25.0));
     let available = capabilities().await.unwrap();
     assert_eq!(available["image"]["available"], true);
     assert_eq!(available["imageEdit"]["available"], true);
@@ -430,17 +428,13 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
                 ));
         }
         let events: Vec<_> = provider.stream(request, AbortSignal::new()).collect().await;
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event,ModelStreamEvent::TextDelta {text} if text=="OK"))
-        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event,ModelStreamEvent::TextDelta {text} if text=="OK")));
         assert!(events.iter().any(|event| matches!(event,ModelStreamEvent::ThinkingBlock {signature:Some(signature),..} if signature.starts_with("gemini-thought:"))));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ModelStreamEvent::Error { .. }))
-        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Error { .. })));
     }
     let auxiliary = resolve("fixture-budget", &serde_json::Map::new())
         .await
@@ -460,11 +454,9 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         .stream(request, AbortSignal::new())
         .collect()
         .await;
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, ModelStreamEvent::Error { .. }))
-    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ModelStreamEvent::Error { .. })));
     let locked = resolve("fixture-locked", &serde_json::Map::new())
         .await
         .unwrap();
@@ -487,7 +479,8 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         );
         let auxiliary_request = streams.last().unwrap();
         assert_eq!(
-            auxiliary_request["body"]["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            auxiliary_request["body"]["request"]["generationConfig"]["thinkingConfig"]
+                ["thinkingBudget"],
             4000
         );
         assert!(
@@ -636,11 +629,9 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
             .unwrap();
         assert!(public.contains(code));
         assert!(public.contains("providerError"));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ModelStreamEvent::MessageStop { .. }))
-        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::MessageStop { .. })));
     }
     assert_eq!(auth::status()["loggedIn"], true);
     assert_eq!(auth::status()["needsLogin"], false);
@@ -701,11 +692,9 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
         "transcribeAudio",
         "cancelOperation",
     ] {
-        assert!(
-            bundle["requests"]
-                .get(format!("antigravity/{method}"))
-                .is_some()
-        );
+        assert!(bundle["requests"]
+            .get(format!("antigravity/{method}"))
+            .is_some());
     }
     assert!(serde_json::from_value::<super::super::wire::AntigravityAdoptParams>(json!({
         "credential":{"accessToken":"fixture","authMethod":"consumer","unexpectedSecret":"refuse"}

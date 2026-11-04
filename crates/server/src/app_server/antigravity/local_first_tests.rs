@@ -1,12 +1,12 @@
 //! Local-first catalog behavior exercised through the app-server test client.
 //! The public stdio regression lives under core/tests/regressions.
 
-use super::{TestClient, make_create_session};
+use super::{make_create_session, TestClient};
 use crate::app_server::antigravity;
 use klaus_agent_core::runtime_process::{
     remove_process_environment_var, set_process_environment_var,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -204,10 +204,9 @@ async fn cold_and_inflight_reads_answer_from_the_baseline_with_one_refresh() {
         .unwrap_or_else(|| panic!("bundled catalog is missing its default: {response}"));
     assert_eq!(baseline["available"], false);
     assert_eq!(baseline["entitlementUnknown"], true);
-    assert!(
-        rows.iter()
-            .any(|row| row["id"] == "gemini-3.8-flash-medium")
-    );
+    assert!(rows
+        .iter()
+        .any(|row| row["id"] == "gemini-3.8-flash-medium"));
     assert!(!rows.iter().any(|row| row["id"] == "legacy-only"));
 
     assert!(
