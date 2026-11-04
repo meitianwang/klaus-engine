@@ -276,6 +276,7 @@ facade_methods! {
     /// Full message/TurnIndex envelope for a saved conversation; no provider or writer.
     EngineReadThreadHistory => "engine/readThreadHistory" (wire::EngineReadThreadHistoryParams) -> RawJson;
     /// One turn's messages, paged by message cursor; no provider or writer.
+    EngineReadThreadFileChanges => "engine/readThreadFileChanges" (wire::EngineReadThreadFileChangesParams) -> RawJson;
     EngineReadThreadItems => "engine/readThreadItems" (wire::EngineReadThreadItemsParams) -> RawJson;
     /// Full child message/TurnIndex envelope through a strictly read-only store hook.
     EngineReadSubagentHistory => "engine/readSubagentHistory" (wire::EngineReadSubagentHistoryParams) -> RawJson;

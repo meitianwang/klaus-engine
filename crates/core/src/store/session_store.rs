@@ -825,6 +825,23 @@ pub trait SessionStore: Send + Sync {
     ) -> std::io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
         Ok(None)
     }
+    /// Read items older than a stable item identity independently of storage cursors.
+    async fn paged_turn_slice_before(
+        &self,
+        _thread_id: &str,
+        _turn_id: &str,
+        _before_item_id: &str,
+        _limit: Option<usize>,
+    ) -> std::io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
+        Ok(None)
+    }
+    /// Complete saved change metadata, independent of transcript page membership.
+    async fn saved_file_changes(
+        &self,
+        _thread_id: &str,
+    ) -> std::io::Result<Option<crate::engine::session::SessionFileChanges>> {
+        Ok(None)
+    }
     /// Inspect a saved child without archive recovery, writer locks, or model startup.
     async fn read_sub_agent(
         &self,

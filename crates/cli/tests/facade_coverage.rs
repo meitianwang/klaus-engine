@@ -41,6 +41,7 @@ enum Reach {
 /// Keyed on the marker type's own name rather than the wire name, because the
 /// marker is what a caller writes. `MethodSpec::marker` exists for exactly this.
 const COVERAGE: &[(&str, Reach)] = &[
+    ("EngineReadThreadFileChanges", Reach::Withheld("The CLI does not present saved file-change cards")),
     ("KiroStatus", Reach::Withheld("The CLI has no account-management command")),
     ("KiroLoginStart", Reach::Withheld("Browser authorization uses the named account facade")),
     ("KiroLoginPoll", Reach::Withheld("Browser authorization uses the named account facade")),
@@ -801,6 +802,7 @@ const COVERAGE: &[(&str, Reach)] = &[
         Reach::Withheld("the CLI owns no subscription audio capture operation"),
     ),
     // ---- Persisted threads -------------------------------------------------
+    ("SessionAppendDisplayMessage", Reach::Withheld("The CLI submits canonical user messages and does not persist host-rendered display envelopes")),
     ("SessionResume", Reach::Called),
     ("SessionFork", Reach::Called),
     ("SessionArchive", Reach::Called),

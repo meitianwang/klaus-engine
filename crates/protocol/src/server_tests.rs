@@ -4648,6 +4648,7 @@ fn protocol_lifecycle(agent: Arc<Agent>, store: Arc<dyn SessionStore>) -> Protoc
         set_skills: None,
         read_thread: None,
         read_thread_page: None,
+        read_thread_file_changes: None,
         read_session_summary: None,
         read_profile_activity: None,
         read_subagent_history: None,

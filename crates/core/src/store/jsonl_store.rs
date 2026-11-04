@@ -378,6 +378,37 @@ impl JsonlSessionStore {
         limit: Option<usize>,
         sort_direction: Option<&str>,
     ) -> io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
+        self.paged_turn_slice_impl(thread_id, turn_id, cursor, limit, sort_direction, None)
+            .await
+    }
+
+    pub async fn paged_turn_slice_before(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        before_item_id: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
+        self.paged_turn_slice_impl(
+            thread_id,
+            turn_id,
+            None,
+            limit,
+            Some("desc"),
+            Some(before_item_id),
+        )
+        .await
+    }
+
+    async fn paged_turn_slice_impl(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        sort_direction: Option<&str>,
+        before_item_id: Option<&str>,
+    ) -> io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
         let path = match self.locate(thread_id).await? {
             Some(path) => path,
             None => return Ok(None),
@@ -388,6 +419,7 @@ impl JsonlSessionStore {
         let db_path = join_path(&self.dir, "threads-index.sqlite3");
         let thread = thread_id.to_string();
         let turn = turn_id.to_string();
+        let before_item_id = before_item_id.map(str::to_owned);
         let cursor = cursor.map(str::to_string);
         let desc = sort_direction != Some("asc");
         if !matches!(sort_direction, None | Some("asc" | "desc")) {
@@ -398,6 +430,17 @@ impl JsonlSessionStore {
         }
         let snapshot = tokio::task::spawn_blocking(move || {
             let mut db = crate::store::thread_index::TurnIndexDb::open(&db_path)?;
+            if let Some(anchor) = before_item_id {
+                return db.turn_slice_before(
+                    &thread,
+                    &path,
+                    len,
+                    stamp,
+                    &turn,
+                    &anchor,
+                    limit.unwrap_or(100).clamp(1, 100),
+                );
+            }
             db.turn_slice(
                 &thread,
                 &path,
@@ -414,6 +457,26 @@ impl JsonlSessionStore {
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
         snapshot
+    }
+
+    pub async fn saved_file_changes(
+        &self,
+        thread_id: &str,
+    ) -> io::Result<Option<crate::engine::session::SessionFileChanges>> {
+        let Some(path) = self.locate(thread_id).await? else {
+            return Ok(None);
+        };
+        let metadata = tokio::fs::metadata(&path).await?;
+        let stamp = file_stamp(&metadata);
+        let len = metadata.len();
+        let db_path = join_path(&self.dir, "threads-index.sqlite3");
+        let thread = thread_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut db = crate::store::thread_index::TurnIndexDb::open(&db_path)?;
+            db.file_changes(&thread, &path, len, stamp).map(Some)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn locate_namespaces(
@@ -1462,6 +1525,24 @@ impl SessionStore for JsonlSessionStore {
     ) -> io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
         JsonlSessionStore::paged_turn_slice(self, thread_id, turn_id, cursor, limit, sort_direction)
             .await
+    }
+
+    async fn paged_turn_slice_before(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        before_item_id: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Option<crate::store::thread_index::ThreadPageSnapshot>> {
+        JsonlSessionStore::paged_turn_slice_before(self, thread_id, turn_id, before_item_id, limit)
+            .await
+    }
+
+    async fn saved_file_changes(
+        &self,
+        thread_id: &str,
+    ) -> io::Result<Option<crate::engine::session::SessionFileChanges>> {
+        JsonlSessionStore::saved_file_changes(self, thread_id).await
     }
 
     async fn read_thread(&self, thread_id: &str) -> io::Result<ThreadReadSnapshot> {

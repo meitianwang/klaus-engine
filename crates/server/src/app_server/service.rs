@@ -926,6 +926,7 @@ async fn read_thread_history(
                     items_view: paging.items_view.clone(),
                     sort_direction: paging.sort_direction.clone(),
                     turn_id: None,
+                    before_item_id: None,
                 };
                 if let Some(snapshot) = hook(thread_id.clone(), request).await? {
                     let view = paging.items_view.clone().unwrap_or_else(|| "full".into());
@@ -1068,6 +1069,49 @@ async fn read_thread_history(
 /// Read directly through the store hook. No scope resolution or initialization
 /// is allowed: a read of an archived or sleeping thread must leave it that way.
 /// Page ONE turn's messages by message cursor, carrying no other turn's rows.
+async fn read_thread_file_changes(state: Arc<AppServerState>, id: Value, thread_id: String) {
+    if thread_id.trim().is_empty() {
+        return send_invalid_params_message(&state, &id, "threadId must be nonempty").await;
+    }
+    let result: Result<Payload, crate::lifecycle::BoxError> = async {
+        let hook = state
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.read_thread_file_changes.clone())
+            .ok_or("saved change metadata is unavailable")?;
+        let changes = hook(thread_id.clone()).await?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "saved conversation not found")
+        })?;
+        Ok(Payload::Runtime(exact_payload::object([
+            ("threadId", RuntimeJson::from(thread_id)),
+            (
+                "fileChanges",
+                super::thread_read::file_changes_value(changes)?,
+            ),
+        ])))
+    }
+    .await;
+    match result {
+        Ok(reply) => state.send(exact_payload::response(&id, reply)).await,
+        Err(error) => {
+            state
+                .send(wire::error_response(
+                    &id,
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        wire::UNKNOWN_SESSION
+                    } else {
+                        wire::ENGINE_ERROR
+                    },
+                    &error.to_string(),
+                ))
+                .await
+        }
+    }
+}
+
 async fn read_thread_items(
     state: Arc<AppServerState>,
     id: Value,
@@ -1076,6 +1120,31 @@ async fn read_thread_items(
     if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
         return send_invalid_params_message(&state, &id, "threadId and turnId must be nonempty")
             .await;
+    }
+    if params.cursor.is_some() && params.before_item_id.is_some() {
+        return send_invalid_params_message(
+            &state,
+            &id,
+            "cursor and beforeItemId cannot be combined",
+        )
+        .await;
+    }
+    if params
+        .before_item_id
+        .as_ref()
+        .is_some_and(|anchor| anchor.trim().is_empty())
+        || params.before_item_id.is_some()
+            && params
+                .sort_direction
+                .as_deref()
+                .is_some_and(|order| order != "desc")
+    {
+        return send_invalid_params_message(
+            &state,
+            &id,
+            "beforeItemId requires a nonempty anchor and descending order",
+        )
+        .await;
     }
     let result: Result<Payload, crate::lifecycle::BoxError> = async {
         let lifecycle = state
@@ -1089,6 +1158,7 @@ async fn read_thread_items(
         if let Some(hook) = lifecycle.read_thread_page.clone() {
             let request = klaus_agent_protocol::server::ThreadPageRequest {
                 turn_id: Some(params.turn_id.clone()),
+                before_item_id: params.before_item_id.clone(),
                 cursor: params.cursor.clone(),
                 limit: params.limit,
                 sort_direction: params.sort_direction.clone(),
@@ -1131,7 +1201,10 @@ async fn read_thread_items(
             &history,
             &params.thread_id,
             &params.turn_id,
-            params.cursor.as_deref(),
+            params
+                .cursor
+                .as_deref()
+                .or(params.before_item_id.as_deref()),
             params.limit,
             params.sort_direction.as_deref(),
         )
@@ -1215,6 +1288,7 @@ fn indexed_history_payload(
         );
     }
     let mut fields = exact_payload::runtime_fields(reply);
+    fields.push(("supportsItemAnchors".into(), Payload::Scalar(true.into())));
     fields.push((
         "fileChanges".into(),
         Payload::Runtime(super::thread_read::file_changes_value(
@@ -1272,6 +1346,7 @@ fn indexed_items_payload(
         );
     }
     let mut fields = exact_payload::runtime_fields(reply);
+    fields.push(("supportsItemAnchors".into(), Payload::Scalar(true.into())));
     fields.push((
         "fileChanges".into(),
         Payload::Runtime(super::thread_read::file_changes_value(
@@ -2618,6 +2693,19 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
             tokio::spawn(async move {
                 let _guard = guard;
                 read_thread_history(state, id, thread_id, agent_id, paging).await;
+            });
+        }
+        "engine/readThreadFileChanges" => {
+            let params = match params.deserialize::<wire::EngineReadThreadFileChangesParams>() {
+                Ok(params) => params,
+                Err(error) => return send_invalid_params(&state, &id, &error).await,
+            };
+            let Some(guard) = HeavyRequestGuard::acquire(&state, &id).await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _guard = guard;
+                read_thread_file_changes(state, id, params.thread_id).await;
             });
         }
         "engine/readThreadItems" => {

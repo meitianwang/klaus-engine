@@ -514,6 +514,18 @@ fn protocol_lifecycle_with_config_root(
                     .map_err(|e| Box::new(e) as BoxError)
             })
         })),
+        read_thread_file_changes: Some(Arc::new({
+            let store = read_store.clone();
+            move |thread_id| {
+                let store = store.clone();
+                Box::pin(async move {
+                    store
+                        .saved_file_changes(&thread_id)
+                        .await
+                        .map_err(|error| Box::new(error) as BoxError)
+                })
+            }
+        })),
         read_thread: Some(Arc::new(move |thread_id: String| {
             let store = read_store.clone();
             Box::pin(async move {
@@ -528,6 +540,19 @@ fn protocol_lifecycle_with_config_root(
                 let store = page_store.clone();
                 Box::pin(async move {
                     let snapshot = match request.turn_id {
+                        Some(turn_id) if request.before_item_id.is_some() => {
+                            store
+                                .paged_turn_slice_before(
+                                    &thread_id,
+                                    &turn_id,
+                                    request
+                                        .before_item_id
+                                        .as_deref()
+                                        .expect("guarded item anchor"),
+                                    request.limit,
+                                )
+                                .await
+                        }
                         Some(turn_id) => {
                             store
                                 .paged_turn_slice(

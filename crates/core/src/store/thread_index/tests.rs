@@ -1281,3 +1281,136 @@ fn projection_failures_persist_the_frozen_checkpoint() {
         .unwrap();
     assert_eq!(retained, 20, "failure history stays bounded per thread");
 }
+
+#[test]
+fn indexed_turn_windows_preserve_cursor_edges_and_global_shell_positions() {
+    let dir = TempDir::new();
+    let rows: Vec<String> = (0..35)
+        .flat_map(|i| {
+            [
+                context(&format!("turn-{i:03}")),
+                message(&format!("row-{i:03}"), "retained"),
+            ]
+        })
+        .collect();
+    let (path, len) = save(dir.path(), &rows);
+    let mut db = TurnIndexDb::open(dir.path().join("index.sqlite3").to_str().unwrap()).unwrap();
+    db.materialize_rollout("t", &path).unwrap();
+    let ids: Vec<String> = (0..35).map(|i| format!("turn-{i:03}")).collect();
+    for desc in [true, false] {
+        for limit in [1, 5, 100] {
+            for cursor in std::iter::once(None).chain(ids.iter().map(|id| Some(id.as_str()))) {
+                let (start, end, expected) = page_window(&ids, cursor, limit, desc).unwrap();
+                let page = db
+                    .window("t", &path, len, 1, cursor, limit, desc, "notLoaded")
+                    .unwrap();
+                assert_eq!(
+                    page.shells
+                        .iter()
+                        .map(|shell| &shell.id)
+                        .collect::<Vec<_>>(),
+                    ids[start..end].iter().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    page.shells.first().map(|shell| shell.ord),
+                    (start < end).then_some(start as i64)
+                );
+                assert_eq!(page.page.next_cursor, expected.next_cursor);
+                assert_eq!(page.page.backwards_cursor, expected.backwards_cursor);
+                assert_eq!(page.page.has_more, expected.has_more);
+            }
+        }
+    }
+    let plan: String = db.conn.query_row("EXPLAIN QUERY PLAN SELECT turn,ordinal FROM history_turn_projection WHERE thread='t' AND ordinal<9223372036854775807 ORDER BY ordinal DESC LIMIT 6",[],|row|row.get(3)).unwrap();
+    assert!(plan.contains("history_turn_order"), "{plan}");
+}
+
+#[test]
+fn change_metadata_reads_do_not_materialize_any_message_chunks() {
+    let dir = TempDir::new();
+    let mut rows = fixture();
+    rows.push(json!({"kind":"event","event":"file_change","turnId":"one","payload":{"path":"/tmp/a","kind":"modify","added":3,"removed":1,"turnDiff":"complete diff"}}).to_string());
+    rows.push(json!({"kind":"event","event":"file_change","turnId":"three","payload":{"path":"/tmp/b","kind":"create","added":null,"removed":null,"turnDiff":null}}).to_string());
+    let (path, len) = save(dir.path(), &rows);
+    let mut db = TurnIndexDb::open(dir.path().join("index.sqlite3").to_str().unwrap()).unwrap();
+    let before = db.file_changes("t", &path, len, 1).unwrap();
+    assert_eq!(before.turns.len(), 2);
+    db.conn
+        .execute_batch("DELETE FROM history_item_chunks")
+        .unwrap();
+    let after = db.file_changes("t", &path, len, 1).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn stable_item_anchors_survive_storage_cursor_epochs() {
+    let dir = TempDir::new();
+    let (path, len) = save(
+        dir.path(),
+        &[
+            context("one"),
+            message("a", "first"),
+            message("b", "second"),
+            message("c", "third"),
+        ],
+    );
+    let mut db = TurnIndexDb::open(dir.path().join("index.sqlite3").to_str().unwrap()).unwrap();
+    db.materialize_rollout("t", &path).unwrap();
+    db.conn
+        .execute(
+            "INSERT OR REPLACE INTO page_epochs_v1(thread,epoch) VALUES('t','epoch-current')",
+            [],
+        )
+        .unwrap();
+    let before = db
+        .turn_slice_before("t", &path, len, 1, "one", "c", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        encoded(&before.history)
+            .get("history")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("uuid")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .try_to_utf8()
+            .unwrap(),
+        "b"
+    );
+    assert_eq!(
+        before.page.next_cursor.as_deref(),
+        Some("migration:epoch-current:b")
+    );
+    let previous = db
+        .turn_slice(
+            "t",
+            &path,
+            len,
+            1,
+            "one",
+            MessageWindow {
+                cursor: before.page.next_cursor.as_deref(),
+                limit: 1,
+                desc: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        encoded(&previous.history)
+            .get("history")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("uuid")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .try_to_utf8()
+            .unwrap(),
+        "a"
+    );
+}

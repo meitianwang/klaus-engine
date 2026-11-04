@@ -854,9 +854,9 @@ pub struct ThreadHistoryPage {
 
 /// Page the messages of ONE turn without carrying any other turn's rows.
 ///
-/// `cursor` names the message uuid the page starts at (exclusive) in the
-/// requested direction; an unknown cursor is refused rather than silently
-/// re-reading from the turn head. `limit` counts messages, not turns.
+/// `cursor` is storage-owned. A separate `beforeItemId` selects older items
+/// by stable identity, independently of the storage cursor revision.
+/// Missing boundaries are refused; `limit` counts messages, not turns.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EngineReadThreadItemsParams {
@@ -868,6 +868,16 @@ pub struct EngineReadThreadItemsParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub sort_direction: Option<String>,
+    /// A stable message anchor; returns older items without interpreting it as a cursor.
+    #[serde(default)]
+    pub before_item_id: Option<String>,
+}
+
+/// Read all saved file-change metadata without loading transcript items.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EngineReadThreadFileChangesParams {
+    pub thread_id: String,
 }
 
 /// Read complete durable child messages without resuming the parent session.

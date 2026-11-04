@@ -619,6 +619,7 @@ pub type SetSkills = Arc<dyn Fn(Arc<Session>, Vec<Skill>) -> Result<(), String> 
 /// select messages in that turn before the store decodes their content.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadPageRequest {
+    pub before_item_id: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<usize>,
     pub items_view: Option<String>,
@@ -642,6 +643,22 @@ pub type ReadThreadPageFuture = Pin<
 /// and must never trigger a whole-file retry.
 pub type ReadThreadPage =
     Arc<dyn Fn(String, ThreadPageRequest) -> ReadThreadPageFuture + Send + Sync>;
+
+pub type ReadThreadFileChanges = Arc<
+    dyn Fn(
+            String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<klaus_agent_core::engine::session::SessionFileChanges>,
+                            BoxError,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 /// Store maintenance stays inside the named facade and never creates a session.
 pub type CompressRollouts = Arc<
@@ -680,6 +697,7 @@ pub struct ProtocolLifecycle {
     /// Paged saved-transcript reads backed by the store's durable turn index.
     /// `None` keeps every paged read on the whole-file projection.
     pub read_thread_page: Option<ReadThreadPage>,
+    pub read_thread_file_changes: Option<ReadThreadFileChanges>,
     pub read_session_summary: Option<ReadSessionSummary>,
     pub read_profile_activity: Option<ReadProfileActivity>,
     pub read_subagent_history: Option<ReadSubagentHistory>,

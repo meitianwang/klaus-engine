@@ -151,6 +151,9 @@ impl TurnIndexDb {
         if version < 5 {
             presentation::upgrade(&conn)?;
         }
+        if version < 6 {
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS history_turn_order ON history_turn_projection(thread,ordinal); PRAGMA user_version=6;").map_err(sql_error)?;
+        }
         Ok(Self { conn, _lock: lock })
     }
 
@@ -181,12 +184,11 @@ impl TurnIndexDb {
         desc: bool,
         view: &str,
     ) -> io::Result<ThreadPageSnapshot> {
-        let ids = self.turn_ids(thread)?;
         let cursor = self.decode_cursor(thread, cursor)?;
-        let (start, end, mut page) = page_window(&ids, cursor.as_deref(), limit, desc)?;
+        let (ids, start, mut page) = self.turn_window(thread, cursor.as_deref(), limit, desc)?;
         self.encode_page(thread, &mut page)?;
         let mut records = Vec::new();
-        for turn in &ids[start..end] {
+        for turn in &ids {
             if view == "full" {
                 records.extend(self.messages(thread, turn, None)?);
             }
@@ -194,14 +196,13 @@ impl TurnIndexDb {
                 records.extend(self.summary_records(thread, turn)?);
             }
         }
-        let (history, file_changes) =
-            self.read_projection(thread, &ids[start..end], records, false)?;
+        let (history, file_changes) = self.read_projection(thread, &ids, records, false)?;
         let presentation_records = if view == "summary" {
             self.presentation_records(thread, &history, false)?
         } else {
             Vec::new()
         };
-        let mut shells = self.shells(thread, &ids, start, end, &history)?;
+        let mut shells = self.shells(thread, &ids, start, &history)?;
         for shell in &mut shells {
             shell.items_view = view.into();
         }
@@ -229,16 +230,50 @@ impl TurnIndexDb {
         self.backfill_presentations(thread)?;
         self.read_snapshot(|db| db.turn_slice_snapshot(thread, turn, window))
     }
+    /// Resolve a stable item identity inside the same snapshot used to read its older page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turn_slice_before(
+        &mut self,
+        thread: &str,
+        path: &str,
+        len: u64,
+        stamp: i64,
+        turn: &str,
+        before_item_id: &str,
+        limit: usize,
+    ) -> io::Result<Option<ThreadPageSnapshot>> {
+        if before_item_id.trim().is_empty() {
+            return Err(invalid_input("beforeItemId must be nonempty"));
+        }
+        self.import_if_missing(thread, path, len, stamp)?;
+        self.backfill_presentations(thread)?;
+        self.read_snapshot(|db| {
+            let cursor = match db.epoch(thread)? {
+                Some(epoch) => format!("migration:{epoch}:{before_item_id}"),
+                None => before_item_id.to_owned(),
+            };
+            db.turn_slice_snapshot(
+                thread,
+                turn,
+                MessageWindow {
+                    cursor: Some(&cursor),
+                    limit,
+                    desc: true,
+                },
+            )
+        })
+    }
     fn turn_slice_snapshot(
         &self,
         thread: &str,
         turn: &str,
         window: MessageWindow<'_>,
     ) -> io::Result<Option<ThreadPageSnapshot>> {
-        let ids = self.turn_ids(thread)?;
-        let Some(ord) = ids.iter().position(|id| id == turn) else {
-            return Err(invalid_input("unknown history turn"));
-        };
+        let ordinal = self
+            .turn_ordinal(thread, turn)?
+            .ok_or_else(|| invalid_input("unknown history turn"))?;
+        let ord = self.turn_rank(thread, ordinal)?;
+        let ids = [turn.to_owned()];
         let total: i64 = self
             .conn
             .query_row(
@@ -310,10 +345,9 @@ impl TurnIndexDb {
         };
         self.encode_page(thread, &mut page)?;
         let records = self.messages(thread, turn, Some((start, end - start)))?;
-        let (history, file_changes) =
-            self.read_projection(thread, &ids[ord..ord + 1], records, true)?;
+        let (history, file_changes) = self.read_projection(thread, &ids, records, true)?;
         let presentation_records = self.presentation_records(thread, &history, true)?;
-        let shells = self.shells(thread, &ids, ord, ord + 1, &history)?;
+        let shells = self.shells(thread, &ids, ord, &history)?;
         Ok(Some(ThreadPageSnapshot {
             history,
             presentation_records,
@@ -321,6 +355,51 @@ impl TurnIndexDb {
             shells,
             file_changes,
         }))
+    }
+
+    /// Read complete change metadata without paging or materializing message bodies.
+    pub fn file_changes(
+        &mut self,
+        thread: &str,
+        path: &str,
+        len: u64,
+        stamp: i64,
+    ) -> io::Result<crate::engine::session::SessionFileChanges> {
+        self.import_if_missing(thread, path, len, stamp)?;
+        self.read_snapshot(|db| {
+            let mut statement = db
+                .conn
+                .prepare(
+                    "SELECT payload FROM history_turn_projection WHERE thread=?1 ORDER BY ordinal",
+                )
+                .map_err(sql_error)?;
+            let mut rows = statement.query(params![thread]).map_err(sql_error)?;
+            let mut changes = crate::engine::session::SessionFileChanges::default();
+            while let Some(row) = rows.next().map_err(sql_error)? {
+                let text: String = row.get(0).map_err(sql_error)?;
+                let value = crate::runtime_values::runtime_json::parse(&text.into())
+                    .map_err(io::Error::other)?;
+                for change in value
+                    .get("fileChanges")
+                    .and_then(crate::runtime_values::RuntimeJson::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let turn: Option<RuntimeString> =
+                        crate::runtime_values::runtime_codec::decode_value(
+                            change
+                                .get("turnId")
+                                .ok_or_else(|| io::Error::other("missing file turn"))?,
+                        )
+                        .map_err(io::Error::other)?;
+                    let change: crate::types::events::FileChange =
+                        crate::runtime_values::runtime_codec::decode_value(change)
+                            .map_err(io::Error::other)?;
+                    changes.record_change(turn.as_ref(), &change);
+                }
+            }
+            Ok(changes)
+        })
     }
 
     fn projection_lease(&self) -> io::Result<ProjectionLease> {
@@ -389,17 +468,100 @@ impl TurnIndexDb {
         }
         Ok(())
     }
-    fn turn_ids(&self, thread: &str) -> io::Result<Vec<String>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT turn FROM history_turn_projection WHERE thread=?1 ORDER BY ordinal")
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![thread], |row| row.get(0))
+    fn turn_ordinal(&self, thread: &str, turn: &str) -> io::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT ordinal FROM history_turn_projection WHERE thread=?1 AND turn=?2",
+                params![thread, turn],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+    fn turn_rank(&self, thread: &str, ordinal: i64) -> io::Result<usize> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_turn_projection WHERE thread=?1 AND ordinal<?2",
+                params![thread, ordinal],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|rank| rank as usize)
+            .map_err(sql_error)
+    }
+    /// Select only the requested identities and one look-ahead row from the ordinal index.
+    fn turn_window(
+        &self,
+        thread: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        desc: bool,
+    ) -> io::Result<(Vec<String>, usize, PageEnvelope)> {
+        let anchor = cursor
+            .map(|id| {
+                self.turn_ordinal(thread, id)?
+                    .ok_or_else(|| invalid_input("unknown history cursor"))
+            })
+            .transpose()?;
+        let sql = if desc {
+            "SELECT turn,ordinal FROM history_turn_projection WHERE thread=?1 AND ordinal<?2 ORDER BY ordinal DESC LIMIT ?3"
+        } else {
+            "SELECT turn,ordinal FROM history_turn_projection WHERE thread=?1 AND ordinal>=?2 ORDER BY ordinal ASC LIMIT ?3"
+        };
+        let mut statement = self.conn.prepare(sql).map_err(sql_error)?;
+        let mut rows = statement
+            .query_map(
+                params![
+                    thread,
+                    anchor.unwrap_or(if desc { i64::MAX } else { i64::MIN }),
+                    limit.saturating_add(1) as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(sql_error);
-        rows
+            .map_err(sql_error)?;
+        let has_more = rows.len() > limit;
+        let extra = if has_more {
+            rows.pop().map(|row| row.0)
+        } else {
+            None
+        };
+        if desc {
+            rows.reverse();
+        }
+        let start = rows
+            .first()
+            .map(|row| self.turn_rank(thread, row.1))
+            .transpose()?
+            .unwrap_or(0);
+        let ids: Vec<String> = rows.into_iter().map(|row| row.0).collect();
+        let backwards_cursor = if desc {
+            cursor.map(str::to_owned)
+        } else if let Some(anchor) = anchor {
+            self.conn.query_row("SELECT turn FROM history_turn_projection WHERE thread=?1 AND ordinal<?2 ORDER BY ordinal DESC LIMIT 1",params![thread,anchor],|row|row.get(0)).optional().map_err(sql_error)?
+        } else {
+            None
+        };
+        let next_cursor = if has_more {
+            if desc {
+                ids.first().cloned()
+            } else {
+                extra
+            }
+        } else {
+            None
+        };
+        Ok((
+            ids,
+            start,
+            PageEnvelope {
+                order: if desc { "newest_first" } else { "oldest_first" }.into(),
+                limit,
+                next_cursor,
+                has_more,
+                backwards_cursor,
+            },
+        ))
     }
     fn messages(
         &self,
@@ -430,11 +592,10 @@ impl TurnIndexDb {
         thread: &str,
         ids: &[String],
         start: usize,
-        end: usize,
         history: &ThreadHistory,
     ) -> io::Result<Vec<TurnShell>> {
         let index = &history.turn_index;
-        ids[start..end].iter().enumerate().map(|(local,id)| {
+        ids.iter().enumerate().map(|(local,id)| {
             let (ordinal,offset,len,updated):(i64,i64,i64,i64)=self.conn.query_row("SELECT ordinal,byte_offset,byte_len,updated_ordinal FROM history_turn_projection WHERE thread=?1 AND turn=?2",params![thread,id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(sql_error)?;
             let key=RuntimeString::from(id.as_str());
             let text=|value:Option<&RuntimeString>|value.and_then(|value|value.try_to_utf8().ok());
@@ -978,6 +1139,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     })
 }
 
+#[cfg(test)]
 fn page_window(
     ids: &[String],
     cursor: Option<&str>,

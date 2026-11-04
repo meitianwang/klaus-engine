@@ -606,3 +606,94 @@ async fn history_rows_carry_source_paths_instead_of_bytes_when_the_file_survives
     );
     assert!(lost_image["path"].is_null());
 }
+
+#[tokio::test]
+async fn stable_item_anchors_restore_older_items_without_a_storage_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = fixture();
+    write_rows(
+        &dir.path().join("1700000000000-history.jsonl"),
+        source["items"].as_array().unwrap(),
+    );
+    let activations = Arc::new(AtomicUsize::new(0));
+    let mut client = read_only_client(dir.path(), activations.clone());
+    client.initialize().await;
+    let before = read(&mut client, 940, "engine/readThreadItems", json!({"threadId":"history","turnId":"one","beforeItemId":"result-one","limit":1,"sortDirection":"desc"})).await;
+    assert!(before.get("error").is_none(), "{before}");
+    assert_eq!(before["result"]["supportsItemAnchors"], true);
+    assert_eq!(before["result"]["history"][0]["uuid"], "assistant-one");
+    assert!(before["result"]["page"]["hasMore"].as_bool().unwrap());
+    let cursor = before["result"]["page"]["nextCursor"].clone();
+    let previous = read(&mut client, 941, "engine/readThreadItems", json!({"threadId":"history","turnId":"one","cursor":cursor,"limit":1,"sortDirection":"desc"})).await;
+    assert_eq!(previous["result"]["history"][0]["uuid"], "user-one");
+    for (id, extra) in [
+        (942, json!({"beforeItemId":"missing"})),
+        (943, json!({"beforeItemId":"user-three"})),
+        (
+            944,
+            json!({"beforeItemId":"result-one","cursor":"user-one"}),
+        ),
+        (
+            945,
+            json!({"beforeItemId":"result-one","sortDirection":"asc"}),
+        ),
+        (946, json!({"beforeItemId":""})),
+    ] {
+        let mut params = json!({"threadId":"history","turnId":"one","limit":1});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let reply = read(&mut client, id, "engine/readThreadItems", params).await;
+        assert_eq!(reply["error"]["code"], wire::INVALID_PARAMS, "{reply}");
+    }
+    assert_eq!(activations.load(Ordering::SeqCst), 0);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn saved_file_change_facade_reads_complete_metadata_without_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rows = fixture()["items"].as_array().unwrap().clone();
+    rows.push(json!({"kind":"event","event":"file_change","turnId":"one","payload":{"path":"/tmp/a","kind":"modify","added":3,"removed":1,"turnDiff":"complete diff"}}));
+    rows.push(json!({"kind":"event","event":"file_change","turnId":"three","payload":{"path":"/tmp/b","kind":"create","added":null,"removed":null,"turnDiff":null}}));
+    write_rows(&dir.path().join("1700000000000-history.jsonl"), &rows);
+    let activations = Arc::new(AtomicUsize::new(0));
+    let mut client = read_only_client(dir.path(), activations.clone());
+    client.initialize().await;
+    let result = read(
+        &mut client,
+        950,
+        "engine/readThreadFileChanges",
+        json!({"threadId":"history"}),
+    )
+    .await;
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(result["result"]["threadId"], "history");
+    assert_eq!(result["result"]["fileChanges"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        result["result"]["fileChanges"][0]["files"][0]["turnDiff"],
+        "complete diff"
+    );
+    assert!(result["result"].get("history").is_none());
+    for (id, thread) in [(951, ""), (952, "unknown")] {
+        let reply = read(
+            &mut client,
+            id,
+            "engine/readThreadFileChanges",
+            json!({"threadId":thread}),
+        )
+        .await;
+        assert_eq!(
+            reply["error"]["code"],
+            if thread.is_empty() {
+                wire::INVALID_PARAMS
+            } else {
+                wire::UNKNOWN_SESSION
+            },
+            "{reply}"
+        );
+    }
+    assert_eq!(activations.load(Ordering::SeqCst), 0);
+    client.close().await;
+}
