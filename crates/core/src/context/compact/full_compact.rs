@@ -303,6 +303,11 @@ impl FullCompactor {
         }
         let signal = self.signal.lock().unwrap().clone();
         let provider = self.provider.lock().unwrap().clone();
+        let max_retries = provider
+            .as_ref()
+            .and_then(|provider| provider.compaction_stream_max_retries())
+            .map(u64::from)
+            .unwrap_or(config.compaction_stream_max_retries);
         if allow_native {
             if let Some(provider) = provider.as_ref().filter(|provider| {
                 provider.remote_compaction_support(&self.model)
@@ -315,41 +320,42 @@ impl FullCompactor {
                     .unwrap_or_default();
                 // Native compaction has its own trigger item, supplied by the transport.
                 request.messages.pop();
-                let result = tokio::select! {
-                    biased;
-                    _ = signal.cancelled() => return failed(messages, "Context compaction was interrupted.", None),
-                    result = provider.compact_remote_with_idle_timeout(request, signal.clone(), config.stream_idle_timeout_ms) => result,
-                };
-                return match result {
-                    Ok(result) => {
-                        let before = estimate_messages_tokens(&messages);
-                        let replacement = vec![Message::CompactBoundary(CompactBoundaryMessage {
-                            uuid: (self.uuid)().into(),
-                            summary: RuntimeString::default(),
-                            native_compaction: Some(result.checkpoint),
-                        })];
-                        CompactionResult {
-                            freed_tokens: before
-                                .saturating_sub(estimate_messages_tokens(&replacement)),
-                            messages: replacement,
-                            compacted: true,
-                            reason: None,
-                            diagnostics: Vec::new(),
+                return super::retry::run(&messages, &signal, max_retries, || {
+                    let request = request.clone();
+                    async {
+                        let result = tokio::select! {
+                            biased;
+                            _ = signal.cancelled() => return failed(messages.to_vec(), "Context compaction was interrupted.", None),
+                            result = provider.compact_remote_with_idle_timeout(request, signal.clone(), config.stream_idle_timeout_ms) => result,
+                        };
+                        match result {
+                            Ok(result) => {
+                                let before = estimate_messages_tokens(&messages);
+                                let replacement = vec![Message::CompactBoundary(CompactBoundaryMessage {
+                                    uuid: (self.uuid)().into(),
+                                    summary: RuntimeString::default(),
+                                    native_compaction: Some(result.checkpoint),
+                                })];
+                                CompactionResult {
+                                    freed_tokens: before
+                                        .saturating_sub(estimate_messages_tokens(&replacement)),
+                                    messages: replacement,
+                                    compacted: true,
+                                    reason: None,
+                                    diagnostics: Vec::new(),
+                                }
+                            }
+                            Err(error) => failed(
+                                messages.to_vec(),
+                                &error.message.try_to_utf8().unwrap_or_default(),
+                                Some(error),
+                            ),
                         }
                     }
-                    Err(error) => failed(
-                        messages,
-                        &error.message.try_to_utf8().unwrap_or_default(),
-                        Some(error),
-                    ),
-                };
+                })
+                .await;
             }
         }
-        let max_retries = provider
-            .as_ref()
-            .and_then(|provider| provider.compaction_stream_max_retries())
-            .map(u64::from)
-            .unwrap_or(config.compaction_stream_max_retries);
         let mut request = self.summary_request(&messages, config, instructions);
         loop {
             if signal.is_cancelled() {

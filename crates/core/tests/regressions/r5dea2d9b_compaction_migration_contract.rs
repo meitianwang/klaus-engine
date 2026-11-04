@@ -20,12 +20,13 @@ use klaus_agent_core::types::provider::{
     ProviderCapabilities, ProviderInfo, RemoteCompactionResult, RemoteCompactionSupport,
 };
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 type Trace = Arc<Mutex<Vec<(String, &'static str, ModelRequest)>>>;
 
 #[derive(Clone, Copy)]
-enum NativeReply {
+pub(super) enum NativeReply {
     Success,
     Unavailable,
     Budget,
@@ -40,6 +41,8 @@ struct Provider {
     remote: bool,
     eligible_fallback: bool,
     reply: NativeReply,
+    native_network_failures: AtomicUsize,
+    max_retries: u32,
     trace: Trace,
 }
 
@@ -91,7 +94,7 @@ impl ModelProvider for Provider {
         self.eligible_fallback
     }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
-        Some(0)
+        Some(self.max_retries)
     }
     async fn native_checkpoint_compatibility(
         &self,
@@ -110,6 +113,10 @@ impl ModelProvider for Provider {
             .lock()
             .unwrap()
             .push((self.info.name.try_to_utf8().unwrap(), "native", request));
+        if self.native_network_failures.load(Ordering::SeqCst) > 0 {
+            self.native_network_failures.fetch_sub(1, Ordering::SeqCst);
+            return Err(provider_error(ProviderErrorKind::Network, "dns_error"));
+        }
         match self.reply {
             NativeReply::Success => Ok(RemoteCompactionResult {
                 checkpoint: self.checkpoint(),
@@ -176,14 +183,16 @@ impl ModelProvider for Provider {
     }
 }
 
-struct Spec {
-    name: &'static str,
-    model: &'static str,
-    window: u64,
-    hash: Option<&'static str>,
-    remote: bool,
-    eligible: bool,
-    reply: NativeReply,
+pub(super) struct Spec {
+    pub(super) name: &'static str,
+    pub(super) model: &'static str,
+    pub(super) window: u64,
+    pub(super) hash: Option<&'static str>,
+    pub(super) remote: bool,
+    pub(super) eligible: bool,
+    pub(super) reply: NativeReply,
+    pub(super) native_network_failures: usize,
+    pub(super) max_retries: u32,
 }
 
 impl Spec {
@@ -201,12 +210,14 @@ impl Spec {
             remote: self.remote,
             eligible_fallback: self.eligible,
             reply: self.reply,
+            native_network_failures: AtomicUsize::new(self.native_network_failures),
+            max_retries: self.max_retries,
             trace: trace.clone(),
         })
     }
 }
 
-fn spec(name: &'static str, model: &'static str, hash: Option<&'static str>) -> Spec {
+pub(super) fn spec(name: &'static str, model: &'static str, hash: Option<&'static str>) -> Spec {
     Spec {
         name,
         model,
@@ -215,6 +226,8 @@ fn spec(name: &'static str, model: &'static str, hash: Option<&'static str>) -> 
         remote: false,
         eligible: false,
         reply: NativeReply::Success,
+        native_network_failures: 0,
+        max_retries: 0,
     }
 }
 
@@ -233,7 +246,7 @@ fn user() -> Message {
     })
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     session: Arc<Session>,
     trace: Trace,
     process: RuntimeProcessContext,
@@ -241,7 +254,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(source: Spec, native_history: bool) -> Self {
+    pub(super) fn new(source: Spec, native_history: bool) -> Self {
         let process = RuntimeProcessContext::initialize(
             super::r7c876d49_spec_restores_latest_permission_policy::process_supervisor(),
         )
@@ -280,7 +293,7 @@ impl Fixture {
             dir,
         }
     }
-    fn select(&self, target: Spec) {
+    pub(super) fn select(&self, target: Spec) {
         self.session
             .reconfigure_inference(
                 target.provider(&self.trace),
@@ -291,7 +304,7 @@ impl Fixture {
             )
             .unwrap();
     }
-    async fn run(&self) -> Vec<EngineEvent> {
+    pub(super) async fn run(&self) -> Vec<EngineEvent> {
         self.session
             .run_streamed(
                 Input::Text("Finish the task.".into()),
@@ -301,7 +314,7 @@ impl Fixture {
             .collect()
             .await
     }
-    fn routes(&self) -> Vec<(String, &'static str)> {
+    pub(super) fn routes(&self) -> Vec<(String, &'static str)> {
         self.trace
             .lock()
             .unwrap()
@@ -309,7 +322,7 @@ impl Fixture {
             .map(|(name, kind, _)| (name.clone(), *kind))
             .collect()
     }
-    async fn close(self) {
+    pub(super) async fn close(self) {
         self.session.shutdown_and_wait().await.unwrap();
         self.process.shutdown().await.unwrap();
         std::fs::remove_dir_all(self.dir).unwrap();
@@ -323,7 +336,7 @@ fn config(spec: &Spec) -> serde_json::Value {
         "modelSource":{"source":spec.name,"modelId":spec.model,"selection":format!("{}:{}",spec.name,spec.model)} })
 }
 
-fn succeeded(events: &[EngineEvent]) -> bool {
+pub(super) fn succeeded(events: &[EngineEvent]) -> bool {
     !events
         .iter()
         .any(|event| matches!(event, EngineEvent::TurnFailed { .. }))
