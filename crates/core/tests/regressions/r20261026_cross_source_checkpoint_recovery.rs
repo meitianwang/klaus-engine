@@ -629,20 +629,21 @@ async fn one_oversized_exchange_still_switches_to_the_selected_model() {
     fixture.switch(SMALL_WINDOW);
     assert_success(&fixture.run().await);
     fixture.assert_no_old_calls();
-    let requests = fixture.calls.target.lock().unwrap();
-    assert!(!requests.is_empty(), "the selected model must be called");
-    for request in requests.iter() {
-        assert_portable(&request.messages);
-        let estimated =
-            klaus_agent_core::context::tokens::estimate_context_tokens(&request.messages);
-        assert!(
-            estimated < SMALL_WINDOW,
-            "request still exceeds the selected window: {estimated}"
-        );
+    {
+        let requests = fixture.calls.target.lock().unwrap();
+        assert!(!requests.is_empty(), "the selected model must be called");
+        for request in requests.iter() {
+            assert_portable(&request.messages);
+            let estimated =
+                klaus_agent_core::context::tokens::estimate_context_tokens(&request.messages);
+            assert!(
+                estimated < SMALL_WINDOW,
+                "request still exceeds the selected window: {estimated}"
+            );
+        }
+        let continuation = encoded(&requests.last().unwrap().messages);
+        assert!(continuation.contains(LATEST), "{continuation}");
     }
-    let continuation = encoded(&requests.last().unwrap().messages);
-    assert!(continuation.contains(LATEST), "{continuation}");
-    drop(requests);
     fixture.shutdown().await;
 }
 
