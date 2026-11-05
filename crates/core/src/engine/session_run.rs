@@ -2760,6 +2760,9 @@ impl Session {
                         EngineEvent::TurnFailed { error, .. } => {
                             error.provider_kind.map(|kind| RuntimeString::from(kind.as_str()))
                         }
+                        EngineEvent::TurnCompleted { stop_reason: TerminalReason::AuthFailed, .. } => {
+                            Some(RuntimeString::from("auth"))
+                        }
                         _ => None,
                     };
                     let failure_details = match &ev {

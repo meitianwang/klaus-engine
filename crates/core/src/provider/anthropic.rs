@@ -1279,9 +1279,13 @@ impl ModelProvider for AnthropicProvider {
                             }
                         }
                     }
-                    let is_quota_err = matches!(&established, Err(RetryError::Provider(error))
-                        if crate::provider::rotation::is_quota_rotation_error(error));
-                    if is_quota_err && !signal.is_cancelled() {
+                    // An account that still cannot authenticate after renewal
+                    // must not prevent the remaining subscription accounts from
+                    // serving this request. Refresh happens before rotation.
+                    let can_rotate = matches!(&established, Err(RetryError::Provider(error))
+                        if crate::provider::rotation::is_quota_rotation_error(error)
+                            || error.kind == ProviderErrorKind::Auth);
+                    if can_rotate && !signal.is_cancelled() {
                         if let (Some(auth), Some(failed)) = (&auth_source, failed_account) {
                             if auth.rotate_credential(&failed).await
                                 .is_some_and(|outcome| outcome.retriable())
@@ -1709,10 +1713,16 @@ async fn attempt_once(
     intercepted_headers: &[(String, String)],
 ) -> Result<Established, RawProviderError> {
     let mut headers = match &ctx.auth_source {
-        Some(a) => a
-            .get_headers(signal)
-            .await
-            .map_err(raw_from_provider_error)?,
+        Some(a) => a.get_headers(signal).await.map_err(|error| {
+            // Credential preparation can fail before there is an HTTP
+            // status. Preserve its auth classification through retry.
+            let authentication_failed = error.kind == ProviderErrorKind::Auth;
+            let mut raw = raw_from_provider_error(error);
+            if authentication_failed {
+                raw.error_type = Some("authentication_error".to_string());
+            }
+            raw
+        })?,
         None => HashMap::new(),
     };
     // Bedrock carries versions/betas via the body and signs with SigV4, so it

@@ -3,11 +3,11 @@
 //! A subscription login may carry more than one account. The account array of
 //! the host-owned credential file is the rotation queue: its head is the
 //! account requests authenticate with. When the upstream refuses a request for
-//! quota reasons (rate limit or exhausted allowance), the queue advances — the
+//! quota reasons or cannot authenticate after renewal, the queue advances — the
 //! failed account moves to the tail — and the caller retries the same request
 //! against the new head. Once the queue wraps around to the account that
 //! started the cycle and that account fails again, rotation reports exhaustion
-//! and the caller surfaces the ordinary quota error; a later manual continue
+//! and the caller surfaces the remaining provider error; a later manual continue
 //! starts a fresh cycle at whatever account the persisted order now leads
 //! with.
 //!
@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// The upstream refusals that mean "this account's allowance is spent right
-/// now": a plain rate limit or an exhausted quota. Auth failures are NOT here —
-/// those belong to the refresh path, not to rotation.
+/// now": a plain rate limit or an exhausted quota. Authentication refusals are
+/// handled separately by the caller so renewal always precedes rotation.
 pub fn is_quota_rotation_error(error: &ProviderError) -> bool {
     matches!(
         error.kind,
