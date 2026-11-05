@@ -62,7 +62,7 @@ impl Drop for FixtureRoot {
 }
 
 #[derive(Clone, Copy)]
-enum Reply {
+pub(super) enum Reply {
     RateLimited,
     Success,
     Unauthorized,
@@ -77,6 +77,7 @@ struct CapturedRequest {
 
 #[derive(Default)]
 struct ServerState {
+    refresh_requests: usize,
     replies: VecDeque<(&'static str, Reply)>,
     requests: Vec<CapturedRequest>,
 }
@@ -111,8 +112,9 @@ async fn read_request(socket: &mut TcpStream) -> (String, Value) {
             {
                 let headers = std::str::from_utf8(&received[..end]).unwrap();
                 assert!(
-                    headers.starts_with("POST /v1/messages "),
-                    "only inference reaches the fixture"
+                    headers.starts_with("POST /v1/messages ")
+                        || headers.starts_with("POST /never-refresh "),
+                    "only inference and token renewal reach the fixture"
                 );
                 let length = headers
                     .lines()
@@ -128,6 +130,11 @@ async fn read_request(socket: &mut TcpStream) -> (String, Value) {
         if let Some((end, length)) = framing {
             if received.len() >= end + length {
                 let headers = std::str::from_utf8(&received[..end]).unwrap();
+                if headers.starts_with("POST /never-refresh ") {
+                    let form = std::str::from_utf8(&received[end..end + length]).unwrap();
+                    assert!(form.contains("refresh_token=fixture-refresh-a"));
+                    return ("refresh".to_owned(), Value::Null);
+                }
                 let mut account = "no-auth".to_owned();
                 for line in headers.lines() {
                     let Some((name, value)) = line.split_once(':') else {
@@ -161,6 +168,16 @@ async fn serve(
     loop {
         let (mut socket, _) = listener.accept().await.unwrap();
         let (account, body) = read_request(&mut socket).await;
+        if account == "refresh" {
+            state.lock().unwrap().refresh_requests += 1;
+            let body = r#"{"error":"invalid_grant"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            continue;
+        }
         let reply = {
             let mut state = state.lock().unwrap();
             state.requests.push(CapturedRequest {
@@ -377,14 +394,15 @@ async fn rebuilding_rotation_auth_preserves_refreshed_credentials_over_the_login
     }
 }
 
-enum AuthMode {
+pub(super) enum AuthMode {
     Multi(&'static [&'static str]),
+    MultiExpired(&'static [&'static str]),
     SingleOAuth,
     StaticApiKey,
     NoAuth,
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     root: FixtureRoot,
     session: Arc<Session>,
     process: RuntimeProcessContext,
@@ -395,7 +413,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(mode: AuthMode) -> Self {
+    pub(super) async fn new(mode: AuthMode) -> Self {
         let root = FixtureRoot::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -409,14 +427,15 @@ impl Fixture {
         };
         let tokens = |account: &str| OAuthTokens {
             access_token: format!("fixture-token-{account}").into(),
-            expires_at: None,
-            refresh_token: None,
+            expires_at: (matches!(mode, AuthMode::MultiExpired(_)) && account == "a").then_some(1),
+            refresh_token: (matches!(mode, AuthMode::MultiExpired(_)) && account == "a")
+                .then(|| "fixture-refresh-a".into()),
             id_token: None,
         };
         let mut queue = None;
         let mut account_file = None;
         let auth_source: Option<Arc<dyn AuthSource>> = match &mode {
-            AuthMode::Multi(accounts) => {
+            AuthMode::Multi(accounts) | AuthMode::MultiExpired(accounts) => {
                 let path = root.0.join("claude-accounts.json");
                 let entries: Vec<Value> = accounts
                     .iter()
@@ -459,7 +478,7 @@ impl Fixture {
             }))),
             AuthMode::StaticApiKey | AuthMode::NoAuth => None,
         };
-        let is_multi = matches!(mode, AuthMode::Multi(_));
+        let is_multi = matches!(mode, AuthMode::Multi(_) | AuthMode::MultiExpired(_));
         let provider = Arc::new(AnthropicProvider::new(AnthropicProviderOptions {
             base_url: Some(base_url),
             default_model: Some("rotation-fixture".into()),
@@ -537,7 +556,7 @@ impl Fixture {
         }
     }
 
-    fn plan(&self, replies: &[(&'static str, Reply)]) {
+    pub(super) fn plan(&self, replies: &[(&'static str, Reply)]) {
         let mut state = self.state.lock().unwrap();
         assert!(
             state.replies.is_empty(),
@@ -546,7 +565,7 @@ impl Fixture {
         state.replies.extend(replies.iter().copied());
     }
 
-    async fn run(&self) -> TurnResult {
+    pub(super) async fn run(&self) -> TurnResult {
         let signal = AbortSignal::new();
         let result = tokio::time::timeout(
             TURN_DEADLINE,
@@ -567,11 +586,24 @@ impl Fixture {
         result.expect("the engine turn must settle within three seconds without a congestion hold")
     }
 
+    pub(super) fn refresh_requests(&self) -> usize {
+        self.state.lock().unwrap().refresh_requests
+    }
+
+    pub(super) fn auth_failure_kinds(&self) -> Vec<String> {
+        self.session
+            .turn_index_snapshot()
+            .turn_error_kinds
+            .values()
+            .map(|kind| kind.try_to_utf8().unwrap())
+            .collect()
+    }
+
     fn requests(&self) -> Vec<CapturedRequest> {
         self.state.lock().unwrap().requests.clone()
     }
 
-    fn assert_trace(&self, expected: &[&str]) {
+    pub(super) fn assert_trace(&self, expected: &[&str]) {
         let requests = self.requests();
         let actual: Vec<&str> = requests
             .iter()
@@ -584,7 +616,7 @@ impl Fixture {
         assert!(self.state.lock().unwrap().replies.is_empty());
     }
 
-    fn assert_order(&self, expected: &[&str]) {
+    pub(super) fn assert_order(&self, expected: &[&str]) {
         let path = self.account_file.as_ref().unwrap();
         assert!(path.starts_with(&self.root.0));
         assert_eq!(persisted_order(path), expected);
@@ -600,7 +632,7 @@ impl Fixture {
         }
     }
 
-    async fn shutdown(&self) {
+    pub(super) async fn shutdown(&self) {
         self.session.shutdown_and_wait().await.unwrap();
         self.process.shutdown().await.unwrap();
         self.server.abort();
@@ -613,7 +645,7 @@ impl Drop for Fixture {
     }
 }
 
-fn assert_success(result: &TurnResult) {
+pub(super) fn assert_success(result: &TurnResult) {
     assert!(result.error.is_none(), "the public turn succeeds");
     assert_eq!(result.stop_reason, TerminalReason::Completed);
     assert_eq!(result.final_text.try_to_utf8().unwrap(), FINAL_TEXT);
@@ -710,21 +742,6 @@ async fn successful_response_resets_the_anchor_and_persists_each_later_rotation(
             vec!["b", "c", "a"],
         ]
     );
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_authentication_failure_does_not_rotate_the_subscription_queue() {
-    let fixture = Fixture::new(AuthMode::Multi(&["a", "b"])).await;
-    fixture.plan(&[("a", Reply::Unauthorized)]);
-    let result = fixture.run().await;
-    assert_eq!(result.stop_reason, TerminalReason::AuthFailed);
-    assert!(
-        result.final_text.is_empty(),
-        "authentication failure is not success"
-    );
-    fixture.assert_trace(&["a"]);
-    fixture.assert_order(&["a", "b"]);
     fixture.shutdown().await;
 }
 

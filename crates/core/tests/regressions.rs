@@ -475,6 +475,8 @@ mod r20261014_subagent_capacity_rejection;
 #[path = "regressions/r20261013_bearer_auth_scheme_gateway.rs"]
 mod r20261013_bearer_auth_scheme_gateway;
 
+#[path = "regressions/r8fd4dc73_claude_auth_rotation.rs"]
+mod claude_auth_rotation;
 #[path = "regressions/rbb313dbb_claude_account_rotation.rs"]
 mod rbb313dbb_claude_account_rotation;
 
