@@ -565,10 +565,26 @@ impl FullCompactor {
                     let message = error.message.try_to_utf8().unwrap_or_default();
                     return failed(original.to_vec(), &message, Some(error));
                 }
-                Some(ModelStreamEvent::MessageStop {
-                    stop_reason: ModelStopReason::EndTurn,
-                    ..
-                }) => {
+                Some(ModelStreamEvent::MessageStop { stop_reason, .. }) => {
+                    let has_text = text.try_to_utf8().is_ok_and(|text| !text.trim().is_empty());
+                    let output_truncated = stop_reason == ModelStopReason::MaxTokens;
+                    if stop_reason != ModelStopReason::EndTurn && !(output_truncated && has_text) {
+                        let message = match stop_reason {
+                            ModelStopReason::MaxTokens => {
+                                "The summary response reached the output token limit without producing usable text.".into()
+                            }
+                            ModelStopReason::Refusal => {
+                                "The model refused the summary request.".into()
+                            }
+                            _ => format!("The summary response stopped with {stop_reason:?}."),
+                        };
+                        let kind = if output_truncated {
+                            CompactionDiagnosticKind::OutputTruncated
+                        } else {
+                            CompactionDiagnosticKind::ProviderError
+                        };
+                        return failed_with_kind(original.to_vec(), &message, None, kind);
+                    }
                     if signal.is_cancelled() {
                         return failed(
                             original.to_vec(),
@@ -622,15 +638,19 @@ impl FullCompactor {
                         messages: replacement,
                         compacted: true,
                         reason: None,
-                        diagnostics: Vec::new(),
+                        diagnostics: if output_truncated {
+                            vec![CompactionDiagnostic::new(
+                                CompactionDiagnosticStage::Summary,
+                                CompactionDiagnosticKind::OutputTruncated,
+                                Some(
+                                    "The summary reached the output token limit; its partial text was retained."
+                                        .into(),
+                                ),
+                            )]
+                        } else {
+                            Vec::new()
+                        },
                     };
-                }
-                Some(ModelStreamEvent::MessageStop { .. }) => {
-                    return failed(
-                        original.to_vec(),
-                        "The summary response did not complete.",
-                        None,
-                    )
                 }
                 Some(_) => {}
                 None => {
@@ -673,13 +693,27 @@ fn provider_error(kind: ProviderErrorKind, message: &str) -> ProviderError {
 }
 
 fn failed(messages: Vec<Message>, message: &str, error: Option<ProviderError>) -> CompactionResult {
+    failed_with_kind(
+        messages,
+        message,
+        error,
+        CompactionDiagnosticKind::ProviderError,
+    )
+}
+
+fn failed_with_kind(
+    messages: Vec<Message>,
+    message: &str,
+    error: Option<ProviderError>,
+    kind: CompactionDiagnosticKind,
+) -> CompactionResult {
     let kind = if error
         .as_ref()
         .is_some_and(|error| error.kind == ProviderErrorKind::PromptTooLong)
     {
         CompactionDiagnosticKind::PromptTooLong
     } else {
-        CompactionDiagnosticKind::ProviderError
+        kind
     };
     let diagnostic = match error {
         Some(error) => {

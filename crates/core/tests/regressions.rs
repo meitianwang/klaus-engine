@@ -13,6 +13,9 @@
 #[path = "regressions/r20261104_native_compaction_retry.rs"]
 mod r20261104_native_compaction_retry;
 
+#[path = "regressions/r20261105_compaction_output_limit.rs"]
+mod r20261105_compaction_output_limit;
+
 #[path = "regressions/r20261102_managed_browser_approval.rs"]
 mod r20261102_managed_browser_approval;
 
