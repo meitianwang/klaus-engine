@@ -623,6 +623,19 @@ impl AnthropicProvider {
             )
     }
 
+    fn structured_output_mode(&self, req: &ModelRequest) -> StructuredOutputMode {
+        let capabilities = self.capabilities_for(&req.model);
+        StructuredOutputMode {
+            native: self.use_native_structured_output(req),
+            review_tool_loop: self.review_tool_loop,
+            // Mandatory reasoning alone says nothing about tool-choice support.
+            auto_result_tool: capabilities.forced_tool_choice_with_thinking == Some(false)
+                && capabilities
+                    .thinking
+                    .is_some_and(|thinking| !thinking.can_disable_thinking),
+        }
+    }
+
     /// Merge static custom headers with env-resolved ones. Env values are
     /// read at request time; unset or empty variables skip the header.
     fn resolved_custom_headers(&self) -> Vec<(String, String)> {
@@ -698,10 +711,7 @@ impl AnthropicProvider {
             req,
             req.output_schema.is_some(),
             false,
-            StructuredOutputMode {
-                native: self.use_native_structured_output(req),
-                review_tool_loop: self.review_tool_loop,
-            },
+            self.structured_output_mode(req),
             self.requires_claude_code_identity(),
             image_limits,
             media_budget,
@@ -844,14 +854,12 @@ impl ModelProvider for AnthropicProvider {
                 self.frozen_runtime_environment,
                 AnthropicFeatureFlag::GlobalCacheScope,
             );
+        let output_mode = self.structured_output_mode(&request);
         let mut params = build_params_with_media_limits(
             &request,
             request.output_schema.is_some(),
             cache_scope_enabled,
-            StructuredOutputMode {
-                native,
-                review_tool_loop: self.review_tool_loop,
-            },
+            output_mode,
             self.requires_claude_code_identity(),
             image_limits,
             media_budget,
@@ -862,7 +870,10 @@ impl ModelProvider for AnthropicProvider {
         if !output_config.is_empty() {
             params.insert("output_config", Value::Object(output_config));
         }
-        let forced = request.output_schema.is_some() && !native && !self.review_tool_loop;
+        let forced = request.output_schema.is_some()
+            && !native
+            && !self.review_tool_loop
+            && !output_mode.auto_result_tool;
         if let Some(thinking) =
             resolve_wire_thinking(&request, &capabilities, self.is_first_party, forced)
         {
@@ -1006,7 +1017,6 @@ impl ModelProvider for AnthropicProvider {
             == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview);
         retry.yield_to_credential_rotation = self.credential_account_id().is_some();
         let is_first_party = self.is_first_party;
-        let review_tool_loop = self.review_tool_loop;
         let native_thinking_summaries = req.reasoning_summary
             != crate::types::provider::ReasoningSummary::None
             && self.vertex.is_none()
@@ -1040,25 +1050,21 @@ impl ModelProvider for AnthropicProvider {
         // clamp lives here where the per-model ceiling is known.
         let mut req = req;
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
+        let output_mode = self.structured_output_mode(&req);
 
         let s = async_stream::stream! {
             let structured = req.output_schema.is_some();
-            // Native structured outputs (grammar-constrained) when the client
-            // declared support; otherwise the forced-tool fallback drives the
-            // emulation bookkeeping.
-            let use_native = structured
-                && is_first_party
-                && capabilities.structured_output
-                && !feature_disabled(
-                    frozen_runtime_environment,
-                    AnthropicFeatureFlag::NativeStructuredOutput,
-                );
+            // Native schemas and synthetic result tools share the same assembly
+            // policy as token counting and approval request accounting.
+            let use_native = output_mode.native;
             let structured_tool_fallback = structured && !use_native;
-            let forced_structured = structured_tool_fallback && !review_tool_loop;
+            let result_tool_only = structured_tool_fallback && !output_mode.review_tool_loop;
+            let forced_structured = result_tool_only && !output_mode.auto_result_tool;
+            let buffer_result_text = result_tool_only && output_mode.auto_result_tool;
             if let Some(error) = validate_anthropic_request_choice(
                 &req,
                 req.web_search.is_some(),
-                forced_structured,
+                result_tool_only,
             ) {
                 yield ModelStreamEvent::Error { error };
                 return;
@@ -1077,7 +1083,7 @@ impl ModelProvider for AnthropicProvider {
                     .is_some_and(|p| p.cache_scope == Some(CacheScope::Global));
             let params = match build_params_with_media_limits(
                 &req, structured, cache_scope_enabled,
-                StructuredOutputMode { native: use_native, review_tool_loop },
+                output_mode,
                 require_claude_code_identity, image_limits, media_budget,
             ) {
                 Ok(params) => params,
@@ -1343,8 +1349,9 @@ impl ModelProvider for AnthropicProvider {
             let mut thinking_summary = ThinkingSummaryState::new(native_thinking_summaries && native_response_endpoint);
             let mut usage = Usage { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, total_tokens: None };
             let mut stop_reason = ModelStopReason::EndTurn;
-            // Structured-output state: the forced tool's accumulated JSON input,
-            // surfaced as the final text once the stream ends.
+            // An automatic result tool may follow ordinary prose. Hold that prose
+            // until completion so only the structured result becomes final text.
+            let mut structured_text = RuntimeString::default();
             let mut structured_json = RuntimeString::default();
             let mut saw_wire_stop = false;
 
@@ -1356,6 +1363,12 @@ impl ModelProvider for AnthropicProvider {
                     yield ModelStreamEvent::UsageSnapshot { usage: usage.clone() };
                 }
                 for e in out.events {
+                    if buffer_result_text {
+                        if let ModelStreamEvent::TextDelta { text } = &e {
+                            structured_text = structured_text.concat(text);
+                            continue;
+                        }
+                    }
                     yield e;
                 }
                 if let Some(sr) = out.stop_reason {
@@ -1397,6 +1410,12 @@ impl ModelProvider for AnthropicProvider {
                         yield ModelStreamEvent::UsageSnapshot { usage: usage.clone() };
                     }
                     for e in out.events {
+                        if buffer_result_text {
+                            if let ModelStreamEvent::TextDelta { text } = &e {
+                                structured_text = structured_text.concat(text);
+                                continue;
+                            }
+                        }
                         yield e;
                     }
                     if let Some(sr) = out.stop_reason {
@@ -1456,6 +1475,9 @@ impl ModelProvider for AnthropicProvider {
                 if stop_reason == ModelStopReason::ToolUse {
                     stop_reason = ModelStopReason::EndTurn;
                 }
+            } else if buffer_result_text && !structured_text.is_empty() {
+                // Text-only JSON still passes through the engine's schema validator.
+                yield ModelStreamEvent::TextDelta { text: structured_text };
             }
 
             if let Some(auth) = &auth_source {
@@ -2630,6 +2652,7 @@ fn build_params(
         StructuredOutputMode {
             native: use_native_structured,
             review_tool_loop: false,
+            auto_result_tool: false,
         },
         require_claude_code_identity,
         ImageLimits::default(),
@@ -2638,9 +2661,11 @@ fn build_params(
     .expect("request assembly fixture must contain valid image payloads")
 }
 
+#[derive(Clone, Copy)]
 struct StructuredOutputMode {
     native: bool,
     review_tool_loop: bool,
+    auto_result_tool: bool,
 }
 
 fn build_params_with_media_limits(
@@ -2686,10 +2711,14 @@ fn build_params_with_media_limits(
             tool_choice = Some(vobj(vec![("type", vs("auto"))]));
         } else {
             tools = vec![result_tool];
-            tool_choice = Some(vobj(vec![
-                ("type", vs("tool")),
-                ("name", vs(STRUCTURED_OUTPUT_TOOL)),
-            ]));
+            tool_choice = Some(if output_mode.auto_result_tool {
+                vobj(vec![("type", vs("auto"))])
+            } else {
+                vobj(vec![
+                    ("type", vs("tool")),
+                    ("name", vs(STRUCTURED_OUTPUT_TOOL)),
+                ])
+            });
         }
     } else if let Some(ws) = &req.web_search {
         // Native server web search: the hosted tool rides in the tools array,

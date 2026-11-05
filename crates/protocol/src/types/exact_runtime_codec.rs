@@ -952,6 +952,7 @@ impl_runtime_struct!(ProtocolModelCapabilitiesEntry, deny_unknown: true, {
 
 impl_runtime_struct!(ModelCapabilitiesInit, deny_unknown: true, {
     tools => "tools": optional,
+    forced_tool_choice_with_thinking => "forcedToolChoiceWithThinking": optional,
     effort => "effort": optional,
     output_verbosity => "outputVerbosity": optional,
     auto_review_model_override => "autoReviewModelOverride": optional,

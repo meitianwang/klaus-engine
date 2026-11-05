@@ -326,10 +326,12 @@ async fn actual_review_inspects_before_internal_result_and_uses_complete_wire_bu
 #[tokio::test]
 async fn ordinary_structured_fallback_keeps_its_forced_result_contract() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut capabilities = metadata();
+    capabilities.thinking.as_mut().unwrap().can_disable_thinking = true;
     let provider = AnthropicProvider::new(AnthropicProviderOptions {
         api_key: Some("fixture-only".into()),
         base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
-        capabilities: Some(metadata()),
+        capabilities: Some(capabilities),
         ..Default::default()
     });
     let server = tokio::spawn(async move {

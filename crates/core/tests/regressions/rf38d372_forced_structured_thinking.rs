@@ -15,6 +15,7 @@ use super::rbd0a6abc_empty_tool_choice::{
 async fn gateway_body_with_capability(
     request: ModelRequest,
     thinking: ThinkingCapability,
+    forced_tool_choice_with_thinking: Option<bool>,
 ) -> Value {
     capture_provider_request(request, |base_url| {
         Box::new(AnthropicProvider::new(AnthropicProviderOptions {
@@ -22,6 +23,7 @@ async fn gateway_body_with_capability(
             base_url: Some(base_url),
             capabilities: Some(ModelCapabilities {
                 thinking: Some(thinking),
+                forced_tool_choice_with_thinking,
                 structured_output: true,
                 image_limits: None,
                 max_media_blocks: None,
@@ -42,6 +44,7 @@ async fn gateway_body(request: ModelRequest) -> Value {
             interleaved: false,
             can_disable_thinking: true,
         },
+        None,
     )
     .await
 }
@@ -108,8 +111,9 @@ async fn ordinary_gateway_requests_preserve_declared_thinking() {
 }
 
 #[tokio::test]
-async fn gateway_forced_structured_titles_keep_thinking_when_model_cannot_disable() {
-    let request = record_engine_request(true).await;
+async fn gateway_structured_titles_use_auto_tool_when_thinking_cannot_disable() {
+    let mut request = record_engine_request(true).await;
+    request.thinking = Some(ThinkingConfig::Adaptive);
     let body = gateway_body_with_capability(
         request,
         ThinkingCapability {
@@ -117,9 +121,11 @@ async fn gateway_forced_structured_titles_keep_thinking_when_model_cannot_disabl
             interleaved: false,
             can_disable_thinking: false,
         },
+        Some(false),
     )
     .await;
     assert_eq!(body["tools"][0]["name"], json!("emit_result"));
+    assert_eq!(body["tool_choice"], json!({"type": "auto"}));
     assert_eq!(
         body["thinking"],
         json!({"type": "adaptive"}),
@@ -128,7 +134,7 @@ async fn gateway_forced_structured_titles_keep_thinking_when_model_cannot_disabl
 }
 
 #[tokio::test]
-async fn gateway_forced_structured_titles_omit_thinking_without_an_adaptive_mode() {
+async fn gateway_structured_titles_use_auto_tool_without_an_adaptive_mode() {
     let request = record_engine_request(true).await;
     let body = gateway_body_with_capability(
         request,
@@ -137,11 +143,69 @@ async fn gateway_forced_structured_titles_omit_thinking_without_an_adaptive_mode
             interleaved: false,
             can_disable_thinking: false,
         },
+        Some(false),
     )
     .await;
     assert_eq!(body["tools"][0]["name"], json!("emit_result"));
+    assert_eq!(body["tool_choice"], json!({"type": "auto"}));
     assert!(
         body.get("thinking").is_none(),
         "without an adaptive mode the gateway default must be left untouched"
     );
+}
+
+#[tokio::test]
+async fn required_thinking_without_a_declared_tool_restriction_preserves_forced_output() {
+    let mut request = record_engine_request(true).await;
+    request.thinking = Some(ThinkingConfig::Adaptive);
+    let expected_system: Vec<String> = request
+        .system
+        .iter()
+        .map(|part| part.text.try_to_utf8().unwrap())
+        .collect();
+    for declaration in [None, Some(true)] {
+        let body = gateway_body_with_capability(
+            request.clone(),
+            ThinkingCapability {
+                adaptive: true,
+                interleaved: false,
+                can_disable_thinking: false,
+            },
+            declaration,
+        )
+        .await;
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type":"tool","name":"emit_result"})
+        );
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        let system: Vec<&str> = body["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(system, expected_system);
+    }
+}
+
+#[tokio::test]
+async fn declared_tool_restriction_does_not_change_ordinary_agent_requests() {
+    let mut request = record_engine_request(false).await;
+    request.thinking = Some(ThinkingConfig::Adaptive);
+    let body = gateway_body_with_capability(
+        request,
+        ThinkingCapability {
+            adaptive: true,
+            interleaved: false,
+            can_disable_thinking: false,
+        },
+        Some(false),
+    )
+    .await;
+    assert_eq!(body["tool_choice"], json!({"type":"auto"}));
+    assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+    assert_eq!(body["tools"][0]["name"], json!("probe"));
+    assert!(!body["tools"].to_string().contains("emit_result"));
+    assert!(!body["system"].to_string().contains("emit_result"));
 }

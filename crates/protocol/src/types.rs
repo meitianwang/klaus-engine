@@ -1319,6 +1319,8 @@ pub struct ModelCapabilitiesInit {
     /// Tool/function calling. Absent keeps the provider's backward-compatible
     /// default; false explicitly keeps a plain-chat model tool-free.
     pub tools: Option<bool>,
+    /// Explicit compatibility of thinking with specified tool choice.
+    pub forced_tool_choice_with_thinking: Option<bool>,
     /// Reasoning effort ladder. Absent = no effort knob.
     pub effort: Option<EffortCapabilityInit>,
     /// Supported native output detail; absent leaves the parameter unset.

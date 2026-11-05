@@ -216,6 +216,9 @@ fn merge_review_catalog_metadata(
     catalog.model_specialty = declared.model_specialty.or(catalog.model_specialty);
     catalog.supports_image_detail_original |= declared.supports_image_detail_original;
     catalog.tools = declared.tools.or(catalog.tools);
+    catalog.forced_tool_choice_with_thinking = declared
+        .forced_tool_choice_with_thinking
+        .or(catalog.forced_tool_choice_with_thinking);
     catalog.effort = declared.effort.or(catalog.effort);
     catalog.output_verbosity = declared.output_verbosity.or(catalog.output_verbosity);
     catalog.thinking = declared.thinking.or(catalog.thinking);

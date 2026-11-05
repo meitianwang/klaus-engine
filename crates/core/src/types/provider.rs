@@ -1693,6 +1693,9 @@ pub struct ModelCapabilities {
     /// Tool/function calling. None keeps the provider's backward-compatible
     /// default; false explicitly keeps a plain-chat model tool-free.
     pub tools: Option<bool>,
+    /// Whether specified tool choice can coexist with thinking. None preserves
+    /// the provider's existing policy; false declares a measured incompatibility.
+    pub forced_tool_choice_with_thinking: Option<bool>,
     /// Reasoning effort ladder. `None` = no effort knob.
     pub effort: Option<EffortCapability>,
     /// Supported native output detail. Absent means undeclared or unsupported;
@@ -1826,6 +1829,9 @@ impl RuntimeEncode for ModelCapabilities {
         if let Some(value) = &self.tools {
             object.field("tools", value)?;
         }
+        if let Some(value) = &self.forced_tool_choice_with_thinking {
+            object.field("forcedToolChoiceWithThinking", value)?;
+        }
         if let Some(value) = &self.effort {
             object.field("effort", value)?;
         }
@@ -1928,6 +1934,8 @@ impl RuntimeDecode for ModelCapabilities {
         runtime_codec::decode_object(value, false, |object| {
             Ok(Self {
                 tools: object.optional("tools", &[])?,
+                forced_tool_choice_with_thinking: object
+                    .optional("forcedToolChoiceWithThinking", &[])?,
                 effort: object.optional("effort", &[])?,
                 output_verbosity: object.optional("outputVerbosity", &[])?,
                 auto_review_model_override: object
@@ -2351,6 +2359,28 @@ mod tests {
         }
         assert!(runtime_codec::decode_value::<ModelCapabilities>(&parse(
             r#"{"multiAgentReasoningEffort":42}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn forced_tool_choice_thinking_capability_preserves_absence_and_explicit_values() {
+        for wire in ["{}", r#"{"forcedToolChoiceWithThinking":null}"#] {
+            let capabilities = decode::<ModelCapabilities>(wire);
+            assert_eq!(capabilities.forced_tool_choice_with_thinking, None);
+            assert_eq!(encoded(&capabilities), parse("{}"));
+        }
+        for supported in [false, true] {
+            let wire = format!(r#"{{"forcedToolChoiceWithThinking":{supported}}}"#);
+            let capabilities = decode::<ModelCapabilities>(&wire);
+            assert_eq!(
+                capabilities.forced_tool_choice_with_thinking,
+                Some(supported)
+            );
+            assert_eq!(encoded(&capabilities), parse(&wire));
+        }
+        assert!(runtime_codec::decode_value::<ModelCapabilities>(&parse(
+            r#"{"forcedToolChoiceWithThinking":"false"}"#
         ))
         .is_err());
     }

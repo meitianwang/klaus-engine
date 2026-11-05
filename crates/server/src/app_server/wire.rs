@@ -4266,6 +4266,7 @@ pub struct PlanningQuestionOption {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelCapabilitiesInitSchema {
     pub tools: Option<bool>,
+    pub forced_tool_choice_with_thinking: Option<bool>,
     pub effort: Option<ModelEffortCapabilityInitSchema>,
     pub output_verbosity: Option<ModelOutputVerbosityInitSchema>,
     pub auto_review_model_override: Option<String>,
@@ -4370,6 +4371,7 @@ pub struct ModelGeminiThinkingInitSchema {
 #[cfg(test)]
 mod approval_review_metadata_schema_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn session_start_schema_publishes_the_closed_review_metadata_bridge() {
@@ -4422,6 +4424,29 @@ mod approval_review_metadata_schema_tests {
             serde_json::to_value(declared).unwrap()["multiAgentReasoningEffort"],
             "custom/Exact"
         );
+    }
+
+    #[test]
+    fn model_init_schema_preserves_optional_forced_tool_choice_thinking_metadata() {
+        let absent: ModelCapabilitiesInitSchema = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.forced_tool_choice_with_thinking, None);
+        for supported in [true, false] {
+            let declared: ModelCapabilitiesInitSchema = serde_json::from_value(json!({
+                "forcedToolChoiceWithThinking": supported
+            }))
+            .unwrap();
+            assert_eq!(declared.forced_tool_choice_with_thinking, Some(supported));
+        }
+        assert!(
+            serde_json::from_value::<ModelCapabilitiesInitSchema>(json!({
+                "forcedToolChoiceWithThinking": "false"
+            }))
+            .is_err()
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(ModelCapabilitiesInitSchema)).unwrap();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(schema["properties"]["forcedToolChoiceWithThinking"].is_object());
     }
 }
 

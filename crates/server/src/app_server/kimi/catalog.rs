@@ -574,6 +574,16 @@ pub fn capabilities_of(entry: Option<&Value>) -> Value {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     });
+    // K3.1 Pro rejects specified tool choice while thinking is enabled, but
+    // accepts automatic tool choice. Project the measured restriction here so
+    // older account-bound catalog snapshots receive it before a live refresh.
+    if entry
+        .and_then(|model| model.get("key"))
+        .and_then(Value::as_str)
+        == Some("k3.1-pro")
+    {
+        capabilities["forcedToolChoiceWithThinking"] = json!(false);
+    }
     // The 1M beta was measured accepted on the models that serve that window.
     if window >= CONTEXT_1M_TOKENS {
         capabilities["oneMillionContext"] = json!(true);
@@ -614,6 +624,23 @@ pub fn capabilities_of(entry: Option<&Value>) -> Value {
 mod tests {
     use super::*;
     crate::app_server::catalog_test_support::warm_catalog_tests!("kimi", read_local_models);
+
+    #[test]
+    fn measured_forced_tool_choice_restriction_applies_to_existing_catalog_snapshots() {
+        let cached = json!({"key":"k3.1-pro","tools":true});
+        assert_eq!(
+            capabilities_of(Some(&cached))["forcedToolChoiceWithThinking"],
+            json!(false)
+        );
+        for key in ["k3", "future-model"] {
+            assert!(capabilities_of(Some(&json!({"key":key})))
+                .get("forcedToolChoiceWithThinking")
+                .is_none());
+        }
+        assert!(capabilities_of(None)
+            .get("forcedToolChoiceWithThinking")
+            .is_none());
+    }
 
     /// The live body, captured 2026-09-29 from `/v1/models` on a Pro membership.
     /// Four models; the Highspeed row carries no `think_efforts` at all.

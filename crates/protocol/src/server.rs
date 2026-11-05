@@ -12547,6 +12547,7 @@ fn model_capabilities_from_init(init: Option<&ModelCapabilitiesInit>) -> ModelCa
     };
     ModelCapabilities {
         tools: init.tools,
+        forced_tool_choice_with_thinking: init.forced_tool_choice_with_thinking,
         output_verbosity: init.output_verbosity,
         auto_review_model_override: init.auto_review_model_override.clone(),
         requires_sandboxed_review: init.requires_sandboxed_review,
@@ -12619,6 +12620,50 @@ fn capabilities_by_model_from_init(
 mod output_verbosity_mapping_tests {
     use super::*;
     use klaus_agent_core::types::provider::OutputVerbosity;
+
+    #[tokio::test]
+    async fn forced_tool_choice_thinking_metadata_reaches_main_and_tier_providers() {
+        let init: ProtocolSessionInit = runtime_codec::decode_text(&RuntimeString::from(
+            r#"{"provider":{"type":"anthropic","model":"main"},"auth":{"type":"api_key","key":"fixture-only"},
+                "capabilities":{"forcedToolChoiceWithThinking":false},
+                "capabilitiesByModel":[
+                    {"model":"supported","capabilities":{"forcedToolChoiceWithThinking":true}},
+                    {"model":"undeclared","capabilities":{}}
+                ]}"#,
+        )).unwrap();
+        let encoded = runtime_codec::encode_value(&init).unwrap();
+        let restored: ProtocolSessionInit = runtime_codec::decode_value(&encoded).unwrap();
+        let provider = provider_from_init(&restored, None).await.unwrap().unwrap();
+        assert_eq!(
+            provider
+                .model_metadata(&"main".into())
+                .forced_tool_choice_with_thinking,
+            Some(false)
+        );
+        assert_eq!(
+            provider
+                .model_metadata(&"supported".into())
+                .forced_tool_choice_with_thinking,
+            Some(true)
+        );
+        assert_eq!(
+            provider
+                .model_metadata(&"undeclared".into())
+                .forced_tool_choice_with_thinking,
+            None
+        );
+        let absent: ModelCapabilitiesInit = runtime_codec::decode_text(&RuntimeString::from(
+            r#"{"forcedToolChoiceWithThinking":null}"#,
+        ))
+        .unwrap();
+        assert_eq!(absent.forced_tool_choice_with_thinking, None);
+        assert!(
+            runtime_codec::decode_text::<ModelCapabilitiesInit>(&RuntimeString::from(
+                r#"{"forcedToolChoiceWithThinking":"false"}"#,
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn session_init_preserves_each_declared_output_detail() {
