@@ -611,8 +611,8 @@ impl AnthropicProvider {
     }
 
     /// Whether to use NATIVE structured outputs (`output_config.format`) instead
-    /// of the forced-tool emulation. Native support is a client-declared
-    /// capability; the engine can always fall back to forced-tool emulation.
+    /// of result-tool emulation. Native support is a client-declared capability;
+    /// result-tool selection also follows the declared thinking compatibility.
     fn use_native_structured_output(&self, req: &ModelRequest) -> bool {
         req.output_schema.is_some()
             && self.is_first_party

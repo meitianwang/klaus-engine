@@ -734,8 +734,8 @@ mod r20261028_required_child_model;
 #[path = "regressions/r20261029_title_thinking_requirement.rs"]
 mod r20261029_title_thinking_requirement;
 
-#[path = "regressions/r20261104_required_thinking_title.rs"]
-mod r20261104_required_thinking_title;
+#[path = "regressions/r76224b5_required_thinking_title.rs"]
+mod r76224b5_required_thinking_title;
 
 #[path = "regressions/r20261031_display_message_live_history.rs"]
 mod r20261031_display_message_live_history;

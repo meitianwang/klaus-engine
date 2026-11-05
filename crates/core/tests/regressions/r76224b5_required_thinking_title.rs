@@ -1,6 +1,6 @@
 //! Defect: required-thinking gateways rejected every structured title request.
 //! Root cause: the result tool was forced while thinking could not be disabled.
-//! Fix: 2026-11-04; select the internal result tool automatically and isolate its JSON.
+//! Fixing commit: 76224b5; honor declared tool-choice compatibility and isolate result JSON.
 
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};
 use klaus_agent_core::provider::anthropic::{AnthropicProvider, AnthropicProviderOptions};

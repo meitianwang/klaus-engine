@@ -1724,7 +1724,7 @@ pub struct ModelCapabilities {
     /// Extended thinking. `None` = the model does not think.
     pub thinking: Option<ThinkingCapability>,
     /// Provider-native structured output (grammar-constrained JSON) vs the
-    /// forced-tool emulation the engine can always fall back to.
+    /// engine's schema-validated result-tool emulation.
     pub structured_output: bool,
     /// Provider-native server-side web search.
     pub web_search: bool,
