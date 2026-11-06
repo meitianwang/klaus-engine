@@ -731,6 +731,10 @@ impl Step {
             return Err("cursor_metadata_history_missing".into());
         }
         if text != self.text || tools && calls.len() != self.held.len() {
+            eprintln!(
+                "[Cursor] native response mismatch site=checkpoint textMatches={} nativeTextBytes={} streamedTextBytes={} nativeCalls={} heldCalls={}",
+                text == self.text, text.len(), self.text.len(), calls.len(), self.held.len()
+            );
             return Err("cursor_native_response_mismatch".into());
         }
         if self.catalog.choice.requires_call() && calls.is_empty() {
@@ -868,6 +872,35 @@ impl Step {
                     return Ok(None);
                 };
                 native.extend(self.pending.iter().cloned());
+                let checkpoint_calls = native
+                    .iter()
+                    .filter(|message| message["role"] == "assistant")
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .filter(|part| part["type"] == "tool-call")
+                    .map(|part| {
+                        let id = part["toolCallId"]
+                            .as_str()
+                            .ok_or("cursor_tool_identity_invalid")?;
+                        if !self.metadata.contains_key(id) && !self.held.contains_key(id) {
+                            return Err(super::tool_mismatch(
+                                "pending_held_missing",
+                                part,
+                                &Value::Null,
+                            ));
+                        }
+                        Ok(id)
+                    })
+                    .collect::<Result<HashSet<_>, String>>()?;
+                // Discovery snapshots can outlive their completed batch. Wait
+                // for every held intent's certificate regardless of packet order.
+                if self
+                    .held
+                    .keys()
+                    .any(|id| !checkpoint_calls.contains(id.as_str()))
+                {
+                    return Ok(None);
+                }
                 self.complete_metadata_history(&mut native)?;
                 return self.certify(&native, true).map(Some);
             }
@@ -2154,6 +2187,102 @@ mod tests {
         )
         .unwrap();
         result
+    }
+
+    #[test]
+    fn completed_discovery_checkpoint_waits_for_the_current_execution_batch() {
+        let mut step = step();
+        let preamble = "Checking the available tools.";
+        step.receive(&json!({"interactionUpdate":{"textDelta":{"text":preamble}}}))
+            .unwrap();
+        reply_metadata(&mut step, "GetDynamicTools");
+        step.batch.count = Some(1);
+        let helper = json!({"role":"assistant","content":[{"type":"text","text":preamble},metadata_native("GetDynamicTools", "GetDynamicTools")]});
+        step.receive(&json!({"conversationCheckpointUpdate":{"rootPromptMessagesJson":step.initial_roots,"pendingToolCalls":[helper.to_string()]}})).unwrap();
+        assert!(step.ready().unwrap().is_none());
+
+        start(&mut step);
+        step.receive(&json!({"execServerMessage":{"mcpArgs":held()}}))
+            .unwrap();
+        step.receive(&json!({"interactionUpdate":{"toolRequestsListed":{"callCount":1}}}))
+            .unwrap();
+        assert!(
+            step.ready().unwrap().is_none(),
+            "a completed discovery checkpoint is not the current execution certificate"
+        );
+        assert_eq!(step.held.len(), 1);
+
+        let mut helpers = vec![helper];
+        step.complete_metadata_history(&mut helpers).unwrap();
+        let mut roots = step.initial_roots.clone();
+        for message in &helpers {
+            roots.push(json!(step
+                .blobs
+                .seed(serde_json::to_vec(message).unwrap())
+                .unwrap()));
+        }
+        step.receive(&json!({"conversationCheckpointUpdate":{"rootPromptMessagesJson":roots,"pendingToolCalls":[native().to_string()]}})).unwrap();
+        let certified = step.ready().unwrap().unwrap();
+        assert_eq!(certified.text, preamble);
+        assert_eq!(certified.calls.len(), 1);
+        assert_eq!(certified.calls[0]["toolName"], "echo");
+        assert_eq!(certified.context["nativeMessages"][0], helpers[0]);
+        assert_eq!(certified.context["nativeMessages"][1], helpers[1]);
+        assert_eq!(certified.context["nativeMessages"][2], native());
+
+        step.pending[0]["content"][1]["args"]["arguments"]["value"] = json!("changed");
+        assert_eq!(step.ready().err().unwrap(), "cursor_native_tool_mismatch");
+    }
+
+    #[test]
+    fn unknown_checkpoint_calls_are_rejected_instead_of_waiting_for_another_snapshot() {
+        for include_current_call in [false, true] {
+            let mut step = step();
+            start(&mut step);
+            step.receive(&json!({"execServerMessage":{"mcpArgs":held()}}))
+                .unwrap();
+            step.receive(&json!({"interactionUpdate":{"toolRequestsListed":{"callCount":1}}}))
+                .unwrap();
+            let mut signed = native();
+            let mut unknown = signed["content"][1].clone();
+            unknown["toolCallId"] = json!("unknown-call");
+            if include_current_call {
+                signed["content"].as_array_mut().unwrap().push(unknown);
+            } else {
+                signed["content"][1] = unknown;
+            }
+            step.receive(&json!({"conversationCheckpointUpdate":{"rootPromptMessagesJson":step.initial_roots,"pendingToolCalls":[signed.to_string()]}})).unwrap();
+            assert_eq!(step.ready().err().unwrap(), "cursor_native_tool_mismatch");
+        }
+    }
+
+    #[test]
+    fn current_execution_checkpoint_can_arrive_before_its_intent() {
+        let mut step = step();
+        step.receive(&json!({"conversationCheckpointUpdate":{"rootPromptMessagesJson":step.initial_roots,"pendingToolCalls":[native().to_string()]}})).unwrap();
+        assert!(step.ready().unwrap().is_none());
+        start(&mut step);
+        step.receive(&json!({"execServerMessage":{"mcpArgs":held()}}))
+            .unwrap();
+        step.receive(&json!({"interactionUpdate":{"toolRequestsListed":{"callCount":1}}}))
+            .unwrap();
+        let certified = step.ready().unwrap().unwrap();
+        assert_eq!(certified.calls.len(), 1);
+        assert_eq!(certified.context["nativeMessages"], json!([native()]));
+    }
+
+    #[test]
+    fn terminal_without_the_current_execution_certificate_cannot_complete() {
+        let mut step = step();
+        start(&mut step);
+        step.receive(&json!({"execServerMessage":{"mcpArgs":held()}}))
+            .unwrap();
+        step.receive(&json!({"interactionUpdate":{"toolRequestsListed":{"callCount":1}}}))
+            .unwrap();
+        assert!(step.ready().unwrap().is_none());
+        step.receive(&json!({"interactionUpdate":{"turnEnded":{}}}))
+            .unwrap();
+        assert_eq!(step.finish().err().unwrap(), "cursor_inference_incomplete");
     }
 
     #[test]

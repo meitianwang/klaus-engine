@@ -197,6 +197,10 @@ impl Output {
         tx: &mpsc::Sender<Bytes>,
     ) -> Result<(), String> {
         if self.text != result.text {
+            eprintln!(
+                "[Cursor] native response mismatch site=output streamedTextBytes={} certifiedTextBytes={}",
+                self.text.len(), result.text.len()
+            );
             return Err("cursor_native_response_mismatch".into());
         }
         if self.reasoning.is_empty() && !result.reasoning.is_empty() {

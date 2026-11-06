@@ -40,6 +40,9 @@ mod r20261019_approval_review_contract;
 #[path = "../../tests/r20261018_cursor_metadata_discovery.rs"]
 mod r20261018_cursor_metadata_discovery;
 
+#[path = "../../../core/tests/regressions/r96e85d7c_cursor_checkpoint_batch.rs"]
+mod r96e85d7c_cursor_checkpoint_batch;
+
 #[path = "../../tests/r20261017_goal_close_facade.rs"]
 mod r20261017_goal_close_facade;
 

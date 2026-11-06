@@ -417,6 +417,16 @@ pub(crate) async fn metadata_inventory_fixture(
     model_step_fixture(read_path, "metadata").await
 }
 
+pub(crate) async fn delayed_checkpoint_inventory_fixture(
+    read_path: String,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    model_step_fixture(read_path, "delayed-checkpoint").await
+}
+
 pub(crate) async fn permission_inventory_fixture(
     path: String,
 ) -> (
@@ -482,6 +492,7 @@ async fn model_step_fixture(
                                 let mut messages = std::collections::BTreeMap::new();
                                 let mut prepared = false;
                                 let mut terminal_pending = false;
+                                let mut checkpoint_after_context = None;
                                 let send = |value| bridge::encode_frame(value).expect("frame");
                                 while let Some(frame) = body.frame().await {
                                     let Ok(frame) = frame else {
@@ -534,6 +545,16 @@ async fn model_step_fixture(
                                                 .clone();
                                             for (index, key) in roots.iter().enumerate() {
                                                 tx.send(send(if index==0 {json!({"kvServerMessage":{"getBlobArgs":{"blobId":key}}})}else{json!({"kvServerMessage":{"id":index as u64,"getBlobArgs":{"blobId":key}}})})).await.unwrap();
+                                            }
+                                        }
+                                        if value["execClientMessage"]["id"] == 901 {
+                                            let checkpoint = checkpoint_after_context
+                                                .take()
+                                                .expect("delayed checkpoint");
+                                            captured.lock().unwrap().last_mut().unwrap()
+                                                ["checkpointBarrierReached"] = json!(true);
+                                            if tx.send(send(checkpoint)).await.is_err() {
+                                                return;
                                             }
                                         }
                                         if let Some(reply) = value.get("kvClientMessage") {
@@ -698,7 +719,9 @@ async fn model_step_fixture(
                                                     )
                                                 };
                                                 let mut metadata_updates = Vec::new();
-                                                if mode == "metadata" {
+                                                if mode == "metadata"
+                                                    || mode == "delayed-checkpoint"
+                                                {
                                                     let id = format!("metadata-{results}");
                                                     let selector = if results == 0 {
                                                         json!({"pattern":"^unavailable_fixture_tool$"})
@@ -726,6 +749,10 @@ async fn model_step_fixture(
                                                         json!({"interactionUpdate":{"toolRequestsListed":{"callCount":1}}}),
                                                         json!({"interactionUpdate":{"toolCallCompleted":{"modelCallId":"metadata-model","toolCall":{"getMcpToolsToolCall":{"args":wire,"result":{"success":{"content":result.to_string()}}}}}}}),
                                                     ]);
+                                                    if mode == "delayed-checkpoint" {
+                                                        let helper = json!({"role":"assistant","content":[{"type":"reasoning","text":"","signature":"metadata-signature"},{"type":"tool-call","toolCallId":id,"toolName":"GetDynamicTools","args":selector}]});
+                                                        metadata_updates.push(json!({"conversationCheckpointUpdate":{"rootPromptMessagesJson":checkpoint_roots,"pendingToolCalls":[helper.to_string()]}}));
+                                                    }
                                                     for (index, message) in [
                                                         json!({"role":"assistant","content":[{"type":"reasoning","text":"","signature":"metadata-signature"},{"type":"tool-call","toolCallId":id,"toolName":"GetDynamicTools","args":selector}]}),
                                                         json!({"role":"tool","content":[{"type":"tool-result","toolCallId":id,"toolName":"GetDynamicTools","result":result.to_string()}]}),
@@ -745,6 +772,13 @@ async fn model_step_fixture(
                                                 // Both batches deliberately share one HTTP data chunk.
                                                 // Protocol validity cannot depend on transport chunking.
                                                 let mut chunk = Vec::new();
+                                                let mut updates = updates.to_vec();
+                                                if mode == "delayed-checkpoint" {
+                                                    checkpoint_after_context = updates.pop();
+                                                    // The reply proves that this chunk was processed
+                                                    // before the current checkpoint can be delivered.
+                                                    updates.push(json!({"execServerMessage":{"id":901,"execId":"checkpoint-barrier","requestContextArgs":{}}}));
+                                                }
                                                 for update in
                                                     metadata_updates.into_iter().chain(updates)
                                                 {

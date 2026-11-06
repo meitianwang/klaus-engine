@@ -448,6 +448,14 @@ async fn cursor_named_facade_permission_denial_prevents_write_and_replays_the_lo
 }
 
 pub(super) async fn run_default_inventory(deny_write: bool, metadata: bool) {
+    run_inventory(deny_write, metadata, false).await;
+}
+
+pub(super) async fn run_delayed_checkpoint_inventory() {
+    run_inventory(false, true, true).await;
+}
+
+async fn run_inventory(deny_write: bool, metadata: bool, delayed_checkpoint: bool) {
     let _guard = super::super::cursor::test_lock().lock().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("config.toml");
@@ -459,6 +467,11 @@ pub(super) async fn run_default_inventory(deny_write: bool, metadata: bool) {
     let (inference, captured, inference_task) = if deny_write {
         super::super::cursor::tests::permission_inventory_fixture(
             denied.to_string_lossy().into_owned(),
+        )
+        .await
+    } else if delayed_checkpoint {
+        super::super::cursor::tests::delayed_checkpoint_inventory_fixture(
+            file.to_string_lossy().into_owned(),
         )
         .await
     } else if metadata {
@@ -535,6 +548,7 @@ pub(super) async fn run_default_inventory(deny_write: bool, metadata: bool) {
             Some(event) => event,
             None => client.next_message().await,
         };
+        assert_ne!(notification["method"], "turn/failed", "{notification}");
         if notification["method"] == "approval/request" {
             approvals += 1;
             assert!(deny_write, "unexpected approval");
@@ -552,6 +566,11 @@ pub(super) async fn run_default_inventory(deny_write: bool, metadata: bool) {
         "{events}"
     );
     let requests = captured.lock().expect("captured").clone();
+    if delayed_checkpoint {
+        assert!(requests[..2]
+            .iter()
+            .all(|request| request["checkpointBarrierReached"] == true));
+    }
     assert_eq!(requests.len(), if deny_write { 2 } else { 3 });
     assert!(
         !denied.exists(),
