@@ -131,6 +131,7 @@ async fn search(
             is_meta: None,
         })],
         tools: Vec::new(),
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 1024,
         task_budget: None,
