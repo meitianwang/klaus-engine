@@ -150,6 +150,7 @@ fn model_request() -> ModelRequest {
         system: vec![],
         messages: vec![],
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 1_000,
         task_budget: None,

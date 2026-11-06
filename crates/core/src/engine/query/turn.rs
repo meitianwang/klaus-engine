@@ -2409,6 +2409,7 @@ async fn run_turn_tool_result_budget(
         tool_specs,
         Some(turn_override),
     );
+    prepared.request.deferred_tools = shared.deferred_request_specs(&prepared.profile);
     Ok(())
 }
 

@@ -75,6 +75,7 @@ fn request_with_poisoned_history() -> ModelRequest {
         system: vec![],
         messages: poisoned_history(),
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 16384,
         task_budget: None,

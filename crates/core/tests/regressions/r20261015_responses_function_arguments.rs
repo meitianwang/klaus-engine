@@ -87,6 +87,7 @@ async fn stream(mut events: Vec<Value>) -> Vec<ModelStreamEvent> {
         system: vec![],
         messages: vec![],
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 128,
         task_budget: None,

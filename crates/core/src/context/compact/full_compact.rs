@@ -395,6 +395,7 @@ impl FullCompactor {
             system: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),
+            deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: self.max_output_tokens.unwrap_or(20_000),
             task_budget: None,

@@ -6740,6 +6740,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             tools: vec![],
+            deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1000,
             task_budget: None,

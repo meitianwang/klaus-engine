@@ -39,6 +39,7 @@ pub(super) fn summary_request() -> ModelRequest {
             is_meta: None,
         })],
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 20_000,
         task_budget: None,

@@ -712,6 +712,7 @@ impl AnthropicProvider {
             req,
             req.output_schema.is_some(),
             false,
+            self.is_first_party && model_supports_deferred_tool_loading(&req.model),
             self.structured_output_mode(req),
             self.requires_claude_code_identity(),
             image_limits,
@@ -860,6 +861,7 @@ impl ModelProvider for AnthropicProvider {
             &request,
             request.output_schema.is_some(),
             cache_scope_enabled,
+            self.is_first_party && model_supports_deferred_tool_loading(&request.model),
             output_mode,
             self.requires_claude_code_identity(),
             image_limits,
@@ -1052,6 +1054,8 @@ impl ModelProvider for AnthropicProvider {
         let mut req = req;
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
         let output_mode = self.structured_output_mode(&req);
+        let defer_loading_supported =
+            is_first_party && model_supports_deferred_tool_loading(&req.model);
 
         let s = async_stream::stream! {
             let structured = req.output_schema.is_some();
@@ -1083,7 +1087,7 @@ impl ModelProvider for AnthropicProvider {
                     .first()
                     .is_some_and(|p| p.cache_scope == Some(CacheScope::Global));
             let params = match build_params_with_media_limits(
-                &req, structured, cache_scope_enabled,
+                &req, structured, cache_scope_enabled, defer_loading_supported,
                 output_mode,
                 require_claude_code_identity, image_limits, media_budget,
             ) {
@@ -2418,6 +2422,62 @@ fn model_returns_thinking_summaries(model: &RuntimeString) -> bool {
     })
 }
 
+/// First-party Anthropic models that implement native deferred tool loading
+/// (`defer_loading` on tool definitions). Mirrors the model-id parsing of
+/// [`model_returns_thinking_summaries`]; the haiku family is excluded and the
+/// version floor is 4.5.
+fn model_supports_deferred_tool_loading(model: &RuntimeString) -> bool {
+    if model.len_utf16() > 128 {
+        return false;
+    }
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    let normalized = model.strip_suffix("[1m]").unwrap_or(&model);
+    let Some(rest) = normalized.strip_prefix("claude-") else {
+        return false;
+    };
+    let fields = rest.split('-').collect::<Vec<_>>();
+    if !(2..=6).contains(&fields.len()) {
+        return false;
+    }
+    let family = |name: &str| matches!(name, "opus" | "sonnet" | "haiku");
+    let (family_name, major, suffix) = if family(fields[0]) {
+        (fields[0], fields[1], &fields[2..])
+    } else if family(fields[1]) {
+        (fields[1], fields[0], &fields[2..])
+    } else {
+        return false;
+    };
+    // The haiku family does not implement deferred tool loading.
+    if family_name == "haiku" {
+        return false;
+    }
+    if major.len() > 2 || major.starts_with('0') || !major.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    if !suffix.iter().enumerate().all(|(index, field)| {
+        (*field == "latest" && index + 1 == suffix.len())
+            || (!field.is_empty()
+                && field.len() <= 8
+                && field.bytes().all(|byte| byte.is_ascii_digit()))
+    }) {
+        return false;
+    }
+    let Some(major) = major.parse::<u8>().ok() else {
+        return false;
+    };
+    // A date suffix ("20250929") is not a minor version; only a short numeric
+    // field directly after the major version counts.
+    let minor = suffix
+        .first()
+        .filter(|field| field.len() <= 2)
+        .and_then(|field| field.parse::<u8>().ok())
+        .unwrap_or(0);
+    major > 4 || (major == 4 && minor >= 5)
+}
+
 struct ThinkingSummaryState {
     native_source: bool,
     model_summary: bool,
@@ -2793,6 +2853,7 @@ fn build_params(
         req,
         structured,
         cache_scope_enabled,
+        false,
         StructuredOutputMode {
             native: use_native_structured,
             review_tool_loop: false,
@@ -2812,10 +2873,12 @@ struct StructuredOutputMode {
     auto_result_tool: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_params_with_media_limits(
     req: &ModelRequest,
     structured: bool,
     cache_scope_enabled: bool,
+    defer_loading_supported: bool,
     output_mode: StructuredOutputMode,
     require_claude_code_identity: bool,
     image_limits: ImageLimits,
@@ -2836,6 +2899,7 @@ fn build_params_with_media_limits(
 
     let mut tools: Vec<Value> = req.tools.iter().map(to_api_tool).collect();
     let mut tool_choice: Option<Value> = req.tool_choice.as_ref().map(to_api_tool_choice);
+    let mut structured_replacement = false;
 
     if let Some(schema) = req
         .output_schema
@@ -2854,6 +2918,7 @@ fn build_params_with_media_limits(
             tools.push(result_tool);
             tool_choice = Some(vobj(vec![("type", vs("auto"))]));
         } else {
+            structured_replacement = true;
             tools = vec![result_tool];
             tool_choice = Some(if output_mode.auto_result_tool {
                 vobj(vec![("type", vs("auto"))])
@@ -2880,6 +2945,28 @@ fn build_params_with_media_limits(
         ttl,
         cache_scope_enabled,
     );
+
+    // Native deferred tool loading: not-yet-surfaced definitions ride along
+    // marked `defer_loading` so a supporting model can pull them in without
+    // paying their context cost up front. Appended AFTER cache breakpoints so
+    // the breakpoint stays on the last immediate tool and the cached prefix
+    // does not shift. Skipped when a forced structured-output tool replaced
+    // the whole inventory.
+    if defer_loading_supported && !req.deferred_tools.is_empty() && !structured_replacement {
+        if tools.is_empty() {
+            // Nothing immediate to bootstrap from: promote the deferred
+            // definitions instead of sending an all-deferred inventory.
+            tools.extend(req.deferred_tools.iter().map(to_api_tool));
+        } else {
+            tools.extend(req.deferred_tools.iter().map(|spec| {
+                let mut tool = to_api_tool(spec);
+                if let Some(object) = tool.as_object_mut() {
+                    object.insert("defer_loading", Value::Bool(true));
+                }
+                tool
+            }));
+        }
+    }
 
     // OAuth subscription premium-model spoof gate: lead with the verbatim Claude
     // Code identity as its own first block. Prepended AFTER cache breakpoints so
@@ -4071,6 +4158,7 @@ mod tests {
             system: vec![sys("You are helpful.")],
             messages: vec![user_msg("hi")],
             tools: vec![],
+            deferred_tools: vec![],
             tool_choice: None,
             max_output_tokens: 1024,
             task_budget: None,
@@ -4282,6 +4370,138 @@ mod tests {
         );
         assert_eq!(params.get("max_tokens").unwrap(), &exact_json!(1024));
         assert_eq!(params.get("stream").unwrap(), &exact_json!(true));
+    }
+
+    fn deferred_spec(name: &str) -> ToolSpec {
+        function_spec(
+            name,
+            "Deferred tool.",
+            schema_of(exact_json!({ "type": "object", "properties": {} })),
+        )
+    }
+
+    fn deferred_req() -> ModelRequest {
+        ModelRequest {
+            tools: vec![deferred_spec("read")],
+            tool_choice: Some(ToolChoice::Auto),
+            deferred_tools: vec![
+                deferred_spec("mcp__alpha__one"),
+                deferred_spec("mcp__alpha__two"),
+            ],
+            ..base_req()
+        }
+    }
+
+    fn deferred_wire_tools(req: &ModelRequest, structured: bool, supported: bool) -> Vec<Value> {
+        let params = build_params_with_media_limits(
+            req,
+            structured,
+            false,
+            supported,
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            false,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("request assembly fixture must contain valid image payloads");
+        params
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn deferred_tool_loading_gate_matches_family_and_version() {
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-5[1m]",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-5-latest",
+        ] {
+            assert!(
+                model_supports_deferred_tool_loading(&RuntimeString::from(model)),
+                "{model} should support deferred tool loading"
+            );
+        }
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-0",
+            "claude-opus-4-1-20250805",
+            "claude-3-5-sonnet",
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-latest",
+            "gpt-5",
+        ] {
+            assert!(
+                !model_supports_deferred_tool_loading(&RuntimeString::from(model)),
+                "{model} should not support deferred tool loading"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_tools_ride_after_the_cache_breakpoint_when_supported() {
+        let tools = deferred_wire_tools(&deferred_req(), false, true);
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0].get("name").unwrap(), &exact_json!("read"));
+        assert!(tools[0].get("defer_loading").is_none());
+        // The cache breakpoint stays on the last immediate tool, never on a
+        // deferred definition appended behind it.
+        assert!(tools[0].get("cache_control").is_some());
+        for tool in &tools[1..] {
+            assert_eq!(tool.get("defer_loading").unwrap(), &exact_json!(true));
+            assert!(tool.get("cache_control").is_none());
+        }
+        assert_eq!(
+            tools[1].get("name").unwrap(),
+            &exact_json!("mcp__alpha__one")
+        );
+        assert_eq!(
+            tools[2].get("name").unwrap(),
+            &exact_json!("mcp__alpha__two")
+        );
+    }
+
+    #[test]
+    fn deferred_tools_are_omitted_without_native_support() {
+        let tools = deferred_wire_tools(&deferred_req(), false, false);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), &exact_json!("read"));
+        assert!(tools[0].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn forced_structured_output_replacement_drops_deferred_tools() {
+        let req = ModelRequest {
+            output_schema: Some(schema_of(
+                exact_json!({ "type": "object", "properties": {} }),
+            )),
+            ..deferred_req()
+        };
+        let tools = deferred_wire_tools(&req, true, true);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), &exact_json!("emit_result"));
+    }
+
+    #[test]
+    fn an_all_deferred_inventory_is_promoted_to_immediate_tools() {
+        let req = ModelRequest {
+            tools: vec![],
+            tool_choice: None,
+            ..deferred_req()
+        };
+        let tools = deferred_wire_tools(&req, false, true);
+        assert_eq!(tools.len(), 2);
+        for tool in &tools {
+            assert!(tool.get("defer_loading").is_none());
+        }
     }
 
     #[test]

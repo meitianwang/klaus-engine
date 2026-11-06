@@ -420,6 +420,7 @@ mod tests {
             ],
             messages: vec![user("m-1", "first"), user("m-2", "second")],
             tools: vec![tool("read"), tool("write")],
+            deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1024,
             task_budget: None,

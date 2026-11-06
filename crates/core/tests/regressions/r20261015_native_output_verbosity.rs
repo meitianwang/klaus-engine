@@ -55,6 +55,7 @@ fn request(model: &str) -> ModelRequest {
             is_meta: None,
         })],
         tools: Vec::new(),
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 321,
         task_budget: None,

@@ -566,6 +566,7 @@ impl TypedMemoryStore {
                 is_meta: None,
             })],
             tools: Vec::new(),
+            deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: 256,
             task_budget: None,

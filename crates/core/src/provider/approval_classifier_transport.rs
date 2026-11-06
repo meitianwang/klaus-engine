@@ -151,6 +151,7 @@ pub(crate) fn test_request() -> ClassifierRequest {
             system: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),
+            deferred_tools: Vec::new(),
             tool_choice: Some(ToolChoice::None),
             max_output_tokens: 16_384,
             task_budget: None,

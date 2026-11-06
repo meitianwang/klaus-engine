@@ -73,6 +73,7 @@ async fn stream_error_details(payload: serde_json::Value) -> ProviderError {
             is_meta: None,
         })],
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 20_000,
         task_budget: None,

@@ -193,6 +193,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
             kind: Default::default(),
             format: None,
         }],
+        deferred_tools: Vec::new(),
         tool_choice: Some(ToolChoice::Auto),
         max_output_tokens: 7_777,
         task_budget: None,

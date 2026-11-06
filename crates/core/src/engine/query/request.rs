@@ -439,6 +439,9 @@ pub(super) fn prepare_with_inference(
         system,
         messages: crate::engine::resume_repair::normalize_tool_history_owned(request_messages),
         tools,
+        // Native deferred-loading lists are bound per-request inside
+        // `Shared::prepare`, which owns the exposure/surfaced state.
+        deferred_tools: Vec::new(),
         tool_choice,
         max_output_tokens,
         task_budget: config.task_budget_tokens,
@@ -489,7 +492,7 @@ impl Shared {
         turn_override: Option<&TurnOverride>,
     ) -> PreparedModelRequest {
         let Some(bundle) = self.bundle() else {
-            let prepared = prepare_model_request(
+            let mut prepared = prepare_model_request(
                 messages,
                 &self.params,
                 canonical_system_prompt,
@@ -506,6 +509,7 @@ impl Shared {
                     turn_override,
                 );
             }
+            prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
             self.observe_approval_context(
                 messages,
                 canonical_system_prompt,
@@ -629,6 +633,9 @@ impl Shared {
                 Some(&turn_override),
             );
         }
+        if capabilities.tools {
+            prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
+        }
         self.observe_approval_context(
             messages,
             canonical_system_prompt,
@@ -662,6 +669,24 @@ impl Shared {
             configured.min(bundle.provider.capabilities(&request.model).context_window)
         });
         window.saturating_sub(request.max_output_tokens)
+    }
+
+    /// Deferred-exposure specs that have not been surfaced yet, rendered for
+    /// the request's provider profile. Providers with native deferred-loading
+    /// wire support send these alongside the immediate tools; every other
+    /// provider ignores the field.
+    pub(super) fn deferred_request_specs(
+        &self,
+        profile: &ProviderBehaviorProfile,
+    ) -> Vec<ToolSpec> {
+        let tools = self.tools.lock_recover().clone();
+        let surfaced = self.surfaced.lock_recover();
+        let internal = deferred_tool_specs(&tools, &surfaced);
+        drop(surfaced);
+        if internal.is_empty() {
+            return Vec::new();
+        }
+        render_tool_specs_for_behavior(&internal, profile)
     }
 
     /// Budget the rendered prefix, rather than a tool count or a model-name
@@ -925,6 +950,23 @@ pub(crate) fn visible_tool_specs(
             .map(|t| to_tool_spec(t.as_ref())),
     );
     visible
+}
+
+/// Deferred-exposure tool specs that have not been surfaced via `tool_search`
+/// yet: the wire list for providers with native deferred tool loading. Walks
+/// the name-sorted pool like [`visible_tool_specs`], never the surfaced set, so
+/// requests that deferred the same tools emit them in the same order.
+pub(crate) fn deferred_tool_specs(
+    tools: &[Arc<dyn Tool>],
+    surfaced: &HashSet<RuntimeString>,
+) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .filter(|tool| {
+            tool.exposure() == ToolExposure::Deferred && !surfaced.contains(&tool.name())
+        })
+        .map(|tool| to_tool_spec(tool.as_ref()))
+        .collect()
 }
 
 pub(crate) fn catalog_entry(

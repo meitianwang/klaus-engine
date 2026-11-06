@@ -127,6 +127,7 @@ fn request_with(messages: Vec<Message>) -> ModelRequest {
         system: vec![],
         messages,
         tools: vec![],
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 16384,
         task_budget: None,

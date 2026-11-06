@@ -117,6 +117,7 @@ fn cached_request() -> ModelRequest {
         }],
         messages: Vec::new(),
         tools: Vec::new(),
+        deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 128,
         task_budget: Some(37),

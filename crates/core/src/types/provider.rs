@@ -728,6 +728,12 @@ pub struct ModelRequest {
     pub system: Vec<SystemPromptPart>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// Deferred-exposure tool specs that have not been surfaced yet. Providers
+    /// with native deferred-loading wire support (first-party Anthropic
+    /// `defer_loading`) send these alongside `tools`; other providers ignore
+    /// them. Native-only binding like `supports_image_detail_original`: never
+    /// serialized, and decoded requests start with an empty list.
+    pub deferred_tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
     /// Agentic task budget (Anthropic task-budgets beta): the output-token
@@ -884,6 +890,7 @@ impl RuntimeDecode for ModelRequest {
                 system: object.required("system", &[])?,
                 messages: object.required("messages", &[])?,
                 tools: object.required("tools", &[])?,
+                deferred_tools: Vec::new(),
                 tool_choice: object.optional("toolChoice", &[])?,
                 max_output_tokens: object.required("maxOutputTokens", &[])?,
                 task_budget: object.optional("taskBudget", &[])?,

@@ -626,6 +626,7 @@ pub const PROVIDER_TOOL_DESCRIPTION_FRAGMENTS: [ProviderToolDescriptionFragment;
         styles: &[
             ProviderPromptStyle::AnthropicReminder,
             ProviderPromptStyle::OpenAiDeveloper,
+            ProviderPromptStyle::Generic,
         ],
         category: ToolDiscovery,
     },
@@ -956,9 +957,6 @@ pub fn render_tool_description_fragments(
     name: &RuntimeString,
     profile: &ProviderBehaviorProfile,
 ) -> Option<RuntimeString> {
-    if profile.prompt_style == ProviderPromptStyle::Generic {
-        return None;
-    }
     let name_key = runtime_classification_key(name);
     let fragments = PROVIDER_TOOL_DESCRIPTION_FRAGMENTS
         .iter()
@@ -1098,7 +1096,26 @@ pub fn render_tool_description_fragments(
             };
             Some(concat_runtime_strings(&[heading.into(), "\n".into(), text]))
         }
-        ProviderPromptStyle::Generic => None,
+        ProviderPromptStyle::Generic => {
+            // Generic providers skip per-tool contract phrasing, but the
+            // tool-search discovery note stays: it is the only place that
+            // tells the model deferred tools exist and how to surface them.
+            match fragments[0].category {
+                ToolDiscovery if name_key == "tool_search" => {
+                    let text = concat_runtime_strings(&[
+                        "Search deferred tool metadata by capability keywords when the needed capability is not currently visible. If you know the exact tool name, query `select:<tool_name>` or a comma-separated list such as `select:Read,Edit`. Use `".into(),
+                        visible_name,
+                        "` before falling back to generic resource-listing tools; call the newly surfaced tool on a later model request.".into(),
+                    ]);
+                    Some(concat_runtime_strings(&[
+                        "# Tool discovery".into(),
+                        "\n".into(),
+                        text,
+                    ]))
+                }
+                _ => None,
+            }
+        }
     }
 }
 
@@ -3708,6 +3725,22 @@ mod tests {
                 render_tool_description_fragments(&RuntimeString::from(tool_name), profile),
                 Some(expected.into()),
                 "fragment {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_style_renders_only_the_tool_search_discovery_note() {
+        let generic = generic_profile();
+        assert_eq!(
+            render_tool_description_fragments(&RuntimeString::from("tool_search"), &generic),
+            Some(OPENAI_TOOL_SEARCH_NOTE.into()),
+        );
+        for tool_name in ["task", "apply_patch", "exec_command", "read", "bash"] {
+            assert_eq!(
+                render_tool_description_fragments(&RuntimeString::from(tool_name), &generic),
+                None,
+                "generic fragment for {tool_name}",
             );
         }
     }
