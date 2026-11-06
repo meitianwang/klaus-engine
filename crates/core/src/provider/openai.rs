@@ -3005,6 +3005,14 @@ fn merge_reported_usage(
     {
         *cache_read = value;
         reported = true;
+    } else if let Some(value) = usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64) {
+        // Flat cache accounting (DeepSeek-style OpenAI-compatible routes): the
+        // cached prefix size rides on top-level `prompt_cache_hit_tokens`, with
+        // `prompt_cache_miss_tokens` as its complement, instead of a nested
+        // details object. Without this fallback the ledger records zero cache
+        // reads for those routes, indistinguishable from a true miss.
+        *cache_read = value;
+        reported = true;
     }
     reported
 }
@@ -9452,6 +9460,30 @@ mod tests {
     }
 
     // ---- chat chunk mapping ----
+
+    #[test]
+    fn chat_usage_reads_flat_prompt_cache_hit_tokens() {
+        let mut state = ChatState::default();
+        let reported = update_chat_usage(
+            &json!({ "usage": { "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_cache_hit_tokens": 80, "prompt_cache_miss_tokens": 20 } }),
+            &mut state,
+        );
+        assert!(reported);
+        assert_eq!(state.cache_read, 80);
+        assert_eq!(state.input_tokens, 100);
+        assert_eq!(state.output_tokens, 10);
+        assert_eq!(state.total_tokens, 110);
+    }
+
+    #[test]
+    fn nested_cached_tokens_take_precedence_over_flat_hit_tokens() {
+        let mut state = ChatState::default();
+        update_chat_usage(
+            &json!({ "usage": { "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "prompt_tokens_details": { "cached_tokens": 30 }, "prompt_cache_hit_tokens": 80 } }),
+            &mut state,
+        );
+        assert_eq!(state.cache_read, 30);
+    }
 
     #[test]
     fn cumulative_chat_message_emits_only_new_text_and_ignores_string_null_finish() {

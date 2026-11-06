@@ -991,6 +991,37 @@ fn validate_fast_mode(body: &Value, model_info: Option<&Value>) -> Result<(), &'
     Ok(())
 }
 
+/// Derive the upstream `session_id` from the engine's stable per-conversation
+/// `prompt_cache_key` so the provider can route requests to a warm prompt
+/// cache. A fresh random id per request made every turn look like a brand-new
+/// conversation and forfeited cache reuse. The digest is formatted as a
+/// version-4 UUID to keep the wire shape unchanged; requests without a cache
+/// key keep the previous per-request random id.
+fn stable_qoder_session_id(body: &Value) -> String {
+    let Some(cache_key) = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    else {
+        return super::uuid_v4();
+    };
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(cache_key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// openAiToQoderInferBody mirror. Runtime knobs follow the Qoder desktop
 /// client's own contract: the chosen context window and reasoning effort ride
 /// BOTH on `model_config` and inside `parameters`; thinking-off is the literal
@@ -1105,7 +1136,7 @@ pub(crate) fn openai_to_qoder_infer_body(
         "request_id": rid,
         "request_set_id": rid,
         "chat_record_id": rid,
-        "session_id": super::uuid_v4(),
+        "session_id": stable_qoder_session_id(body),
         "stream": true,
         "chat_task": "FREE_INPUT",
         "chat_context": {
@@ -2019,6 +2050,50 @@ mod tests {
         assert_eq!(out["parameters"]["max_tokens"], json!(128));
         assert_eq!(out["messages"].as_array().unwrap().len(), 2);
         assert_eq!(out["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_id_is_stable_for_one_prompt_cache_key() {
+        let body = json!({
+            "model": "auto",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "prompt_cache_key": "conv-1",
+        });
+        let first = openai_to_qoder_infer_body(&body, "auto", None, None);
+        let second = openai_to_qoder_infer_body(&body, "auto", None, None);
+        assert_eq!(first["session_id"], second["session_id"]);
+
+        let other = json!({
+            "model": "auto",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "prompt_cache_key": "conv-2",
+        });
+        let third = openai_to_qoder_infer_body(&other, "auto", None, None);
+        assert_ne!(first["session_id"], third["session_id"]);
+
+        // The wire shape stays a version-4 UUID.
+        let sid = first["session_id"].as_str().unwrap();
+        let groups: Vec<&str> = sid.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(groups[2].starts_with('4'));
+        assert!(matches!(
+            groups[3].chars().next(),
+            Some('8') | Some('9') | Some('a') | Some('b')
+        ));
+    }
+
+    #[test]
+    fn session_id_stays_random_without_prompt_cache_key() {
+        let body = json!({
+            "model": "auto",
+            "messages": [{ "role": "user", "content": "hello" }],
+        });
+        let first = openai_to_qoder_infer_body(&body, "auto", None, None);
+        let second = openai_to_qoder_infer_body(&body, "auto", None, None);
+        assert_ne!(first["session_id"], second["session_id"]);
     }
 
     #[test]
