@@ -150,7 +150,7 @@ impl ModelProvider for Provider {
                     kind: if matches!(script.reply, Reply::TooLarge) { ProviderErrorKind::PromptTooLong } else { ProviderErrorKind::Network },
                     message: "controlled retry".into(),
                     status: matches!(script.reply, Reply::TooLarge).then_some(413), retry_after_ms: Some(1), request_id: None,
-                    code: None, error_type: None, media_origins: None, media_repair_complete: false,
+                    code: None, error_type: None, media_origins: None, media_repair_complete: false, credential_recovery: None,
                 }};
                 return;
             }

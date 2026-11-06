@@ -86,6 +86,7 @@ fn error(kind: ProviderErrorKind, message: &str) -> ProviderError {
         request_id: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
     }
 }

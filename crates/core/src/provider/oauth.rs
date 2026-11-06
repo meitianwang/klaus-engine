@@ -106,6 +106,7 @@ fn auth_error(message: impl Into<RuntimeString>) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -120,6 +121,7 @@ fn network_error(message: impl Into<RuntimeString>) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -951,6 +953,7 @@ impl OAuthInner {
                 error_type: error.error_type,
                 media_origins: None,
                 media_repair_complete: false,
+                credential_recovery: None,
                 retry_after_ms: error.retry_after_ms,
                 request_id: None,
             })?;
@@ -1087,6 +1090,7 @@ impl OAuthInner {
             error_type: None,
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms: None,
             request_id: None,
         })?;

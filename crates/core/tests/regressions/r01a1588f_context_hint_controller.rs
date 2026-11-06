@@ -122,6 +122,7 @@ fn error(status: Option<u16>, message: &str, kind: Option<&str>) -> ProviderErro
         error_type: kind.map(Into::into),
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

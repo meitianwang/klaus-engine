@@ -624,6 +624,7 @@ pub(crate) fn uncaptured_model_error(model: &RuntimeString) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

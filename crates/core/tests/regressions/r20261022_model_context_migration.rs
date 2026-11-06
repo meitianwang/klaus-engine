@@ -107,6 +107,7 @@ impl ModelProvider for Provider {
                     error_type: None,
                     media_origins: None,
                     media_repair_complete: false,
+                    credential_recovery: None,
                 },
             }]));
         }

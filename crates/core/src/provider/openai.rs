@@ -113,6 +113,7 @@ fn invalid_openai_tool_choice(provider: &str, reason: impl Into<String>) -> Prov
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -131,6 +132,7 @@ fn invalid_openai_compatibility(reason: impl Into<String>) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -651,6 +653,7 @@ fn structured_output_error(reason: &str) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -1656,6 +1659,7 @@ fn build_responses_params_with_tool_mode(
             request_id: None,
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms: None,
         });
     }
@@ -1875,6 +1879,7 @@ fn incomplete_responses_error(reason: Option<&RuntimeString>) -> ProviderError {
         request_id: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
     }
 }
@@ -2048,7 +2053,7 @@ fn responses_function_tool_input(
         error_type: None,
         request_id: None,
         media_origins: None,
-        media_repair_complete: false,
+        media_repair_complete: false, credential_recovery: None,
         retry_after_ms: None,
     })
 }
@@ -2821,6 +2826,7 @@ fn invalid_cumulative_stream(reason: &'static str) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -3436,6 +3442,7 @@ fn empty_chat_stream_error() -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -3704,6 +3711,7 @@ fn response_function_arguments(
                 request_id: None,
                 media_origins: None,
                 media_repair_complete: false,
+                credential_recovery: None,
                 retry_after_ms: None,
             },
         });
@@ -4427,6 +4435,7 @@ fn aborted_error() -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

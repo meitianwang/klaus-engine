@@ -169,7 +169,7 @@ impl ModelProvider for TraeProvider {
                             }
                             yield ModelStreamEvent::Error{error:ProviderError{
                                 kind:ProviderErrorKind::InvalidRequest,message:"trae_replay_metadata_invalid".into(),status:None,code:Some("trae_replay_metadata_invalid".into()),
-                                error_type:None,request_id:None,media_origins:None,media_repair_complete:false,retry_after_ms:None,
+                                error_type:None,request_id:None,media_origins:None,media_repair_complete: false, credential_recovery: None,retry_after_ms:None,
                             }};
                             return;
                         }

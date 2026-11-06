@@ -187,6 +187,7 @@ fn validate_anthropic_request_choice(
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     })
@@ -1095,7 +1096,7 @@ impl ModelProvider for AnthropicProvider {
                         code: None,
                         error_type: None,
                         media_origins: None,
-                        media_repair_complete: false,
+                        media_repair_complete: false, credential_recovery: None,
                         retry_after_ms: None,
                         request_id: None,
                     }};
@@ -1190,7 +1191,7 @@ impl ModelProvider for AnthropicProvider {
                             code: None,
                             error_type: None,
                             media_origins: None,
-                            media_repair_complete: false,
+                            media_repair_complete: false, credential_recovery: None,
                             retry_after_ms: None,
                             request_id: None,
                         },
@@ -1222,6 +1223,7 @@ impl ModelProvider for AnthropicProvider {
             };
             let body = Value::Object(request_params);
 
+            let credential_request_id = uuid::Uuid::new_v4().to_string();
             let ctx = Arc::new(AttemptCtx {
                 client,
                 url: request_url,
@@ -1249,6 +1251,14 @@ impl ModelProvider for AnthropicProvider {
                 provider_id,
                 model: diagnostic_string(&req.model),
                 interceptor,
+                credential_recovery: Mutex::new(crate::types::errors::CredentialRecovery {
+                    diagnostic_request_id: Some(credential_request_id.clone()),
+                    ..Default::default()
+                }),
+                credential_request_id,
+                body_bytes: AtomicU32::new(0),
+                output_tokens: AtomicU32::new(0),
+                upstream_request_id: Mutex::new(None),
             });
 
             // One establishment attempt: refresh + attach the token, open the SSE,
@@ -1269,17 +1279,19 @@ impl ModelProvider for AnthropicProvider {
 
             let establish = async {
                 loop {
-                    let failed_account = auth_source
-                        .as_ref()
-                        .and_then(|auth| auth.credential_account_id());
                     let mut established =
                         with_retry(retry_opts.clone(), signal.clone(), make_attempt()).await;
+                    let failed_account = ctx.credential_recovery.lock_recover().failed_account_id.clone();
                     // A revoked token may need one refresh even before its local expiry.
                     let is_auth_err =
                         matches!(&established, Err(RetryError::Provider(pe)) if pe.kind == ProviderErrorKind::Auth);
                     if is_auth_err && !signal.is_cancelled() {
                         if let Some(auth) = &auth_source {
-                            if auth.force_refresh().await == Some(true) {
+                            let refreshed = match failed_account.as_deref() {
+                                Some(id) => auth.force_refresh_for_account(id).await,
+                                None => auth.force_refresh().await,
+                            };
+                            if refreshed == Some(true) {
                                 established =
                                     with_retry(retry_opts.clone(), signal.clone(), make_attempt()).await;
                             }
@@ -1288,16 +1300,41 @@ impl ModelProvider for AnthropicProvider {
                     // An account that still cannot authenticate after renewal
                     // must not prevent the remaining subscription accounts from
                     // serving this request. Refresh happens before rotation.
+                    let failed_account = ctx.credential_recovery.lock_recover().failed_account_id.clone();
                     let can_rotate = matches!(&established, Err(RetryError::Provider(error))
                         if crate::provider::rotation::is_quota_rotation_error(error)
                             || error.kind == ProviderErrorKind::Auth);
                     if can_rotate && !signal.is_cancelled() {
                         if let (Some(auth), Some(failed)) = (&auth_source, failed_account) {
-                            if auth.rotate_credential(&failed).await
-                                .is_some_and(|outcome| outcome.retriable())
-                            {
+                            let repeated = {
+                                let mut recovery = ctx.credential_recovery.lock_recover();
+                                if recovery.attempted_account_ids.contains(&failed) {
+                                    true
+                                } else {
+                                    recovery.attempted_account_ids.push(failed.clone());
+                                    false
+                                }
+                            };
+                            if repeated {
+                                record_credential_exhaustion(&ctx);
+                                return established;
+                            }
+                            let rotation = auth.rotate_credential(&failed).await;
+                            crate::observability::provider_diagnostics::record_named(
+                                crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
+                                "credential_rotation",
+                                serde_json::json!({
+                                    "credentialRequestId": ctx.credential_request_id,
+                                    "model": ctx.model,
+                                    "failedAccountId": failed,
+                                    "nextAccountId": rotation.as_ref().and_then(|outcome| outcome.current()),
+                                    "outcome": format!("{rotation:?}"),
+                                }),
+                            );
+                            if rotation.as_ref().is_some_and(|outcome| outcome.retriable()) {
                                 continue;
                             }
+                            record_credential_exhaustion(&ctx);
                         }
                     }
                     return established;
@@ -1339,6 +1376,7 @@ impl ModelProvider for AnthropicProvider {
                         return;
                     }
                     let mut error = retry_err_to_provider(err);
+                    error.credential_recovery = Some(Box::new(ctx.credential_recovery.lock_recover().clone()));
                     error.media_repair_complete = ctx.media_repair.lock_recover().has_repairs();
                     yield ModelStreamEvent::Error { error };
                     return;
@@ -1392,6 +1430,22 @@ impl ModelProvider for AnthropicProvider {
                             yield ModelStreamEvent::Error {
                                 error: {
                                     let mut error = classify_error(&raw_from_sse(&data));
+                                    error.credential_recovery = Some(Box::new(ctx.credential_recovery.lock_recover().clone()));
+                                    if error.request_id.is_none() {
+                                        error.request_id = ctx.upstream_request_id.lock_recover().clone().map(Into::into);
+                                    }
+                                    crate::observability::provider_diagnostics::record_named(
+                                        crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
+                                        "credential_stream_error",
+                                        serde_json::json!({
+                                            "credentialRequestId": ctx.credential_request_id,
+                                            "accountId": ctx.credential_recovery.lock_recover().failed_account_id,
+                                            "upstreamRequestId": error.request_id.as_ref().and_then(|id| id.try_to_utf8().ok()),
+                                            "status": error.status,
+                                            "errorKind": error.kind.as_str(),
+                                            "retryAfterMs": error.retry_after_ms,
+                                        }),
+                                    );
                                     if ctx.context_hints.lock_recover().classify_stream_error(&error) {
                                         error.code = Some(CONTEXT_HINT_STREAM_FALLBACK_CODE.into());
                                     }
@@ -1530,6 +1584,30 @@ struct AttemptCtx {
     model: String,
     /// Transport-level request interception, when configured.
     interceptor: Option<SharedRequestInterceptor>,
+    credential_recovery: Mutex<crate::types::errors::CredentialRecovery>,
+    credential_request_id: String,
+    body_bytes: AtomicU32,
+    output_tokens: AtomicU32,
+    upstream_request_id: Mutex<Option<String>>,
+}
+
+fn record_credential_exhaustion(ctx: &AttemptCtx) {
+    let recovery = {
+        let mut recovery = ctx.credential_recovery.lock_recover();
+        recovery.exhausted = true;
+        recovery.clone()
+    };
+    crate::observability::provider_diagnostics::record_named(
+        crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
+        "credential_exhausted",
+        serde_json::json!({
+            "credentialRequestId": ctx.credential_request_id,
+            "model": ctx.model,
+            "attemptedAccountIds": recovery.attempted_account_ids,
+            "attemptedAccountCount": recovery.attempted_account_ids.len(),
+            "outcome": "exhausted",
+        }),
+    );
 }
 
 /// Per-request AWS Bedrock signing inputs.
@@ -1624,6 +1702,26 @@ async fn attempt_with_media_remediation(
             }
         };
         let result = attempt_once(ctx, signal, &extra).await;
+        let classified = result.as_ref().err().map(classify_error);
+        crate::observability::provider_diagnostics::record_named(
+            crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
+            "credential_attempt",
+            serde_json::json!({
+                "providerId": ctx.provider_id,
+                "phase": "establishment",
+                "model": ctx.model,
+                "credentialRequestId": ctx.credential_request_id,
+                "accountId": ctx.credential_recovery.lock_recover().failed_account_id,
+                "bodyBytes": ctx.body_bytes.load(Ordering::Relaxed),
+                "maxOutputTokens": ctx.output_tokens.load(Ordering::Relaxed),
+                "attempt": request.attempt,
+                "elapsedMs": started.elapsed().as_millis(),
+                "success": result.is_ok(),
+                "status": classified.as_ref().and_then(|error| error.status).or_else(|| result.is_ok().then_some(200)),
+                "retryAfterMs": classified.as_ref().and_then(|error| error.retry_after_ms),
+                "upstreamRequestId": ctx.upstream_request_id.lock_recover().clone(),
+            }),
+        );
         match &result {
             Ok(_) => report_attempt(
                 ctx.interceptor.as_ref(),
@@ -1735,16 +1833,42 @@ async fn attempt_once(
     intercepted_headers: &[(String, String)],
 ) -> Result<Established, RawProviderError> {
     let mut headers = match &ctx.auth_source {
-        Some(a) => a.get_headers(signal).await.map_err(|error| {
-            // Credential preparation can fail before there is an HTTP
-            // status. Preserve its auth classification through retry.
-            let authentication_failed = error.kind == ProviderErrorKind::Auth;
-            let mut raw = raw_from_provider_error(error);
-            if authentication_failed {
-                raw.error_type = Some("authentication_error".to_string());
-            }
-            raw
-        })?,
+        Some(a) => {
+            let current = a.credential_account_id();
+            let attempted = ctx
+                .credential_recovery
+                .lock_recover()
+                .attempted_account_ids
+                .clone();
+            // Other requests can move the shared head back to an account this
+            // request already failed on. Membership, not queue position, tells
+            // whether there is still an untried credential.
+            let id = current.as_ref().and_then(|current| {
+                if attempted.contains(current) {
+                    a.credential_account_ids()
+                        .into_iter()
+                        .find(|id| !attempted.contains(id))
+                        .or_else(|| Some(current.clone()))
+                } else {
+                    Some(current.clone())
+                }
+            });
+            ctx.credential_recovery.lock_recover().failed_account_id = id.clone();
+            let result = match id.as_deref() {
+                Some(id) => a.get_headers_for_account(id, signal).await,
+                None => a.get_headers(signal).await,
+            };
+            result.map_err(|error| {
+                // Credential preparation can fail before there is an HTTP
+                // status. Preserve its auth classification through retry.
+                let authentication_failed = error.kind == ProviderErrorKind::Auth;
+                let mut raw = raw_from_provider_error(error);
+                if authentication_failed {
+                    raw.error_type = Some("authentication_error".to_string());
+                }
+                raw
+            })?
+        }
         None => HashMap::new(),
     };
     // Bedrock carries versions/betas via the body and signs with SigV4, so it
@@ -1781,7 +1905,21 @@ async fn attempt_once(
 
     // Encode the body ONCE: Bedrock's SigV4 signature is over the exact bytes we
     // send, so the hashed payload and the request body must be identical.
-    let payload = encode_anthropic_request_body(&ctx.body.lock_recover());
+    let payload = {
+        let body = ctx.body.lock_recover();
+        ctx.output_tokens.store(
+            body.get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                .min(u64::from(u32::MAX)) as u32,
+            Ordering::Relaxed,
+        );
+        encode_anthropic_request_body(&body)
+    };
+    ctx.body_bytes.store(
+        payload.len().min(u32::MAX as usize) as u32,
+        Ordering::Relaxed,
+    );
     let mut rb = ctx
         .client
         .post(&ctx.url)
@@ -1849,6 +1987,12 @@ async fn attempt_once(
         .map_err(|e| raw_from_transport(&e))?;
 
     let status = resp.status();
+    *ctx.upstream_request_id.lock_recover() = resp
+        .headers()
+        .get("request-id")
+        .or_else(|| resp.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     if !status.is_success() {
         let hdrs = header_hashmap(resp.headers());
         let body = resp.text().await.unwrap_or_default();

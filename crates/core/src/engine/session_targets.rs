@@ -665,6 +665,7 @@ pub(super) fn usage_admission_error(error: std::io::Error) -> crate::types::erro
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

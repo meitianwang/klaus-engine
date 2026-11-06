@@ -111,6 +111,7 @@ mod tests {
             error_type: None,
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms,
             request_id: None,
         }

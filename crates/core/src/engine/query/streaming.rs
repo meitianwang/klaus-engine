@@ -409,6 +409,7 @@ pub(super) async fn stream_and_dispatch(
         shared.params.config.stream_total_timeout_ms,
         shared.params.signal.clone(),
     );
+    timing.bind_turn_id(&shared.params.turn_id);
     timing.record_prefix(req);
     let outcome = crate::context::media_budget::REQUEST_MEDIA_REPAIRED
         .scope(
@@ -490,6 +491,7 @@ fn cancelled_before_provider_call(assistant_uuid: &str) -> Outcome {
             error_type: None,
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms: None,
             request_id: None,
         },
@@ -769,6 +771,7 @@ async fn stream_and_dispatch_inner(
                     error_type: None,
                     media_origins: None,
                     media_repair_complete: crate::context::media_budget::request_media_repaired(),
+                    credential_recovery: None,
                     retry_after_ms: None,
                     request_id: None,
                 },
@@ -806,6 +809,7 @@ async fn stream_and_dispatch_inner(
                         media_origins: None,
                         media_repair_complete: crate::context::media_budget::request_media_repaired(
                         ),
+                        credential_recovery: None,
                         retry_after_ms: None,
                         request_id: None,
                     },
@@ -1228,6 +1232,7 @@ async fn stream_and_dispatch_inner(
                 error_type: None,
                 media_origins: None,
                 media_repair_complete: false,
+                credential_recovery: None,
                 retry_after_ms: None,
                 request_id: None,
             },

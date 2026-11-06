@@ -104,7 +104,7 @@ impl ModelProvider for Provider {
                     yield ModelStreamEvent::Error { error: ProviderError {
                         kind: ProviderErrorKind::Network, message: "controlled fixture retry".into(),
                         status: None, retry_after_ms: Some(1), request_id: None,
-                        code: None, error_type: None, media_origins: None, media_repair_complete: false,
+                        code: None, error_type: None, media_origins: None, media_repair_complete: false, credential_recovery: None,
                     }};
                     return;
                 }

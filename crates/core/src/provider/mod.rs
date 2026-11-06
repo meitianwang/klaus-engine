@@ -62,7 +62,7 @@ pub(crate) fn unsupported_inference_control(
         code: Some("unsupported_inference_setting".into()),
         error_type: None,
         media_origins: None,
-        media_repair_complete: false,
+        media_repair_complete: false, credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     })

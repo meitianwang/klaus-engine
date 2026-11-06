@@ -9262,6 +9262,7 @@ fn provider_error_turn(message: &str) -> Vec<crate::types::provider::ModelStream
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     })]
@@ -13692,6 +13693,7 @@ async fn auto_memory_turn_count_excludes_transient_provider_retries() {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: Some(0),
         request_id: None,
     })];

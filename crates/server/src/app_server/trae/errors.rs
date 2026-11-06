@@ -185,6 +185,7 @@ impl ServiceError {
             request_id: self.request_id.map(Into::into),
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms: self.retry_after_ms,
         }
     }

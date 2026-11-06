@@ -98,6 +98,7 @@ fn invalid_extra_headers(error: String) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -173,6 +174,7 @@ fn credential_access_error(denial: CredentialAccessDenial) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -267,6 +269,25 @@ pub trait AuthSource: Send + Sync {
     /// Account identity captured before a request, when another credential is available.
     fn credential_account_id(&self) -> Option<String> {
         None
+    }
+
+    /// Current queue membership, for request-local recovery accounting.
+    fn credential_account_ids(&self) -> Vec<String> {
+        self.credential_account_id().into_iter().collect()
+    }
+
+    /// Pin authentication to the account selected by this physical attempt.
+    async fn get_headers_for_account(
+        &self,
+        _account_id: &str,
+        signal: &AbortSignal,
+    ) -> Result<AuthHeaders, ProviderError> {
+        self.get_headers(signal).await
+    }
+
+    /// Renew the same account that the upstream refused.
+    async fn force_refresh_for_account(&self, _account_id: &str) -> Option<bool> {
+        self.force_refresh().await
     }
 
     /// Advance past the failed request's account without double-advancing concurrent failures.

@@ -514,6 +514,7 @@ async fn terminal_policy_is_bound_to_the_source_and_keeps_other_requests_unchang
                     request_id: None,
                     media_origins: None,
                     media_repair_complete: false,
+                    credential_recovery: None,
                     retry_after_ms: None,
                 },
             }],

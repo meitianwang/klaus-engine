@@ -114,6 +114,7 @@ impl ApprovalClassifierTransport for ProviderClassifierTransport {
                 error_type: None,
                 media_origins: None,
                 media_repair_complete: false,
+                credential_recovery: None,
                 retry_after_ms: None,
                 request_id: None,
             };

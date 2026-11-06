@@ -72,6 +72,7 @@ fn provider_error(kind: ProviderErrorKind, code: &str) -> ProviderError {
         request_id: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
     }
 }
 

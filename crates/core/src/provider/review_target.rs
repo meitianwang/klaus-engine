@@ -244,6 +244,7 @@ pub(crate) fn unsupported_review_effort() -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

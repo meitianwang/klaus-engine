@@ -5,11 +5,9 @@
 //! account requests authenticate with. When the upstream refuses a request for
 //! quota reasons or cannot authenticate after renewal, the queue advances — the
 //! failed account moves to the tail — and the caller retries the same request
-//! against the new head. Once the queue wraps around to the account that
-//! started the cycle and that account fails again, rotation reports exhaustion
-//! and the caller surfaces the remaining provider error; a later manual continue
-//! starts a fresh cycle at whatever account the persisted order now leads
-//! with.
+//! against the new head. Callers keep their own attempted-account set, so an
+//! exhausted or cancelled request cannot stop another request from trying the
+//! remaining credentials. A later request starts with fresh recovery accounting.
 //!
 //! Each account keeps its own [`OAuthAuth`] slot, so token refresh stays
 //! per-account: its credential namespace and its cross-process refresh lock
@@ -97,9 +95,6 @@ struct RotationInner {
     accounts: Mutex<Vec<RotationAccountSpec>>,
     slots: Mutex<HashMap<String, Arc<OAuthAuth>>>,
     current: Mutex<String>,
-    /// The account whose second failure ends the cycle.
-    anchor: Mutex<Option<String>>,
-    exhausted: Mutex<bool>,
     credential_changes: tokio::sync::watch::Sender<crate::provider::auth::CredentialChangeState>,
 }
 
@@ -125,8 +120,6 @@ impl MultiAccountAuthSource {
                 accounts: Mutex::new(init.accounts),
                 slots: Mutex::new(HashMap::new()),
                 current: Mutex::new(head),
-                anchor: Mutex::new(None),
-                exhausted: Mutex::new(false),
                 credential_changes: tokio::sync::watch::channel(Default::default()).0,
             }),
         })
@@ -147,21 +140,10 @@ impl MultiAccountAuthSource {
         let outcome = {
             let mut accounts = self.inner.accounts.lock().unwrap();
             let mut current = self.inner.current.lock().unwrap();
-            let mut anchor = self.inner.anchor.lock().unwrap();
-            let mut exhausted = self.inner.exhausted.lock().unwrap();
-            if *exhausted {
-                return RotateOutcome::Exhausted;
-            }
             if *current != failed_id {
                 return RotateOutcome::AlreadyAdvanced(current.clone());
             }
             if accounts.len() < 2 {
-                return RotateOutcome::Exhausted;
-            }
-            if anchor.as_deref() == Some(failed_id) {
-                // The cycle wrapped and the account it started with failed
-                // again: nothing left to try in this cycle.
-                *exhausted = true;
                 return RotateOutcome::Exhausted;
             }
             let position = match accounts.iter().position(|account| account.id == failed_id) {
@@ -170,9 +152,6 @@ impl MultiAccountAuthSource {
             };
             let failed = accounts.remove(position);
             accounts.push(failed);
-            if anchor.is_none() {
-                *anchor = Some(failed_id.to_string());
-            }
             let next = accounts[0].id.clone();
             *current = next.clone();
             self.inner.credential_changes.send_modify(|state| {
@@ -356,6 +335,7 @@ fn rotation_error(message: impl Into<RuntimeString>) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -411,7 +391,15 @@ impl AuthSource for MultiAccountAuthSource {
     }
     async fn get_headers(&self, signal: &AbortSignal) -> Result<AuthHeaders, ProviderError> {
         let id = self.current_account_id();
-        let slot = self.slot(&id).await?;
+        self.get_headers_for_account(&id, signal).await
+    }
+
+    async fn get_headers_for_account(
+        &self,
+        id: &str,
+        signal: &AbortSignal,
+    ) -> Result<AuthHeaders, ProviderError> {
+        let slot = self.slot(id).await?;
         match slot.get_headers(signal).await {
             Ok(headers) => Ok(headers),
             Err(error) => {
@@ -419,8 +407,8 @@ impl AuthSource for MultiAccountAuthSource {
                 // stale: drop it and rebuild once from the current file copy.
                 let message = error.message.try_to_utf8().unwrap_or_default();
                 if message.contains("identity changed") {
-                    self.inner.slots.lock().unwrap().remove(&id);
-                    let slot = self.slot(&id).await?;
+                    self.inner.slots.lock().unwrap().remove(id);
+                    let slot = self.slot(id).await?;
                     return slot.get_headers(signal).await;
                 }
                 Err(error)
@@ -436,24 +424,22 @@ impl AuthSource for MultiAccountAuthSource {
         (self.account_count() > 1).then(|| self.current_account_id())
     }
 
+    fn credential_account_ids(&self) -> Vec<String> {
+        self.inner
+            .accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|account| account.id.clone())
+            .collect()
+    }
+
     async fn rotate_credential(&self, failed_id: &str) -> Option<RotateOutcome> {
         Some(self.rotate(failed_id).await)
     }
 
-    fn credential_request_succeeded(&self) {
-        let mut anchor = self.inner.anchor.lock().unwrap();
-        let mut exhausted = self.inner.exhausted.lock().unwrap();
-        *anchor = None;
-        *exhausted = false;
-    }
-
-    fn credential_request_started(&self) {
-        let mut anchor = self.inner.anchor.lock().unwrap();
-        let mut exhausted = self.inner.exhausted.lock().unwrap();
-        if *exhausted {
-            *anchor = None;
-            *exhausted = false;
-        }
+    async fn force_refresh_for_account(&self, id: &str) -> Option<bool> {
+        Some(self.slot(id).await.ok()?.force_refresh().await)
     }
 
     async fn force_refresh(&self) -> Option<bool> {
@@ -584,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_wraps_a_full_cycle_then_exhausts() {
+    async fn queue_rotation_does_not_share_request_exhaustion() {
         let dir = temp_dir("case");
         let source = source_with_file(&dir, &["a", "b", "c"]).await;
         assert_eq!(source.current_account_id(), "a");
@@ -603,15 +589,15 @@ mod tests {
             RotateOutcome::Rotated("a".to_string())
         );
         assert_eq!(file_order(&dir).await, vec!["a", "b", "c"]);
-        // The account that started the cycle failing again ends it.
-        assert_eq!(source.rotate("a").await, RotateOutcome::Exhausted);
-        // The turn must not restart the same exhausted cycle.
-        assert_eq!(source.rotate("a").await, RotateOutcome::Exhausted);
-        source.credential_request_started();
-        // A later request can start a fresh cycle.
+        // Queue mutation is shared, but request exhaustion is owned by callers.
+        // One request wrapping the queue cannot poison another request.
         assert_eq!(
             source.rotate("a").await,
             RotateOutcome::Rotated("b".to_string())
+        );
+        assert_eq!(
+            source.rotate("b").await,
+            RotateOutcome::Rotated("c".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

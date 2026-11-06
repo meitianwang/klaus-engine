@@ -236,6 +236,7 @@ async fn accepted_answer_survives_checkpoint_followed_by_provider_failure() {
                     error_type: None,
                     media_origins: None,
                     media_repair_complete: false,
+                    credential_recovery: None,
                     retry_after_ms: None,
                     request_id: None,
                 },

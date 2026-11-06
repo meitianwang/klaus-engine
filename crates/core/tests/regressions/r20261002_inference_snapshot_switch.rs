@@ -165,7 +165,7 @@ impl ModelProvider for Provider {
                     kind, message: "controlled provider failure".into(),
                     status: if matches!(script.reply, Reply::TooLarge) { Some(413) } else { None },
                     retry_after_ms: Some(1), request_id: None,
-                    code: None, error_type: None, media_origins: None, media_repair_complete: false,
+                    code: None, error_type: None, media_origins: None, media_repair_complete: false, credential_recovery: None,
                 }};
                 return;
             }

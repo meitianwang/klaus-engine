@@ -2726,6 +2726,7 @@ async fn run_turn_stream_with_retry(
     let mut media_recovery = media_recovery::MediaRecovery::default();
     let mut hint_fallback_used = false;
     let mut failure_recovery = "not-retryable";
+    let mut credential_failures = HashSet::new();
     loop {
         append_admitted_messages(&mut prepared.request.messages, &admitted_messages);
         append_admitted_system(&mut prepared.request.system, &admitted_system);
@@ -2892,15 +2893,64 @@ async fn run_turn_stream_with_retry(
                 && !signal.is_cancelled()
                 && crate::provider::rotation::is_quota_rotation_error(error)
             {
-                if let Some(failed) = request_account.clone() {
-                    let rotation = match shared.bundle() {
+                if error
+                    .credential_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.exhausted)
+                {
+                    outcome = out;
+                    break;
+                }
+                if let Some(recovery) = &error.credential_recovery {
+                    credential_failures.extend(recovery.attempted_account_ids.iter().cloned());
+                }
+                let failed_account = error
+                    .credential_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.failed_account_id.clone())
+                    .or_else(|| request_account.clone());
+                if let Some(failed) = failed_account {
+                    credential_failures.insert(failed.clone());
+                    let mut rotation = match shared.bundle() {
                         Some(bundle) => bundle.provider.rotate_credential(&failed).await,
                         None => None,
                     };
+                    // Concurrent requests may have advanced the shared head to
+                    // an account this request already tried. Skip it locally.
+                    let mut skipped = HashSet::new();
+                    while let Some(next) = rotation
+                        .as_ref()
+                        .and_then(|outcome| outcome.current())
+                        .map(str::to_owned)
+                        .filter(|id| credential_failures.contains(id))
+                    {
+                        if !skipped.insert(next.clone()) {
+                            rotation = Some(crate::provider::rotation::RotateOutcome::Exhausted);
+                            break;
+                        }
+                        rotation = match shared.bundle() {
+                            Some(bundle) => bundle.provider.rotate_credential(&next).await,
+                            None => None,
+                        };
+                    }
                     if matches!(
                         rotation,
                         Some(crate::provider::rotation::RotateOutcome::Exhausted)
                     ) {
+                        let mut attempted: Vec<_> = credential_failures.iter().cloned().collect();
+                        attempted.sort();
+                        crate::observability::provider_diagnostics::record_named(
+                            crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
+                            "credential_exhausted",
+                            serde_json::json!({
+                                "sessionId": shared.params.thread_id.try_to_utf8().ok(),
+                                "model": prepared.request.model.try_to_utf8().ok(),
+                                "attemptedAccountIds": attempted,
+                                "attemptedAccountCount": attempted.len(),
+                                "upstreamRequestId": error.request_id.as_ref().and_then(|id| id.try_to_utf8().ok()),
+                                "outcome": "exhausted",
+                            }),
+                        );
                         outcome = out;
                         break;
                     }

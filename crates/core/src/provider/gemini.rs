@@ -148,6 +148,7 @@ fn invalid_gemini_tool_choice(reason: impl Into<RuntimeString>) -> ProviderError
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }
@@ -162,6 +163,7 @@ fn stream_ownership_error() -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: None,
     }

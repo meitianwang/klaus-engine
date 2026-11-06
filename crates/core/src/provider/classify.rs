@@ -174,6 +174,7 @@ pub fn classify_error(err: &RawProviderError) -> ProviderError {
         code: err.code.clone().map(Into::into),
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         error_type: err
             .inner_type
             .as_ref()

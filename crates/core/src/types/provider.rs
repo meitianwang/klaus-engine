@@ -2076,6 +2076,7 @@ pub trait ModelProvider: Send + Sync {
             request_id: None,
             media_origins: None,
             media_repair_complete: false,
+            credential_recovery: None,
             retry_after_ms: None,
         })
     }

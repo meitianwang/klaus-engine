@@ -23,6 +23,7 @@ use klaus_agent_core::provider::rotation::{
 use klaus_agent_core::runtime_process::RuntimeProcessContext;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::errors::{ProviderErrorKind, TerminalReason};
+use klaus_agent_core::types::provider::{AuthHeaders, ModelProvider, ModelStreamEvent};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,77 @@ const SSE_SUCCESS: &str = concat!(
 
 struct FixtureRoot(PathBuf);
 
+#[derive(Default)]
+pub(super) struct AuthPause {
+    calls: std::sync::atomic::AtomicUsize,
+    pub paused: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+}
+
+struct PausedAuth {
+    inner: Arc<dyn AuthSource>,
+    pause: Arc<AuthPause>,
+}
+
+impl PausedAuth {
+    async fn gate(&self) {
+        if self
+            .pause
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.pause.paused.notify_one();
+            self.pause.resume.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthSource for PausedAuth {
+    async fn get_headers(
+        &self,
+        signal: &AbortSignal,
+    ) -> Result<AuthHeaders, klaus_agent_core::types::errors::ProviderError> {
+        self.gate().await;
+        self.inner.get_headers(signal).await
+    }
+
+    async fn get_headers_for_account(
+        &self,
+        id: &str,
+        signal: &AbortSignal,
+    ) -> Result<AuthHeaders, klaus_agent_core::types::errors::ProviderError> {
+        self.gate().await;
+        self.inner.get_headers_for_account(id, signal).await
+    }
+
+    fn is_subscription_oauth(&self) -> bool {
+        self.inner.is_subscription_oauth()
+    }
+    fn base_url(&self) -> Option<&str> {
+        self.inner.base_url()
+    }
+    fn credential_account_id(&self) -> Option<String> {
+        self.inner.credential_account_id()
+    }
+    fn credential_account_ids(&self) -> Vec<String> {
+        self.inner.credential_account_ids()
+    }
+    async fn rotate_credential(
+        &self,
+        id: &str,
+    ) -> Option<klaus_agent_core::provider::rotation::RotateOutcome> {
+        self.inner.rotate_credential(id).await
+    }
+    fn credential_request_started(&self) {
+        self.inner.credential_request_started();
+    }
+    fn credential_request_succeeded(&self) {
+        self.inner.credential_request_succeeded();
+    }
+}
+
 impl FixtureRoot {
     fn new() -> Self {
         let root =
@@ -64,6 +136,7 @@ impl Drop for FixtureRoot {
 #[derive(Clone, Copy)]
 pub(super) enum Reply {
     RateLimited,
+    StreamRateLimited,
     Success,
     Unauthorized,
 }
@@ -194,6 +267,14 @@ async fn serve(
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"unexpected fixture account"}}"#,
             ),
             Some((_, Reply::Success)) => ("200 OK", "text/event-stream", SSE_SUCCESS),
+            Some((_, Reply::StreamRateLimited)) => (
+                "200 OK",
+                "text/event-stream",
+                concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_limit\",\"model\":\"rotation-fixture\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"synthetic streaming account limit\"}}\n\n"
+                ),
+            ),
             Some((_, Reply::Unauthorized)) => (
                 "401 Unauthorized",
                 "application/json",
@@ -410,10 +491,15 @@ pub(super) struct Fixture {
     state: Arc<Mutex<ServerState>>,
     queue: Option<Arc<MultiAccountAuthSource>>,
     account_file: Option<PathBuf>,
+    provider: Arc<dyn ModelProvider>,
 }
 
 impl Fixture {
     pub(super) async fn new(mode: AuthMode) -> Self {
+        Self::new_with_auth_pause(mode, None).await
+    }
+
+    pub(super) async fn new_with_auth_pause(mode: AuthMode, pause: Option<Arc<AuthPause>>) -> Self {
         let root = FixtureRoot::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -478,6 +564,12 @@ impl Fixture {
             }))),
             AuthMode::StaticApiKey | AuthMode::NoAuth => None,
         };
+        let auth_source = match (auth_source, pause) {
+            (Some(inner), Some(pause)) => {
+                Some(Arc::new(PausedAuth { inner, pause }) as Arc<dyn AuthSource>)
+            }
+            (source, _) => source,
+        };
         let is_multi = matches!(mode, AuthMode::Multi(_) | AuthMode::MultiExpired(_));
         let provider = Arc::new(AnthropicProvider::new(AnthropicProviderOptions {
             base_url: Some(base_url),
@@ -501,7 +593,7 @@ impl Fixture {
         let mut options =
             super::r7c876d49_spec_restores_latest_permission_policy::agent_options(process.clone());
         options.provider = klaus_agent_core::provider::model_catalog::with_model_catalog(
-            provider,
+            provider.clone(),
             klaus_agent_core::provider::model_catalog::ModelCatalog::empty(),
         );
         options.credential_store = Some(store);
@@ -553,6 +645,7 @@ impl Fixture {
             state,
             queue,
             account_file,
+            provider,
         }
     }
 
@@ -584,6 +677,19 @@ impl Fixture {
             let _ = tokio::time::timeout(CLEANUP_DEADLINE, self.process.shutdown()).await;
         }
         result.expect("the engine turn must settle within three seconds without a congestion hold")
+    }
+
+    pub(super) async fn run_standalone(&self) -> Vec<ModelStreamEvent> {
+        use futures::StreamExt;
+        let request = klaus_agent_core::runtime_values::runtime_codec::decode_text(
+            &r#"{"model":"rotation-fixture","system":[],"messages":[],"tools":[],"maxOutputTokens":64}"#.into(),
+        ).unwrap();
+        tokio::time::timeout(
+            TURN_DEADLINE,
+            self.provider.stream(request, AbortSignal::new()).collect(),
+        )
+        .await
+        .expect("standalone request must remain bounded")
     }
 
     pub(super) fn refresh_requests(&self) -> usize {
@@ -651,7 +757,7 @@ pub(super) fn assert_success(result: &TurnResult) {
     assert_eq!(result.final_text.try_to_utf8().unwrap(), FINAL_TEXT);
 }
 
-fn assert_rate_limit_terminal(result: &TurnResult) {
+pub(super) fn assert_rate_limit_terminal(result: &TurnResult) {
     assert_eq!(result.stop_reason, TerminalReason::Error);
     let error = result
         .error

@@ -94,6 +94,28 @@ impl RequestTiming {
         self.events = self.events.saturating_add(1);
         self.last_event_kind = Some(event_kind(event));
         self.next_progress = Instant::now() + PROGRESS_INTERVAL;
+        if let ModelStreamEvent::Error { error } = event {
+            self.fields["errorKind"] = json!(error.kind.as_str());
+            self.fields["status"] = json!(error.status);
+            self.fields["retryAfterMs"] = json!(error.retry_after_ms);
+            self.fields["upstreamRequestId"] = json!(error
+                .request_id
+                .as_ref()
+                .and_then(|id| id.try_to_utf8().ok()));
+            if let Some(recovery) = &error.credential_recovery {
+                let mut attempted = recovery.attempted_account_ids.clone();
+                if let Some(failed) = &recovery.failed_account_id {
+                    if !attempted.contains(failed) {
+                        attempted.push(failed.clone());
+                    }
+                }
+                self.fields["credentialRequestId"] = json!(recovery.diagnostic_request_id);
+                self.fields["failedAccountId"] = json!(recovery.failed_account_id);
+                self.fields["attemptedAccountCount"] = json!(attempted.len());
+                self.fields["attemptedAccountIds"] = json!(attempted);
+                self.fields["credentialExhausted"] = json!(recovery.exhausted);
+            }
+        }
         if let ModelStreamEvent::MessageStop { usage, .. }
         | ModelStreamEvent::UsageSnapshot { usage } = event
         {
@@ -177,6 +199,13 @@ impl RequestTiming {
         }
     }
 
+    /// Bind the owning turn without changing other request-timing callers.
+    pub(crate) fn bind_turn_id(&mut self, turn_id: &RuntimeString) {
+        if let Ok(id) = turn_id.try_to_utf8() {
+            self.fields["turnId"] = json!(id);
+        }
+    }
+
     pub(crate) fn finish(&mut self, outcome: &'static str) {
         if !self.finished {
             self.finished = true;
@@ -245,6 +274,85 @@ mod tests {
         text.lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn credential_failures_join_request_scope_without_private_error_contents() {
+        use crate::types::errors::{CredentialRecovery, ProviderError, ProviderErrorKind};
+
+        for sequence in [1, 2] {
+            let session_id = RuntimeString::from(format!("synthetic-session-{sequence}"));
+            let turn_id = RuntimeString::from(format!("synthetic-turn-{sequence}"));
+            let outer_id = format!("synthetic-model-request-{sequence}");
+            let credential_id = format!("synthetic-credential-request-{sequence}");
+            let mut timing = RequestTiming::start(
+                "normal",
+                &outer_id,
+                &"synthetic-model".into(),
+                Some(&"synthetic-provider".into()),
+                Some(&session_id),
+                sequence,
+                100,
+                200,
+                AbortSignal::new(),
+            );
+            let path = std::env::temp_dir()
+                .join(format!("klaus-timing-join-{}.log", uuid::Uuid::new_v4()));
+            timing.test_path = Some(path.clone());
+            timing.bind_turn_id(&turn_id);
+            timing.observe(&ModelStreamEvent::Error {
+                error: ProviderError {
+                    kind: ProviderErrorKind::RateLimit,
+                    message:
+                        "private-user@example.invalid Authorization: Bearer private-token body"
+                            .into(),
+                    status: Some(429),
+                    code: Some("private-code".into()),
+                    error_type: Some("private-type".into()),
+                    media_origins: None,
+                    media_repair_complete: false,
+                    credential_recovery: Some(Box::new(CredentialRecovery {
+                        diagnostic_request_id: Some(credential_id.clone()),
+                        failed_account_id: Some("synthetic-account-b".into()),
+                        attempted_account_ids: vec!["synthetic-account-a".into()],
+                        exhausted: true,
+                    })),
+                    retry_after_ms: Some(120_000),
+                    request_id: Some("synthetic-upstream-request".into()),
+                },
+            });
+            timing.finish("failed");
+            drop(timing);
+            let records = records(&path);
+            assert_eq!(records.len(), 1);
+            let failure = &records[0];
+            assert_eq!(failure["kind"], "failed");
+            assert_eq!(failure["requestId"], outer_id);
+            assert_eq!(failure["sessionId"], session_id.try_to_utf8().unwrap());
+            assert_eq!(failure["turnId"], turn_id.try_to_utf8().unwrap());
+            assert_eq!(failure["credentialRequestId"], credential_id);
+            assert_eq!(failure["failedAccountId"], "synthetic-account-b");
+            assert_eq!(
+                failure["attemptedAccountIds"],
+                json!(["synthetic-account-a", "synthetic-account-b"])
+            );
+            assert_eq!(failure["attemptedAccountCount"], 2);
+            assert_eq!(failure["credentialExhausted"], true);
+            assert_eq!(failure["errorKind"], "rate_limit");
+            assert_eq!(failure["status"], 429);
+            assert_eq!(failure["retryAfterMs"], 120_000);
+            assert_eq!(failure["upstreamRequestId"], "synthetic-upstream-request");
+            let text = serde_json::to_string(&records).unwrap();
+            for private in [
+                "private",
+                "example.invalid",
+                "Authorization",
+                "Bearer",
+                "body",
+            ] {
+                assert!(!text.contains(private), "{text}");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -332,6 +440,7 @@ mod tests {
                     error_type: None,
                     media_origins: None,
                     media_repair_complete: false,
+                    credential_recovery: None,
                     kind: crate::types::errors::ProviderErrorKind::Network,
                     message: "private retry body".into(),
                     status: None,

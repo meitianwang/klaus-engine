@@ -16,7 +16,7 @@ pub fn unsupported_checkpoint() -> ProviderError {
         error_type: None,
         request_id: None,
         media_origins: None,
-        media_repair_complete: false,
+        media_repair_complete: false, credential_recovery: None,
         retry_after_ms: None,
     }
 }

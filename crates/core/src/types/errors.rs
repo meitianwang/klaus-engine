@@ -170,10 +170,23 @@ pub struct ProviderError {
     /// must not rebuild the original body or open another recovery episode.
     #[doc(hidden)]
     pub media_repair_complete: bool,
+    /// Request-local credential recovery. Never serialized into the protocol.
+    #[doc(hidden)]
+    pub credential_recovery: Option<Box<CredentialRecovery>>,
     pub retry_after_ms: Option<u64>,
     /// Server-assigned request id for the failed call — diagnostic only; never
     /// drives retry.
     pub request_id: Option<RuntimeString>,
+}
+
+/// The exact credential attempt and the failures already observed by this request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CredentialRecovery {
+    /// Correlates physical account attempts with their enclosing model request.
+    pub diagnostic_request_id: Option<String>,
+    pub failed_account_id: Option<String>,
+    pub attempted_account_ids: Vec<String>,
+    pub exhausted: bool,
 }
 
 /// The transport boundary at which a native failure occurred.
@@ -240,6 +253,7 @@ impl RuntimeDecode for ProviderError {
                 error_type: object.optional("type", &[])?,
                 media_origins: None,
                 media_repair_complete: false,
+                credential_recovery: None,
                 retry_after_ms: object.optional("retryAfterMs", &[])?,
                 request_id: object.optional("requestId", &[])?,
             })
@@ -807,6 +821,25 @@ impl RuntimeDecode for TerminalReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_recovery_remains_internal_to_the_request() {
+        let mut error: ProviderError = runtime_codec::decode_text(
+            &r#"{"kind":"rate_limit","message":"upstream refused","status":429,"requestId":"synthetic-request"}"#.into(),
+        ).unwrap();
+        let wire = runtime_codec::encode_value(&error).unwrap();
+        let display = error.to_string();
+        error.credential_recovery = Some(Box::new(CredentialRecovery {
+            diagnostic_request_id: Some("synthetic-credential-request".into()),
+            failed_account_id: Some("synthetic-account-a".into()),
+            attempted_account_ids: vec!["synthetic-account-a".into()],
+            exhausted: true,
+        }));
+        assert_eq!(runtime_codec::encode_value(&error).unwrap(), wire);
+        assert_eq!(error.to_string(), display);
+        let decoded: ProviderError = runtime_codec::decode_value(&wire).unwrap();
+        assert!(decoded.credential_recovery.is_none());
+    }
 
     #[test]
     fn input_validation_error_detail_remains_a_by_value_public_field() {

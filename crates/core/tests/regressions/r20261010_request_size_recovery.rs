@@ -92,6 +92,7 @@ fn error(kind: ProviderErrorKind, message: &str, status: Option<u16>) -> Provide
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
         retry_after_ms: None,
         request_id: Some("req_fixture".into()),
     }

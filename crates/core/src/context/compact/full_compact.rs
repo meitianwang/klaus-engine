@@ -689,6 +689,7 @@ fn provider_error(kind: ProviderErrorKind, message: &str) -> ProviderError {
         error_type: None,
         media_origins: None,
         media_repair_complete: false,
+        credential_recovery: None,
     }
 }
 
