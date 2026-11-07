@@ -1829,7 +1829,7 @@ mod provider_behavior_tests {
                     ]}
                 ],
                 "replayAfterCompaction": [
-                    {"role":"user","content":"# Earlier Conversation Summary\n\nprovider state"},
+                    {"role":"user","content":"# Earlier Conversation Summary\n\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nprovider state"},
                     {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"},
                     {"type":"custom_tool_call_output","call_id":"c1","output":"done"},
                     {"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"calendar"}},

@@ -4014,6 +4014,7 @@ impl Session {
             } else {
                 None
             },
+            cache_domain: None,
             cache_key: Some(self.id.clone()),
             plan_file_path: None,
             message_queue: None,

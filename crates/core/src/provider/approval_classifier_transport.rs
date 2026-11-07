@@ -163,6 +163,7 @@ pub(crate) fn test_request() -> ClassifierRequest {
             reasoning_summary: ReasoningSummary::None,
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: Some("guardian-v2:parent-thread".into()),
             context_management: None,
             context_hints: None,

@@ -1950,6 +1950,7 @@ impl Session {
             } else {
                 None
             },
+            cache_domain: None,
             cache_key: Some(this.id.clone()),
             // Only a BOUND document has a path. Nothing is derived from the mode,
             // so entering plan mode does not by itself conjure a plan file — the

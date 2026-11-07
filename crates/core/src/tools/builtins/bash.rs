@@ -558,6 +558,10 @@ impl Tool for BashTool {
             self.default_timeout_ms,
             std::env::var("BASH_MAX_TIMEOUT_MS").ok().as_deref(),
         );
+        // Baseline for the post-command stale-read sweep: only files whose
+        // mtime moves past this point (and past their recorded baseline) were
+        // touched by this command.
+        let command_started_at_ms = crate::tools::freshness::now_ms();
 
         let res = run_one(
             &ctx.process_context,
@@ -647,6 +651,17 @@ impl Tool for BashTool {
                 rtext = rtext.concat(&RuntimeString::from(
                     "\n[Re-ran WITHOUT the sandbox after approval.]",
                 ));
+                if !rerun.aborted && !rerun.timed_out {
+                    let stale = crate::tools::freshness::tracked_files_modified_since(
+                        &command,
+                        command_started_at_ms,
+                        ctx.file_state.as_ref(),
+                    )
+                    .await;
+                    if let Some(hint) = crate::tools::freshness::stale_read_hint(&stale, &cwd) {
+                        rtext = rtext.concat(&RuntimeString::from("\n\n")).concat(&hint);
+                    }
+                }
                 let mut output = RuntimeObject::new();
                 output.insert(
                     "exitCode",
@@ -689,6 +704,21 @@ impl Tool for BashTool {
                 "\n[This failure looks like the active sandbox ({kind}) denied the command — e.g. a blocked file write outside the workspace or a forbidden syscall — not a fault in the command itself. The engine will not silently re-run it unsandboxed; if it genuinely needs broader access, relax the sandbox (config sandbox: 'process') or widen the writable roots, then retry.]",
                 kind = sandbox_kind_str(ctx.sandbox.kind()),
             )));
+        }
+
+        // A foreground command that rewrote files the model has already read
+        // leaves stale baselines behind; surface that here instead of letting
+        // the next edit bounce off the write guard.
+        if !res.aborted && !res.timed_out {
+            let stale = crate::tools::freshness::tracked_files_modified_since(
+                &command,
+                command_started_at_ms,
+                ctx.file_state.as_ref(),
+            )
+            .await;
+            if let Some(hint) = crate::tools::freshness::stale_read_hint(&stale, &cwd) {
+                text = text.concat(&RuntimeString::from("\n\n")).concat(&hint);
+            }
         }
 
         let mut output = RuntimeObject::new();
@@ -1341,6 +1371,131 @@ mod tests {
             .await
             .unwrap();
         assert!(text_of(&res).contains("hi"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    use crate::types::file_state::FileStateCache as _;
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingFileState(
+        std::sync::Mutex<
+            std::collections::HashMap<RuntimePath, crate::types::file_state::FileStateEntry>,
+        >,
+    );
+
+    #[cfg(unix)]
+    impl crate::types::file_state::FileStateCache for RecordingFileState {
+        fn get(&self, path: &RuntimePath) -> Option<crate::types::file_state::FileStateEntry> {
+            self.0.lock().unwrap().get(path).cloned()
+        }
+        fn record(
+            &self,
+            path: &RuntimePath,
+            mtime_ms: f64,
+            opts: crate::types::file_state::RecordOptions,
+        ) {
+            self.0.lock().unwrap().insert(
+                path.clone(),
+                crate::types::file_state::FileStateEntry {
+                    mtime_ms,
+                    size: opts.size,
+                    content: opts.content,
+                    encoding: opts.encoding,
+                },
+            );
+        }
+        fn has(&self, path: &RuntimePath) -> bool {
+            self.0.lock().unwrap().contains_key(path)
+        }
+        fn entries(&self) -> Vec<(RuntimePath, crate::types::file_state::FileStateEntry)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+        fn delete(&self, path: &RuntimePath) {
+            self.0.lock().unwrap().remove(path);
+        }
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+        fn clone_box(&self) -> Box<dyn crate::types::file_state::FileStateCache> {
+            Box::new(Self(std::sync::Mutex::new(
+                self.0.lock().unwrap().clone(),
+            )))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_modifying_command_flags_tracked_reads_as_stale() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let tracked = dir.join("tracked.txt");
+        std::fs::write(&tracked, "original").unwrap();
+        let mut ctx = base_ctx(&cwd, Arc::new(ProcessSandbox::new()));
+        let cache = Arc::new(RecordingFileState::default());
+        cache.record(
+            &RuntimePath::from(tracked.to_string_lossy().into_owned()),
+            1.0,
+            crate::types::file_state::RecordOptions {
+                size: None,
+                content: Some(RuntimeString::from("original")),
+                encoding: None,
+            },
+        );
+        ctx.file_state = cache;
+        let res = create_bash_tool()
+            .call(
+                rjson!({ "command": "echo changed > tracked.txt && true --write" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains(
+                "[This command modified 1 file you've previously read: tracked.txt. Call Read before editing.]"
+            ),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plain_command_leaves_tracked_reads_unflagged() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let tracked = dir.join("tracked.txt");
+        std::fs::write(&tracked, "original").unwrap();
+        let mut ctx = base_ctx(&cwd, Arc::new(ProcessSandbox::new()));
+        let cache = Arc::new(RecordingFileState::default());
+        cache.record(
+            &RuntimePath::from(tracked.to_string_lossy().into_owned()),
+            1.0,
+            crate::types::file_state::RecordOptions {
+                size: None,
+                content: Some(RuntimeString::from("original")),
+                encoding: None,
+            },
+        );
+        ctx.file_state = cache;
+        let res = create_bash_tool()
+            .call(
+                rjson!({ "command": "echo changed > tracked.txt" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(!text.contains("This command modified"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -2390,6 +2390,20 @@ impl Session {
                     Vec::new(),
                 ),
             )));
+            // Wire-level cache routing for a spawned child: siblings of one
+            // delegation share a parent-scoped domain so their common prefix
+            // caches once; fork continuations ride the parent's own key.
+            let child_cache_domain = if fork_path || resuming_fork {
+                None
+            } else {
+                let domain = subagent_cache_domain(&this.id, type_name.as_ref());
+                tracing::debug!(
+                    parent_thread = %this.id.try_to_utf8().unwrap_or_default(),
+                    cache_domain = %domain.try_to_utf8().unwrap_or_default(),
+                    "derived subagent prompt-cache domain from parent thread"
+                );
+                Some(domain)
+            };
             let mut params = QueryParams {
                 retained_tool_tasks: Some(this.persistence.tool_tasks.clone()),
                 prepare_request_usage: Some(this.request_usage_recorder({
@@ -2495,6 +2509,7 @@ impl Session {
                 } else {
                     effective_agent_id.clone().into()
                 }),
+                cache_domain: child_cache_domain,
                 plan_file_path: child_plan_file_path.clone(),
                 message_queue: Some(this.conversation.queue().clone()),
                 input_pdf_bytes: 0,
@@ -3407,4 +3422,65 @@ pub(crate) fn is_unc_path(p: &str) -> bool {
     let is_wsl = (after.starts_with("wsl$") && ab.get(4).map(is_sep).unwrap_or(false))
         || (after.starts_with("wsl.localhost") && ab.get(13).map(is_sep).unwrap_or(false));
     !is_wsl
+}
+
+/// Derive the shared wire-level prompt-cache domain for a spawned internal
+/// session: scoped to the parent thread and the agent source so sibling
+/// sessions of one delegation reuse one cached prefix instead of each
+/// fragmenting the domain under its own per-child identity. The unique
+/// per-child `cache_key` remains the identity used for trace attribution.
+pub(crate) fn subagent_cache_domain(
+    parent_id: &RuntimeString,
+    agent_type: Option<&RuntimeString>,
+) -> RuntimeString {
+    let source = agent_type
+        .cloned()
+        .unwrap_or_else(|| RuntimeString::from("subagent"));
+    parent_id.concat(&RuntimeString::from(":")).concat(&source)
+}
+
+#[cfg(test)]
+mod cache_domain_tests {
+    use super::subagent_cache_domain;
+    use crate::runtime_values::RuntimeString;
+
+    #[test]
+    fn siblings_of_one_parent_and_source_share_a_domain() {
+        let parent = RuntimeString::from("thread-1");
+        let kind = Some(RuntimeString::from("explore"));
+        assert_eq!(
+            subagent_cache_domain(&parent, kind.as_ref())
+                .try_to_utf8()
+                .unwrap(),
+            "thread-1:explore"
+        );
+        assert_eq!(
+            subagent_cache_domain(&parent, kind.as_ref()),
+            subagent_cache_domain(&parent, kind.as_ref())
+        );
+    }
+
+    #[test]
+    fn domains_stay_scoped_per_parent_and_source() {
+        let kind = Some(RuntimeString::from("explore"));
+        let other_kind = Some(RuntimeString::from("plan"));
+        assert_ne!(
+            subagent_cache_domain(&RuntimeString::from("thread-1"), kind.as_ref()),
+            subagent_cache_domain(&RuntimeString::from("thread-2"), kind.as_ref())
+        );
+        assert_ne!(
+            subagent_cache_domain(&RuntimeString::from("thread-1"), kind.as_ref()),
+            subagent_cache_domain(&RuntimeString::from("thread-1"), other_kind.as_ref())
+        );
+    }
+
+    #[test]
+    fn missing_source_falls_back_to_a_stable_label() {
+        assert_eq!(
+            subagent_cache_domain(&RuntimeString::from("thread-1"), None)
+                .try_to_utf8()
+                .unwrap(),
+            "thread-1:subagent"
+        );
+    }
 }

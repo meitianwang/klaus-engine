@@ -484,6 +484,7 @@ fn approval_query_params(
         thinking: None,
         skip_cache_write: None,
         cache_ttl: None,
+        cache_domain: None,
         cache_key: None,
         plan_file_path: None,
         message_queue: None,

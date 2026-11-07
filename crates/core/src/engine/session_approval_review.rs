@@ -1196,6 +1196,7 @@ impl ReviewerRequest for ReviewAttempt {
                 effort: self.setup.target.effort.clone(),
                 skip_cache_write: None,
                 cache_ttl: None,
+                cache_domain: None,
                 cache_key: None,
                 context_management: None,
                 context_hints: None,

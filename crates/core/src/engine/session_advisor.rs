@@ -232,6 +232,7 @@ impl Session {
             self.id
                 .concat(&RuntimeString::from(format!(":advisor:{target_key}"))),
         );
+        request.cache_domain = None;
         let minimum_output = MINIMUM_OUTPUT.min(request.max_output_tokens);
         let mut available = available_output(&request, &caps);
         let summarized = available < minimum_output;
@@ -367,6 +368,7 @@ impl Session {
         ));
         request.bind_media_capabilities(&caps);
         request.cache_key = Some(self.id.concat(&RuntimeString::from(":advisor-summary")));
+        request.cache_domain = None;
         request.context_hints = None;
         request.thinking = None;
         request.effort = None;

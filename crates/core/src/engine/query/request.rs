@@ -458,6 +458,7 @@ pub(super) fn prepare_with_inference(
         },
         cache_ttl: params.cache_ttl,
         cache_key: params.cache_key.clone(),
+        cache_domain: params.cache_domain.clone(),
         context_management: config.context_management.clone(),
         context_hints,
         thinking_context: resolve_thinking_context(

@@ -1896,11 +1896,23 @@ fn render_gemini_compact_boundary_exact(
 ) -> RuntimeString {
     let (prefix, suffix) = match profile.prompt_style {
         ProviderPromptStyle::AnthropicReminder => (
-            "<system-reminder>\nEarlier conversation summary:\n",
-            "\n</system-reminder>",
+            format!(
+                "<system-reminder>\n{}\n\nEarlier conversation summary:\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            "\n</system-reminder>".to_string(),
         ),
-        ProviderPromptStyle::OpenAiDeveloper => ("# Earlier Conversation Summary\n\n", ""),
-        ProviderPromptStyle::Generic => ("[Earlier conversation summarized]\n", ""),
+        ProviderPromptStyle::OpenAiDeveloper => (
+            format!(
+                "# Earlier Conversation Summary\n\n{}\n\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            String::new(),
+        ),
+        ProviderPromptStyle::Generic => (
+            crate::provider::behavior::COMPACT_BOUNDARY_GENERIC_PREFIX.to_string(),
+            String::new(),
+        ),
     };
     RuntimeString::from(prefix)
         .concat(summary)
@@ -3035,8 +3047,9 @@ mod tests {
             let out = to_contents_with_profile(&messages, &profile, &[], false);
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].role, "user");
-            let expected =
-                RuntimeString::from(format!("[Earlier conversation summarized]\n{summary}"));
+            let expected = RuntimeString::from(format!(
+                "[Earlier conversation summarized. Build on the work already done and avoid duplicating it.]\n{summary}"
+            ));
             assert_eq!(out[0].parts[0].text.as_ref(), Some(&expected));
         }
     }
@@ -3406,6 +3419,7 @@ mod tests {
             effort: None,
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: None,
             context_management: None,
             context_hints: None,

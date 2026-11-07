@@ -435,6 +435,11 @@ pub struct QueryParams {
     pub cache_ttl: Option<CacheTtl>,
     /// Stable per-conversation cache-routing key.
     pub cache_key: Option<RuntimeString>,
+    /// Shared cache-routing domain for internal sessions spawned from one
+    /// parent thread. Wire providers prefer this over `cache_key` when routing
+    /// prompt caching; per-session identity and trace attribution keep using
+    /// the unique `cache_key`.
+    pub cache_domain: Option<RuntimeString>,
     /// This loop's plan-mode plan document, when the session has one. Feeds
     /// the plan-mode reminder's "read-only except plan file" guidance.
     pub plan_file_path: Option<RuntimePath>,

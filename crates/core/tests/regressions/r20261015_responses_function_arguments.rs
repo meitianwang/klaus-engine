@@ -97,6 +97,7 @@ async fn stream(mut events: Vec<Value>) -> Vec<ModelStreamEvent> {
         effort: None,
         skip_cache_write: None,
         cache_ttl: None,
+        cache_domain: None,
         cache_key: None,
         context_management: None,
         context_hints: None,

@@ -756,6 +756,12 @@ pub struct ModelRequest {
     pub cache_ttl: Option<CacheTtl>,
     /// Stable per-conversation cache-routing key (the `prompt_cache_key` field).
     pub cache_key: Option<RuntimeString>,
+    /// Shared cache-routing domain for internal sessions spawned from one
+    /// parent thread. Wire providers that route prompt caching by a
+    /// conversation key prefer this over the per-session `cache_key`, so
+    /// sibling internal sessions of the same source reuse one cached prefix
+    /// instead of each fragmenting the domain under its own identity.
+    pub cache_domain: Option<RuntimeString>,
     /// API-level context editing (Anthropic `context-management` beta). When
     /// present, the Anthropic first-party adapter asks the server to clear aged
     /// tool blocks in-flight; other adapters ignore it.
@@ -869,6 +875,9 @@ impl RuntimeEncode for ModelRequest {
         if let Some(cache_key) = &self.cache_key {
             object.field("cacheKey", cache_key)?;
         }
+        if let Some(cache_domain) = &self.cache_domain {
+            object.field("cacheDomain", cache_domain)?;
+        }
         if let Some(context_management) = &self.context_management {
             object.field("contextManagement", context_management)?;
         }
@@ -903,6 +912,7 @@ impl RuntimeDecode for ModelRequest {
                 skip_cache_write: object.optional("skipCacheWrite", &[])?,
                 cache_ttl: object.optional("cacheTtl", &[])?,
                 cache_key: object.optional("cacheKey", &[])?,
+            cache_domain: object.optional("cacheDomain", &[])?,
                 context_management: object.optional("contextManagement", &[])?,
                 context_hints: None,
                 thinking_context: object.optional("thinkingContext", &[])?,

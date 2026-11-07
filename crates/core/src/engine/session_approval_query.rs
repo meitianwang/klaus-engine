@@ -430,6 +430,7 @@ impl Session {
             thinking: (config.thinking && caps.thinking).then_some(ThinkingConfig::Adaptive),
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: Some(cache_key),
             plan_file_path: None,
             message_queue: None,

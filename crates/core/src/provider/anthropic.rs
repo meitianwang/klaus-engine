@@ -3464,11 +3464,23 @@ fn render_anthropic_compact_boundary_exact(
 ) -> RuntimeString {
     let (prefix, suffix) = match profile.prompt_style {
         ProviderPromptStyle::AnthropicReminder => (
-            "<system-reminder>\nEarlier conversation summary:\n",
-            "\n</system-reminder>",
+            format!(
+                "<system-reminder>\n{}\n\nEarlier conversation summary:\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            "\n</system-reminder>".to_string(),
         ),
-        ProviderPromptStyle::OpenAiDeveloper => ("# Earlier Conversation Summary\n\n", ""),
-        ProviderPromptStyle::Generic => ("[Earlier conversation summarized]\n", ""),
+        ProviderPromptStyle::OpenAiDeveloper => (
+            format!(
+                "# Earlier Conversation Summary\n\n{}\n\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            String::new(),
+        ),
+        ProviderPromptStyle::Generic => (
+            crate::provider::behavior::COMPACT_BOUNDARY_GENERIC_PREFIX.to_string(),
+            String::new(),
+        ),
     };
     RuntimeString::from(prefix)
         .concat(summary)
@@ -4099,7 +4111,7 @@ mod tests {
             )];
             let out = to_api_messages(&messages, "claude-sonnet-4-6", &[]);
             let expected_text = RuntimeString::from(format!(
-                "<system-reminder>\nEarlier conversation summary:\n{summary}\n</system-reminder>"
+                "<system-reminder>\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nEarlier conversation summary:\n{summary}\n</system-reminder>"
             ));
             assert_eq!(
                 out,
@@ -4168,6 +4180,7 @@ mod tests {
             effort: None,
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: None,
             context_management: None,
             context_hints: None,
@@ -5993,6 +6006,48 @@ mod tests {
             })
             .sum();
         assert_eq!(sys_marks + msg_marks, MAX_CACHE_BREAKPOINTS);
+    }
+
+    #[test]
+    fn skip_cache_write_keeps_the_ephemeral_tail_out_of_the_cache() {
+        // A summary-style request reuses the live cached prefix but must not
+        // create a cache entry for its one-off tail: the message breakpoint
+        // steps back to the penultimate message, which the prefix already
+        // cached, so the request reads without writing new cache.
+        let mut r = base_req();
+        r.messages = vec![
+            user_msg("history"),
+            Message::Assistant(AssistantMessage {
+                uuid: "a1".into(),
+                model: r.model.clone(),
+                usage: None,
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: "draft".into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })],
+            }),
+            user_msg("summary prompt"),
+        ];
+        let writing = build_params(&r, false, false, false, false);
+        let msgs = writing.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[2]["content"][0].get("cache_control").is_some());
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+
+        r.skip_cache_write = Some(true);
+        let skipping = build_params(&r, false, false, false, false);
+        let msgs = skipping.get("messages").unwrap().as_array().unwrap();
+        assert!(
+            msgs[2]["content"][0].get("cache_control").is_none(),
+            "the ephemeral tail must not carry a cache breakpoint"
+        );
+        assert!(
+            msgs[1]["content"][0].get("cache_control").is_some(),
+            "the breakpoint steps back to the penultimate message"
+        );
     }
 }
 

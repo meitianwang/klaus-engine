@@ -111,6 +111,14 @@ fn join_runtime_strings(values: &[RuntimeString], separator: &str) -> RuntimeStr
     joined
 }
 
+/// Handoff framing for the compact-boundary projection: the summary replaces
+/// retired history while the files and tool state it describes stay live, so
+/// the continuing assistant builds on the summarized work instead of redoing
+/// it.
+pub(crate) const COMPACT_BOUNDARY_HANDOFF: &str = "The conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.";
+pub(crate) const COMPACT_BOUNDARY_GENERIC_PREFIX: &str =
+    "[Earlier conversation summarized. Build on the work already done and avoid duplicating it.]\n";
+
 fn wrap_runtime_string(prefix: &str, text: &RuntimeString, suffix: &str) -> RuntimeString {
     concat_runtime_strings(&[prefix.into(), text.clone(), suffix.into()])
 }
@@ -165,15 +173,21 @@ pub fn render_provider_text_envelope(
         ProviderTextEnvelopeKind::CompactBoundary => match profile.prompt_style {
             ProviderPromptStyle::AnthropicReminder => render_provider_text_envelope(
                 ProviderTextEnvelopeKind::SystemReminder,
-                wrap_runtime_string("Earlier conversation summary:\n", &text, ""),
+                wrap_runtime_string(
+                    &format!("{COMPACT_BOUNDARY_HANDOFF}\n\nEarlier conversation summary:\n"),
+                    &text,
+                    "",
+                ),
                 profile,
                 options,
             ),
-            ProviderPromptStyle::OpenAiDeveloper => {
-                wrap_runtime_string("# Earlier Conversation Summary\n\n", &text, "")
-            }
+            ProviderPromptStyle::OpenAiDeveloper => wrap_runtime_string(
+                &format!("# Earlier Conversation Summary\n\n{COMPACT_BOUNDARY_HANDOFF}\n\n"),
+                &text,
+                "",
+            ),
             ProviderPromptStyle::Generic => {
-                wrap_runtime_string("[Earlier conversation summarized]\n", &text, "")
+                wrap_runtime_string(COMPACT_BOUNDARY_GENERIC_PREFIX, &text, "")
             }
         },
         ProviderTextEnvelopeKind::ToolError => match profile.prompt_style {
@@ -2294,9 +2308,9 @@ mod tests {
             ),
             (
                 ProviderTextEnvelopeKind::CompactBoundary,
-                "<system-reminder>\nEarlier conversation summary:\nbody\n</system-reminder>",
-                "# Earlier Conversation Summary\n\nbody",
-                "[Earlier conversation summarized]\nbody",
+                "<system-reminder>\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nEarlier conversation summary:\nbody\n</system-reminder>",
+                "# Earlier Conversation Summary\n\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nbody",
+                "[Earlier conversation summarized. Build on the work already done and avoid duplicating it.]\nbody",
             ),
             (
                 ProviderTextEnvelopeKind::ToolError,

@@ -430,6 +430,7 @@ mod tests {
             effort: None,
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: Some("session-1".into()),
             context_management: None,
             context_hints: None,

@@ -823,6 +823,7 @@ fn projected_request(
     request.skip_cache_write = Some(true);
     request.cache_ttl = None;
     request.cache_key = Some(cache_key);
+    request.cache_domain = None;
     request.context_management = None;
     request.thinking_context = Some(ThinkingContextPolicy::KeepAll);
     for native in input {

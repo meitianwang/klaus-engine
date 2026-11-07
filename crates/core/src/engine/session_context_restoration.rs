@@ -318,6 +318,7 @@ impl Session {
             reasoning_summary: config.reasoning_summary,
             skip_cache_write: Some(true),
             cache_ttl: None,
+            cache_domain: None,
             cache_key: Some(self.id.clone()),
             context_management: config.context_management.clone(),
             context_hints: None,

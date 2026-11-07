@@ -1,5 +1,6 @@
 //! The freshness checks the write-class tools run during input validation,
-//! before a write is applied.
+//! before a write is applied, plus the post-command sweep that tells the model
+//! when a shell command rewrote files it has already read.
 //!
 //! There are two rules because the tools carry different risk. Write and
 //! NotebookEdit put down content the model never had to match against the file,
@@ -11,6 +12,8 @@
 
 use crate::runtime_values::{RuntimePath, RuntimeString};
 use crate::types::file_state::FileStateCache;
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// The write-tool read-before-write / stale-write messages (verbatim).
 pub const NOT_READ_MESSAGE: &str =
@@ -70,6 +73,115 @@ pub fn check_stale_write(
         return Some(STALE_MESSAGE);
     }
     None
+}
+
+/// Command-text prefilter for the post-command stale-read sweep: only a
+/// command that plausibly rewrites files in place pays for stat-ing the
+/// tracked baselines. The in-place `sed`/`perl` forms are included because
+/// the shell runs them directly here — nothing else refreshes the baseline
+/// the model read before them.
+static MODIFYING_COMMAND_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"--write|--fix|--in-place|--auto-correct|\brun\s+format\b|\brun\s+fix\b|\b(yarn|pnpm)\s+format\b|\blint:file\b|\blint:fix\b|\bblack\b|\bisort\b|\bruff\s+format\b|\bcargo\s+(fmt|fix)\b|\brustfmt\b|\bgo\s+fmt\b|\bterraform\s+fmt\b|\bdprint\s+fmt\b|\bswiftformat\b|\bphpcbf\b|\bsed\b[^\r\n]*\s-\w*i|\bperl\b[^\r\n]*\s-\w*i",
+    )
+    .expect("static stale-read sweep pattern")
+});
+
+pub fn command_may_modify_files(command: &str) -> bool {
+    MODIFYING_COMMAND_PATTERN.is_match(command)
+}
+
+/// Milliseconds since the UNIX epoch in a metadata snapshot (the unit read
+/// baselines record).
+pub(crate) fn metadata_mtime_ms(meta: &std::fs::Metadata) -> f64 {
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as f64 * 1000.0 + f64::from(d.subsec_nanos()) / 1e6)
+        .unwrap_or(0.0)
+}
+
+/// Current wall-clock milliseconds since the UNIX epoch.
+pub(crate) fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as f64 * 1e3 + d.subsec_nanos() as f64 / 1e6)
+        .unwrap_or(0.0)
+}
+
+/// Tracked read baselines a shell command invalidated: a file is stale when
+/// its on-disk mtime moved past BOTH the command start and the recorded
+/// baseline. A file already newer than its baseline before the command ran
+/// is the write guards' business, not this sweep's.
+pub async fn tracked_files_modified_since(
+    command: &RuntimeString,
+    started_at_ms: f64,
+    file_state: &dyn FileStateCache,
+) -> Vec<RuntimePath> {
+    if !command_may_modify_files(&command.try_to_utf8().unwrap_or_default()) {
+        return Vec::new();
+    }
+    let mut modified = Vec::new();
+    for (path, entry) in file_state.entries() {
+        let Ok(os_path) = crate::fs::node_path::project_runtime_path(&path, "path") else {
+            continue;
+        };
+        let Ok(meta) = tokio::fs::metadata(&os_path).await else {
+            continue;
+        };
+        let disk_mtime = metadata_mtime_ms(&meta);
+        if disk_mtime > started_at_ms && disk_mtime > entry.mtime_ms {
+            modified.push(path);
+        }
+    }
+    modified.sort_by_cached_key(|path| path.as_runtime_string().try_to_utf8().unwrap_or_default());
+    modified
+}
+
+/// The model-visible notice that a shell command rewrote files whose read
+/// baselines are now stale, listing up to five cwd-relative paths.
+pub fn stale_read_hint(modified: &[RuntimePath], cwd: &RuntimePath) -> Option<RuntimeString> {
+    if modified.is_empty() {
+        return None;
+    }
+    let cwd_text = cwd.as_runtime_string().try_to_utf8().unwrap_or_default();
+    let listed: Vec<String> = modified
+        .iter()
+        .take(5)
+        .map(|path| {
+            let text = path.as_runtime_string().try_to_utf8().unwrap_or_default();
+            match strip_cwd_prefix(&text, &cwd_text) {
+                Some(rest) if !rest.is_empty() => rest.to_owned(),
+                _ => text,
+            }
+        })
+        .collect();
+    let extra = modified.len().saturating_sub(5);
+    let more = if extra > 0 {
+        format!(" and {extra} more")
+    } else {
+        String::new()
+    };
+    let noun = if modified.len() == 1 { "file" } else { "files" };
+    Some(RuntimeString::from_utf8(&format!(
+        "[This command modified {} {} you've previously read: {}{}. Call Read before editing.]",
+        modified.len(),
+        noun,
+        listed.join(", "),
+        more
+    )))
+}
+
+fn strip_cwd_prefix<'a>(path: &'a str, cwd: &'a str) -> Option<&'a str> {
+    let trimmed = cwd
+        .strip_suffix('/')
+        .or_else(|| cwd.strip_suffix('\\'))
+        .unwrap_or(cwd);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rest = path.strip_prefix(trimmed)?;
+    rest.strip_prefix('/').or_else(|| rest.strip_prefix('\\'))
 }
 
 #[cfg(test)]
@@ -216,5 +328,83 @@ mod tests {
             check_stale_write(&path, 200.0, &c, &RuntimeString::from("changed")),
             Some(STALE_MESSAGE)
         );
+    }
+
+    #[test]
+    fn modifying_command_prefilter_matches_in_place_rewrites() {
+        assert!(command_may_modify_files("cargo fmt"));
+        assert!(command_may_modify_files("cargo fix --allow-dirty"));
+        assert!(command_may_modify_files("prettier --write src/app.ts"));
+        assert!(command_may_modify_files("ruff format ."));
+        assert!(command_may_modify_files("black ."));
+        assert!(command_may_modify_files("npm run format"));
+        assert!(command_may_modify_files("sed -i '' 's/a/b/' f.txt"));
+        assert!(command_may_modify_files("sed -i 's/a/b/' f.txt"));
+        assert!(command_may_modify_files("perl -pi -e 's/a/b/' f.txt"));
+    }
+
+    #[test]
+    fn modifying_command_prefilter_ignores_read_only_commands() {
+        assert!(!command_may_modify_files("ls -la"));
+        assert!(!command_may_modify_files("cat f.txt"));
+        assert!(!command_may_modify_files("grep -rn pattern ."));
+        assert!(!command_may_modify_files("git status"));
+        assert!(!command_may_modify_files("echo hi"));
+    }
+
+    #[tokio::test]
+    async fn sweep_detects_files_modified_after_the_command_started() {
+        let dir = std::env::temp_dir().join(format!("klaus-freshness-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tracked.txt");
+        std::fs::write(&file, "original").unwrap();
+        let path = RuntimePath::from(file.to_string_lossy().into_owned());
+        let c = TestCache::default();
+        // A baseline recorded long before the command ran.
+        c.record(&path, 1.0, full("original"));
+        let modified =
+            tracked_files_modified_since(&RuntimeString::from("cargo fmt"), 2.0, &c).await;
+        assert_eq!(modified.len(), 1);
+        assert_eq!(
+            modified[0].as_runtime_string().try_to_utf8().unwrap(),
+            path.as_runtime_string().try_to_utf8().unwrap()
+        );
+        // A command that cannot modify files skips the sweep entirely.
+        let skipped =
+            tracked_files_modified_since(&RuntimeString::from("ls -la"), 2.0, &c).await;
+        assert!(skipped.is_empty());
+        // A baseline already at (or past) the on-disk mtime is not stale.
+        let disk = metadata_mtime_ms(&std::fs::metadata(&file).unwrap());
+        c.record(&path, disk + 1000.0, full("original"));
+        let fresh =
+            tracked_files_modified_since(&RuntimeString::from("cargo fmt"), 2.0, &c).await;
+        assert!(fresh.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_read_hint_lists_relative_paths_and_caps_at_five() {
+        let cwd = RuntimePath::from("/work/project");
+        let one = vec![RuntimePath::from("/work/project/src/main.rs")];
+        let hint = stale_read_hint(&one, &cwd).unwrap().try_to_utf8().unwrap();
+        assert_eq!(
+            hint,
+            "[This command modified 1 file you've previously read: src/main.rs. Call Read before editing.]"
+        );
+        let many: Vec<RuntimePath> = (0..7)
+            .map(|i| RuntimePath::from(format!("/work/project/f{i}.txt")))
+            .collect();
+        let hint = stale_read_hint(&many, &cwd).unwrap().try_to_utf8().unwrap();
+        assert!(
+            hint.contains(
+                "7 files you've previously read: f0.txt, f1.txt, f2.txt, f3.txt, f4.txt and 2 more."
+            ),
+            "{hint}"
+        );
+        assert!(stale_read_hint(&[], &cwd).is_none());
+        // A path outside cwd stays absolute.
+        let outside = vec![RuntimePath::from("/elsewhere/x.txt")];
+        let hint = stale_read_hint(&outside, &cwd).unwrap().try_to_utf8().unwrap();
+        assert!(hint.contains("/elsewhere/x.txt"), "{hint}");
     }
 }

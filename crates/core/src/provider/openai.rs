@@ -1206,7 +1206,7 @@ fn build_chat_params_with_identity(
             ]),
         );
     }
-    if let Some(ck) = &req.cache_key {
+    if let Some(ck) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
         obj.insert("prompt_cache_key", vs(ck.clone()));
     }
     if let Some(identity) = identity {
@@ -1719,7 +1719,7 @@ fn build_responses_params_with_tool_mode(
     if !text.is_empty() {
         obj.insert("text", Value::Object(text));
     }
-    if let Some(ck) = &req.cache_key {
+    if let Some(ck) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
         obj.insert("prompt_cache_key", vs(ck.clone()));
     }
     Ok(Value::Object(obj))
@@ -2355,11 +2355,23 @@ fn render_openai_compact_boundary_exact(
 ) -> RuntimeString {
     let (prefix, suffix) = match profile.prompt_style {
         ProviderPromptStyle::AnthropicReminder => (
-            "<system-reminder>\nEarlier conversation summary:\n",
-            "\n</system-reminder>",
+            format!(
+                "<system-reminder>\n{}\n\nEarlier conversation summary:\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            "\n</system-reminder>".to_string(),
         ),
-        ProviderPromptStyle::OpenAiDeveloper => ("# Earlier Conversation Summary\n\n", ""),
-        ProviderPromptStyle::Generic => ("[Earlier conversation summarized]\n", ""),
+        ProviderPromptStyle::OpenAiDeveloper => (
+            format!(
+                "# Earlier Conversation Summary\n\n{}\n\n",
+                crate::provider::behavior::COMPACT_BOUNDARY_HANDOFF
+            ),
+            String::new(),
+        ),
+        ProviderPromptStyle::Generic => (
+            crate::provider::behavior::COMPACT_BOUNDARY_GENERIC_PREFIX.to_string(),
+            String::new(),
+        ),
     };
     RuntimeString::from(prefix)
         .concat(summary)
@@ -6611,7 +6623,7 @@ mod tests {
                 (
                     "content",
                     vs(RuntimeString::from(format!(
-                        "# Earlier Conversation Summary\n\n{summary}"
+                        "# Earlier Conversation Summary\n\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\n{summary}"
                     ))),
                 ),
             ])]);
@@ -6758,6 +6770,7 @@ mod tests {
             effort: None,
             skip_cache_write: None,
             cache_ttl: None,
+            cache_domain: None,
             cache_key: None,
             context_management: None,
             context_hints: None,
@@ -7980,7 +7993,7 @@ mod tests {
         );
         assert_eq!(
             arr[5],
-            json!({ "role": "user", "content": "[Earlier conversation summarized]\nsum" })
+            json!({ "role": "user", "content": "[Earlier conversation summarized. Build on the work already done and avoid duplicating it.]\nsum" })
         );
     }
 

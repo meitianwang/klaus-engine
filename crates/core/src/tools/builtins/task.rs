@@ -1111,6 +1111,7 @@ pub(super) async fn dispatch_native_message_tool(
         thinking: None,
         skip_cache_write: None,
         cache_ttl: None,
+        cache_domain: None,
         cache_key: None,
         plan_file_path: None,
         message_queue: None,
