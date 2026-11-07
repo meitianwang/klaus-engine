@@ -43,6 +43,9 @@ mod r20261018_cursor_metadata_discovery;
 #[path = "../../../core/tests/regressions/r96e85d7c_cursor_checkpoint_batch.rs"]
 mod r96e85d7c_cursor_checkpoint_batch;
 
+#[path = "../../../core/tests/regressions/r91f6a179_cursor_malformed_response.rs"]
+mod r91f6a179_cursor_malformed_response;
+
 #[path = "../../tests/r20261017_goal_close_facade.rs"]
 mod r20261017_goal_close_facade;
 

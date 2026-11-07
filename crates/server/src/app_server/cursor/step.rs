@@ -75,6 +75,38 @@ fn safe_shape(value: &Value, known: &[&str]) -> Value {
     json!({"type":kind(value),"fields":fields,"unknownFieldCount":unknown})
 }
 
+fn invalid_message(site: &'static str, value: &Value) -> String {
+    let shape = safe_shape(value, &["role", "content", "type", "text"]);
+    super::diagnostics::event(
+        "native_message_rejected",
+        json!({"site":site,"shape":shape}),
+    );
+    eprintln!(
+        "[Cursor] native message rejected site={site} shape={}",
+        shape
+    );
+    "cursor_native_message_invalid".into()
+}
+
+fn decode_message(bytes: &[u8], site: &'static str) -> Result<Value, String> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        // Parser messages can quote input. Record only location and category.
+        super::diagnostics::event(
+            "native_message_rejected",
+            json!({"site":site,"bytes":bytes.len(),"category":format!("{:?}",error.classify()),
+                "line":error.line(),"column":error.column()}),
+        );
+        eprintln!(
+            "[Cursor] native message rejected site={site} bytes={} category={:?} line={} column={}",
+            bytes.len(),
+            error.classify(),
+            error.line(),
+            error.column()
+        );
+        "cursor_native_message_invalid".into()
+    })
+}
+
 fn rejected_exec(exec: &Value) {
     let known = [
         "id",
@@ -542,18 +574,22 @@ impl Step {
         }
         self.pending.clear();
         if let Some(pending) = checkpoint.get("pendingToolCalls") {
-            let pending = pending.as_array().ok_or("cursor_native_message_invalid")?;
+            let pending = pending
+                .as_array()
+                .ok_or_else(|| invalid_message("checkpoint.pending", pending))?;
             if pending.len() > MAX_TOOLS {
                 return Err("cursor_native_message_limit".into());
             }
             self.pending = pending
                 .iter()
                 .map(|value| {
-                    let text = value.as_str().ok_or("cursor_native_message_invalid")?;
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| invalid_message("checkpoint.pending_item", value))?;
                     if text.len() > 4 * 1024 * 1024 {
                         return Err("cursor_native_message_limit".into());
                     }
-                    serde_json::from_str(text).map_err(|_| "cursor_native_message_invalid".into())
+                    decode_message(text.as_bytes(), "checkpoint.pending_json")
                 })
                 .collect::<Result<_, String>>()?;
         }
@@ -603,22 +639,22 @@ impl Step {
                 continue;
             }
             if message["role"] != "assistant" {
-                return Err("cursor_native_message_invalid".into());
+                return Err(invalid_message("certify.role", message));
             }
             for part in message["content"]
                 .as_array()
-                .ok_or("cursor_native_message_invalid")?
+                .ok_or_else(|| invalid_message("certify.content", message))?
             {
                 match part["type"].as_str() {
                     Some("text") => text.push_str(
                         part["text"]
                             .as_str()
-                            .ok_or("cursor_native_message_invalid")?,
+                            .ok_or_else(|| invalid_message("certify.text", part))?,
                     ),
                     Some("reasoning") => reasoning.push_str(
                         part["text"]
                             .as_str()
-                            .ok_or("cursor_native_message_invalid")?,
+                            .ok_or_else(|| invalid_message("certify.reasoning", part))?,
                     ),
                     Some("redacted-reasoning") => {}
                     Some("tool-call") => {
@@ -930,6 +966,20 @@ impl Step {
         self.certify(&self.terminal_native, false)
     }
 
+    fn rejection(&self, error: String, stage: &'static str) -> String {
+        super::diagnostics::event(
+            "certification_failed",
+            json!({"stage":stage,"error":super::diagnostics::error_code(&error),
+                "packetCount":self.events,"heldCalls":self.held.len(),
+                "pendingMessages":self.pending.len(),"initialRoots":self.initial_roots.len(),
+                "latestRoots":self.latest_roots.as_ref().map(Vec::len),
+                "batchCount":self.batch.count,"batchStarted":self.batch.started.len(),
+                "batchCompleted":self.batch.completed.len(),"textBytes":self.text.len(),
+                "ended":self.ended}),
+        );
+        error
+    }
+
     fn new_roots(&self) -> Result<Option<Vec<Value>>, String> {
         let Some(roots) = &self.latest_roots else {
             return Ok(None);
@@ -947,10 +997,8 @@ impl Step {
                     let original = self
                         .blobs
                         .get(original.as_str().ok_or("cursor_checkpoint_invalid")?)?;
-                    let original: Value = serde_json::from_slice(original)
-                        .map_err(|_| "cursor_native_message_invalid")?;
-                    let updated: Value = serde_json::from_slice(bytes)
-                        .map_err(|_| "cursor_native_message_invalid")?;
+                    let original = decode_message(original, "roots.original_json")?;
+                    let updated = decode_message(bytes, "roots.updated_json")?;
                     // Content hashes may change when identical JSON is encoded
                     // with different field ordering. The original caller-owned
                     // signed message remains the replay source.
@@ -959,9 +1007,7 @@ impl Step {
                     }
                 }
             } else {
-                native.push(
-                    serde_json::from_slice(bytes).map_err(|_| "cursor_native_message_invalid")?,
-                );
+                native.push(decode_message(bytes, "roots.appended_json")?);
             }
         }
         Ok(Some(native))
@@ -1266,6 +1312,21 @@ pub(super) async fn invoke(
     output: &mut super::responses::Output,
     downstream: &mpsc::Sender<Bytes>,
 ) -> Result<Certified, String> {
+    super::diagnostics::result(
+        "model_step",
+        invoke_inner(body, model, credential, generation, output, downstream),
+    )
+    .await
+}
+
+async fn invoke_inner(
+    body: &Value,
+    model: &Value,
+    credential: &credential::Credential,
+    generation: u64,
+    output: &mut super::responses::Output,
+    downstream: &mpsc::Sender<Bytes>,
+) -> Result<Certified, String> {
     for field in ["temperature", "top_p", "stop"] {
         if body.get(field).is_some_and(|value| !value.is_null()) {
             return Err(format!("cursor_{field}_unsupported"));
@@ -1310,12 +1371,17 @@ pub(super) async fn invoke(
     });
     let client = credential::inference_client()?;
     let inference_origin = credential.inference_origin()?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    super::diagnostics::event(
+        "request_send",
+        json!({"requestId":request_id,"generation":generation}),
+    );
     let request = credential::sdk_authenticated(
         client.post(format!("{}/agent.v1.AgentService/Run", inference_origin)),
         credential,
     )
     .header("x-cursor-agent-allowed-tools", allowed_tools)
-    .header("x-request-id", uuid::Uuid::new_v4().to_string())
+    .header("x-request-id", request_id)
     .header("x-original-request-id", uuid::Uuid::new_v4().to_string())
     .version(reqwest::Version::HTTP_2)
     .header("content-type", "application/connect+json")
@@ -1374,7 +1440,9 @@ pub(super) async fn invoke(
                 clean_terminal = true;
                 continue;
             }
-            let replies = step.receive(value)?;
+            let replies = step
+                .receive(value)
+                .map_err(|error| step.rejection(error, "receive"))?;
             if let Some(update) = value.get("interactionUpdate") {
                 tokio::select! {
                     _ = change.changed() => return Err("cursor_credential_changed".into()),
@@ -1389,14 +1457,19 @@ pub(super) async fn invoke(
             }
         }
         if clean_terminal {
-            let certified = step.finish()?;
+            let certified = step
+                .finish()
+                .map_err(|error| step.rejection(error, "finish"))?;
             drop(source);
             drop(input_tx);
             drop(client);
             credential::check_generation(generation)?;
             return Ok(certified);
         }
-        if let Some(certified) = step.ready()? {
+        if let Some(certified) = step
+            .ready()
+            .map_err(|error| step.rejection(error, "ready"))?
+        {
             // Dropping both halves closes the HTTP/2 stream before the caller
             // can observe calls or run any tool. No execution result is sent.
             drop(source);
@@ -1412,6 +1485,39 @@ pub(super) async fn invoke(
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    #[test]
+    fn malformed_message_diagnostics_preserve_strict_certification_without_echoing_values() {
+        let state = step();
+        for message in [
+            json!({"role":"private-role","content":[]}),
+            json!({"role":"assistant","content":"private-content"}),
+            json!({"role":"assistant","content":null}),
+            json!({"role":"assistant","content":[{"type":"text"}]}),
+            json!({"role":"assistant","content":[{"type":"text","text":null}]}),
+            json!({"role":"assistant","content":[{"type":"reasoning","text":1}]}),
+        ] {
+            assert!(matches!(
+                state.certify(&[message], false),
+                Err(error) if error == "cursor_native_message_invalid"
+            ));
+        }
+        for value in [json!(null), json!([{}]), json!(["{private-invalid-json"])] {
+            assert_eq!(
+                step()
+                    .checkpoint(&json!({"pendingToolCalls":value}))
+                    .unwrap_err(),
+                "cursor_native_message_invalid"
+            );
+        }
+        let private = json!({"role":"private-role","content":"private-content","text":"private-text","private-field":"private-value"});
+        let diagnostic = safe_shape(&private, &["role", "content", "type", "text"]).to_string();
+        assert!(!diagnostic.contains("private"));
+        assert_eq!(
+            decode_message(b"{private-json", "test.json").unwrap_err(),
+            "cursor_native_message_invalid"
+        );
+    }
 
     #[test]
     fn rejected_packet_diagnostics_contain_only_bounded_known_field_names_and_types() {

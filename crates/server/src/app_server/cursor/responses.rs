@@ -232,6 +232,11 @@ impl Output {
 }
 
 pub(super) fn public_error(error: &str) -> Value {
+    // A malformed model message has not been certified or exposed as an
+    // executable call. Let the engine discard partial output and resample
+    // within its existing retry budget. Integrity and ownership failures
+    // remain terminal.
+    let invalid_model_message = error == "cursor_native_message_invalid";
     let protocol_guard = error.starts_with("cursor_native_")
         || error.starts_with("cursor_read_intent_")
         || error.starts_with("cursor_tool_batch_")
@@ -267,14 +272,16 @@ pub(super) fn public_error(error: &str) -> Value {
         "permission_error"
     } else if error == "cursor_rate_limit" {
         "rate_limit_error"
-    } else if matches!(
-        error,
-        "cursor_overloaded"
-            | "cursor_network_error"
-            | "cursor_response_read_failed"
-            | "cursor_inference_incomplete"
-            | "cursor_inference_timeout"
-    ) {
+    } else if invalid_model_message
+        || matches!(
+            error,
+            "cursor_overloaded"
+                | "cursor_network_error"
+                | "cursor_response_read_failed"
+                | "cursor_inference_incomplete"
+                | "cursor_inference_timeout"
+        )
+    {
         "overloaded_error"
     } else if matches!(
         error,

@@ -397,6 +397,23 @@ fn http_and_connect_capacity_errors_retain_safe_classifications() {
     );
 }
 
+#[test]
+fn malformed_messages_allow_bounded_recovery_but_integrity_failures_remain_terminal() {
+    let error = responses::public_error("cursor_native_message_invalid");
+    assert_eq!(error["error"]["type"], "overloaded_error");
+    assert_eq!(error["message"], "cursor_model_response_unsupported");
+    for guard in [
+        "cursor_checkpoint_history_changed",
+        "cursor_tool_not_owned",
+        "cursor_native_response_mismatch",
+        "cursor_tool_batch_duplicate",
+        "cursor_native_message_limit",
+    ] {
+        let error = responses::public_error(guard);
+        assert_eq!(error["error"]["type"], "invalid_request_error", "{guard}");
+    }
+}
+
 pub(crate) async fn default_inventory_fixture(
     read_path: String,
 ) -> (
@@ -443,6 +460,88 @@ pub(crate) async fn image_inventory_fixture() -> (
     tokio::task::JoinHandle<()>,
 ) {
     model_step_fixture(String::new(), "image").await
+}
+
+pub(crate) async fn malformed_message_fixture(
+    persistent: bool,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    model_step_fixture(
+        String::new(),
+        if persistent {
+            "terminal-malformed-always"
+        } else {
+            "terminal-malformed-once"
+        },
+    )
+    .await
+}
+
+pub(crate) async fn malformed_tool_message_fixture(
+    read_path: String,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    model_step_fixture(read_path, "malformed-tool-once").await
+}
+
+#[tokio::test]
+async fn malformed_message_diagnostics_correlate_request_site_and_state_without_content() {
+    let _guard = test_lock().lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    set_config_root(temp.path());
+    let (api, api_task) = unary_fixture().await;
+    let (inference, _, inference_task) = malformed_message_fixture(true).await;
+    adopt_credential(
+        json!({"accessToken":"fixture-token","clientIdentity":"fixture-machine","backendUrl":api,"inferenceUrl":inference}),
+    );
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let (result, events) = diagnostics::capture(bridge::run(provider_body(), &tx)).await;
+    assert_eq!(result.unwrap_err(), "cursor_native_message_invalid");
+    let request = events
+        .iter()
+        .find(|event| event["operation"] == "model_step" && event["phase"] == "request_send")
+        .unwrap();
+    let request_id = request["fields"]["requestId"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    let rejection = events
+        .iter()
+        .find(|event| event["phase"] == "native_message_rejected")
+        .unwrap();
+    assert_eq!(rejection["fields"]["site"], "certify.content");
+    assert_eq!(request["operationId"], rejection["operationId"]);
+    let state = events
+        .iter()
+        .find(|event| event["phase"] == "certification_failed")
+        .unwrap();
+    assert_eq!(state["operationId"], request["operationId"]);
+    assert_eq!(state["fields"]["stage"], "finish");
+    assert_eq!(state["fields"]["error"], "cursor_native_message_invalid");
+    assert!(state["fields"]["packetCount"].as_u64().unwrap() > 0);
+    assert_eq!(state["fields"]["heldCalls"], 0);
+    let end = events
+        .iter()
+        .find(|event| event["operation"] == "model_step" && event["phase"] == "end")
+        .unwrap();
+    assert_eq!(end["fields"]["error"], "cursor_native_message_invalid");
+    let encoded = serde_json::to_string(&events).unwrap();
+    for private in [
+        "fixture-token",
+        "fixture-machine",
+        "UNCERTIFIED_PARTIAL",
+        "Find the read tool",
+        "signed-terminal",
+    ] {
+        assert!(!encoded.contains(private), "{private}");
+    }
+    logout(None).unwrap();
+    api_task.abort();
+    inference_task.abort();
 }
 
 async fn model_step_fixture(
@@ -693,8 +792,16 @@ async fn model_step_fixture(
                                                 if mode == "foreign-tool" {
                                                     exec["providerIdentifier"] = json!("foreign");
                                                 }
-                                                let native_read = mode == "normal" && results == 1;
+                                                let native_read = matches!(
+                                                    mode,
+                                                    "normal" | "malformed-tool-once"
+                                                ) && results == 1;
                                                 let mut native = native;
+                                                if mode == "malformed-tool-once"
+                                                    && captured.lock().unwrap().len() == 1
+                                                {
+                                                    native["content"][0]["text"] = Value::Null;
+                                                }
                                                 let (started, execution) = if native_read {
                                                     native["content"][1]["toolName"] =
                                                         json!("Read");
@@ -793,12 +900,18 @@ async fn model_step_fixture(
                                                     }
                                                 }
                                             } else {
-                                                let native = json!({"role":"assistant","id":"terminal","content":[{"type":"reasoning","text":"Reason","signature":"signed-terminal","providerOptions":{"cursor":{"modelName":"fixture-high-fast"}}},{"type":"text","text":"FACADE_TOOL_OK"}],"providerOptions":{"cursor":{"modelName":"fixture-high-fast"}}});
+                                                let malformed = mode == "terminal-malformed-always"
+                                                    || mode == "terminal-malformed-once"
+                                                        && captured.lock().unwrap().len() == 1;
+                                                let mut native = json!({"role":"assistant","id":"terminal","content":[{"type":"reasoning","text":"Reason","signature":"signed-terminal","providerOptions":{"cursor":{"modelName":"fixture-high-fast"}}},{"type":"text","text":"FACADE_TOOL_OK"}],"providerOptions":{"cursor":{"modelName":"fixture-high-fast"}}});
+                                                if malformed {
+                                                    native["content"] = Value::Null;
+                                                }
                                                 let bytes = serde_json::to_vec(&native).unwrap();
                                                 let key = STANDARD.encode(Sha256::digest(&bytes));
                                                 let mut final_roots = checkpoint_roots;
                                                 final_roots.push(json!(key));
-                                                tx.send(send(json!({"interactionUpdate":{"textDelta":{"text":"FACADE_TOOL_OK"}},"ttftBreakdown":{"providerTtftMs":2.5,"clientClock":false}}))).await.unwrap();
+                                                tx.send(send(json!({"interactionUpdate":{"textDelta":{"text":if malformed {"UNCERTIFIED_PARTIAL"} else {"FACADE_TOOL_OK"}}},"ttftBreakdown":{"providerTtftMs":2.5,"clientClock":false}}))).await.unwrap();
                                                 if mode == "terminal-streaming" {
                                                     tokio::time::sleep(
                                                         std::time::Duration::from_millis(250),

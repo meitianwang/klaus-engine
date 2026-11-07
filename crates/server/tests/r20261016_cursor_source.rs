@@ -448,14 +448,117 @@ async fn cursor_named_facade_permission_denial_prevents_write_and_replays_the_lo
 }
 
 pub(super) async fn run_default_inventory(deny_write: bool, metadata: bool) {
-    run_inventory(deny_write, metadata, false).await;
+    run_inventory(deny_write, metadata, false, false).await;
 }
 
 pub(super) async fn run_delayed_checkpoint_inventory() {
-    run_inventory(false, true, true).await;
+    run_inventory(false, true, true, false).await;
 }
 
-async fn run_inventory(deny_write: bool, metadata: bool, delayed_checkpoint: bool) {
+pub(super) async fn run_malformed_tool_response() {
+    run_inventory(false, false, false, true).await;
+}
+
+pub(super) async fn run_malformed_response(persistent: bool) {
+    let _guard = super::super::cursor::test_lock().lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let (api, api_task) = super::super::cursor::tests::unary_fixture().await;
+    let (inference, captured, inference_task) =
+        super::super::cursor::tests::malformed_message_fixture(persistent).await;
+    let agent = make_agent_with_provider_and_config(Arc::new(fake_provider()), None, None);
+    let mut client = TestClient::start_full(
+        crate::lifecycle::engine_sessions(agent, None).create_session,
+        None,
+        Some(temp.path().join("rules.json")),
+        Some(config),
+    );
+    client.initialize().await;
+    client.send(json!({"id":701,"method":"cursor/adoptCredential","params":{"userInfo":{"accessToken":"fixture-token","clientIdentity":"fixture-machine","backendUrl":api,"inferenceUrl":inference}}})).await;
+    assert_eq!(client.response_for(701).await.0["result"]["ok"], true);
+    client.send(json!({"id":702,"method":"session/start","params":{"init":{"cwd":temp.path(),"modelSelection":"cursor:auto","config":{"maxRetries":1,"maxOutputTokens":256}}}})).await;
+    let started = client.response_for(702).await.0;
+    assert!(started.get("error").is_none(), "{started}");
+    let session = started["result"]["sessionId"].as_str().unwrap();
+    client.send(json!({"id":703,"method":"turn/start","params":{"sessionId":session,"input":"Reply with a short answer."}})).await;
+    let (_, early) = client.response_for(703).await;
+    let mut pending: std::collections::VecDeque<_> = early.into();
+    let mut events = Vec::new();
+    loop {
+        assert!(events.len() < 512, "bounded recovery notifications");
+        let event = match pending.pop_front() {
+            Some(event) => event,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), client.next_message())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "recovery stalled: {}",
+                        serde_json::to_string(&events).unwrap()
+                    )
+                }),
+        };
+        assert!(
+            event["params"]["event"].get("dynamicToolCall").is_none(),
+            "uncertified messages cannot expose calls: {event}"
+        );
+        let terminal = matches!(
+            event["method"].as_str(),
+            Some("turn/completed" | "turn/failed")
+        ) || event["params"]["event"]["event"]["type"] == "turn.failed";
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    let encoded = serde_json::to_string(&events).unwrap();
+    assert_eq!(captured.lock().unwrap().len(), 2, "{encoded}");
+    let partial = events
+        .iter()
+        .find_map(|message| {
+            let event = &message["params"]["event"]["event"];
+            (event["type"] == "text.delta" && event["text"] == "UNCERTIFIED_PARTIAL")
+                .then(|| event["messageId"].clone())
+        })
+        .expect("partial text before certification failure");
+    assert!(
+        events.iter().any(|message| {
+            let event = &message["params"]["event"]["event"];
+            event["type"] == "tombstone" && event["uuid"] == partial
+        }),
+        "{encoded}"
+    );
+    if persistent {
+        assert_eq!(
+            events.last().unwrap()["params"]["event"]["event"]["type"],
+            "turn.failed",
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains("cursor_model_response_unsupported"),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("FACADE_TOOL_OK"), "{encoded}");
+    } else {
+        assert!(encoded.contains("FACADE_TOOL_OK"), "{encoded}");
+        assert_eq!(
+            events.last().unwrap()["method"],
+            "turn/completed",
+            "{encoded}"
+        );
+    }
+    client.writer.shutdown().await.unwrap();
+    client.close().await;
+    api_task.abort();
+    inference_task.abort();
+}
+
+async fn run_inventory(
+    deny_write: bool,
+    metadata: bool,
+    delayed_checkpoint: bool,
+    malformed: bool,
+) {
     let _guard = super::super::cursor::test_lock().lock().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("config.toml");
@@ -467,6 +570,11 @@ async fn run_inventory(deny_write: bool, metadata: bool, delayed_checkpoint: boo
     let (inference, captured, inference_task) = if deny_write {
         super::super::cursor::tests::permission_inventory_fixture(
             denied.to_string_lossy().into_owned(),
+        )
+        .await
+    } else if malformed {
+        super::super::cursor::tests::malformed_tool_message_fixture(
+            file.to_string_lossy().into_owned(),
         )
         .await
     } else if delayed_checkpoint {
@@ -518,6 +626,9 @@ async fn run_inventory(deny_write: bool, metadata: bool, delayed_checkpoint: boo
     let (adoption, _) = client.response_for(2).await;
     assert_eq!(adoption["result"]["ok"], true, "{adoption}");
     let mut engine_config = json!({"maxRetries":0,"maxOutputTokens":256});
+    if malformed {
+        engine_config["maxRetries"] = json!(1);
+    }
     if deny_write {
         engine_config["approval_policy"] = json!("on-request");
         engine_config["sandbox_mode"] = json!("read-only");
@@ -565,7 +676,48 @@ async fn run_inventory(deny_write: bool, metadata: bool, delayed_checkpoint: boo
             .all(|message| message["method"] != "turn/failed"),
         "{events}"
     );
-    let requests = captured.lock().expect("captured").clone();
+    let mut requests = captured.lock().expect("captured").clone();
+    if malformed {
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0]["messages"], requests[1]["messages"],
+            "retry retains caller history without uncertified calls or their results"
+        );
+        assert_eq!(
+            requests[2]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests[3]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            2
+        );
+        for name in ["tool_search", "read"] {
+            assert_eq!(
+                notifications
+                    .iter()
+                    .filter(|message| {
+                        let event = &message["params"]["event"]["event"];
+                        event["type"] == "item.completed"
+                            && event["item"]["type"] == "tool_call"
+                            && event["item"]["toolName"] == name
+                    })
+                    .count(),
+                1,
+                "{events}"
+            );
+        }
+        requests.remove(0);
+    }
     if delayed_checkpoint {
         assert!(requests[..2]
             .iter()

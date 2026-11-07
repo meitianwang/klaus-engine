@@ -215,12 +215,21 @@ pub(super) fn error_code(error: &str) -> &'static str {
         "cursor_rate_limit",
         "cursor_overloaded",
         "cursor_upstream_error",
+        "cursor_native_message_invalid",
     ];
     CODES
         .iter()
         .copied()
         .find(|code| *code == error)
         .unwrap_or("unclassified")
+}
+
+#[cfg(test)]
+pub(super) async fn capture<T>(future: impl Future<Output = T>) -> (T, Vec<Value>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let result = CAPTURE.scope(events.clone(), future).await;
+    let captured = events.lock().unwrap().clone();
+    (result, captured)
 }
 
 #[cfg(test)]
