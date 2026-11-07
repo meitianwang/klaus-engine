@@ -75,6 +75,11 @@ const ACORN_SOURCE: &str = include_str!("vendor/acorn.js");
 // the top-level-await transform built on the vendored parser.
 const FORMAT_SOURCE: &str = include_str!("vendor/format.js");
 const TRANSFORM_SOURCE: &str = include_str!("vendor/transform.js");
+// Project-authored companion: a browser control surface layered over the
+// bound host browser tools. Its helpers resolve the target function at call
+// time, so per-exec binding changes are picked up without a reinstall and
+// sessions without browser tools pay nothing beyond one small script.
+const BROWSER_PRELUDE_SOURCE: &str = include_str!("vendor/browser-prelude.js");
 
 /// Captured console, the result formatter entry point and the context seal.
 const REPL_BOOTSTRAP_SOURCE: &str = r#"
@@ -293,7 +298,12 @@ fn run_repl_runtime(
 
 fn bootstrap(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> {
     eval_acorn(scope)?;
-    for source in [FORMAT_SOURCE, TRANSFORM_SOURCE, REPL_BOOTSTRAP_SOURCE] {
+    for source in [
+        FORMAT_SOURCE,
+        TRANSFORM_SOURCE,
+        REPL_BOOTSTRAP_SOURCE,
+        BROWSER_PRELUDE_SOURCE,
+    ] {
         eval_plain_script(scope, source)?;
     }
     install_timers(scope)?;
