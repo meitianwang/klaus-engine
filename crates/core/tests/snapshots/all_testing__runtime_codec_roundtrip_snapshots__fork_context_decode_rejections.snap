@@ -1,0 +1,7 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{zero}\\n{negative}\\n{string}\")"
+---
+runtime codec fork context count must be positive and finite at <root>
+runtime codec fork context count must be positive and finite at <root>
+runtime codec NoMatchingUntaggedVariant at <root>

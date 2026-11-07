@@ -1,0 +1,47 @@
+[package]
+name = "klaus-agent-sdk"
+description = "Convenience SDK for the agent engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+include = ["src/**", "assets/**"]
+
+[lib]
+name = "klaus_agent_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+dunce = "1.0"
+klaus-agent-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "process", "io-util"] }
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+rand = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Tests script the engine through the feature-gated test-support surface.
+klaus-agent-core = { path = "../core", features = ["testing"] }

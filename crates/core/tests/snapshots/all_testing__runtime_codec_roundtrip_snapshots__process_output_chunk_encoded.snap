@@ -1,0 +1,14 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{}\\n{}\", roundtrip(&empty), roundtrip(&binary))"
+---
+{
+  "seq": 0,
+  "stream": "stdout",
+  "chunk": ""
+}
+{
+  "seq": 7,
+  "stream": "stderr",
+  "chunk": "aGkA/w=="
+}

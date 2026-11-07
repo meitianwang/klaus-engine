@@ -1,0 +1,51 @@
+{
+  "_why": "Reading saved history must preserve original message grouping, signed reasoning, citations, media, tool identities and durable terminal metadata without starting a provider. Prompt compaction cannot erase display history; an explicit conversation rollback must erase only the rolled-back turns.",
+  "_presentationRecords": "Summary history retains its existing user/assistant anchors. A separate optional presentationRecords array carries the last valid user_display for each returned user UUID. Item page history and cursor membership remain exact; limit 1 concatenation equals full history, while every user page independently carries its display dependency. Full pages may omit the sidecar because their raw history already includes the envelopes.",
+  "items": [
+    {"kind":"session_meta","schemaVersion":2,"meta":{"id":"history","createdAt":1700000000000,"cwd":"/tmp","model":"fixture-model","title":"Saved history"}},
+    {"kind":"event","event":"agent_notification","turnId":"unmatched-turn","payload":{"notificationId":"notice-one","source":"team-mailbox","status":"updated","agentName":"reviewer","timestamp":1000,"turnId":"unmatched-turn"}},
+    {"kind":"turn_context","ctx":{"cwd":"/tmp","model":"fixture-model","permissionMode":"default","turnId":"one","startedAtMs":1700000000100}},
+    {"kind":"message","message":{"type":"system","uuid":"display-one","subtype":"user_display","text":"{\"messageUuid\":\"user-one\",\"localRender\":{\"origin\":\"goal\",\"displayText\":\"Explain\"}}"}},
+    {"kind":"message","message":{"type":"user","uuid":"user-one","content":[{"type":"text","text":"Explain"},{"type":"image","mimeType":"image/png","base64":"aGVsbG8="}]}},
+    {"kind":"message","message":{"type":"assistant","uuid":"assistant-one","model":"fixture-model","usage":{"inputTokens":3,"outputTokens":5,"cacheReadInputTokens":7,"cacheCreationInputTokens":11,"totalTokens":26},"content":[
+      {"type":"thinking","text":"Visible reasoning","signature":"opaque-signature"},
+      {"type":"thinking","text":"Reasoning summary","encryptedContent":"opaque-encrypted"},
+      {"type":"redacted_thinking","data":"opaque-redacted"},
+      {"type":"tool_use","id":"shell-one","name":"Bash","input":{"command":"printf hello"},"thoughtSignature":"opaque-tool-signature"},
+      {"type":"tool_use","id":"unfinished-one","name":"Read","input":{"file_path":"/tmp/missing"}},
+      {"type":"text","text":"Result","messageId":"part-one","phase":"final_answer","citations":[{"url":"https://example.test","title":"Example","citedText":"Result","startIndex":0,"endIndex":6,"encryptedIndex":"opaque-citation"}]},
+      {"type":"image","mimeType":"image/png","base64":"aGVsbG8="},
+      {"type":"document","mimeType":"application/pdf","base64":"JVBERi0=","filename":"fixture.pdf"}
+    ]}},
+    {"kind":"message","message":{"type":"tool_result","uuid":"result-one","toolUseId":"shell-one","content":[{"type":"text","text":"Stopped"},{"type":"image","mimeType":"image/png","base64":"aGVsbG8="}],"isError":true,"nativeToolOutput":{"fixture":"native"},"extraUserBlocks":[{"type":"document","mimeType":"application/pdf","base64":"JVBERi0=","filename":"tool.pdf"}]}},
+    {"kind":"event","event":"tool_result_output","turnId":"one","payload":{"toolUseId":"shell-one","output":{"exit_code":130,"stdout":"Stopped","fixture":"structured"}}},
+    {"kind":"event","event":"tool_lifecycle","turnId":"one","payload":{"turnId":"one","toolUseId":"shell-one","phase":"cancelled"}},
+    {"kind":"event","event":"turn_lifecycle","turnId":"one","payload":{"status":"interrupted","startedAtMs":1700000000100,"finishedAtMs":1700000000200,"durationMs":100}},
+    {"kind":"compacted","summary":"Saved summary","replacedRange":[0,4],"replacementHistory":[]},
+    {"kind":"turn_context","ctx":{"cwd":"/tmp","model":"fixture-model","permissionMode":"default","turnId":"discarded","startedAtMs":1700000000300}},
+    {"kind":"message","message":{"type":"user","uuid":"discarded-user","content":[{"type":"text","text":"Removed question"}]}},
+    {"kind":"message","message":{"type":"assistant","uuid":"discarded-answer","model":"fixture-model","content":[{"type":"text","text":"Removed answer"}]}},
+    {"kind":"event","event":"turn_lifecycle","turnId":"discarded","payload":{"status":"failed","error":"Removed error","kind":"internal"}},
+    {"kind":"rollback","numTurns":1},
+    {"kind":"turn_context","ctx":{"cwd":"/tmp","model":"fixture-model","permissionMode":"default","turnId":"two","startedAtMs":1700000000400}},
+    {"kind":"message","message":{"type":"user","uuid":"user-two","content":[{"type":"text","text":"Second question"}]}},
+    {"kind":"event","event":"turn_lifecycle","turnId":"two","payload":{"status":"failed","error":"Provider unavailable","kind":"auth","startedAtMs":1700000000400,"finishedAtMs":1700000000500,"durationMs":100}},
+    {"kind":"turn_context","ctx":{"cwd":"/tmp","model":"fixture-model","permissionMode":"default","turnId":"three","startedAtMs":1700000000600}},
+    {"kind":"message","message":{"type":"user","uuid":"user-three","content":[{"type":"text","text":"Recovered question"}]}},
+    {"kind":"message","message":{"type":"assistant","uuid":"assistant-three","model":"fixture-model","content":[{"type":"text","text":"Recovered answer","phase":"final_answer"}]}},
+    {"kind":"event","event":"turn_lifecycle","turnId":"three","payload":{"status":"completed","finalMessageId":"assistant-three","startedAtMs":1700000000600,"finishedAtMs":1700000000700,"durationMs":100}}
+  ],
+  "expected": {
+    "messageIds": ["display-one","user-one","assistant-one","result-one","history-compaction-10","user-two","user-three","assistant-three"],
+    "historyTurnIds": {"display-one":"one","user-one":"one","assistant-one":"one","result-one":"one","history-compaction-10":"one","user-two":"two","user-three":"three","assistant-three":"three"},
+    "turnStatuses": {"one":"interrupted","two":"failed","three":"completed"},
+    "turnStartedAtMs": {"one":1700000000100,"two":1700000000400,"three":1700000000600},
+    "turnFinishedAtMs": {"one":1700000000200,"two":1700000000500,"three":1700000000700},
+    "turnDurations": {"one":100,"two":100,"three":100},
+    "turnCancelledTools": {"one":["shell-one"]},
+    "turnFinalMessageIds": {"three":"assistant-three"},
+    "turnErrors": {"two":"Provider unavailable"},
+    "turnErrorKinds": {"two":"auth"},
+    "agentNotifications": [{"notificationId":"notice-one","source":"team-mailbox","status":"updated","agentName":"reviewer","timestamp":1000,"turnId":"unmatched-turn"}]
+  }
+}

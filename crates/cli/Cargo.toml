@@ -1,0 +1,57 @@
+[package]
+name = "klaus-agent-cli"
+description = "Terminal client for the Klaus agent engine"
+# The CLI's OWN version, deliberately not `workspace = true`. This is a product a
+# user installs and holds: `klaus --version` prints it, the published install
+# manifest names its artifacts after it, and the site shows it. The engine around
+# it is unversioned (see the note in the workspace manifest), so bumping this is
+# a CLI release decision and nothing else in the tree has to move. Bump it in the
+# same commit that ships a CLI release; never reuse a number for different bytes.
+version = "0.1.5"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# NOT a distribution package. `scripts/check-distribution-packages.mjs` asserts
+# that the publishable workspace set is exactly the distribution allow-list, so a
+# crate outside that list must opt out of publishing or the check fails.
+publish = false
+# One aggregate integration target, same reason as the server crate: `tests/all.rs`
+# mounts every file with `#[path]` so the crate links once instead of once per
+# file, and auto-discovery is off so a new file joins the aggregate.
+autotests = false
+
+[lib]
+name = "klaus_agent_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "klaus"
+path = "src/main.rs"
+
+[dependencies]
+klaus-agent-core = { workspace = true }
+klaus-agent-protocol = { workspace = true }
+klaus-agent-server = { workspace = true }
+clap = { workspace = true }
+clap_complete = "=4.5.42"
+# The TUI's own two: `anstyle` for the escape sequences, `unicode-width` for the
+# cell measuring every layout in it depends on. Both already ride in through
+# clap, so naming them adds no new tree — but the TUI must not depend on clap's
+# internals to reach them.
+anstyle = { workspace = true }
+unicode-width = "0.2"
+futures = "0.3"
+# Named directly, not just pulled in by `serde_json`: the facade's declared
+# results are its own serde structs, so printing one means bounding on
+# `Serialize` rather than on the engine's runtime codec.
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "io-util", "io-std", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+
+[dev-dependencies]
+klaus-agent-core = { path = "../core", features = ["testing"] }
+
+[[test]]
+name = "all"

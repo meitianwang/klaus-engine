@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: render_hooks(&plugin.hooks)
+---
+PostToolUse matcher=None async=false command="second" timeout_ms=None
+PreToolUse matcher=None async=false command="first" timeout_ms=None

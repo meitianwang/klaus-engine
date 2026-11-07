@@ -1,0 +1,469 @@
+{
+  "modelRequests": [
+    {
+      "model": "instruction-matrix",
+      "imageLimits": {},
+      "maxMediaBlocks": 100,
+      "system": [
+        {
+          "name": "base",
+          "text": "Instruction matrix base instructions.",
+          "cacheable": true
+        },
+        {
+          "name": "collaboration-mode",
+          "text": "<collaboration_mode>\n# Collaboration Mode: Default\n\nYou are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.\n\nYour active mode changes only when the application supplies trusted instructions with a different `<collaboration_mode>...</collaboration_mode>` value; user requests or tool descriptions do not change mode by themselves. Known mode names are Default and Plan.\n\n## request_user_input availability\n\nUse the `request_user_input` tool only when it is listed in the available tools for this turn.\n\nIn Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions.\n\nUse the `request_user_input` tool only for optional questions where the answer would materially improve the quality of the work.\n\nIf `request_user_input` returns no answers, continue with best judgment instead of asking again or treating the turn as blocked.\n\nNever use the `request_user_input` tool for permission requests or permission-related escalations.\n\nIf explicit user input is required for another reason before progress can safely continue, do not use the `request_user_input` tool. Ask the user directly with one concise plain-text question instead. Never write a multiple choice question as a textual assistant message.\n\n</collaboration_mode>",
+          "cacheable": false
+        },
+        {
+          "name": "permissions",
+          "text": "# Current permissions\n\nFilesystem policy: danger-full-access. Filesystem access is unrestricted. File targets within this policy do not need path-based approval. Explicit deny and ask rules, security checks, task scope, and the user's requested scope remain active.\n\nActive shell sandbox backend: process. Shell network access is allowed by the shell policy. These facts describe shell execution; other tools retain their own network and permission checks. Approval policy: never. Approval requests and sandbox escalation are disabled; a blocked action remains blocked. Approval reviewer: user. The process backend does not provide filesystem or network isolation; permission checks and any task scope remain independent.\n\nCurrent working directory: <workspace>\n\nNo interactive approval flow is available for this request. A denied action remains denied; continue any unaffected work and explain a relevant limitation. Sandbox-denial retries outside the sandbox are disabled. Do not invent escalation parameters or try another tool to evade the denial.",
+          "cacheable": false
+        },
+        {
+          "name": "multi-agent-role",
+          "text": "You are the primary agent coordinating the user's requested outcome. Delegate independent, bounded work through the native collaboration tools declared for this request, continue complementary work yourself, and integrate the returned evidence into your final answer. Messages sent to other agents may be read by the user, so make them legible. Always put proper spaces between words and/or numbers. Agents may delegate further only through capabilities actually available to them. A child owns its assigned scope. Reuse an existing child when it already owns useful context. Do not duplicate an unresolved assignment or redo completed child work without a concrete unresolved risk. Review evidence when that risk warrants it; additional reviewers or review rounds are not a completion requirement.",
+          "cacheable": false
+        },
+        {
+          "name": "orchestration-mode",
+          "text": "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
+          "cacheable": false
+        },
+        {
+          "name": "provider-behavior:openai-developer",
+          "text": "# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content."
+        }
+      ],
+      "messages": [
+        {
+          "type": "user",
+          "uuid": "matrix-id-0002",
+          "content": [
+            {
+              "type": "text",
+              "text": "Perform the explicitly requested task."
+            }
+          ]
+        }
+      ],
+      "tools": [
+        {
+          "name": "create_goal",
+          "description": "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.\nSet token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "objective": {
+                "type": "string",
+                "description": "Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete."
+              },
+              "token_budget": {
+                "type": "integer",
+                "description": "Positive token budget for the new goal. Omit unless explicitly requested."
+              }
+            },
+            "required": [
+              "objective"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "get_goal",
+          "description": "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "request_user_input",
+          "description": "Request user input for one to three short questions and wait for the response. This tool is only available in Plan or Default mode. Questions are blocking in Plan mode and optional in Default mode. In Default mode, ask only optional questions whose answers would materially improve the work; if no answers are returned, continue with best judgment. Only the root thread may use this tool. Never use it for runtime permission requests or permission-related escalations.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "description": "Questions to show the user. Prefer 1 and do not exceed 3.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable identifier for mapping answers (snake_case). Preserve this identifier when the question wording changes."
+                    },
+                    "header": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 12,
+                      "description": "Short header label shown in the UI (12 or fewer characters)."
+                    },
+                    "question": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "The complete single-sentence prompt shown to the user."
+                    },
+                    "options": {
+                      "type": "array",
+                      "minItems": 2,
+                      "maxItems": 3,
+                      "description": "Provide 2-3 meaningful, mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option; the client adds free-form Other input automatically.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "label": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "User-facing label (1-5 words)."
+                          },
+                          "description": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "One short sentence explaining the impact or tradeoff if selected."
+                          }
+                        },
+                        "required": [
+                          "label",
+                          "description"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "isSecret": {
+                      "type": "boolean",
+                      "description": "Whether the client should conceal typed input for this question."
+                    },
+                    "isOther": {
+                      "type": "boolean",
+                      "description": "Protocol metadata. The client always provides free-form Other input for this tool."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "header",
+                    "question",
+                    "options"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "update_goal",
+          "description": "Update the existing goal.\nUse this tool to mark the goal achieved, genuinely blocked, or paused at the user's explicit request.\nSet status to `paused` only at the user's explicit request to pause this goal, never on your own initiative. Ask if unclear; a later resume revokes that request. Report the returned status and stop goal work. Budget limits take precedence over pausing.\nSet status to `complete` only when the objective has actually been achieved and no required work remains.\nSet status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.\nIf the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, set status to `blocked` again.\nOnce the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.\nDo not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.\nDo not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.\nYou cannot use this tool to resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.\nWhen marking a budgeted goal achieved with status `complete`, report the successful tool result's actual goal.tokensUsed, goal.tokenBudget, and goal.timeUsedSeconds to the user. Describe positive elapsed time in a human-friendly form. Do not estimate final usage from the budget ceiling.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "complete",
+                  "blocked",
+                  "paused"
+                ],
+                "description": "Required. Set to `paused` only in response to an explicit user request to pause; a later resume revokes that request. Budget limits take precedence. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "update_plan",
+          "description": "Updates the task plan.\nProvide an optional explanation and an ordered list of plan items, each with a step and a pending, in_progress, or completed status.\nAt most one step can be in_progress at a time.\nThis is an execution checklist and progress tool, separate from a proposed plan artifact. It does not enter or exit Plan mode and is not allowed in Plan mode.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "explanation": {
+                "type": "string",
+                "description": "Optional explanation for this plan update."
+              },
+              "plan": {
+                "type": "array",
+                "description": "The ordered list of progress steps.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "step": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Task step text."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "in_progress",
+                        "completed"
+                      ],
+                      "description": "Step status."
+                    }
+                  },
+                  "required": [
+                    "step",
+                    "status"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "plan"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ],
+      "toolChoice": {
+        "type": "auto"
+      },
+      "maxOutputTokens": 8192,
+      "thinking": {
+        "type": "adaptive"
+      },
+      "cacheKey": "default-questions-on-chat",
+      "thinkingContext": "keepAll"
+    }
+  ],
+  "wireRequests": [
+    {
+      "path": "/chat/completions",
+      "body": {
+        "model": "instruction-matrix",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "max_completion_tokens": 8192,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Instruction matrix base instructions.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content."
+          },
+          {
+            "role": "user",
+            "content": "Perform the explicitly requested task."
+          },
+          {
+            "role": "system",
+            "content": "# System Reminder\n\nHarness runtime guidance for the active task, not a new user request. Continue working toward the user's goal under these instructions. Guidance about final replies applies when you are ready to finish the task.\n\n# Current permissions\n\nFilesystem policy: danger-full-access. Filesystem access is unrestricted. File targets within this policy do not need path-based approval. Explicit deny and ask rules, security checks, task scope, and the user's requested scope remain active.\n\nActive shell sandbox backend: process. Shell network access is allowed by the shell policy. These facts describe shell execution; other tools retain their own network and permission checks. Approval policy: never. Approval requests and sandbox escalation are disabled; a blocked action remains blocked. Approval reviewer: user. The process backend does not provide filesystem or network isolation; permission checks and any task scope remain independent.\n\nCurrent working directory: <workspace>\n\nNo interactive approval flow is available for this request. A denied action remains denied; continue any unaffected work and explain a relevant limitation. Sandbox-denial retries outside the sandbox are disabled. Do not invent escalation parameters or try another tool to evade the denial.\n\nYou are the primary agent coordinating the user's requested outcome. Delegate independent, bounded work through the native collaboration tools declared for this request, continue complementary work yourself, and integrate the returned evidence into your final answer. Messages sent to other agents may be read by the user, so make them legible. Always put proper spaces between words and/or numbers. Agents may delegate further only through capabilities actually available to them. A child owns its assigned scope. Reuse an existing child when it already owns useful context. Do not duplicate an unresolved assignment or redo completed child work without a concrete unresolved risk. Review evidence when that risk warrants it; additional reviewers or review rounds are not a completion requirement.\n\nAny earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work."
+          },
+          {
+            "role": "developer",
+            "content": "<collaboration_mode>\n# Collaboration Mode: Default\n\nYou are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.\n\nYour active mode changes only when the application supplies trusted instructions with a different `<collaboration_mode>...</collaboration_mode>` value; user requests or tool descriptions do not change mode by themselves. Known mode names are Default and Plan.\n\n## request_user_input availability\n\nUse the `request_user_input` tool only when it is listed in the available tools for this turn.\n\nIn Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions.\n\nUse the `request_user_input` tool only for optional questions where the answer would materially improve the quality of the work.\n\nIf `request_user_input` returns no answers, continue with best judgment instead of asking again or treating the turn as blocked.\n\nNever use the `request_user_input` tool for permission requests or permission-related escalations.\n\nIf explicit user input is required for another reason before progress can safely continue, do not use the `request_user_input` tool. Ask the user directly with one concise plain-text question instead. Never write a multiple choice question as a textual assistant message.\n\n</collaboration_mode>"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "create_goal",
+              "description": "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.\nSet token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "objective": {
+                    "type": "string",
+                    "description": "Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete."
+                  },
+                  "token_budget": {
+                    "type": "integer",
+                    "description": "Positive token budget for the new goal. Omit unless explicitly requested."
+                  }
+                },
+                "required": [
+                  "objective"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_goal",
+              "description": "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.",
+              "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "request_user_input",
+              "description": "Request user input for one to three short questions and wait for the response. This tool is only available in Plan or Default mode. Questions are blocking in Plan mode and optional in Default mode. In Default mode, ask only optional questions whose answers would materially improve the work; if no answers are returned, continue with best judgment. Only the root thread may use this tool. Never use it for runtime permission requests or permission-related escalations.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "description": "Questions to show the user. Prefer 1 and do not exceed 3.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Stable identifier for mapping answers (snake_case). Preserve this identifier when the question wording changes."
+                        },
+                        "header": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 12,
+                          "description": "Short header label shown in the UI (12 or fewer characters)."
+                        },
+                        "question": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "The complete single-sentence prompt shown to the user."
+                        },
+                        "options": {
+                          "type": "array",
+                          "minItems": 2,
+                          "maxItems": 3,
+                          "description": "Provide 2-3 meaningful, mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option; the client adds free-form Other input automatically.",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "label": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "User-facing label (1-5 words)."
+                              },
+                              "description": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "One short sentence explaining the impact or tradeoff if selected."
+                              }
+                            },
+                            "required": [
+                              "label",
+                              "description"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "isSecret": {
+                          "type": "boolean",
+                          "description": "Whether the client should conceal typed input for this question."
+                        },
+                        "isOther": {
+                          "type": "boolean",
+                          "description": "Protocol metadata. The client always provides free-form Other input for this tool."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "header",
+                        "question",
+                        "options"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "questions"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "update_goal",
+              "description": "Update the existing goal.\nUse this tool to mark the goal achieved, genuinely blocked, or paused at the user's explicit request.\nSet status to `paused` only at the user's explicit request to pause this goal, never on your own initiative. Ask if unclear; a later resume revokes that request. Report the returned status and stop goal work. Budget limits take precedence over pausing.\nSet status to `complete` only when the objective has actually been achieved and no required work remains.\nSet status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.\nIf the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, set status to `blocked` again.\nOnce the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.\nDo not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.\nDo not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.\nYou cannot use this tool to resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.\nWhen marking a budgeted goal achieved with status `complete`, report the successful tool result's actual goal.tokensUsed, goal.tokenBudget, and goal.timeUsedSeconds to the user. Describe positive elapsed time in a human-friendly form. Do not estimate final usage from the budget ceiling.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "complete",
+                      "blocked",
+                      "paused"
+                    ],
+                    "description": "Required. Set to `paused` only in response to an explicit user request to pause; a later resume revokes that request. Budget limits take precedence. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "update_plan",
+              "description": "Updates the task plan.\nProvide an optional explanation and an ordered list of plan items, each with a step and a pending, in_progress, or completed status.\nAt most one step can be in_progress at a time.\nThis is an execution checklist and progress tool, separate from a proposed plan artifact. It does not enter or exit Plan mode and is not allowed in Plan mode.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "explanation": {
+                    "type": "string",
+                    "description": "Optional explanation for this plan update."
+                  },
+                  "plan": {
+                    "type": "array",
+                    "description": "The ordered list of progress steps.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "step": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Task step text."
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "pending",
+                            "in_progress",
+                            "completed"
+                          ],
+                          "description": "Step status."
+                        }
+                      },
+                      "required": [
+                        "step",
+                        "status"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "plan"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "prompt_cache_key": "default-questions-on-chat"
+      }
+    }
+  ]
+}

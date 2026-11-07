@@ -1,0 +1,11 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+Modifications for Klaus:
+- Adapt native Windows token, filesystem, and process setup to the engine runtime.
+- Adapt native process-security policy projection and bounded launcher transport.
+- Adapt authenticated service provisioning to native identities and cancellable setup.
+
+Microsoft MXC SDK
+Copyright (c) Microsoft Corporation.
+The SDK is used under the MIT License, reproduced in src/mxc/LICENSE-MIT.

@@ -1,0 +1,4 @@
+SPDX-FileCopyrightText: 2025 OpenAI
+SPDX-License-Identifier: Apache-2.0
+
+Action classification and untrusted-description framing adapted to registration-owned metadata and native executor context.

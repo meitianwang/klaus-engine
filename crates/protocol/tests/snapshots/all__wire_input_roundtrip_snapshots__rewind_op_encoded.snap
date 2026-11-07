@@ -1,0 +1,11 @@
+---
+source: crates/protocol/tests/wire_input_roundtrip_snapshots.rs
+expression: roundtrip(&rewind)
+---
+{
+  "id": "rw",
+  "op": {
+    "type": "rewind",
+    "numTurns": 2
+  }
+}

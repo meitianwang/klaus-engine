@@ -1,0 +1,13 @@
+{
+  "reason": "Internal model metadata remains available to runtime calls while conversation choices honor the source visibility declaration independently of account eligibility.",
+  "models": [
+    { "id": "listed-model", "visibility": "list", "available": false },
+    { "id": "gpt-reserve", "visibility": "hide", "contextWindow": 272000 },
+    { "id": "default-model", "visibility": "default" },
+    { "id": "codex-auto-review", "visibility": "hide", "contextWindow": 872000 },
+    { "id": "legacy-model" },
+    { "id": "internal-model", "visibility": "none" }
+  ],
+  "pickerIds": ["listed-model", "default-model", "legacy-model"],
+  "internalIds": ["gpt-reserve", "codex-auto-review", "internal-model"]
+}

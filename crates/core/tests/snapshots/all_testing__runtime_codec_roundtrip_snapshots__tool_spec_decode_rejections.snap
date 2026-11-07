@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{legacy_without_kind}\\n{missing_schema}\")"
+---
+runtime codec legacy string tool format requires an explicit freeform kind at <root>
+runtime codec MissingField at /inputSchema

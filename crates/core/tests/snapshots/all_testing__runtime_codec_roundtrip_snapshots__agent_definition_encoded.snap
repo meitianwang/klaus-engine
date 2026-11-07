@@ -1,0 +1,20 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{minimal_encoded}\\n{isolated_encoded}\")"
+---
+{
+  "name": "reviewer",
+  "description": "reviews code"
+}
+{
+  "name": "worker",
+  "description": "runs in a worktree",
+  "tools": [
+    "bash"
+  ],
+  "disallowedTools": [],
+  "model": "opus",
+  "isolation": "worktree",
+  "maxTurns": 12,
+  "background": true
+}

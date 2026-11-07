@@ -1,0 +1,6 @@
+{
+  "reason": "A running background shell does not occupy the foreground turn or prevent an active goal from auditing a persistent blocker.",
+  "goalStatusesAfterTurns": ["active", "active", "blocked"],
+  "backgroundStatusAtBlocked": "running",
+  "automaticGoalTurns": 2
+}

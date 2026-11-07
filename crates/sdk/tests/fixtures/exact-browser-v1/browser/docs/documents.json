@@ -1,0 +1,34 @@
+{
+  "documents": [
+    {
+      "name": "browser-safety",
+      "path": "browser-safety.md",
+      "description": "Untrusted browser content and action safety policy."
+    },
+    {
+      "name": "confirmations",
+      "path": "confirmations.md",
+      "description": "When browser actions need user confirmation."
+    },
+    {
+      "name": "file-uploads",
+      "path": "file-uploads.md",
+      "description": "File input and file chooser handling."
+    },
+    {
+      "name": "downloads",
+      "path": "downloads.md",
+      "description": "Download and media artifact handling."
+    },
+    {
+      "name": "tab-cleanup",
+      "path": "tab-cleanup.md",
+      "description": "Finalize, deliverable, and handoff tab cleanup policy."
+    },
+    {
+      "name": "visibility",
+      "path": "visibility.md",
+      "description": "Visible browser operation and verification guidance."
+    }
+  ]
+}

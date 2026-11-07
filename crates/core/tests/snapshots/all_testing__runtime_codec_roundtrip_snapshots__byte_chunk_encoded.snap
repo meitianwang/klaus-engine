@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{}\\n{}\", roundtrip(&empty), roundtrip(&binary))"
+---
+""
+"AAH+/0E="

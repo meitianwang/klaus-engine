@@ -1,0 +1,32 @@
+---
+source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
+expression: "format!(\"{canonical:#?}\\n{legacy_freeform:#?}\\n{external_function:#?}\")"
+---
+ToolSpec {
+    name: RuntimeString("grep"),
+    description: RuntimeString("search"),
+    input_schema: Object({RuntimeString("type"): String(RuntimeString("object"))}),
+    kind: Function,
+    format: Some(
+        Grammar {
+            syntax: Lark,
+            definition: RuntimeString("start: WORD"),
+        },
+    ),
+}
+ToolSpec {
+    name: RuntimeString("free"),
+    description: RuntimeString("legacy"),
+    input_schema: Object({RuntimeString("type"): String(RuntimeString("object")), RuntimeString("properties"): Object({}), RuntimeString("additionalProperties"): Bool(true)}),
+    kind: Freeform,
+    format: Some(
+        Text,
+    ),
+}
+ToolSpec {
+    name: RuntimeString("fx"),
+    description: RuntimeString("ext"),
+    input_schema: Object({}),
+    kind: Function,
+    format: None,
+}

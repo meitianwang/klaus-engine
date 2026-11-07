@@ -1,0 +1,753 @@
+{
+  "scenario": "permission-decisions-approval-flow",
+  "decisions": [
+    {
+      "name": "read-only-policy-read-allows",
+      "tool": "read",
+      "input": {
+        "path": "src/index.ts"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": "src/index.ts"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "read-only-policy-write-requires-approval",
+      "tool": "write",
+      "input": {
+        "path": "src/index.ts",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "This write exceeds the current filesystem policy. Allow this operation?",
+        "input": {
+          "path": "src/index.ts",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "full-access-write-allows",
+      "tool": "write",
+      "input": {
+        "path": "src/index.ts",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": "src/index.ts",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "plan-write-denies",
+      "tool": "write",
+      "input": {
+        "path": "src/index.ts",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "Plan mode is read-only; no mutating actions are permitted.",
+        "reason": {
+          "type": "mode",
+          "mode": "plan"
+        }
+      }
+    },
+    {
+      "name": "never-policy-write-denies",
+      "tool": "write",
+      "input": {
+        "path": "src/index.ts",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "Approval policy disallowed a sandbox approval prompt.",
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "config-bash-allow-prefix-allows",
+      "tool": "bash",
+      "input": {
+        "command": "git status -sb"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "The requested filesystem policy requires an available isolation backend.",
+        "reason": {
+          "type": "safetyCheck"
+        }
+      }
+    },
+    {
+      "name": "config-bash-deny-beats-full-access",
+      "tool": "bash",
+      "input": {
+        "command": "rm -rf /"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "Denied by rule: Bash(rm)",
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "bash",
+            "argumentPrefix": "rm"
+          }
+        }
+      }
+    },
+    {
+      "name": "bash-dangerous-removal-asks-without-suggestion",
+      "tool": "bash",
+      "input": {
+        "command": "rm -rf /"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "Allow bash (deletes a critical path): rm -rf /?",
+        "input": {
+          "command": "rm -rf /"
+        },
+        "reason": {
+          "type": "safetyCheck"
+        }
+      }
+    },
+    {
+      "name": "unsafe-compound-bash-ask-omits-suggestion",
+      "tool": "bash",
+      "input": {
+        "command": "npm install foo && rm -rf /tmp/x"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "The requested filesystem policy requires an available isolation backend.",
+        "reason": {
+          "type": "safetyCheck"
+        }
+      }
+    },
+    {
+      "name": "generic-ask-rule-beats-full-access",
+      "tool": "write",
+      "input": {
+        "path": "x",
+        "content": "y"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "Allow write?",
+        "input": {
+          "path": "x",
+          "content": "y"
+        },
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "write"
+          }
+        },
+        "suggestions": [
+          {
+            "type": "addRules",
+            "rules": [
+              {
+                "toolName": "write"
+              }
+            ],
+            "behavior": "allow",
+            "destination": "session"
+          }
+        ]
+      }
+    },
+    {
+      "name": "read-deny-path-rule-blocks-read",
+      "tool": "read",
+      "input": {
+        "path": "secrets/key.txt"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "Denied by rule: Read(secrets/**)",
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "Read",
+            "argumentPrefix": "secrets/**"
+          }
+        }
+      }
+    },
+    {
+      "name": "path-allow-rule-cannot-widen-read-only-policy",
+      "tool": "write",
+      "input": {
+        "path": "dist/bundle.js",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "This write exceeds the current filesystem policy. Allow this operation?",
+        "input": {
+          "path": "dist/bundle.js",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "glob-read-deny-path-rule-blocks-glob",
+      "tool": "glob",
+      "input": {
+        "pattern": "*.log",
+        "path": "logs"
+      },
+      "decision": {
+        "decision": "deny",
+        "message": "Denied by rule: Read(logs/**)",
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "Read",
+            "argumentPrefix": "logs/**"
+          }
+        }
+      }
+    },
+    {
+      "name": "sensitive-write-asks-under-read-only",
+      "tool": "write",
+      "input": {
+        "path": ".klaus/settings.json",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "Allow write to a sensitive path (agent-config)?",
+        "input": {
+          "path": ".klaus/settings.json",
+          "content": "x"
+        },
+        "reason": {
+          "type": "safetyCheck"
+        }
+      }
+    },
+    {
+      "name": "sensitive-write-asks-under-workspace",
+      "tool": "write",
+      "input": {
+        "path": ".klaus/settings.json",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "Allow write to a sensitive path (agent-config)?",
+        "input": {
+          "path": ".klaus/settings.json",
+          "content": "x"
+        },
+        "reason": {
+          "type": "safetyCheck"
+        }
+      }
+    },
+    {
+      "name": "sensitive-write-allows-under-full-access",
+      "tool": "write",
+      "input": {
+        "path": ".klaus/settings.json",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": ".klaus/settings.json",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "workspace-inside-cwd-allows",
+      "tool": "write",
+      "input": {
+        "path": "src/a.ts",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": "src/a.ts",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "workspace-outside-roots-asks",
+      "tool": "write",
+      "input": {
+        "path": "/tmp/klaus-permission-trace/outside/notes.txt",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "This write exceeds the current filesystem policy. Allow this operation?",
+        "input": {
+          "path": "/tmp/klaus-permission-trace/outside/notes.txt",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "workspace-additional-root-allows",
+      "tool": "write",
+      "input": {
+        "path": "/tmp/klaus-permission-trace/outside/notes.txt",
+        "content": "x"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": "/tmp/klaus-permission-trace/outside/notes.txt",
+          "content": "x"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "empty-apply-patch-asks-not-vacuous-allow",
+      "tool": "apply_patch",
+      "input": {
+        "patch": "*** Begin Patch\n*** End Patch"
+      },
+      "decision": {
+        "decision": "ask",
+        "message": "This write exceeds the current filesystem policy. Allow this operation?",
+        "input": {
+          "patch": "*** Begin Patch\n*** End Patch"
+        },
+        "reason": {
+          "type": "default"
+        }
+      }
+    },
+    {
+      "name": "confined-outside-read-asks-before-plan-baseline",
+      "tool": "read",
+      "input": {
+        "path": "/etc/hosts"
+      },
+      "decision": {
+        "decision": "allow",
+        "input": {
+          "path": "/etc/hosts"
+        },
+        "reason": {
+          "type": "mode",
+          "mode": "plan"
+        }
+      }
+    },
+    {
+      "name": "mcp-wildcard-allow-covers-server-tool",
+      "tool": "mcp__github__get_issue",
+      "input": {},
+      "decision": {
+        "decision": "allow",
+        "input": {},
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "mcp__github__*",
+            "toolNamePrefix": "mcp__github__"
+          }
+        }
+      }
+    },
+    {
+      "name": "mcp-wildcard-deny-beats-full-access",
+      "tool": "mcp__github__get_issue",
+      "input": {},
+      "decision": {
+        "decision": "deny",
+        "message": "Denied by rule: mcp__github__*",
+        "reason": {
+          "type": "rule",
+          "rule": {
+            "toolName": "mcp__github__*",
+            "toolNamePrefix": "mcp__github__"
+          }
+        }
+      }
+    },
+    {
+      "name": "tool-self-deny-beats-session-allow",
+      "tool": "selfdeny",
+      "input": {},
+      "decision": {
+        "decision": "deny",
+        "message": "tool self-deny",
+        "reason": {
+          "type": "toolSelfCheck"
+        }
+      }
+    }
+  ],
+  "approvalFlow": {
+    "eventTypes": [
+      "thread.started",
+      "turn.started",
+      "stream.request_start",
+      "provider.decision",
+      "provider.decision",
+      "item.started",
+      "approval.requested",
+      "item.completed",
+      "item.started",
+      "item.completed",
+      "stream.request_start",
+      "provider.decision",
+      "item.started",
+      "text.delta",
+      "item.completed",
+      "provider.decision",
+      "turn.completed"
+    ],
+    "events": [
+      {
+        "type": "thread.started",
+        "threadId": "thread-permission"
+      },
+      {
+        "type": "turn.started",
+        "turnId": "turn-permission"
+      },
+      {
+        "type": "stream.request_start"
+      },
+      {
+        "type": "provider.decision",
+        "event": {
+          "kind": "request_started",
+          "providerId": "test-provider",
+          "model": "fake-model",
+          "attempt": 1,
+          "debug": {}
+        }
+      },
+      {
+        "type": "provider.decision",
+        "event": {
+          "kind": "request_completed",
+          "providerId": "test-provider",
+          "model": "fake-model",
+          "attempt": 1,
+          "debug": {},
+          "usage": {
+            "inputTokens": 13,
+            "outputTokens": 3,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "totalTokens": 16,
+            "cacheHitRate": 0
+          }
+        }
+      },
+      {
+        "type": "item.started",
+        "item": {
+          "type": "tool_call",
+          "id": "tu_mutate_1",
+          "toolName": "mutate",
+          "arguments": {
+            "value": "first"
+          },
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "approval.requested",
+        "request": {
+          "id": "tu_mutate_1",
+          "kind": "tool",
+          "toolName": "mutate",
+          "input": {
+            "value": "first"
+          },
+          "message": "Allow mutate?",
+          "suggestions": [
+            {
+              "type": "addRules",
+              "rules": [
+                {
+                  "toolName": "mutate"
+                }
+              ],
+              "behavior": "allow",
+              "destination": "session"
+            }
+          ]
+        }
+      },
+      {
+        "type": "item.completed",
+        "item": {
+          "type": "tool_call",
+          "id": "tu_mutate_1",
+          "toolName": "mutate",
+          "arguments": {
+            "value": "first"
+          },
+          "result": {
+            "ran": "first"
+          },
+          "status": "completed"
+        }
+      },
+      {
+        "type": "item.started",
+        "item": {
+          "type": "tool_call",
+          "id": "tu_mutate_2",
+          "toolName": "mutate",
+          "arguments": {
+            "value": "second"
+          },
+          "status": "in_progress"
+        }
+      },
+      {
+        "type": "item.completed",
+        "item": {
+          "type": "tool_call",
+          "id": "tu_mutate_2",
+          "toolName": "mutate",
+          "arguments": {
+            "value": "second"
+          },
+          "result": {
+            "ran": "second"
+          },
+          "status": "completed"
+        }
+      },
+      {
+        "type": "stream.request_start"
+      },
+      {
+        "type": "provider.decision",
+        "event": {
+          "kind": "request_started",
+          "providerId": "test-provider",
+          "model": "fake-model",
+          "attempt": 1,
+          "debug": {}
+        }
+      },
+      {
+        "type": "item.started",
+        "item": {
+          "type": "agent_message",
+          "id": "perm-id-3",
+          "text": ""
+        }
+      },
+      {
+        "type": "text.delta",
+        "text": "mutations complete",
+        "messageId": "perm-id-3"
+      },
+      {
+        "type": "item.completed",
+        "item": {
+          "type": "agent_message",
+          "id": "perm-id-3",
+          "text": "mutations complete"
+        }
+      },
+      {
+        "type": "provider.decision",
+        "event": {
+          "kind": "request_completed",
+          "providerId": "test-provider",
+          "model": "fake-model",
+          "attempt": 1,
+          "debug": {},
+          "usage": {
+            "inputTokens": 5,
+            "outputTokens": 4,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "totalTokens": 9,
+            "cacheHitRate": 0
+          }
+        }
+      },
+      {
+        "type": "turn.completed",
+        "turnId": "turn-permission",
+        "usage": {
+          "inputTokens": 5,
+          "outputTokens": 4,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0
+        },
+        "stopReason": "completed"
+      }
+    ],
+    "approvalRequests": [
+      {
+        "id": "tu_mutate_1",
+        "kind": "tool",
+        "toolName": "mutate",
+        "input": {
+          "value": "first"
+        },
+        "message": "Allow mutate?",
+        "suggestions": [
+          {
+            "type": "addRules",
+            "rules": [
+              {
+                "toolName": "mutate"
+              }
+            ],
+            "behavior": "allow",
+            "destination": "session"
+          }
+        ]
+      }
+    ],
+    "permissionUpdates": [
+      [
+        {
+          "type": "addRules",
+          "rules": [
+            {
+              "toolName": "mutate"
+            }
+          ],
+          "behavior": "allow",
+          "destination": "session"
+        }
+      ]
+    ],
+    "finalSessionRules": {
+      "allowRules": [
+        {
+          "toolName": "mutate"
+        }
+      ],
+      "denyRules": [],
+      "askRules": []
+    },
+    "persistedMessages": [
+      {
+        "type": "assistant",
+        "uuid": "perm-id-0",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "tu_mutate_1",
+            "name": "mutate",
+            "input": {
+              "value": "first"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "tu_mutate_2",
+            "name": "mutate",
+            "input": {
+              "value": "second"
+            }
+          }
+        ],
+        "model": "fake-model",
+        "usage": {
+          "inputTokens": 13,
+          "outputTokens": 3,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0
+        }
+      },
+      {
+        "type": "tool_result",
+        "uuid": "perm-id-1",
+        "toolUseId": "tu_mutate_1",
+        "content": [
+          {
+            "type": "text",
+            "text": "mutate:first"
+          }
+        ],
+        "isError": false
+      },
+      {
+        "type": "tool_result",
+        "uuid": "perm-id-2",
+        "toolUseId": "tu_mutate_2",
+        "content": [
+          {
+            "type": "text",
+            "text": "mutate:second"
+          }
+        ],
+        "isError": false
+      },
+      {
+        "type": "assistant",
+        "uuid": "perm-id-3",
+        "content": [
+          {
+            "type": "text",
+            "text": "mutations complete",
+            "messageId": "perm-id-3"
+          }
+        ],
+        "model": "fake-model",
+        "usage": {
+          "inputTokens": 5,
+          "outputTokens": 4,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0
+        }
+      }
+    ]
+  }
+}

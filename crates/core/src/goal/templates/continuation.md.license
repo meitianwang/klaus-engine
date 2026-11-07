@@ -1,0 +1,4 @@
+SPDX-FileCopyrightText: 2025 OpenAI
+SPDX-License-Identifier: Apache-2.0
+
+Modified for persistent-thread goal controls, pause and budget precedence, and conditional progress guidance.
