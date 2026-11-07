@@ -102,7 +102,6 @@ async fn task_resource_scope_hard_denies_unscoped_native_side_effect_tools() {
     let tools = default_builtins(
         &config,
         BuiltinsOptions {
-            browser_runtime_available: true,
             plugin_management_home: Some(directory.0.to_str().unwrap().to_owned()),
             ..Default::default()
         },
@@ -118,7 +117,6 @@ async fn task_resource_scope_hard_denies_unscoped_native_side_effect_tools() {
         "exec_command",
         "web_search",
         "web_fetch",
-        "browser_eval",
         "plugin_manage",
         "CronCreate",
         "notebook_edit",

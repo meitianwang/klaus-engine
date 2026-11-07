@@ -11990,7 +11990,7 @@ async fn init_session_accepts_stored_provider_oauth_from_endpoint_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn init_session_host_capabilities_expose_browser_tools_via_mcp_mapping() {
+async fn init_session_host_capabilities_adopt_browser_mapping_without_engine_builtins() {
     let requests = Arc::new(Mutex::new(Vec::<ModelRequest>::new()));
     let agent = make_recording_agent("/tmp/klaus-proto", requests.clone());
     let ((sr, sw), (cr, cw)) = duplex_pair();
@@ -12052,9 +12052,16 @@ async fn init_session_host_capabilities_expose_browser_tools_via_mcp_mapping() {
         .iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
+    // The declared mapping routes internal browser dispatch; the model-visible
+    // browser surface belongs to the declared MCP server's own tools, so a
+    // mapping-only host gets no engine browser_* builtins.
+    assert!(
+        !tool_names.iter().any(|name| name.starts_with("browser_")),
+        "{tool_names:?}"
+    );
     assert!(tool_names
         .iter()
-        .any(|name| *name == &RuntimeString::from("browser_navigate")));
+        .any(|name| *name == &RuntimeString::from("web_search")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

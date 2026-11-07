@@ -620,8 +620,10 @@ resuming an ended rollout restores history without an interactive request.
 
 `task`、`web_search`（检索后端；后端级替换仅此一途，跨进程宿主可用 3.6 整体接管）、
 `agents`、`skills`、`skill_gate`、
-`workflows`、`web_fetch_page`（抓取实现，**仅此一途**）、`browser_runtime`、
-`browser_runtime_available`、`mcp_catalog`、`skill_catalog`、`plugin_catalog`（三个商店
+`workflows`、`web_fetch_page`（抓取实现，**仅此一途**）、`browser_runtime`（内建
+browser_* 工具面**仅在注入直连运行时**才注册；只声明 MCP 工具映射的宿主不注册，
+浏览器面由映射目标 MCP 服务器自己的工具承载，映射仅供 web_search 等内部消费者按
+调用解析）、`mcp_catalog`、`skill_catalog`、`plugin_catalog`（三个商店
 目录，**均仅宿主注入**）、`plugin_management_home`、`process_context`（code-mode 宿主
 子进程启动上下文；没有则 cell 退化到本进程执行）。
 

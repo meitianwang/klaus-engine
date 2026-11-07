@@ -4105,7 +4105,7 @@ impl Session {
                 !browser_names.contains(&tool.name())
                     || update.browser_tool_overrides.contains(&tool.name())
             });
-            if browser.browser_runtime.is_some() || browser.browser_tool_mapping.is_some() {
+            if browser.browser_runtime.is_some() {
                 tools.extend(browser_tools.into_iter().filter(|tool| {
                     !update.browser_tool_overrides.contains(&tool.name())
                         && !self.config.disabled_tools.contains(&tool.name())

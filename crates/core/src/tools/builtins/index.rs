@@ -147,12 +147,10 @@ pub struct BuiltinsOptions {
     pub web_fetch_page: Option<Arc<dyn PageFetcher>>,
     /// Host-injected browser automation runtime. When present, expose browser_*
     /// protocol tools; the runtime itself is placed on each ToolContext by the
-    /// session.
+    /// session. Hosts that surface browser automation through an MCP tool
+    /// mapping do not register these builtins; their browser surface is owned
+    /// by the mapped MCP server's tools instead.
     pub browser_runtime: Option<Arc<dyn BrowserRuntime>>,
-    /// Browser runtime may also be provided by a host/plugin tool mapping. This
-    /// only gates model-visible browser_* tools; the session materializes the
-    /// mapping per tool call.
-    pub browser_runtime_available: bool,
     /// MCP-server-store catalog backend factory.
     pub mcp_catalog: Option<McpCatalogThunk>,
     /// Skill-store catalog backend factory.
@@ -276,7 +274,7 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
         create_list_mcp_prompts_tool(),
         create_get_mcp_prompt_tool(),
     ];
-    if opts.browser_runtime.is_some() || opts.browser_runtime_available {
+    if opts.browser_runtime.is_some() {
         tools.extend(create_browser_tools());
     }
     // Sub-agent delegation via the `task` tool (advertises the engine's roles).

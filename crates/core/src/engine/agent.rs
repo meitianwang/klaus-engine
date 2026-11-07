@@ -2491,9 +2491,6 @@ impl Agent {
                     workflows: workflows.clone(),
                     web_fetch_page: web_fetch_page.clone(),
                     browser_runtime: browser_capabilities_for_tools.browser_runtime.clone(),
-                    browser_runtime_available: browser_capabilities_for_tools
-                        .browser_tool_mapping
-                        .is_some(),
                     mcp_catalog: mcp_catalog.clone(),
                     plugin_catalog: plugin_catalog.clone(),
                     plugin_management_home,
@@ -6372,24 +6369,38 @@ mod tests {
             move |req: ModelRequest, signal: AbortSignal| -> ModelStream {
                 requests.lock().unwrap().push(req);
                 let idx = call_count.fetch_add(1, Ordering::SeqCst);
-                let turn = if idx == 0 {
-                    let mut events = vec![ev::message_start(None)];
-                    events.extend(exact_tool_use_events(
-                        "browser-tu-1",
-                        "browser_navigate",
-                        &exact_json!({ "url": "https://example.com/" }),
-                    ));
-                    events.push(ev::stop(
-                        Some(crate::types::provider::ModelStopReason::ToolUse),
-                        None,
-                    ));
-                    events
-                } else {
-                    vec![
+                let turn = match idx {
+                    0 => {
+                        let mut events = vec![ev::message_start(None)];
+                        events.extend(exact_tool_use_events(
+                            "search-tu-1",
+                            "tool_search",
+                            &exact_json!({ "query": "select:mcp__browser__navigate" }),
+                        ));
+                        events.push(ev::stop(
+                            Some(crate::types::provider::ModelStopReason::ToolUse),
+                            None,
+                        ));
+                        events
+                    }
+                    1 => {
+                        let mut events = vec![ev::message_start(None)];
+                        events.extend(exact_tool_use_events(
+                            "mcp-tu-1",
+                            "mcp__browser__navigate",
+                            &exact_json!({ "url": "https://example.com/" }),
+                        ));
+                        events.push(ev::stop(
+                            Some(crate::types::provider::ModelStopReason::ToolUse),
+                            None,
+                        ));
+                        events
+                    }
+                    _ => vec![
                         ev::message_start(None),
                         ev::text("done"),
                         ev::stop(None, None),
-                    ]
+                    ],
                 };
                 Box::pin(
                     futures::stream::iter(turn)
@@ -10205,9 +10216,28 @@ mod tests {
         );
         assert_eq!(mcp_calls.load(Ordering::SeqCst), 1);
         let requests = requests.lock().unwrap();
-        assert!(request_tool_names(&requests[0])
-            .iter()
-            .any(|name| name == "browser_navigate"));
+        // The plugin's browser capability no longer registers engine builtins:
+        // its own MCP tool is the model-visible surface, while the mapping stays
+        // adopted for internal dispatch.
+        assert!(
+            !request_tool_names(&requests[0])
+                .iter()
+                .any(|name| name.starts_with("browser_")),
+            "mapping-backed plugin capability must not register engine browser builtins"
+        );
+        assert!(
+            requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    crate::schemas::message::Message::ToolResult(result)
+                        if result.tool_use_id == "mcp-tu-1" && !result.is_error
+                )),
+            "the plugin MCP browser tool must execute without an error envelope"
+        );
     }
 
     #[test]

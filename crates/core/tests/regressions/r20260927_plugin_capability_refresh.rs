@@ -316,7 +316,7 @@ async fn loaded_session_removes_plugin_mcp_before_the_next_model_step() {
 }
 
 #[tokio::test]
-async fn old_session_adopts_plugin_style_lsp_and_browser_tools_on_next_turn() {
+async fn old_session_adopts_plugin_style_lsp_and_browser_mapping_on_next_turn() {
     let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
     let provider = Arc::new(RecordingProvider {
         info: ProviderInfo {
@@ -375,10 +375,16 @@ async fn old_session_adopts_plugin_style_lsp_and_browser_tools_on_next_turn() {
     {
         let requests = provider.requests.lock().unwrap();
         let request = requests.last().unwrap();
-        assert!(request
-            .tools
-            .iter()
-            .any(|tool| tool.name == "browser_navigate"));
+        // The adopted browser capability is a dispatch mapping only: the browser
+        // surface belongs to the mapped MCP server's own tools, so adopting the
+        // capability must not register engine browser_* builtins.
+        assert!(
+            !request
+                .tools
+                .iter()
+                .any(|tool| tool.name.starts_with("browser_")),
+            "mapping adoption alone must not surface engine browser builtins"
+        );
         assert!(request
             .system
             .iter()

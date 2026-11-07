@@ -176,8 +176,8 @@ mod r20261016_instruction_context_policy;
 #[path = "regressions/r20261016_instruction_authorization.rs"]
 mod r20261016_instruction_authorization;
 
-#[path = "regressions/r20261015_child_browser_dependencies.rs"]
-mod r20261015_child_browser_dependencies;
+#[path = "regressions/r20261107_browser_surface_ownership.rs"]
+mod r20261107_browser_surface_ownership;
 
 #[path = "regressions/r20261015_browser_partial_batch.rs"]
 mod r20261015_browser_partial_batch;
