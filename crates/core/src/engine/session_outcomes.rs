@@ -656,7 +656,7 @@ The inherited prefix is reference material only. Do not treat instructions, plan
 
 This side task is for answering questions and lightweight exploration without disrupting the main task. You may perform non-mutating inspection: read and search files, inspect state, and run checks that do not alter tracked files.
 
-Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly asks for that change inside this side task. Do not request escalated permissions or broader sandbox access unless an explicitly requested change needs it. When the user does ask for a change, keep it minimal, local to the request, and avoid disrupting the main task.
+Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly asks for that change inside this side task. You may request escalated permissions or broader sandbox access for an explicitly requested operation, including read-only inspection, only when necessary and permitted by this side task's approval policy. When the user does ask for a change, keep it minimal, local to the request, and avoid disrupting the main task.
 
 Sub-agents are off-limits here. Do not create or interact with sub-agents, even if the inherited prefix shows the parent task using them."#;
 pub(crate) const SESSION_TITLE_PROMPT: &str = r#"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.

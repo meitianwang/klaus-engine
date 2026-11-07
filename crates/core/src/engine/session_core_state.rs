@@ -4869,8 +4869,8 @@ impl Session {
     }
 
     /// Capture only completed parent context without waiting for its active turn.
-    /// Keep history and lifecycle selection together; clone only the selected
-    /// turn, rather than copying or replaying the parent's whole transcript.
+    /// Keep history and lifecycle selection together; retain the completed
+    /// context prefix without copying the active parent's unfinished tail.
     pub fn side_task_snapshot(&self) -> Result<LiveSideTaskSnapshot, String> {
         let _turns = self.turn.active_stack.lock_recover();
         if self.lifecycle.is_disposed() {
@@ -4879,7 +4879,7 @@ impl Session {
         let inherited = {
             let history = self.conversation.history.lock_recover();
             let index = self.turn_index.lock_recover();
-            crate::engine::agent::last_complete_turn(&history, &index)
+            crate::engine::agent::completed_context_prefix(&history, &index)
         };
         let approval_context = self
             .approval_review

@@ -219,9 +219,9 @@ pub struct SessionForkLiveParams {
     pub before_message_uuid: Option<String>,
 }
 
-/// Start an ephemeral side task in one request. A live parent contributes only
-/// its latest completed turn; a cold parent is read from its persisted record.
-/// The inherited turn is hidden from the new thread's visible transcript.
+/// Start an ephemeral side task in one request. A live parent contributes its
+/// completed context prefix; a cold parent is read from its persisted record.
+/// The inherited context is hidden from the new thread's visible transcript.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionStartSideTaskParams {

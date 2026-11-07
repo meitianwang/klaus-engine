@@ -1,6 +1,7 @@
 //! Defect: side-chat startup replayed the full persisted parent after a separate endpoint init.
 //! Root cause: the side-task facade could only bind an existing endpoint from a store.
 //! Work item 20261004: atomically start an ephemeral side task from completed live context.
+//! Work item 20261107: retain every completed context turn instead of dropping earlier discussion.
 //! This public facade regression belongs to server; core cannot depend on its own facade.
 //!
 //! Cancellation defect: closing during a blocked factory left startup and promoted RPCs parked.
@@ -62,6 +63,7 @@ fn assert_visible_side_turn(session: &Session, input: &str) {
 
 fn parent_rows() -> Vec<Value> {
     vec![
+        json!({"kind":"message","message":{"type":"compact_boundary","uuid":"compact-context","summary":"Earlier discussion selected the archive format."}}),
         json!({"kind":"turn_context","ctx":{"cwd":"/tmp","model":"m","permissionMode":"default","turnId":"old","startedAtMs":1}}),
         json!({"kind":"message","message":{"type":"user","uuid":"old-user","content":[{"type":"text","text":"older request"}]}}),
         json!({"kind":"message","message":{"type":"assistant","uuid":"old-answer","content":[{"type":"text","text":"older answer"}],"model":"m"}}),
@@ -91,6 +93,9 @@ fn message_ids(messages: &[Message]) -> Vec<String> {
 
 fn completed_ids() -> Vec<String> {
     [
+        "compact-context",
+        "old-user",
+        "old-answer",
         "complete-user",
         "complete-call",
         "complete-result",
@@ -388,7 +393,10 @@ async fn live_side_start_uses_only_completed_context_while_parent_runs_without_a
     {
         let requests = fixture.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(message_ids(&requests[1].messages[..4]), completed_ids());
+        assert_eq!(
+            message_ids(&requests[1].messages[..completed_ids().len()]),
+            completed_ids()
+        );
         assert!(
             !requests[1].messages.iter().any(|message| matches!(message,
             Message::User(user) if user.content.iter().any(|block| matches!(block,

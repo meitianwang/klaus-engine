@@ -1552,11 +1552,35 @@ fn tools_are_paired(messages: &[Message]) -> bool {
     pending.is_empty()
 }
 
-pub(crate) fn last_complete_turn(messages: &[Message], turns: &TurnIndex) -> Vec<Message> {
-    // Completion belongs to the turn lifecycle, not the last assistant's
-    // position. Results can be persisted after the final reply or status event.
+pub(crate) fn completed_context_prefix(messages: &[Message], turns: &TurnIndex) -> Vec<Message> {
+    // Retain earlier discussion and compaction ancestry through a completed
+    // boundary. Incomplete indexed turns cannot contribute dangling tool calls.
+    let checkpoint = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::CompactBoundary(_)));
+    let prefix = |end: usize| {
+        let end = end.max(checkpoint.map_or(0, |position| position + 1));
+        let start = checkpoint.unwrap_or(0);
+        messages[start..end]
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::CompactBoundary(_))
+                    || turns
+                        .message_turn
+                        .get(message_uuid(message))
+                        .is_none_or(|turn_id| {
+                            turns
+                                .turn_status
+                                .get(turn_id)
+                                .is_some_and(|status| status == "completed")
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Completion belongs to lifecycle state; results may follow the final reply.
     let mut checked = HashSet::new();
-    for message in messages.iter().rev() {
+    for (position, message) in messages.iter().enumerate().rev() {
         let Some(turn_id) = turns.message_turn.get(message_uuid(message)) else {
             continue;
         };
@@ -1578,7 +1602,10 @@ pub(crate) fn last_complete_turn(messages: &[Message], turns: &TurnIndex) -> Vec
             .any(|message| matches!(message, Message::Assistant(_)))
             && tools_are_paired(&candidate)
         {
-            return candidate;
+            let inherited = prefix(position + 1);
+            if tools_are_paired(&inherited) {
+                return inherited;
+            }
         }
     }
 
@@ -1601,10 +1628,13 @@ pub(crate) fn last_complete_turn(messages: &[Message], turns: &TurnIndex) -> Vec
             !assistant.content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_)))
         }) && tools_are_paired(candidate)
         {
-            return candidate.to_vec();
+            let inherited = prefix(start + candidate.len());
+            if tools_are_paired(&inherited) {
+                return inherited;
+            }
         }
     }
-    Vec::new()
+    checkpoint.map_or_else(Vec::new, |position| prefix(position + 1))
 }
 
 fn message_uuid(message: &Message) -> &RuntimeString {
@@ -2973,7 +3003,7 @@ impl Agent {
 
     /// Start an ephemeral side task off a persisted parent thread.
     ///
-    /// A side task inherits the parent's latest complete turn as a hidden context
+    /// A side task inherits the parent's completed context prefix as hidden context
     /// prefix and then lives only in memory: no rollout is created, so nothing is
     /// written to disk and the task cannot outlive this process. The host owns the
     /// side task's lifetime and idle expiry; the engine only records the role so the
@@ -2985,7 +3015,7 @@ impl Agent {
         sopts: StartSessionOptions,
     ) -> std::io::Result<Arc<Session>> {
         let resumed = store.resume(parent_thread_id).await?;
-        let inherited = last_complete_turn(&resumed.messages, &resumed.turn_index);
+        let inherited = completed_context_prefix(&resumed.messages, &resumed.turn_index);
         let approval_context =
             super::approval_capture::ReviewParentHistory::from_rollout(&resumed.raw_items)
                 .map_err(|error| {
@@ -3000,7 +3030,7 @@ impl Agent {
             .await
     }
 
-    /// Create an ephemeral side task from an engine-captured completed turn.
+    /// Create an ephemeral side task from an engine-captured completed context prefix.
     /// The source may still be running; no parent rollout is read or written.
     pub async fn create_side_task_from_live(
         &self,
@@ -5255,7 +5285,7 @@ mod tests {
     }
 
     #[test]
-    fn side_task_inherits_only_the_latest_complete_turn() {
+    fn side_task_retains_earlier_completed_context_without_an_active_tail() {
         let answer = |uuid: &str| {
             Message::Assistant(AssistantMessage {
                 uuid: uuid.into(),
@@ -5274,7 +5304,7 @@ mod tests {
         let first_assistant = answer("assistant-1");
         let incomplete_user = user("user-2");
         assert_eq!(
-            last_complete_turn(
+            completed_context_prefix(
                 &[first_user.clone(), first_assistant.clone(), incomplete_user,],
                 &TurnIndex::default()
             ),
@@ -5284,17 +5314,100 @@ mod tests {
         let second_user = user("user-3");
         let second_assistant = answer("assistant-2");
         assert_eq!(
-            last_complete_turn(
+            completed_context_prefix(
                 &[
-                    first_user,
-                    first_assistant,
+                    first_user.clone(),
+                    first_assistant.clone(),
                     second_user.clone(),
                     second_assistant.clone(),
                 ],
                 &TurnIndex::default()
             ),
-            vec![second_user, second_assistant]
+            vec![first_user, first_assistant, second_user, second_assistant]
         );
+    }
+
+    #[test]
+    fn completed_side_context_retains_a_checkpoint_before_any_new_completion() {
+        let summary = Message::CompactBoundary(crate::schemas::message::CompactBoundaryMessage {
+            uuid: "compacted-context".into(),
+            summary: "Earlier project decisions".into(),
+            native_compaction: None,
+        });
+        let messages = vec![
+            user("old-request"),
+            assistant_with_tool_use("old-call", "old-unpaired"),
+            summary.clone(),
+            user("active-after-compact"),
+        ];
+        let mut index = TurnIndex::default();
+        index
+            .message_turn
+            .insert("active-after-compact".into(), "active".into());
+        index.turn_status.insert("active".into(), "running".into());
+        assert_eq!(completed_context_prefix(&messages, &index), vec![summary]);
+    }
+
+    #[test]
+    fn completed_side_context_excludes_failed_and_interrupted_tool_tails() {
+        let answer = |id: &str| {
+            assistant_with_usage(
+                id,
+                Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    total_tokens: None,
+                },
+            )
+        };
+        let summary = Message::CompactBoundary(crate::schemas::message::CompactBoundaryMessage {
+            uuid: "summary".into(),
+            summary: "Earlier decisions".into(),
+            native_compaction: None,
+        });
+        let messages = vec![
+            summary.clone(),
+            user("done-user"),
+            answer("done-answer"),
+            user("failed-user"),
+            assistant_with_tool_use("failed-call", "unresolved-failure"),
+            user("next-user"),
+            answer("next-answer"),
+            user("active-user"),
+            assistant_with_tool_use("active-call", "unresolved-active"),
+        ];
+        for excluded_status in ["failed", "interrupted"] {
+            let mut index = TurnIndex::default();
+            for (turn, status, ids) in [
+                ("done", "completed", vec!["done-user", "done-answer"]),
+                (
+                    "excluded",
+                    excluded_status,
+                    vec!["failed-user", "failed-call"],
+                ),
+                ("next", "completed", vec!["next-user", "next-answer"]),
+                ("active", "running", vec!["active-user", "active-call"]),
+            ] {
+                index.turn_status.insert(turn.into(), status.into());
+                for id in ids {
+                    index.message_turn.insert(id.into(), turn.into());
+                }
+            }
+            let inherited = completed_context_prefix(&messages, &index);
+            assert_eq!(
+                inherited,
+                vec![
+                    summary.clone(),
+                    messages[1].clone(),
+                    messages[2].clone(),
+                    messages[5].clone(),
+                    messages[6].clone()
+                ]
+            );
+            assert!(tools_are_paired(&inherited));
+        }
     }
 
     #[tokio::test]
