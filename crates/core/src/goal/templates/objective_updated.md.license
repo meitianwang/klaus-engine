@@ -1,4 +1,0 @@
-SPDX-FileCopyrightText: 2025 OpenAI
-SPDX-License-Identifier: Apache-2.0
-
-Modified for explicit pause controls, budget precedence, and continuation deferrals.

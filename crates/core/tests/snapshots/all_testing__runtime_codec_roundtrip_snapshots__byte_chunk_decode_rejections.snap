@@ -1,6 +1,0 @@
----
-source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
-expression: "format!(\"{invalid}\\n{non_ascii}\")"
----
-runtime codec invalid base64 byte chunk: Invalid symbol 64, offset 0. at <root>
-runtime codec base64 byte chunk must contain ASCII only at <root>

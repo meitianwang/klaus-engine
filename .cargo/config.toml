@@ -1,5 +1,0 @@
-# Debug 构建下引擎会话 future 状态机体积巨大，protocol/server 的多线程
-# tokio 单测在默认 2 MiB 线程栈上确定性溢出（SIGABRT）。为工作区内所有
-# cargo 派生线程提升默认栈上限；显式设置过栈大小的线程不受影响。
-[env]
-RUST_MIN_STACK = "16777216"

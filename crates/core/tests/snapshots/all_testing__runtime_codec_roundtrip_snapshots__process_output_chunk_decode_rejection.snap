@@ -1,5 +1,0 @@
----
-source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
-expression: invalid.to_string()
----
-runtime codec Invalid symbol 33, offset 0. at <root>

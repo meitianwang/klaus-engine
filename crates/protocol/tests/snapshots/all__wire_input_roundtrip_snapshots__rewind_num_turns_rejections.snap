@@ -1,7 +1,0 @@
----
-source: crates/protocol/tests/wire_input_roundtrip_snapshots.rs
-expression: "format!(\"{zero}\\n{fractional}\\n{non_number}\")"
----
-runtime codec numTurns must be a positive integer at /op/numTurns
-runtime codec numTurns must be a positive integer at /op/numTurns
-runtime codec ExpectedNumber at /op/numTurns

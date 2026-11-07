@@ -17,11 +17,22 @@ struct Context {
     operation: &'static str,
     started: Instant,
     phase: Arc<Mutex<&'static str>>,
+    request: Arc<Mutex<Value>>,
 }
 
 impl Context {
     fn new(operation: &'static str) -> Self {
         let parent = CONTEXT.try_with(Clone::clone).ok();
+        let request = parent
+            .as_ref()
+            .map(|parent| {
+                parent
+                    .request
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+            .unwrap_or_else(|| json!({}));
         Self {
             operation_id: parent
                 .as_ref()
@@ -32,6 +43,7 @@ impl Context {
             operation,
             started: Instant::now(),
             phase: Arc::new(Mutex::new("begin")),
+            request: Arc::new(Mutex::new(request)),
         }
     }
 
@@ -40,6 +52,7 @@ impl Context {
         let event = json!({"schemaVersion":1,"operationId":self.operation_id,
             "spanId":self.span_id,"parentId":self.parent_id,"operation":self.operation,
             "phase":phase,"lastPhase":last_phase,"elapsedMs":self.started.elapsed().as_millis() as u64,
+            "request":self.request.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             "fields":fields});
         #[cfg(test)]
         let _ = CAPTURE.try_with(|events| events.lock().unwrap().push(event.clone()));
@@ -91,6 +104,68 @@ pub(crate) async fn rpc<T>(
 
 pub(super) fn event(phase: &'static str, fields: Value) {
     let _ = CONTEXT.try_with(|context| context.emit(phase, fields));
+}
+
+pub(super) fn request_fields(fields: Value) {
+    let _ = CONTEXT.try_with(|context| {
+        if let (Some(target), Some(fields)) = (
+            context
+                .request
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_object_mut(),
+            fields.as_object(),
+        ) {
+            target.extend(fields.clone());
+        }
+    });
+}
+
+/// Detailed failure snapshots bypass stderr chunking and survive host restarts.
+/// The shared writer sanitizes credentials, bounds strings and rotates the file.
+pub(super) fn failure(phase: &'static str, fields: Value) {
+    let record = failure_record(phase, fields);
+    #[cfg(not(test))]
+    klaus_agent_core::observability::provider_diagnostics::record_named(
+        "cursor-response-failures.log",
+        "cursor_response_rejected",
+        record,
+    );
+    #[cfg(test)]
+    let _ = FAILURE_PATH.try_with(|path| {
+        klaus_agent_core::observability::provider_diagnostics::record_to(
+            path,
+            "cursor_response_rejected",
+            record,
+        )
+    });
+}
+
+fn failure_record(phase: &'static str, fields: Value) -> Value {
+    let mut record = json!({"schemaVersion":1,"phase":phase,"fields":fields});
+    let _ = CONTEXT.try_with(|context| {
+        record["operationId"] = json!(context.operation_id);
+        record["spanId"] = json!(context.span_id);
+        record["operation"] = json!(context.operation);
+        record["lastPhase"] = json!(*context.phase.lock().unwrap_or_else(|p| p.into_inner()));
+        record["request"] = context
+            .request
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+    });
+    record
+}
+
+#[cfg(test)]
+tokio::task_local! { static FAILURE_PATH: std::path::PathBuf; }
+
+#[cfg(test)]
+pub(super) async fn capture_failures<T>(
+    path: std::path::PathBuf,
+    future: impl Future<Output = T>,
+) -> T {
+    FAILURE_PATH.scope(path, future).await
 }
 
 pub(super) async fn result<T>(
@@ -216,6 +291,21 @@ pub(super) fn error_code(error: &str) -> &'static str {
         "cursor_overloaded",
         "cursor_upstream_error",
         "cursor_native_message_invalid",
+        "cursor_metadata_selector_invalid",
+        "cursor_metadata_not_owned",
+        "cursor_metadata_call_invalid",
+        "cursor_metadata_call_mismatch",
+        "cursor_metadata_result_mismatch",
+        "cursor_metadata_call_not_started",
+        "cursor_metadata_call_not_replied",
+        "cursor_metadata_call_duplicate",
+        "cursor_metadata_pattern_invalid",
+        "cursor_metadata_result_invalid",
+        "cursor_metadata_result_too_large",
+        "cursor_metadata_history_invalid",
+        "cursor_metadata_state_invalid",
+        "cursor_mixed_metadata_tool_batch",
+        "cursor_tool_identity_invalid",
     ];
     CODES
         .iter()
@@ -276,7 +366,7 @@ mod tests {
     #[test]
     fn arbitrary_error_text_is_never_recorded() {
         assert_eq!(
-            error_code("request failed: https://user:secret@example.invalid?verifier=secret"),
+            error_code("request failed: fixture-sensitive-input"),
             "unclassified"
         );
         assert_eq!(error_code("cursor_network_error"), "cursor_network_error");

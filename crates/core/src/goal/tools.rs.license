@@ -1,4 +1,0 @@
-SPDX-FileCopyrightText: 2025 OpenAI
-SPDX-License-Identifier: Apache-2.0
-
-Goal-tool policy descriptions modified for persistent-thread eligibility, explicit pause controls, and budget precedence.

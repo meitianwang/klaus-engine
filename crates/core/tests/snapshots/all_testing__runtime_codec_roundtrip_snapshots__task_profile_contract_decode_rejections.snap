@@ -1,6 +1,0 @@
----
-source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
-expression: "format!(\"{loose_provider_info}\\n{loose_event}\")"
----
-runtime codec UnknownField at /providerInfo/extra
-runtime codec model stream event contains unknown field "extra" at /scriptedTurns/0/0

@@ -1,7 +1,0 @@
----
-source: crates/core/tests/runtime_codec_roundtrip_snapshots.rs
-expression: render_hooks(&hooks)
----
-PostToolUse matcher=Some("Edit") async=true command="fmt --check" timeout_ms=Some(2500)
-PostToolUse matcher=None async=false command="lint" timeout_ms=None
-PreToolUse matcher=None async=false command="审计 $FILE" timeout_ms=None
