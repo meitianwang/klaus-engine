@@ -466,6 +466,10 @@ pub struct QueryParams {
     /// Frozen native request replacements owned by this main conversation.
     /// Auxiliary and child queries never inherit the parent's hint controller.
     pub context_hint_state: Option<Arc<crate::context::context_hints::ContextHintState>>,
+    /// Canonical read-state cache, present on the same turns as
+    /// `context_hint_state`. A hint clear drops the baselines of cleared reads
+    /// so the next edit re-reads files the model can no longer see.
+    pub file_state: Option<Arc<crate::tools::file_state::InMemoryFileStateCache>>,
     /// Persist fresh budget replacement records so a resumed session re-applies
     /// the same bodies byte-identically. Called with this turn's new records.
     pub on_tool_result_budget_records: Option<OnToolResultBudgetRecords>,

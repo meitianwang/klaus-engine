@@ -425,6 +425,8 @@ pub(super) fn prepare_with_inference(
                         crate::runtime_values::RuntimePath::from("tool-results"),
                     ],
                 )),
+                cwd: permission_context.cwd.clone(),
+                read_state: params.file_state.clone(),
                 state: state.clone(),
             }
         })

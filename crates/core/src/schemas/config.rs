@@ -1730,7 +1730,7 @@ impl Default for EngineConfig {
             speculative_compaction: false,
             persist_precomputed_compaction: false,
             compact_cold_cleanup: false,
-            context_hints: false,
+            context_hints: true,
             precompute_buffer_fraction: None,
             provider_trace: false,
             early_microcompact: false,

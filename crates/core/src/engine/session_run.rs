@@ -1970,7 +1970,10 @@ impl Session {
             tool_result_budget_state: Some(this.tool_result_budget_state()),
             context_hint_state: (this.meta.role
                 != Some(crate::schemas::rollout::SessionRole::SideTask))
-            .then(|| this.context_hint_state.clone()),
+                .then(|| this.context_hint_state.clone()),
+            file_state: (this.meta.role
+                != Some(crate::schemas::rollout::SessionRole::SideTask))
+                .then(|| this.file_state.clone()),
             on_tool_result_budget_records: {
                 let this = this.clone();
                 Some(Arc::new(move |records| {

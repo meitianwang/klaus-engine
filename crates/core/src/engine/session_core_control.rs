@@ -4031,6 +4031,7 @@ impl Session {
             // A read-only side query runs on its own thread id and owns no
             // long-lived cached prefix, so the idle pass never applies.
             context_hint_state: None,
+            file_state: None,
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),

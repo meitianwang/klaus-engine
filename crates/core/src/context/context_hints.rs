@@ -5,12 +5,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use crate::fs::node_path::resolve_runtime;
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimePath, RuntimeString};
 use crate::schemas::content::{ContentBlock, OutputBlock, TextBlock};
 use crate::schemas::message::Message;
 use crate::schemas::rollout::RolloutItem;
+use crate::tools::file_state::InMemoryFileStateCache;
 use crate::tools::result_storage::{maybe_spill_result, SpillOptions};
 use crate::types::errors::ProviderError;
+use crate::types::file_state::FileStateCache;
 use crate::types::provider::ModelRequest;
 
 pub const CONTEXT_HINT_BETA: &str = "context-hint-2026-04-09";
@@ -18,19 +21,38 @@ pub const CONTEXT_HINT_TARGET_TOKENS: u64 = 75_000;
 pub const CONTEXT_HINT_MIN_SAVINGS: u64 = 20_000;
 pub const CONTEXT_HINT_KEEP_RECENT: usize = 5;
 pub const CONTEXT_HINT_STREAM_FALLBACK_CODE: &str = "context-hint-stream-fallback";
-pub const CONTEXT_HINT_CLEARED_MARKER: &str = "[tool output cleared to save context]";
+pub const CONTEXT_HINT_CLEARED_MARKER: &str = "[Old tool result content cleared]";
+pub const CONTEXT_HINT_PERSISTED_PREFIX: &str = "<persisted-output>";
 pub const CONTEXT_HINT_ROLLOUT_EVENT: &str = "context_hint_records";
 
 /// Captured native request intent. Decoded or auxiliary requests do not inherit
 /// it. The transport separately verifies its own first-party identity.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContextHintRequest {
     pub enabled: bool,
     pub main_thread: bool,
     /// Full text can be saved here before replacing an old result with a path.
     /// Without a directory, the original transcript still retains that text.
     pub artifact_dir: Option<RuntimePath>,
+    /// Working directory used to resolve the recorded input of a cleared read.
+    pub cwd: RuntimePath,
+    /// Canonical read-state cache. A cleared read drops its baseline so the
+    /// next edit must re-read a file whose content the model can no longer see.
+    pub read_state: Option<Arc<InMemoryFileStateCache>>,
     pub state: Arc<ContextHintState>,
+}
+
+impl std::fmt::Debug for ContextHintRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContextHintRequest")
+            .field("enabled", &self.enabled)
+            .field("main_thread", &self.main_thread)
+            .field("artifact_dir", &self.artifact_dir)
+            .field("cwd", &self.cwd)
+            .field("read_state", &self.read_state.is_some())
+            .finish()
+    }
 }
 
 impl PartialEq for ContextHintRequest {
@@ -38,6 +60,12 @@ impl PartialEq for ContextHintRequest {
         self.enabled == other.enabled
             && self.main_thread == other.main_thread
             && self.artifact_dir == other.artifact_dir
+            && self.cwd == other.cwd
+            && match (&self.read_state, &other.read_state) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
             && Arc::ptr_eq(&self.state, &other.state)
     }
 }
@@ -386,8 +414,7 @@ fn eligible_tool(name: &RuntimeString) -> bool {
 fn already_replaced(content: &[OutputBlock]) -> bool {
     matches!(content, [OutputBlock::Text(text)] if
         text.text == CONTEXT_HINT_CLEARED_MARKER
-            || text.text == "[Old tool result content cleared]"
-            || text.text.starts_with("<persisted-output>")
+            || text.text.starts_with(CONTEXT_HINT_PERSISTED_PREFIX)
             || text.text.starts_with(crate::context::tool_result_budget::BUDGET_REPLACEMENT_TAG))
 }
 
@@ -537,13 +564,13 @@ pub async fn project_hint_edits(
                 SpillOptions {
                     max_chars: 0.0,
                     dir: dir.clone(),
-                    id: format!("hint-{}", uuid::Uuid::new_v4()).into(),
+                    id: hint_spill_id(&id),
                 },
                 |_, _, path| {
-                    RuntimeString::from(crate::context::tool_result_budget::BUDGET_REPLACEMENT_TAG)
-                        .concat(&"\nTool result saved to: ".into())
+                    RuntimeString::from(CONTEXT_HINT_PERSISTED_PREFIX)
+                        .concat(&"Tool result saved to: ".into())
                         .concat(path.as_runtime_string())
-                        .concat(&"\nUse read to view the complete output.".into())
+                        .concat(&"\n\nUse read to view</persisted-output>".into())
                 },
             )
             .await;
@@ -555,7 +582,95 @@ pub async fn project_hint_edits(
         }
         projection.replacements.insert(id, replacement);
     }
+    tracing::debug!(
+        cleared = projection.replacements.len(),
+        estimated_tokens_saved = projection.estimated_tokens_saved,
+        keep_recent = CONTEXT_HINT_KEEP_RECENT,
+        "context hint projection replaced old reconstructible tool results"
+    );
     projection
+}
+
+/// Deterministic, filesystem-safe artifact name derived from the tool call id:
+/// re-projecting the same intact transcript reuses one artifact instead of
+/// leaking a fresh file per episode.
+fn hint_spill_id(id: &RuntimeString) -> RuntimeString {
+    let cleaned: String = id
+        .try_to_utf8()
+        .unwrap_or_default()
+        .chars()
+        .take(160)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        RuntimeString::from("hint-result")
+    } else {
+        RuntimeString::from(cleaned)
+    }
+}
+
+/// Mirror of one clear episode: every read whose result just left the model's
+/// view drops its read-state baseline, so a later edit must re-read the file
+/// instead of relying on content the model can no longer see. Cleared results
+/// of other tools and reads inside the keep-recent window are untouched.
+pub fn invalidate_cleared_reads(
+    messages: &[Message],
+    projection: &ContextHintProjection,
+    intent: &ContextHintRequest,
+) {
+    let Some(read_state) = intent.read_state.as_ref() else {
+        return;
+    };
+    if projection.replacements.is_empty() {
+        return;
+    }
+    let mut invalidated = 0usize;
+    for message in messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.content {
+            let ContentBlock::ToolUse(tool) = block else {
+                continue;
+            };
+            if !matches!(
+                tool.name.try_to_utf8().ok().as_deref(),
+                Some("Read" | "read")
+            ) || !projection.replacements.contains_key(&tool.id)
+            {
+                continue;
+            }
+            let Some(input) = tool.input.as_object() else {
+                continue;
+            };
+            let Some(path) = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .and_then(RuntimeJson::as_string)
+            else {
+                continue;
+            };
+            let Ok(resolved) = resolve_runtime(&intent.cwd, &[RuntimePath::from(path.clone())])
+            else {
+                continue;
+            };
+            read_state.delete(&resolved);
+            invalidated += 1;
+        }
+    }
+    if invalidated > 0 {
+        tracing::debug!(
+            invalidated_reads = invalidated,
+            cleared = projection.replacements.len(),
+            "context hint clear dropped read-state baselines for cleared reads"
+        );
+    }
 }
 
 /// The query layer owns retiring any partial visible response. It can then use
@@ -581,7 +696,171 @@ pub async fn stream_fallback_request(
         .apply_frozen(&request.model, &mut next.messages);
     let projection = project_hint_edits(&next.messages, intent.artifact_dir.as_ref()).await;
     intent.state.record_projection(&request.model, &projection);
+    invalidate_cleared_reads(&next.messages, &projection, intent);
     next.context_hints = None;
     projection.apply(&mut next.messages);
     Some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_values::runtime_json;
+    use crate::schemas::content::ToolUseBlock;
+    use crate::schemas::message::{AssistantMessage, ToolResultMessage};
+    use crate::types::file_state::RecordOptions;
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "klaus-context-hints-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn runtime_path(dir: &std::path::Path) -> RuntimePath {
+        RuntimePath::from(dir.to_string_lossy().into_owned())
+    }
+
+    fn pair(name: &str, id: &str, input: &str, body: String) -> [Message; 2] {
+        [
+            Message::Assistant(AssistantMessage {
+                uuid: RuntimeString::from(format!("assistant-{id}")),
+                model: RuntimeString::from("hint-model"),
+                usage: None,
+                content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                    id: RuntimeString::from(id),
+                    name: RuntimeString::from(name),
+                    input: runtime_json::parse(&RuntimeString::from(input)).unwrap(),
+                    tool_kind: None,
+                    thought_signature: None,
+                })],
+            }),
+            Message::ToolResult(ToolResultMessage {
+                uuid: RuntimeString::from(format!("result-{id}")),
+                tool_use_id: RuntimeString::from(id),
+                content: vec![OutputBlock::Text(TextBlock {
+                    text: RuntimeString::from(body),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })],
+                is_error: false,
+                tool_kind: None,
+                native_tool_output: None,
+                output: None,
+                extra_user_blocks: None,
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn persisted_reference_is_wrapped_and_the_artifact_name_is_deterministic() {
+        let host = unique_dir("persist");
+        let dir = runtime_path(&host);
+        let mut messages: Vec<Message> = Vec::new();
+        messages.extend(pair(
+            "read",
+            "tool-a",
+            r#"{"path":"a.txt"}"#,
+            "x".repeat(80_000),
+        ));
+        for index in 0..5 {
+            messages.extend(pair(
+                "read",
+                &format!("tool-keep-{index}"),
+                r#"{"path":"kept.txt"}"#,
+                format!("recent result {index}"),
+            ));
+        }
+        let projection = project_hint_edits(&messages, Some(&dir)).await;
+        assert_eq!(projection.replacements.len(), 1);
+        let replacement = &projection.replacements[&RuntimeString::from("tool-a")];
+        assert!(replacement.starts_with("<persisted-output>Tool result saved to: "));
+        assert!(replacement.ends_with("\n\nUse read to view</persisted-output>"));
+        let names: Vec<String> = std::fs::read_dir(&host)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["tool-a.txt".to_string()]);
+        // A later episode re-projects the same intact transcript and must reuse
+        // the one artifact instead of leaking another file per retry.
+        let again = project_hint_edits(&messages, Some(&dir)).await;
+        assert_eq!(
+            again.replacements[&RuntimeString::from("tool-a")]
+                .try_to_utf8()
+                .unwrap(),
+            replacement.try_to_utf8().unwrap()
+        );
+        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 1);
+        std::fs::remove_dir_all(&host).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_reads_drops_their_baselines_but_keeps_other_tools() {
+        let host = unique_dir("invalidate");
+        let cwd = runtime_path(&host);
+        let cache = Arc::new(InMemoryFileStateCache::default());
+        let cleared = resolve_runtime(&cwd, &[RuntimePath::from("cleared.txt")]).unwrap();
+        let kept = resolve_runtime(&cwd, &[RuntimePath::from("kept.txt")]).unwrap();
+        let shell = resolve_runtime(&cwd, &[RuntimePath::from("shell.txt")]).unwrap();
+        for path in [&cleared, &kept, &shell] {
+            cache.record(path, 1.0, RecordOptions::default());
+        }
+        let mut messages: Vec<Message> = Vec::new();
+        messages.extend(pair(
+            "bash",
+            "tool-0",
+            r#"{"path":"shell.txt"}"#,
+            "x".repeat(80_000),
+        ));
+        messages.extend(pair(
+            "read",
+            "tool-1",
+            r#"{"path":"cleared.txt"}"#,
+            "y".repeat(40_000),
+        ));
+        for index in 2..7 {
+            messages.extend(pair(
+                "read",
+                &format!("tool-{index}"),
+                r#"{"path":"kept.txt"}"#,
+                format!("recent result {index}"),
+            ));
+        }
+        let intent = ContextHintRequest {
+            enabled: true,
+            main_thread: true,
+            artifact_dir: None,
+            cwd: cwd.clone(),
+            read_state: Some(cache.clone()),
+            state: Arc::new(ContextHintState::new()),
+        };
+        let projection = project_hint_edits(&messages, None).await;
+        assert_eq!(projection.replacements.len(), 2);
+        assert!(projection
+            .replacements
+            .contains_key(&RuntimeString::from("tool-0")));
+        assert!(projection
+            .replacements
+            .contains_key(&RuntimeString::from("tool-1")));
+        invalidate_cleared_reads(&messages, &projection, &intent);
+        assert!(
+            !cache.has(&cleared),
+            "a cleared read must drop its read-state baseline"
+        );
+        assert!(
+            cache.has(&shell),
+            "a cleared non-read tool never held a read baseline to drop"
+        );
+        assert!(cache.has(&kept), "kept reads stay tracked");
+        std::fs::remove_dir_all(&host).unwrap();
+    }
 }

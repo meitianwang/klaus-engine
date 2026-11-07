@@ -734,6 +734,7 @@ impl Session {
             // A forked review is a one-shot side query with its own thread id; it
             // owns no long-lived cached prefix, so the idle pass never applies.
             context_hint_state: None,
+            file_state: None,
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),

@@ -40,6 +40,8 @@ fn intent() -> ContextHintRequest {
         enabled: true,
         main_thread: true,
         artifact_dir: None,
+        cwd: RuntimePath::default(),
+        read_state: None,
         state: std::sync::Arc::new(ContextHintState::new()),
     }
 }

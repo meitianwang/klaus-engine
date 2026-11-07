@@ -2526,6 +2526,7 @@ impl Session {
                 // stretch of work, so a gap long enough to cool the prompt cache
                 // means the sub-agent has already finished.
                 context_hint_state: None,
+                file_state: None,
                 tool_result_budget_state: child_budget_state,
                 on_tool_result_budget_records: None,
                 // Sub-agents consult the main thread's cache-cold decision but never

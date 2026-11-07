@@ -3289,6 +3289,7 @@ fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {
         agent_id: None,
         agent_type: None,
         context_hint_state: None,
+        file_state: None,
         tool_result_budget_state: None,
         on_tool_result_budget_records: None,
         thinking_context_cold: false,

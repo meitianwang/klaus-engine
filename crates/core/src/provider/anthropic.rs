@@ -10,8 +10,8 @@
 //! can be unit-tested with canned bytes without any network.
 
 use crate::context::context_hints::{
-    project_hint_edits, ContextHintController, ContextHintProjection, HintErrorAction,
-    CONTEXT_HINT_BETA, CONTEXT_HINT_STREAM_FALLBACK_CODE,
+    invalidate_cleared_reads, project_hint_edits, ContextHintController, ContextHintProjection,
+    HintErrorAction, CONTEXT_HINT_BETA, CONTEXT_HINT_STREAM_FALLBACK_CODE,
 };
 use crate::context::images::ImageLimits;
 use crate::context::media_budget::{
@@ -1802,6 +1802,7 @@ async fn attempt_with_media_remediation(
                     let projection = project_hint_edits(&ctx.hint_messages, directory).await;
                     if let Some(intent) = intent {
                         intent.state.record_projection(&ctx.hint_model, &projection);
+                        invalidate_cleared_reads(&ctx.hint_messages, &projection, &intent);
                     }
                     projection
                 } else {
@@ -6072,6 +6073,8 @@ mod context_hint_transport_tests {
             enabled: true,
             main_thread: true,
             artifact_dir: None,
+            cwd: crate::runtime_values::RuntimePath::default(),
+            read_state: None,
             state: Arc::new(crate::context::context_hints::ContextHintState::new()),
         });
         for index in 0..6 {
