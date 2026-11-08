@@ -82,6 +82,14 @@ pub fn approx_tokens_from_byte_count(bytes: usize) -> u64 {
         / (APPROX_BYTES_PER_TOKEN as u64)
 }
 
+/// Renders the byte-omission notice placed where a capped collection dropped
+/// bytes from the middle of a stream. Stream surfaces (interactive shell
+/// sessions) pair it with their own token-count metadata so the model can tell
+/// collection loss apart from model-facing truncation.
+pub fn format_output_omission_marker(omitted_bytes: u64) -> String {
+    format!("... {omitted_bytes} bytes omitted ...")
+}
+
 /// One UTF-8-aligned range replaced by a notice. Callers can apply the same
 /// edit to annotated text without losing the sources of the retained slices.
 pub struct TextTruncation {

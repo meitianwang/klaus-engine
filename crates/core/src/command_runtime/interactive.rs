@@ -361,6 +361,16 @@ pub struct ExecCommandResult {
     pub exit_code: Option<i32>,
     /// Non-null when the child is still alive and stored as a session.
     pub session_id: Option<RuntimeString>,
+    /// Identifier of this response's output chunk; empty on legacy paths that
+    /// predate chunked collection.
+    pub chunk_id: RuntimeString,
+    /// Milliseconds the collection window actually observed the process.
+    pub wall_time_ms: u64,
+    /// Approximate tokens over every byte the window observed, including bytes
+    /// dropped by the collection cap.
+    pub original_token_count: u64,
+    /// Bytes dropped by the collection cap before model-facing truncation.
+    pub output_omitted_bytes: Option<u64>,
 }
 
 impl RuntimeEncode for ExecCommandResult {
@@ -370,6 +380,10 @@ impl RuntimeEncode for ExecCommandResult {
         object.field("exited", &self.exited)?;
         object.field("exitCode", &self.exit_code)?;
         object.field("sessionId", &self.session_id)?;
+        object.field("chunkId", &self.chunk_id)?;
+        object.field("wallTimeMs", &self.wall_time_ms)?;
+        object.field("originalTokenCount", &self.original_token_count)?;
+        object.field("outputOmittedBytes", &self.output_omitted_bytes)?;
         out.emit(RuntimeJson::Object(object.finish()))
     }
 }
@@ -382,6 +396,10 @@ impl RuntimeDecode for ExecCommandResult {
                 exited: object.required("exited", &[])?,
                 exit_code: object.optional("exitCode", &[])?,
                 session_id: object.optional("sessionId", &[])?,
+                chunk_id: object.optional("chunkId", &[])?.unwrap_or_default(),
+                wall_time_ms: object.optional("wallTimeMs", &[])?.unwrap_or(0),
+                original_token_count: object.optional("originalTokenCount", &[])?.unwrap_or(0),
+                output_omitted_bytes: object.optional("outputOmittedBytes", &[])?,
             })
         })
     }
@@ -456,6 +474,16 @@ pub struct WriteStdinResult {
     pub terminal_size: Option<TerminalOptions>,
     pub resized: bool,
     pub tail: Option<RuntimeString>,
+    /// Identifier of this response's output chunk; empty on legacy paths that
+    /// predate chunked collection.
+    pub chunk_id: RuntimeString,
+    /// Milliseconds the collection window actually observed the process.
+    pub wall_time_ms: u64,
+    /// Approximate tokens over every byte the window observed, including bytes
+    /// dropped by the collection cap.
+    pub original_token_count: u64,
+    /// Bytes dropped by the collection cap before model-facing truncation.
+    pub output_omitted_bytes: Option<u64>,
 }
 
 impl RuntimeEncode for WriteStdinResult {
@@ -470,6 +498,10 @@ impl RuntimeEncode for WriteStdinResult {
         object.field("terminalSize", &self.terminal_size)?;
         object.field("resized", &self.resized)?;
         object.field("tail", &self.tail)?;
+        object.field("chunkId", &self.chunk_id)?;
+        object.field("wallTimeMs", &self.wall_time_ms)?;
+        object.field("originalTokenCount", &self.original_token_count)?;
+        object.field("outputOmittedBytes", &self.output_omitted_bytes)?;
         out.emit(RuntimeJson::Object(object.finish()))
     }
 }
@@ -487,6 +519,10 @@ impl RuntimeDecode for WriteStdinResult {
                 terminal_size: object.optional("terminalSize", &[])?,
                 resized: object.required("resized", &[])?,
                 tail: object.optional("tail", &[])?,
+                chunk_id: object.optional("chunkId", &[])?.unwrap_or_default(),
+                wall_time_ms: object.optional("wallTimeMs", &[])?.unwrap_or(0),
+                original_token_count: object.optional("originalTokenCount", &[])?.unwrap_or(0),
+                output_omitted_bytes: object.optional("outputOmittedBytes", &[])?,
             })
         })
     }
@@ -656,6 +692,10 @@ impl InteractiveCommandRegistry {
                 exited: true,
                 exit_code,
                 session_id: None,
+                chunk_id: RuntimeString::default(),
+                wall_time_ms: 0,
+                original_token_count: 0,
+                output_omitted_bytes: None,
             };
         }
         self.sessions.lock_recover().push(session);
@@ -664,6 +704,10 @@ impl InteractiveCommandRegistry {
             exited: false,
             exit_code: None,
             session_id: Some(id),
+            chunk_id: RuntimeString::default(),
+            wall_time_ms: 0,
+            original_token_count: 0,
+            output_omitted_bytes: None,
         }
     }
 
@@ -747,6 +791,10 @@ impl InteractiveCommandRegistry {
                 terminal_size: None,
                 resized: false,
                 tail: None,
+                chunk_id: RuntimeString::default(),
+                wall_time_ms: 0,
+                original_token_count: 0,
+                output_omitted_bytes: None,
             };
         };
         {
@@ -818,6 +866,10 @@ impl InteractiveCommandRegistry {
                 terminal_size,
                 resized,
                 tail,
+                chunk_id: RuntimeString::default(),
+                wall_time_ms: 0,
+                original_token_count: 0,
+                output_omitted_bytes: None,
             };
         }
         WriteStdinResult {
@@ -830,6 +882,10 @@ impl InteractiveCommandRegistry {
             terminal_size,
             resized,
             tail,
+            chunk_id: RuntimeString::default(),
+            wall_time_ms: 0,
+            original_token_count: 0,
+            output_omitted_bytes: None,
         }
     }
 

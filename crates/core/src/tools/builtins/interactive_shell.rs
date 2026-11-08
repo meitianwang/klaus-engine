@@ -13,16 +13,19 @@ use crate::fs::node_path::resolve_runtime;
 use crate::fs::path_safety::{writable_roots, writes_are_unconfined, PathContext};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimePath, RuntimeString};
 use crate::tools::build_tool::text_result;
+use crate::tools::output_truncation::{
+    format_output_omission_marker, formatted_truncate_text, truncate_text,
+    with_serialization_allowance, TruncationPolicy, DEFAULT_OUTPUT_TRUNCATION_POLICY,
+};
 use crate::tools::shell_session::{
     ExecCommandParams, TerminalOptions, WriteStdinErrorClass, WriteStdinFailure, WriteStdinParams,
+    EXEC_OUTPUT_MAX_BYTES,
 };
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
 use crate::types::tool::{Tool, ToolContext, ToolExposure, ToolProgress, ToolResult};
 
-use super::shell_common::{
-    code_str, first_chars, request_shell_escalation, DEFAULT_MAX_OUTPUT_BYTES,
-};
+use super::shell_common::{first_chars, request_shell_escalation};
 
 const MAX_TERMINAL_DIMENSION: u16 = 10_000;
 const EXEC_INPUT_SCHEMA_PROPERTY_ORDER: &[&str] = &[
@@ -60,6 +63,127 @@ fn terminal_size_json(size: Option<TerminalOptions>) -> RuntimeJson {
     object.insert("cols", RuntimeJson::from(size.cols));
     object.insert("rows", RuntimeJson::from(size.rows));
     RuntimeJson::Object(object)
+}
+
+/// Default model-visible output budget for one session response, in
+/// approximate tokens.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+
+/// The smaller of the token budget and the shared shell-output truncation
+/// policy, so a session response never exceeds either.
+fn model_output_policy() -> TruncationPolicy {
+    let requested = TruncationPolicy::Tokens(DEFAULT_MAX_OUTPUT_TOKENS);
+    let base = DEFAULT_OUTPUT_TRUNCATION_POLICY;
+    if requested.byte_budget() < base.byte_budget() {
+        requested
+    } else {
+        base
+    }
+}
+
+/// Renders one session response body under a policy, keeping the explicit
+/// omission marker when the collection window dropped bytes from the middle.
+/// Non-scalar runtime text (lone surrogates from lossy sources) passes through
+/// unchanged: byte budgets are undefined for it and a lossy rewrite would
+/// corrupt the only record of the value.
+fn truncated_session_output(
+    body: &RuntimeString,
+    policy: TruncationPolicy,
+    omitted_bytes: Option<u64>,
+    original_token_count: u64,
+) -> RuntimeString {
+    let Ok(text) = body.try_to_utf8() else {
+        return body.clone();
+    };
+    let Some(omitted) = omitted_bytes else {
+        return RuntimeString::from_utf8(&formatted_truncate_text(&text, policy));
+    };
+    let marker = format_output_omission_marker(omitted);
+    if text.len() <= policy.byte_budget() {
+        return if text.contains(&marker) {
+            body.clone()
+        } else {
+            RuntimeString::from_utf8(&format!("{marker}\n{text}"))
+        };
+    }
+    let truncated = truncate_text(&text, policy);
+    let omission_notice = if truncated.contains(&marker) {
+        String::new()
+    } else {
+        format!("{marker}\n")
+    };
+    RuntimeString::from_utf8(&format!(
+        "Warning: truncated output (original token count: {original_token_count})\n{omission_notice}\n{truncated}"
+    ))
+}
+
+/// The metadata header leading every session response: chunk identity, the
+/// observed wall time, the process state line, and the observed output size.
+fn session_response_header(
+    chunk_id: &RuntimeString,
+    wall_time_ms: u64,
+    exit_code: Option<i32>,
+    session_id: Option<&RuntimeString>,
+    resized: Option<TerminalOptions>,
+    original_token_count: u64,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Ok(chunk_id) = chunk_id.try_to_utf8() {
+        if !chunk_id.is_empty() {
+            sections.push(format!("Chunk ID: {chunk_id}"));
+        }
+    }
+    sections.push(format!(
+        "Wall time: {:.4} seconds",
+        wall_time_ms as f64 / 1000.0
+    ));
+    if let Some(exit_code) = exit_code {
+        sections.push(format!("Process exited with code {exit_code}"));
+    }
+    if let Some(session_id) = session_id {
+        if let Ok(session_id) = session_id.try_to_utf8() {
+            sections.push(format!("Process running with session ID {session_id}"));
+        }
+    }
+    if let Some(size) = resized {
+        sections.push(format!("[terminal resized to {}x{}]", size.cols, size.rows));
+    }
+    sections.push(format!("Original token count: {original_token_count}"));
+    sections.push("Output:".to_string());
+    sections.join("\n")
+}
+
+fn measurable_len(text: &RuntimeString) -> usize {
+    text.try_to_utf8().map(|utf8| utf8.len()).unwrap_or(0)
+}
+
+/// Assembles the model-visible response: header plus body, shrinking the body
+/// policy until the complete response fits the serialization budget so history
+/// does not truncate an already-truncated output a second time.
+fn session_response_text(
+    header: &str,
+    body: &RuntimeString,
+    omitted_bytes: Option<u64>,
+    original_token_count: u64,
+) -> RuntimeString {
+    let output_budget = with_serialization_allowance(DEFAULT_OUTPUT_TRUNCATION_POLICY)
+        .byte_budget()
+        .saturating_sub(header.len().saturating_add(1));
+    let mut policy = model_output_policy();
+    let mut output = truncated_session_output(body, policy, omitted_bytes, original_token_count);
+    while measurable_len(&output) > output_budget && policy.byte_budget() > 0 {
+        let excess_bytes = measurable_len(&output).saturating_sub(output_budget);
+        policy = match policy {
+            TruncationPolicy::Bytes(bytes) => {
+                TruncationPolicy::Bytes(bytes.saturating_sub(excess_bytes))
+            }
+            TruncationPolicy::Tokens(tokens) => TruncationPolicy::Tokens(
+                tokens.saturating_sub(TruncationPolicy::Bytes(excess_bytes).token_budget()),
+            ),
+        };
+        output = truncated_session_output(body, policy, omitted_bytes, original_token_count);
+    }
+    RuntimeString::from_utf8(&format!("{header}\n")).concat(&output)
 }
 
 // ===================== exec_command =====================
@@ -124,7 +248,7 @@ pub struct ExecCommandTool {
 impl ExecCommandTool {
     fn new(opts: InteractiveShellOptions) -> Self {
         ExecCommandTool {
-            max_output_bytes: opts.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
+            max_output_bytes: opts.max_output_bytes.unwrap_or(EXEC_OUTPUT_MAX_BYTES),
             input_schema: exec_input_schema(),
         }
     }
@@ -350,25 +474,23 @@ impl Tool for ExecCommandTool {
                 .map_err(ToolError::new)?;
         }
 
-        let body = if r.output.is_empty() {
-            RuntimeString::from("(no output)")
+        let header = session_response_header(
+            &r.chunk_id,
+            r.wall_time_ms,
+            r.exit_code,
+            r.session_id.as_ref(),
+            None,
+            r.original_token_count,
+        );
+        let text = if r.output.is_empty() {
+            RuntimeString::from_utf8(&format!("{header}\n(no output)"))
         } else {
-            r.output.clone()
-        };
-        let status = if r.exited {
-            RuntimeString::from("[exited, code ")
-                .concat(&code_str(r.exit_code))
-                .concat(&RuntimeString::from("]"))
-        } else {
-            let session_id = r
-                .session_id
-                .clone()
-                .unwrap_or_else(|| RuntimeString::from("null"));
-            RuntimeString::from("[session ")
-                .concat(&session_id)
-                .concat(&RuntimeString::from(
-                    " still running — send input with write_stdin, stop with kill_shell]",
-                ))
+            session_response_text(
+                &header,
+                &r.output,
+                r.output_omitted_bytes,
+                r.original_token_count,
+            )
         };
         let mut output = RuntimeObject::new();
         output.insert("exited", RuntimeJson::Bool(r.exited));
@@ -382,9 +504,15 @@ impl Tool for ExecCommandTool {
                 .clone()
                 .map_or(RuntimeJson::Null, RuntimeJson::String),
         );
+        output.insert("chunkId", RuntimeJson::String(r.chunk_id.clone()));
+        output.insert("wallTimeMs", RuntimeJson::from(r.wall_time_ms));
+        output.insert(
+            "originalTokenCount",
+            RuntimeJson::from(r.original_token_count),
+        );
         Ok(text_result(
             RuntimeJson::Object(output),
-            body.concat(&RuntimeString::from("\n")).concat(&status),
+            text,
             r.exited && r.exit_code != Some(0),
         ))
     }
@@ -405,7 +533,7 @@ fn write_stdin_input_schema() -> JsonSchema {
                 "type": "string"
             },
             "yieldMs": {
-                "description": "How long to wait for output (default 5000 polling, 10000 when sending input).",
+                "description": "How long to wait for output (default 5000 polling, 250 when sending input).",
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991_i64
@@ -533,35 +661,28 @@ impl Tool for WriteStdinTool {
             Ok(result) => result,
             Err(failure) => return Ok(write_stdin_error_result(&session_id, failure)),
         };
-        let body = if r.output.is_empty() {
-            match r.tail.as_ref().filter(|tail| !tail.is_empty()) {
+        let header = session_response_header(
+            &r.chunk_id,
+            r.wall_time_ms,
+            r.exit_code,
+            r.session_id.as_ref(),
+            r.resized.then_some(r.terminal_size).flatten(),
+            r.original_token_count,
+        );
+        let text = if r.output.is_empty() {
+            let placeholder = match r.tail.as_ref().filter(|tail| !tail.is_empty()) {
                 Some(tail) => RuntimeString::from("(no new output)\n[tail]\n").concat(tail),
                 None => RuntimeString::from("(no new output)"),
-            }
+            };
+            RuntimeString::from_utf8(&format!("{header}\n")).concat(&placeholder)
         } else {
-            r.output.clone()
+            session_response_text(
+                &header,
+                &r.output,
+                r.output_omitted_bytes,
+                r.original_token_count,
+            )
         };
-        let mut status = if r.exited {
-            RuntimeString::from("[exited, code ")
-                .concat(&code_str(r.exit_code))
-                .concat(&RuntimeString::from("]"))
-        } else {
-            let session_id = r
-                .session_id
-                .clone()
-                .unwrap_or_else(|| RuntimeString::from("null"));
-            RuntimeString::from("[session ")
-                .concat(&session_id)
-                .concat(&RuntimeString::from(" still running]"))
-        };
-        if r.resized {
-            if let Some(size) = r.terminal_size {
-                status = status.concat(&RuntimeString::from_utf8(&format!(
-                    "\n[terminal resized to {}x{}]",
-                    size.cols, size.rows
-                )));
-            }
-        }
         let mut output = RuntimeObject::new();
         output.insert("found", RuntimeJson::Bool(true));
         output.insert("exited", RuntimeJson::Bool(r.exited));
@@ -584,11 +705,13 @@ impl Tool for WriteStdinTool {
                 .clone()
                 .map_or(RuntimeJson::Null, RuntimeJson::String),
         );
-        Ok(text_result(
-            RuntimeJson::Object(output),
-            body.concat(&RuntimeString::from("\n")).concat(&status),
-            false,
-        ))
+        output.insert("chunkId", RuntimeJson::String(r.chunk_id.clone()));
+        output.insert("wallTimeMs", RuntimeJson::from(r.wall_time_ms));
+        output.insert(
+            "originalTokenCount",
+            RuntimeJson::from(r.original_token_count),
+        );
+        Ok(text_result(RuntimeJson::Object(output), text, false))
     }
 }
 
@@ -911,7 +1034,7 @@ mod tests {
         let mut stdin_input = RuntimeObject::new();
         stdin_input.insert("sessionId", RuntimeJson::String(session_id.clone()));
         stdin_input.insert("input", RuntimeJson::String(lone.concat(&rs("\n"))));
-        stdin_input.insert("yieldMs", RuntimeJson::from(1000));
+        stdin_input.insert("yieldMs", RuntimeJson::from(250));
         let sent = create_write_stdin_tool()
             .call(RuntimeJson::Object(stdin_input), &context, None)
             .await
@@ -952,7 +1075,7 @@ mod tests {
                         "type": "string"
                     },
                     "yieldMs": {
-                        "description": "How long to wait for output (default 5000 polling, 10000 when sending input).",
+                        "description": "How long to wait for output (default 5000 polling, 250 when sending input).",
                         "type": "integer",
                         "exclusiveMinimum": 0,
                         "maximum": 9007199254740991_i64
@@ -1002,7 +1125,40 @@ mod tests {
         );
         let text = text_of(&res);
         assert!(text.contains("hi"), "text: {text}");
-        assert!(text.contains("[exited, code 0]"), "text: {text}");
+        assert!(text.contains("Process exited with code 0"), "text: {text}");
+        // The response leads with the chunk metadata header; the body follows
+        // the Output: section.
+        assert!(text.starts_with("Chunk ID: "), "text: {text}");
+        assert!(text.contains("\nWall time: "), "text: {text}");
+        assert!(text.contains("\nOriginal token count: "), "text: {text}");
+        assert!(text.contains("\nOutput:\nhi"), "text: {text}");
+        let chunk_id = ui_string(
+            &res.serializable
+                .output
+                .get("chunkId")
+                .and_then(RuntimeJson::as_str)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        assert_eq!(chunk_id.len(), 6, "chunk id: {chunk_id}");
+        assert!(
+            chunk_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            "chunk id: {chunk_id}"
+        );
+        assert!(res
+            .serializable
+            .output
+            .get("wallTimeMs")
+            .and_then(RuntimeJson::as_u64)
+            .is_some());
+        assert!(res
+            .serializable
+            .output
+            .get("originalTokenCount")
+            .and_then(RuntimeJson::as_u64)
+            .is_some());
     }
 
     #[cfg(unix)]
@@ -1018,7 +1174,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.serializable.is_error, Some(true));
         assert_eq!(res.serializable.output.get("exitCode"), Some(&rjson!(3)));
-        assert!(text_of(&res).contains("[exited, code 3]"));
+        assert!(text_of(&res).contains("Process exited with code 3"));
     }
 
     #[cfg(unix)]
@@ -1062,7 +1218,7 @@ mod tests {
             .and_then(RuntimeJson::as_str)
             .cloned()
             .unwrap();
-        assert!(text_of(&exec).contains("still running"));
+        assert!(text_of(&exec).contains("Process running with session ID"));
         let running = context.background_processes.snapshot();
         assert_eq!(running.processes.len(), 1);
         assert_eq!(running.processes[0].shell_id, session_id);
@@ -1073,7 +1229,7 @@ mod tests {
 
         let echoed = create_write_stdin_tool()
             .call(
-                rjson!({ "sessionId": ui_string(&session_id), "input": "ping\n", "yieldMs": 4000 }),
+                rjson!({ "sessionId": ui_string(&session_id), "input": "ping\n", "yieldMs": 1000 }),
                 &context,
                 None,
             )
@@ -1104,7 +1260,7 @@ mod tests {
         let context = ctx();
         let exec = create_exec_command_tool()
             .call(
-                rjson!({ "command": "sleep 0.05; printf exec-finished", "yieldMs": 1 }),
+                rjson!({ "command": "sleep 0.8; printf exec-finished", "yieldMs": 300 }),
                 &context,
                 None,
             )
@@ -1175,7 +1331,7 @@ mod tests {
                 rjson!({
                     "sessionId": ui_string(&session_id),
                     "input": "tool-tail\n",
-                    "yieldMs": 4000,
+                    "yieldMs": 1000,
                     "cols": 100,
                     "rows": 40,
                     "tailBytes": 1024
@@ -1201,6 +1357,13 @@ mod tests {
         assert_eq!(
             updated.serializable.output.get("terminalSize"),
             Some(&rjson!({ "cols": 100, "rows": 40 }))
+        );
+        // The resize note sits in the header, right after the process state
+        // line and before the output section.
+        assert!(
+            text_of(&updated).contains("[terminal resized to 100x40]"),
+            "text: {}",
+            text_of(&updated)
         );
         assert!(updated
             .serializable

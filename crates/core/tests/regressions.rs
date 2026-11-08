@@ -748,3 +748,6 @@ mod r76224b5_required_thinking_title;
 
 #[path = "regressions/r20261031_display_message_live_history.rs"]
 mod r20261031_display_message_live_history;
+
+#[path = "regressions/r20261108_shell_yield_defaults.rs"]
+mod r20261108_shell_yield_defaults;

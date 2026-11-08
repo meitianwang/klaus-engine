@@ -369,6 +369,7 @@ impl ExecProcess for LocalExecProcess {
             .read(local::LocalProcessReadParams {
                 process_id: RuntimeString::from(params.process_id),
                 after_seq: params.after_seq,
+                after_offset: None,
                 max_bytes: params.max_bytes,
                 wait_ms: params.wait_ms,
                 signal: None,

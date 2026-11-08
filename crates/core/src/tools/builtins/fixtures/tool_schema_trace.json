@@ -1923,7 +1923,7 @@
             "type": "string"
           },
           "yieldMs": {
-            "description": "How long to wait for output (default 5000 polling, 10000 when sending input).",
+            "description": "How long to wait for output (default 5000 polling, 250 when sending input).",
             "type": "integer",
             "exclusiveMinimum": 0,
             "maximum": 9007199254740991

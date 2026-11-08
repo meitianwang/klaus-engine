@@ -15,6 +15,7 @@ use crate::types::abort::AbortSignal;
 use crate::types::sandbox::{ExecRequest, SandboxBackend, SandboxKind, SandboxPolicy, SpawnSpec};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,14 @@ use tokio::sync::{broadcast, watch, Mutex as AsyncMutex};
 const DEFAULT_RETAINED_OUTPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 const ACCEPTED_WRITE_ID_CAPACITY: usize = 1024;
+/// Hard bound on how many process entries one registry holds. Reaching the cap
+/// makes a new start evict the least-recently-used unprotected session instead
+/// of letting abandoned sessions accumulate without limit.
+pub const MAX_RETAINED_PROCESSES: usize = 64;
+/// The most recently used entries that pruning never evicts. An in-flight
+/// interaction always sits inside this window because every read and write
+/// refreshes recency.
+const PRUNE_PROTECT_RECENT: usize = 8;
 #[cfg(test)]
 const DEFAULT_EXITED_PROCESS_RETENTION: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
@@ -394,6 +403,10 @@ impl RuntimeDecode for WriteStatus {
 pub struct LocalProcessReadParams {
     pub process_id: RuntimeString,
     pub after_seq: Option<u64>,
+    /// Cumulative output byte position the caller has already consumed. When
+    /// present, the response reports bytes evicted between that position and
+    /// the first returned chunk.
+    pub after_offset: Option<u64>,
     pub max_bytes: Option<usize>,
     pub wait_ms: Option<u64>,
     pub signal: Option<AbortSignal>,
@@ -403,6 +416,10 @@ pub struct LocalProcessReadParams {
 pub struct LocalProcessReadResponse {
     pub chunks: Vec<ProcessOutputChunk>,
     pub next_seq: u64,
+    /// Bytes evicted from the retained middle between the requested position
+    /// and the first returned chunk. Always zero unless the caller tracks a
+    /// byte offset.
+    pub dropped_bytes: u64,
     pub exited: bool,
     pub exit_code: Option<i32>,
     pub closed: bool,
@@ -515,6 +532,15 @@ enum ProcessOutputTransport {
     Pty(RuntimeChildPtyReader),
 }
 
+/// A retained output chunk plus the cumulative byte position where it starts.
+/// The offset lets a read report the exact size of an evicted middle span when
+/// a lagging cursor crosses it, so callers can render the loss instead of
+/// guessing from sequence jumps.
+struct RetainedChunk {
+    chunk: ProcessOutputChunk,
+    start_offset: u64,
+}
+
 struct ProcessEntry {
     argv: Vec<RuntimeString>,
     cwd: RuntimePath,
@@ -522,9 +548,22 @@ struct ProcessEntry {
     controller: RuntimeProcessController,
     terminal_size: Option<TerminalSize>,
     pipe_stdin: bool,
-    chunks: VecDeque<ProcessOutputChunk>,
-    retained_bytes: usize,
-    retained_byte_limit: usize,
+    /// Stable oldest prefix of the output, never evicted, so a reader starting
+    /// from the beginning still sees how the stream began after the middle was
+    /// dropped. Filled to half of the retention budget (chunk-granular: the
+    /// boundary chunk may overhang by less than one chunk).
+    head_chunks: Vec<RetainedChunk>,
+    /// Most recent suffix of the output; the oldest tail chunks are evicted
+    /// once the tail budget is exceeded.
+    tail_chunks: VecDeque<RetainedChunk>,
+    head_bytes: usize,
+    tail_bytes: usize,
+    head_budget: usize,
+    tail_budget: usize,
+    /// Cumulative bytes ever produced by the process.
+    produced_bytes: u64,
+    /// Cumulative bytes evicted from the middle between the head and tail spans.
+    evicted_bytes: u64,
     next_seq: u64,
     exit_code: Option<i32>,
     exited: bool,
@@ -533,9 +572,17 @@ struct ProcessEntry {
     accepted_write_ids: AcceptedWriteIds,
     events: ProcessEventLog,
     wake_tx: watch::Sender<u64>,
+    /// Held for the duration of a registry read/write/resize call. Pruning only
+    /// evicts entries whose lock is free, so an in-flight interaction never has
+    /// its process killed underneath it.
+    interaction: Arc<AsyncMutex<()>>,
+    /// Logical recency stamp (registry-wide monotonic tick) driving eviction
+    /// order and the most-recently-used protection window.
+    last_used: u64,
 }
 
 impl ProcessEntry {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         argv: Vec<RuntimeString>,
         cwd: RuntimePath,
@@ -544,8 +591,10 @@ impl ProcessEntry {
         terminal_size: Option<TerminalSize>,
         pipe_stdin: bool,
         retained_byte_limit: usize,
+        last_used: u64,
     ) -> Self {
         let (wake_tx, _wake_rx) = watch::channel(0);
+        let head_budget = retained_byte_limit / 2;
         Self {
             argv,
             cwd,
@@ -553,9 +602,14 @@ impl ProcessEntry {
             controller,
             terminal_size,
             pipe_stdin,
-            chunks: VecDeque::new(),
-            retained_bytes: 0,
-            retained_byte_limit,
+            head_chunks: Vec::new(),
+            tail_chunks: VecDeque::new(),
+            head_bytes: 0,
+            tail_bytes: 0,
+            head_budget,
+            tail_budget: retained_byte_limit.saturating_sub(head_budget),
+            produced_bytes: 0,
+            evicted_bytes: 0,
             next_seq: 1,
             exit_code: None,
             exited: false,
@@ -564,6 +618,8 @@ impl ProcessEntry {
             accepted_write_ids: AcceptedWriteIds::default(),
             events: ProcessEventLog::new(DEFAULT_EVENT_CAPACITY, retained_byte_limit),
             wake_tx,
+            interaction: Arc::new(AsyncMutex::new(())),
+            last_used,
         }
     }
 
@@ -571,6 +627,8 @@ impl ProcessEntry {
         if bytes.is_empty() {
             return;
         }
+        let start_offset = self.produced_bytes;
+        self.produced_bytes = self.produced_bytes.saturating_add(bytes.len() as u64);
         let seq = self.next_seq;
         let chunk = ProcessOutputChunk {
             seq,
@@ -578,15 +636,27 @@ impl ProcessEntry {
             chunk: bytes,
         };
         self.next_seq = self.next_seq.saturating_add(1);
-        self.retained_bytes += chunk.chunk.len();
         let _ = self.wake_tx.send(seq);
         self.events.publish(ProcessEvent::Output(chunk.clone()));
-        self.chunks.push_back(chunk);
-        while self.retained_bytes > self.retained_byte_limit {
-            let Some(evicted) = self.chunks.pop_front() else {
-                break;
-            };
-            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.chunk.len());
+        let retained = RetainedChunk {
+            chunk,
+            start_offset,
+        };
+        let len = retained.chunk.chunk.len();
+        if self.head_bytes < self.head_budget {
+            self.head_bytes += len;
+            self.head_chunks.push(retained);
+        } else {
+            self.tail_bytes += len;
+            self.tail_chunks.push_back(retained);
+            while self.tail_bytes > self.tail_budget {
+                let Some(evicted) = self.tail_chunks.pop_front() else {
+                    break;
+                };
+                let evicted_len = evicted.chunk.chunk.len();
+                self.tail_bytes = self.tail_bytes.saturating_sub(evicted_len);
+                self.evicted_bytes = self.evicted_bytes.saturating_add(evicted_len as u64);
+            }
         }
     }
 
@@ -624,14 +694,34 @@ impl ProcessEntry {
         self.events.publish(ProcessEvent::Closed { seq });
     }
 
-    fn read_from(&self, after_seq: u64, max_bytes: Option<usize>) -> LocalProcessReadResponse {
+    fn read_from(
+        &self,
+        after_seq: u64,
+        after_offset: Option<u64>,
+        max_bytes: Option<usize>,
+    ) -> LocalProcessReadResponse {
         let mut chunks = Vec::new();
         let mut total_bytes = 0usize;
         let mut next_seq = self.next_seq;
-        for chunk in self.chunks.iter().filter(|chunk| chunk.seq > after_seq) {
+        let mut dropped_bytes = 0u64;
+        // Track the cumulative end offset of what the caller consumed so a
+        // returned span that crosses the evicted middle can report its exact
+        // size. Callers that do not track a byte offset (the process wire
+        // surface) see zero and rely on sequence jumps as before.
+        let mut consumed_end = after_offset.unwrap_or(0);
+        for retained in self.head_chunks.iter().chain(self.tail_chunks.iter()) {
+            let chunk = &retained.chunk;
+            if chunk.seq <= after_seq {
+                continue;
+            }
             let chunk_len = chunk.chunk.len();
             if max_bytes.is_some_and(|max| !chunks.is_empty() && total_bytes + chunk_len > max) {
                 break;
+            }
+            if after_offset.is_some() {
+                dropped_bytes = dropped_bytes
+                    .saturating_add(retained.start_offset.saturating_sub(consumed_end));
+                consumed_end = retained.start_offset.saturating_add(chunk_len as u64);
             }
             total_bytes += chunk_len;
             chunks.push(chunk.clone());
@@ -645,6 +735,7 @@ impl ProcessEntry {
         LocalProcessReadResponse {
             chunks,
             next_seq,
+            dropped_bytes,
             exited: self.exited,
             exit_code: self.exit_code,
             closed: self.closed,
@@ -656,6 +747,7 @@ impl ProcessEntry {
 pub struct LocalExecProcessRegistry {
     processes: Arc<Mutex<HashMap<RuntimeString, ProcessEntry>>>,
     next_process_id: AtomicU64,
+    last_used_clock: AtomicU64,
     exited_process_retention: Duration,
 }
 
@@ -674,6 +766,7 @@ impl LocalExecProcessRegistry {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             next_process_id: AtomicU64::new(1),
+            last_used_clock: AtomicU64::new(0),
             exited_process_retention,
         }
     }
@@ -801,8 +894,20 @@ impl LocalExecProcessRegistry {
             params
                 .max_output_bytes
                 .unwrap_or(DEFAULT_RETAINED_OUTPUT_BYTES),
+            self.next_last_used(),
         );
-        self.processes().insert(process_id.clone(), entry);
+        let pruned = {
+            let mut processes = self.processes();
+            let pruned = Self::prune_one_if_needed(&mut processes);
+            processes.insert(process_id.clone(), entry);
+            pruned
+        };
+        if let Some((_pruned_id, pruned_controller)) = pruned {
+            // An evicted session is torn down, not leaked: its subscribers
+            // already saw the terminal transition under the table lock, so
+            // only the child process itself remains to stop.
+            pruned_controller.signal(RuntimeSignal::Kill);
+        }
         let mut wake = self.subscribe_wake(&process_id)?;
         let processes = Arc::clone(&self.processes);
         let task_process_id = process_id.clone();
@@ -861,6 +966,17 @@ impl LocalExecProcessRegistry {
         &self,
         params: LocalProcessReadParams,
     ) -> ProcessResult<LocalProcessReadResponse> {
+        // Serialize reads and writes against one process, and keep pruning away
+        // from a session with an interaction in progress.
+        let interaction = {
+            let processes = self.processes();
+            let Some(entry) = processes.get(&params.process_id) else {
+                return Err(RuntimeString::from("unknown process id ").concat(&params.process_id));
+            };
+            Arc::clone(&entry.interaction)
+        };
+        let _interaction_guard = interaction.lock().await;
+        self.touch_last_used(&params.process_id);
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(params.wait_ms.unwrap_or_default());
         loop {
@@ -872,7 +988,11 @@ impl LocalExecProcessRegistry {
                     );
                 };
                 (
-                    entry.read_from(params.after_seq.unwrap_or_default(), params.max_bytes),
+                    entry.read_from(
+                        params.after_seq.unwrap_or_default(),
+                        params.after_offset,
+                        params.max_bytes,
+                    ),
                     entry.wake_tx.subscribe(),
                 )
             };
@@ -906,6 +1026,20 @@ impl LocalExecProcessRegistry {
         if params.write_id.is_empty() {
             return Err(RuntimeString::from("writeId must not be empty"));
         }
+        // Serialize with reads and with pruning on the same process.
+        let interaction = {
+            let processes = self.processes();
+            processes
+                .get(&params.process_id)
+                .map(|entry| Arc::clone(&entry.interaction))
+        };
+        let Some(interaction) = interaction else {
+            return Ok(LocalProcessWriteResponse {
+                status: WriteStatus::UnknownProcess,
+            });
+        };
+        let _interaction_guard = interaction.lock().await;
+        self.touch_last_used(&params.process_id);
         let (input, mut wake) = {
             let mut processes = self.processes();
             let Some(entry) = processes.get_mut(&params.process_id) else {
@@ -980,6 +1114,23 @@ impl LocalExecProcessRegistry {
         })
     }
 
+    /// Closes the stdin side of a piped session so the child observes EOF. Over
+    /// a pipe the EOT control byte is just data, so an interactive shell that
+    /// promises EOF must drop the writer instead of sending the byte; terminal
+    /// sessions take the byte itself because their line discipline already
+    /// turns it into EOF. Returns false when the process is unknown, already
+    /// finished, or has no live input handle.
+    pub fn close_stdin(&self, process_id: &RuntimeString) -> bool {
+        let mut processes = self.processes();
+        let Some(entry) = processes.get_mut(process_id) else {
+            return false;
+        };
+        if entry.exited || entry.closed {
+            return false;
+        }
+        entry.input.take().is_some()
+    }
+
     pub async fn signal(
         &self,
         process_id: &RuntimeString,
@@ -1000,6 +1151,17 @@ impl LocalExecProcessRegistry {
         process_id: &RuntimeString,
         size: TerminalSize,
     ) -> ProcessResult<bool> {
+        // Serialize with reads and writes on the same process, and keep pruning
+        // away from a session with an interaction in progress.
+        let interaction = {
+            let processes = self.processes();
+            let Some(entry) = processes.get(process_id) else {
+                return Err(RuntimeString::from("unknown process id ").concat(process_id));
+            };
+            Arc::clone(&entry.interaction)
+        };
+        let _interaction_guard = interaction.lock().await;
+        self.touch_last_used(process_id);
         let input = {
             let processes = self.processes();
             let Some(entry) = processes.get(process_id) else {
@@ -1090,18 +1252,36 @@ impl LocalExecProcessRegistry {
         let entry = processes.get(process_id)?;
         let mut out = VecDeque::new();
         let mut retained = 0usize;
-        for chunk in entry.chunks.iter().rev() {
+        // Newest contiguous suffix first; the stable head prefix joins only when
+        // nothing was evicted, because head bytes are no longer adjacent to tail
+        // bytes once the middle span was dropped.
+        for rc in entry.tail_chunks.iter().rev() {
             if retained >= bytes {
                 break;
             }
             let needed = bytes.saturating_sub(retained);
-            let slice = if chunk.chunk.len() > needed {
-                &chunk.chunk[chunk.chunk.len() - needed..]
+            let slice = if rc.chunk.chunk.len() > needed {
+                &rc.chunk.chunk[rc.chunk.chunk.len() - needed..]
             } else {
-                &chunk.chunk[..]
+                &rc.chunk.chunk[..]
             };
             retained += slice.len();
             out.push_front(slice.to_vec());
+        }
+        if retained < bytes && entry.evicted_bytes == 0 {
+            for rc in entry.head_chunks.iter().rev() {
+                if retained >= bytes {
+                    break;
+                }
+                let needed = bytes.saturating_sub(retained);
+                let slice = if rc.chunk.chunk.len() > needed {
+                    &rc.chunk.chunk[rc.chunk.chunk.len() - needed..]
+                } else {
+                    &rc.chunk.chunk[..]
+                };
+                retained += slice.len();
+                out.push_front(slice.to_vec());
+            }
         }
         let bytes = out.into_iter().flatten().collect::<Vec<_>>();
         Some(NodeChunkUtf8::decode_chunk(&bytes))
@@ -1144,6 +1324,94 @@ impl LocalExecProcessRegistry {
             return Ok(None);
         }
         Ok(Some(entry.controller.clone()))
+    }
+
+    fn next_last_used(&self) -> u64 {
+        self.last_used_clock.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn touch_last_used(&self, process_id: &RuntimeString) {
+        let tick = self.next_last_used();
+        if let Some(entry) = self.processes().get_mut(process_id) {
+            entry.last_used = tick;
+        }
+    }
+
+    /// Evicts one session when the table reached its cap: the least recently
+    /// used finished session first, then any least recently used live session,
+    /// never inside the most-recently-used protection window and never while an
+    /// interaction holds the candidate's lock. Returns the evicted entry's id
+    /// and controller so the caller stops the child outside the table lock.
+    fn prune_one_if_needed(
+        processes: &mut HashMap<RuntimeString, ProcessEntry>,
+    ) -> Option<(RuntimeString, RuntimeProcessController)> {
+        if processes.len() < MAX_RETAINED_PROCESSES {
+            return None;
+        }
+        let mut meta: Vec<(RuntimeString, u64, bool)> = processes
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.last_used, entry.exited || entry.closed))
+            .collect();
+        let mut found_locked_exited_process = false;
+        while let Some(candidate_id) = Self::prune_candidate(&meta) {
+            let (candidate_exited, interaction, controller) = match processes.get(&candidate_id) {
+                Some(entry) => (
+                    entry.exited || entry.closed,
+                    Arc::clone(&entry.interaction),
+                    entry.controller.clone(),
+                ),
+                None => {
+                    meta.retain(|(id, _, _)| *id != candidate_id);
+                    continue;
+                }
+            };
+            if found_locked_exited_process && !candidate_exited {
+                // A finished session may briefly hold its interaction lock
+                // while publishing terminal events. The table tolerates the
+                // soft cap instead of evicting a live session for it.
+                return None;
+            }
+            if let Ok(_interaction_guard) = interaction.try_lock() {
+                if let Some(entry) = processes.get_mut(&candidate_id) {
+                    // Subscribers observe the normal terminal transition
+                    // before the entry disappears.
+                    entry.mark_exited(None);
+                    entry.mark_closed();
+                }
+                processes.remove(&candidate_id);
+                return Some((candidate_id, controller));
+            }
+            found_locked_exited_process |= candidate_exited;
+            meta.retain(|(id, _, _)| *id != candidate_id);
+        }
+        None
+    }
+
+    /// Centralized eviction order: the least recently used finished session
+    /// outside the protected window first, else the least recently used session
+    /// outside that window.
+    fn prune_candidate(meta: &[(RuntimeString, u64, bool)]) -> Option<RuntimeString> {
+        if meta.is_empty() {
+            return None;
+        }
+        let mut by_recency: Vec<&(RuntimeString, u64, bool)> = meta.iter().collect();
+        by_recency.sort_by_key(|(_, last_used, _)| Reverse(*last_used));
+        let protected: HashSet<RuntimeString> = by_recency
+            .iter()
+            .take(PRUNE_PROTECT_RECENT)
+            .map(|(id, _, _)| (*id).clone())
+            .collect();
+        let mut lru: Vec<&(RuntimeString, u64, bool)> = meta.iter().collect();
+        lru.sort_by_key(|(_, last_used, _)| *last_used);
+        if let Some((id, _, _)) = lru
+            .iter()
+            .find(|(id, _, exited)| !protected.contains(id) && *exited)
+        {
+            return Some(id.clone());
+        }
+        lru.into_iter()
+            .find(|(id, _, _)| !protected.contains(id))
+            .map(|(id, _, _)| id.clone())
     }
 
     fn processes(&self) -> std::sync::MutexGuard<'_, HashMap<RuntimeString, ProcessEntry>> {
@@ -1472,6 +1740,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("seq-proc"),
                 after_seq: Some(0),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(100),
                 signal: None,
@@ -1496,6 +1765,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("seq-proc"),
                 after_seq: Some(first.next_seq - 1),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(100),
                 signal: None,
@@ -1549,6 +1819,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("dedupe-proc"),
                 after_seq: Some(0),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(100),
                 signal: None,
@@ -1733,6 +2004,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("interrupt-proc"),
                 after_seq: Some(0),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(5000),
                 signal: None,
@@ -1753,6 +2025,7 @@ mod tests {
                 .read(LocalProcessReadParams {
                     process_id: runtime("interrupt-proc"),
                     after_seq: Some(read.next_seq),
+                    after_offset: None,
                     max_bytes: None,
                     wait_ms: Some(5000),
                     signal: None,
@@ -1804,6 +2077,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("resize-proc"),
                 after_seq: Some(0),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(5000),
                 signal: None,
@@ -1844,6 +2118,7 @@ mod tests {
             .read(LocalProcessReadParams {
                 process_id: runtime("resize-proc"),
                 after_seq: Some(initial.next_seq),
+                after_offset: None,
                 max_bytes: None,
                 wait_ms: Some(5000),
                 signal: None,
@@ -1864,6 +2139,7 @@ mod tests {
                 .read(LocalProcessReadParams {
                     process_id: runtime("resize-proc"),
                     after_seq: Some(read.next_seq),
+                    after_offset: None,
                     max_bytes: None,
                     wait_ms: Some(5000),
                     signal: None,
@@ -1873,5 +2149,201 @@ mod tests {
                 .exited
         };
         assert!(exited);
+    }
+
+    /// The retention window keeps the stream's beginning and its newest end,
+    /// and a reader starting from byte zero learns the exact size of the
+    /// evicted middle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retention_keeps_head_and_tail_and_reports_the_evicted_middle() {
+        let registry = LocalExecProcessRegistry::new();
+        registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                LocalProcessStartParams {
+                    process_id: Some(runtime("retention-proc")),
+                    argv: vec![
+                        runtime("bash"),
+                        runtime("-c"),
+                        runtime(
+                            "i=0; while [ $i -lt 40 ]; do printf 'line-%02d-0123456789abcdef\\n' $i; i=$((i+1)); sleep 0.02; done",
+                        ),
+                    ],
+                    cwd: cwd(),
+                    sandbox: sandbox(),
+                    tty: false,
+                    pipe_stdin: false,
+                    yield_ms: Some(0),
+                    max_output_bytes: Some(512),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut finished = None;
+        for _ in 0..300 {
+            let read = registry
+                .read(LocalProcessReadParams {
+                    process_id: runtime("retention-proc"),
+                    after_seq: Some(0),
+                    after_offset: Some(0),
+                    max_bytes: None,
+                    wait_ms: Some(100),
+                    signal: None,
+                })
+                .await
+                .unwrap();
+            if read.exited {
+                finished = Some(read);
+                break;
+            }
+            // A read with chunks available returns immediately, so pace the
+            // guard loop to span the producer's ~0.8 s lifetime.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let read = finished.expect("the producer exits within the guard window");
+        let retained: usize = read.chunks.iter().map(|chunk| chunk.chunk.len()).sum();
+        // 40 lines x 25 bytes = 1000 produced against a 512-byte budget, so
+        // the accounting must be exact: retained + dropped == produced.
+        assert!(retained > 0);
+        assert!(retained < 1000, "the middle must be evicted: {retained}");
+        assert_eq!(read.dropped_bytes, 1000 - retained as u64);
+        let first = String::from_utf8_lossy(&read.chunks.first().unwrap().chunk);
+        let last = String::from_utf8_lossy(&read.chunks.last().unwrap().chunk);
+        assert!(first.contains("line-00"), "head kept: {first:?}");
+        assert!(last.contains("line-39"), "tail kept: {last:?}");
+        registry
+            .terminate(&runtime("retention-proc"))
+            .await
+            .unwrap();
+    }
+
+    /// Closing the stdin side of a piped session delivers EOF to the child,
+    /// which is what the documented EOT input promises over a pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_stdin_delivers_eof_to_a_piped_child() {
+        let registry = LocalExecProcessRegistry::new();
+        registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                LocalProcessStartParams {
+                    process_id: Some(runtime("eof-proc")),
+                    argv: vec![runtime("cat")],
+                    cwd: cwd(),
+                    sandbox: sandbox(),
+                    tty: false,
+                    pipe_stdin: true,
+                    yield_ms: Some(0),
+                    max_output_bytes: Some(1024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.close_stdin(&runtime("eof-proc")));
+        // A second close finds no live input handle.
+        assert!(!registry.close_stdin(&runtime("eof-proc")));
+
+        let mut exited = false;
+        for _ in 0..50 {
+            match registry
+                .read(LocalProcessReadParams {
+                    process_id: runtime("eof-proc"),
+                    after_seq: Some(0),
+                    after_offset: None,
+                    max_bytes: None,
+                    wait_ms: Some(100),
+                    signal: None,
+                })
+                .await
+            {
+                Ok(read) if read.exited => {
+                    exited = true;
+                    break;
+                }
+                Ok(_) => {}
+                // The short test retention window may remove the finished
+                // entry outright; a gone entry is a finished child.
+                Err(_) => {
+                    exited = true;
+                    break;
+                }
+            }
+        }
+        assert!(exited, "cat must exit after its stdin closes");
+    }
+
+    /// The process table is capped: a new start at the cap evicts the least
+    /// recently used unprotected session, and a recent interaction moves a
+    /// session back inside the protected window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_process_table_prunes_the_least_recently_used_at_the_cap() {
+        let registry = LocalExecProcessRegistry::new();
+        for index in 0..MAX_RETAINED_PROCESSES {
+            registry
+                .start(
+                    crate::runtime_process::test_runtime_process_context(),
+                    LocalProcessStartParams {
+                        process_id: Some(runtime(&format!("cap-proc-{index}"))),
+                        argv: vec![runtime("sleep"), runtime("30")],
+                        cwd: cwd(),
+                        sandbox: sandbox(),
+                        tty: false,
+                        pipe_stdin: false,
+                        yield_ms: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(registry.list().len(), MAX_RETAINED_PROCESSES);
+
+        // Refresh one old session so it re-enters the protected window.
+        registry
+            .read(LocalProcessReadParams {
+                process_id: runtime("cap-proc-0"),
+                after_seq: Some(0),
+                after_offset: None,
+                max_bytes: None,
+                wait_ms: Some(0),
+                signal: None,
+            })
+            .await
+            .unwrap();
+
+        registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                LocalProcessStartParams {
+                    process_id: Some(runtime("cap-overflow")),
+                    argv: vec![runtime("sleep"), runtime("30")],
+                    cwd: cwd(),
+                    sandbox: sandbox(),
+                    tty: false,
+                    pipe_stdin: false,
+                    yield_ms: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            registry.info(&runtime("cap-proc-0")).is_some(),
+            "a recently used session stays protected"
+        );
+        assert!(
+            registry.info(&runtime("cap-proc-1")).is_none(),
+            "the least recently used unprotected session is evicted"
+        );
+        assert!(registry.info(&runtime("cap-overflow")).is_some());
+        assert_eq!(registry.list().len(), MAX_RETAINED_PROCESSES);
+        registry.dispose_all();
     }
 }

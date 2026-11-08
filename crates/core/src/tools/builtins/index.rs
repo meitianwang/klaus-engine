@@ -59,9 +59,7 @@ use super::edit::create_edit_tool;
 use super::file_search::create_file_search_tool;
 use super::glob::create_glob_tool;
 use super::grep::create_grep_tool;
-use super::interactive_shell::{
-    create_exec_command_tool_with, create_write_stdin_tool, InteractiveShellOptions,
-};
+use super::interactive_shell::{create_exec_command_tool, create_write_stdin_tool};
 use super::kill_shell::create_kill_shell_tool;
 use super::ls::create_ls_tool;
 use super::lsp_tools::create_lsp_tools;
@@ -228,9 +226,7 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
             max_output_bytes: Some(config.max_aggregated_output_bytes as usize),
         }),
         create_bash_output_tool(),
-        create_exec_command_tool_with(InteractiveShellOptions {
-            max_output_bytes: Some(config.max_aggregated_output_bytes as usize),
-        }),
+        create_exec_command_tool(),
         create_write_stdin_tool(),
         create_kill_shell_tool(),
         create_sleep_tool(),
