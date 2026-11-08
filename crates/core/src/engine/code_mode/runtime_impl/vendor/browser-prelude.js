@@ -54,7 +54,8 @@
     '                                   (available as browser.ax.write and tab.ax.write).',
     '',
     'Act (by element index from the latest state):',
-    '  browser.getTab(tabId?)           Persistent handle for one tab (omitted: the active tab).',
+    '  browser.getTab(tabId?, opts?)    Persistent handle for one tab (omitted: the active tab).',
+    '                                   opts: {browserId} scopes every call to one connected browser.',
     '  tab.ax.click(index, opts?)       Real input click. opts: {clickCount, mouseButton, key (held',
     "                                   combo such as 'shift+a'), duration (hold seconds 0-30), timeoutMs}.",
     '  tab.ax.type(index, text)         Type into an element; index omitted types into the focused element.',
@@ -180,10 +181,13 @@
     };
   }
 
-  function makeTab(tabId) {
-    const scope = (name, args) => call(name, merge(args, tabId === undefined ? null : { tabId }));
+  function makeTab(tabId, browserId) {
+    const scope = (name, args) => call(name, merge(args,
+      tabId === undefined ? null : { tabId },
+      browserId === undefined ? null : { browserId }));
     const tab = {
       id: tabId === undefined ? null : tabId,
+      browserId: browserId === undefined ? null : browserId,
       ax: axGroup(scope),
       content: contentGroup(scope),
       clipboard: clipboardGroup(scope),
@@ -197,7 +201,8 @@
     docs: () => { note(); return DOCS; },
     getState: (opts) => call('ax_state', opts),
     action: (action, params) => call('ax_action', merge({ action }, params)),
-    getTab: (tabId) => makeTab(tabId),
+    getTab: (tabId, opts) => makeTab(tabId,
+      opts && opts.browserId !== undefined && opts.browserId !== null ? String(opts.browserId) : undefined),
     tabs: {
       list: () => call('tabs', { action: 'list' }),
       new: (url, opts) => call('new_tab', merge(url ? { url } : null, opts)),

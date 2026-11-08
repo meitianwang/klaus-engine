@@ -80,6 +80,13 @@ const TRANSFORM_SOURCE: &str = include_str!("vendor/transform.js");
 // time, so per-exec binding changes are picked up without a reinstall and
 // sessions without browser tools pay nothing beyond one small script.
 const BROWSER_PRELUDE_SOURCE: &str = include_str!("vendor/browser-prelude.js");
+// Project-authored companion: a unified computer-use surface layering the
+// bound native app tools and the browser channel into one hierarchical API
+// (cross-surface inventory, app and desktop handles, tab handles with mention
+// resolution). Binding lookup and failure semantics match the browser
+// prelude: helpers resolve their target at call time and fail with an
+// actionable message instead of a TypeError.
+const COMPUTER_PRELUDE_SOURCE: &str = include_str!("vendor/computer-prelude.js");
 
 /// Captured console, the result formatter entry point and the context seal.
 const REPL_BOOTSTRAP_SOURCE: &str = r#"
@@ -303,6 +310,7 @@ fn bootstrap(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> {
         TRANSFORM_SOURCE,
         REPL_BOOTSTRAP_SOURCE,
         BROWSER_PRELUDE_SOURCE,
+        COMPUTER_PRELUDE_SOURCE,
     ] {
         eval_plain_script(scope, source)?;
     }

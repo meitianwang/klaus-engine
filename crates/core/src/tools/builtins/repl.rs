@@ -797,6 +797,354 @@ mod tests {
         );
     }
 
+    // ---- computer prelude ------------------------------------------------------
+
+    /// Like [`recording_invoke`], but tool names listed in `canned` answer with
+    /// the given JSON text (parsed back into a value by the binding layer) so
+    /// tests can drive prelude logic that reads host payloads.
+    fn canned_invoke(
+        calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>>,
+        canned: &'static [(&'static str, &'static str)],
+    ) -> InvokeToolFn {
+        Arc::new(move |name: RuntimeString, arg: RuntimeJson| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                let key = String::from_utf8(name.to_node_utf8()).unwrap();
+                calls.lock().unwrap().push((name.clone(), arg.clone()));
+                let text = match canned.iter().find(|(tool, _)| *tool == key) {
+                    Some((_, body)) => rs(body),
+                    None => {
+                        let mut output = RuntimeObject::new();
+                        output.insert("tool", RuntimeJson::String(name));
+                        output.insert("arg", arg);
+                        runtime_json::stringify(&RuntimeJson::Object(output))
+                    }
+                };
+                Ok(InvokeToolResult {
+                    is_error: false,
+                    output: None,
+                    content: vec![OutputBlock::Text(crate::schemas::content::TextBlock {
+                        text,
+                        citations: None,
+                        harness_envelope: None,
+                        message_id: None,
+                        phase: None,
+                    })],
+                })
+            }) as BoxFuture<'static, Result<InvokeToolResult, ToolError>>
+        })
+    }
+
+    fn computer_ctx_with(
+        calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>>,
+        canned: &'static [(&'static str, &'static str)],
+    ) -> ToolContext {
+        let mut ctx = make_ctx(".");
+        ctx.invoke_tool = Some(canned_invoke(calls, canned));
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__computer-use__list_apps",
+                "mcp__computer-use__get_app_state",
+                "mcp__computer-use__click",
+                "mcp__computer-use__desktop_click",
+                "mcp__klaus-browser__list_connected_browsers",
+                "mcp__klaus-browser__resolve_tab",
+                "mcp__klaus-browser__ax_state",
+                "mcp__klaus-browser__ax_action",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn computer_get_state_aggregates_apps_and_browsers() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(calls.clone(), &[]);
+        let res = tool
+            .call(
+                rjson!({ "code": "const s = await computer.getState(); JSON.stringify({ apps: s.apps, browsers: s.browsers, errors: s.errors ?? null })" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), 2, "exactly one call per surface");
+            assert_eq!(recorded[0].0, rs("mcp__computer-use__list_apps"));
+            assert_eq!(recorded[0].1, rjson!({}));
+            assert_eq!(
+                recorded[1].0,
+                rs("mcp__klaus-browser__list_connected_browsers")
+            );
+            assert_eq!(recorded[1].1, rjson!({ "tabs": true }));
+        }
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains("mcp__computer-use__list_apps"),
+            "the app surface result passes through into the inventory: {text}"
+        );
+        assert!(
+            text.contains(r#""browsers":[]"#),
+            "a browser payload without an inventory list yields an empty list: {text}"
+        );
+        assert!(
+            text.contains("computer.docs()"),
+            "first use prints the API pointer: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_get_state_isolates_an_unbound_surface() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let mut ctx = make_ctx(".");
+        ctx.invoke_tool = Some(canned_invoke(calls.clone(), &[]));
+        ctx.tool_catalog = Some(Box::new(|| {
+            ["mcp__computer-use__list_apps", "REPL"]
+                .into_iter()
+                .map(|name| ToolCatalogEntry {
+                    name: rs(name),
+                    description: rs("d"),
+                    search_hint: None,
+                    exposure: ToolExposure::Direct,
+                    spec: None,
+                })
+                .collect()
+        }));
+        let res = tool
+            .call(
+                rjson!({ "code": "const s = await computer.getState(); JSON.stringify({ hasApps: s.apps !== undefined, errors: s.errors ?? [] })" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(text.contains(r#""hasApps":true"#), "{text}");
+        assert!(
+            text.contains("Browsers:"),
+            "the unbound browser surface lands in errors without dropping apps: {text}"
+        );
+        assert!(text.contains("not bound in this REPL session"), "{text}");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, rs("mcp__computer-use__list_apps"));
+    }
+
+    #[tokio::test]
+    async fn computer_get_tab_resolves_a_mention_to_a_scoped_handle() {
+        const MENTION: &str = "plugin://browser@klaus-bundled?mention=tab-v1&source=extension&browserId=chrome:abc123&tabId=42&title=Example&url=https%3A%2F%2Fexample.invalid%2F";
+        const CANNED: &[(&str, &str)] = &[(
+            "mcp__klaus-browser__resolve_tab",
+            r#"{"value":{"browserId":"chrome:abc123","tabId":42,"title":"Example","url":"https://example.invalid/"}}"#,
+        )];
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(calls.clone(), CANNED);
+        let code = format!(
+            "const t = await computer.getTab('{}'); await t.ax.click(3); JSON.stringify({{ browserId: t.browserId, tabId: t.id, title: t.title }})",
+            MENTION
+        );
+        let arg = runtime_json::parse(&rs(&format!(r#"{{ "code": {:?} }}"#, code)))
+            .expect("call arg parses");
+        let res = tool.call(arg, &ctx, None).await.unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let expected_mention =
+            runtime_json::parse(&rs(&format!(r#"{{ "mention": {:?} }}"#, MENTION)))
+                .expect("expected arg parses");
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0].0, rs("mcp__klaus-browser__resolve_tab"));
+            assert_eq!(recorded[0].1, expected_mention);
+            assert_eq!(recorded[1].0, rs("mcp__klaus-browser__ax_action"));
+            assert_eq!(
+                recorded[1].1,
+                rjson!({ "action": "click", "elementIndex": 3, "tabId": 42, "browserId": "chrome:abc123" })
+            );
+        }
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains(r#""browserId":"chrome:abc123""#),
+            "the handle keeps the resolved browser scope: {text}"
+        );
+        assert!(text.contains(r#""tabId":42"#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn computer_get_tab_matches_a_url_against_the_inventory() {
+        const CANNED: &[(&str, &str)] = &[(
+            "mcp__klaus-browser__list_connected_browsers",
+            r#"{"value":{"browsers":[{"id":"iab","browserId":"iab","name":"Built-in browser","type":"iab","available":true,"tabs":[{"id":5,"title":"A","url":"https://a.invalid/","active":true}]},{"id":"chrome:x1","browserId":"chrome:x1","name":"Chrome","type":"chrome","available":true,"tabs":[{"id":9,"title":"B","url":"https://b.invalid/"}]}],"selectedBrowserId":"iab"}}"#,
+        )];
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(calls.clone(), CANNED);
+        let res = tool
+            .call(
+                rjson!({ "code": "const t = await computer.getTab({ url: 'https://b.invalid/' }); await t.ax.getState(); JSON.stringify({ browserId: t.browserId, tabId: t.id, title: t.title })" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(
+                recorded[0].0,
+                rs("mcp__klaus-browser__list_connected_browsers")
+            );
+            assert_eq!(recorded[0].1, rjson!({ "tabs": true }));
+            assert_eq!(recorded[1].0, rs("mcp__klaus-browser__ax_state"));
+            assert_eq!(
+                recorded[1].1,
+                rjson!({ "tabId": 9, "browserId": "chrome:x1" })
+            );
+        }
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(text.contains(r#""browserId":"chrome:x1""#), "{text}");
+        assert!(text.contains(r#""title":"B""#), "{text}");
+
+        let miss = tool
+            .call(
+                rjson!({ "code": "await computer.getTab({ url: 'https://miss.invalid/' }); 'unreachable'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.serializable.is_error, Some(true));
+        let miss_text = String::from_utf8(text_of(&miss).to_node_utf8()).unwrap();
+        assert!(
+            miss_text.contains("No open tab matches"),
+            "a URL miss fails with an actionable inventory pointer: {miss_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_get_app_scopes_the_flat_native_tools() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(calls.clone(), &[]);
+        let res = tool
+            .call(
+                rjson!({ "code": "const app = computer.getApp('Safari'); await app.state({ disable_diff: true }); await app.click({ element_index: 3 }); 'done'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, rs("mcp__computer-use__get_app_state"));
+        assert_eq!(
+            recorded[0].1,
+            rjson!({ "app": "Safari", "disable_diff": true })
+        );
+        assert_eq!(recorded[1].0, rs("mcp__computer-use__click"));
+        assert_eq!(
+            recorded[1].1,
+            rjson!({ "app": "Safari", "element_index": 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_desktop_handle_routes_to_the_full_desktop_tools() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(calls.clone(), &[]);
+        let res = tool
+            .call(
+                rjson!({ "code": "await computer.desktop.click({ x: 1, y: 2 }); 'done'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, rs("mcp__computer-use__desktop_click"));
+        assert_eq!(recorded[0].1, rjson!({ "x": 1, "y": 2 }));
+    }
+
+    #[tokio::test]
+    async fn browser_tab_handles_accept_a_browser_scope() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ctx(calls.clone());
+        let res = tool
+            .call(
+                rjson!({ "code": "await browser.getTab(7, { browserId: 'chrome:x1' }).ax.click(3); 'done'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, rs("mcp__klaus-browser__ax_action"));
+        assert_eq!(
+            recorded[0].1,
+            rjson!({ "action": "click", "elementIndex": 3, "tabId": 7, "browserId": "chrome:x1" })
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_docs_cover_the_inventory_and_tab_targeting() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = computer_ctx_with(Default::default(), &[]);
+        let docs = tool
+            .call(rjson!({ "code": "computer.docs()" }), &ctx, None)
+            .await
+            .unwrap();
+        let text = String::from_utf8(text_of(&docs).to_node_utf8()).unwrap();
+        assert!(text.contains("computer.getState()"), "{text}");
+        assert!(text.contains("computer.getTab(target"), "{text}");
+        assert!(
+            text.contains("tab @-mention URI"),
+            "the docs teach verbatim mention passing: {text}"
+        );
+        assert!(
+            text.contains("never substitute another tab"),
+            "the docs carry the no-substitution rule: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn nested_tool_errors_are_aggregated_into_the_error_text() {
         let tool = create_repl_tool(Arc::new(

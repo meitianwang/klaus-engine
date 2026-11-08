@@ -99,6 +99,13 @@ Keep progress updates useful and concise. Preserve unrelated user work and stay 
 - The `app` argument accepts a display name, an exact executable path, or an unambiguous bundle identifier; state reads launch the app when needed.
 - If name resolution is ambiguous or fails, take the exact identity from `list_apps` and retry with it before other debugging.
 
+## Browser channel
+
+- Drive web content through the browser channel instead of pixel-clicking a browser window: accessibility state with element indices plus real browser input. In scripted runs, `computer.getTab(...)` returns a tab handle whose `ax.*` actions act by element index, and the session-wide `browser` global carries the page surface.
+- `computer.getState()` returns one inventory across surfaces: `{apps, browsers, errors?}`, where every browser entry can list its tabs. `computer.getTab(target)` accepts a tab @-mention URI (pass the complete `plugin://` URL from the user message verbatim), a `{url}`, or a tab id with an optional `{browser}` id.
+- Mention resolution re-verifies the live title and URL and claims external user tabs through task ownership. When a mention is stale, ask the user for a fresh reference; never substitute another tab or browser.
+- When the browser tools are not bound, the surface says so explicitly. Window-level actions on a browser window remain available for native app chrome; they are not a silent replacement for a failing browser channel.
+
 ## Keyboard, text and clipboard
 
 - `press_key` takes one key or a `+`-separated chord in keysym style (`Return`, `super+c`, `Page_Down`, `KP_0`); standalone modifiers are released before the call returns.
@@ -386,6 +393,11 @@ mod tests {
         assert!(body.contains("get_desktop_screenshot"));
         assert!(body.contains("reading the documentation it returns"));
         assert!(body.contains("permission and hook pipeline"));
+        // The browser channel section keeps the unified inventory, verbatim
+        // mention passing and the no-substitution rule pinned.
+        assert!(body.contains("## Browser channel"));
+        assert!(body.contains("computer.getState()"));
+        assert!(body.contains("never substitute another tab or browser"));
     }
 
     #[test]
