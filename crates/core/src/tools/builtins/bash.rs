@@ -12,21 +12,27 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::fs::node_path::resolve_runtime;
 use crate::fs::path_safety::{writable_roots, writes_are_unconfined, PathContext};
 use crate::permission::PLAN_MODE_READONLY_ENFORCED_KEY;
-use crate::runtime_process::{RuntimeEnv, RuntimeProcessContext};
+use crate::runtime_process::{path_join, NodePathDialect, RuntimeEnv, RuntimeProcessContext};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimePath, RuntimeString};
 use crate::sandbox::denial::is_likely_sandbox_denied;
 use crate::sandbox::plan_readonly::PlanReadOnlySandbox;
 use crate::sandbox::process::ProcessSandbox;
+use crate::schemas::content::{OutputBlock, TextBlock};
 use crate::tools::background_shells::{BackgroundShellStatus, CompleteResult, StartShellOptions};
 use crate::tools::build_tool::text_result;
 use crate::tools::builtins::shell_common::{
     code_str, first_chars, request_shell_escalation, DEFAULT_MAX_OUTPUT_BYTES,
 };
 use crate::tools::exec::{run_shell, OutputStream, RunShellOptions, RunShellResult};
+use crate::tools::output_truncation::{
+    truncate_text, TruncationPolicy, DEFAULT_OUTPUT_TRUNCATION_POLICY,
+};
+use crate::tools::result_storage::{maybe_spill_result, SpillOptions};
 use crate::types::abort::AbortSignal;
 use crate::types::errors::ToolError;
 use crate::types::events::ToolDomainEvent;
@@ -128,32 +134,138 @@ pub fn resolve_bash_timeout(
         .min(max_timeout_ms)
 }
 
+/// Render the model-visible outcome of one foreground command as structured
+/// sections: exit code, wall time, the original line count when truncation
+/// changed it, and the output body under the shared truncation policy. Failure
+/// context (timeout, abort) leads the body so it survives middle truncation of
+/// a large output. Returns the text, whether the outcome is an error, and
+/// whether the body was truncated.
+///
+/// `wall_time` must be the millisecond-quantized duration that is also recorded
+/// in the result payload, so any consumer can re-render the exact text from the
+/// recorded fields alone.
 pub(crate) fn render_bash_outcome_text(
     output: &RuntimeString,
     exit_code: Option<i32>,
     timed_out: bool,
     aborted: bool,
-    timeout_ms: u64,
-) -> (RuntimeString, bool) {
+    wall_time: std::time::Duration,
+    policy: TruncationPolicy,
+) -> (RuntimeString, bool, bool) {
     let is_error = exit_code != Some(0) || timed_out || aborted;
-    let mut text = if output.is_empty() {
+    let base = if output.is_empty() {
         RuntimeString::from("(no output)")
     } else {
         output.clone()
     };
-    if timed_out {
-        text = text.concat(&RuntimeString::from_utf8(&format!(
-            "\n[command timed out after {timeout_ms}ms]"
-        )));
+    let content = if timed_out {
+        RuntimeString::from_utf8(&format!(
+            "command timed out after {} milliseconds\n",
+            wall_time.as_millis()
+        ))
+        .concat(&base)
     } else if aborted {
-        text = text.concat(&RuntimeString::from("\n[command aborted]"));
-    } else if exit_code != Some(0) {
-        text = text
-            .concat(&RuntimeString::from("\n[exit code "))
-            .concat(&code_str(exit_code))
-            .concat(&RuntimeString::from("]"));
+        RuntimeString::from("[command aborted]\n").concat(&base)
+    } else {
+        base
+    };
+    // Middle truncation works on UTF-8 bytes; non-scalar runtime text (lone
+    // surrogates from lossy sources) has no UTF-8 length and passes through
+    // unchanged instead of being corrupted by a lossy rewrite.
+    let mut total_lines_section = None;
+    let mut truncated = false;
+    let body = match content.try_to_utf8() {
+        Ok(utf8) if utf8.len() > policy.byte_budget() => {
+            let total_lines = utf8.lines().count();
+            let formatted = truncate_text(&utf8, policy);
+            if total_lines != formatted.lines().count() {
+                total_lines_section = Some(format!("Total output lines: {total_lines}"));
+            }
+            truncated = true;
+            RuntimeString::from_utf8(&formatted)
+        }
+        _ => content,
+    };
+    // Round to one decimal place for a stable, compact metadata line.
+    let duration_seconds = ((wall_time.as_secs_f32()) * 10.0).round() / 10.0;
+    let mut text = RuntimeString::from("Exit code: ")
+        .concat(&code_str(exit_code))
+        .concat(&RuntimeString::from_utf8(&format!(
+            "\nWall time: {duration_seconds} seconds"
+        )));
+    if let Some(section) = total_lines_section {
+        text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
     }
-    (text, is_error)
+    (
+        text.concat(&RuntimeString::from("\nOutput:\n"))
+            .concat(&body),
+        is_error,
+        truncated,
+    )
+}
+
+/// Persist the FULL output of a middle-truncated command beside the session's
+/// other tool-result artifacts and return the reference note to append
+/// (leading newlines included). The artifact name is the content hash, so
+/// identical output re-spills onto the same file deterministically and an
+/// independent reconstructor can recompute the exact path. A failed persist
+/// degrades to the truncated text alone — never to a tool error.
+async fn spill_truncated_bash_output(
+    output: &RuntimeString,
+    cwd: &RuntimePath,
+) -> Option<RuntimeString> {
+    let digest = Sha256::digest(output.to_node_utf8());
+    let mut id = String::from("bash-");
+    for byte in &digest[..8] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    let dir = path_join(
+        bash_spill_path_dialect(),
+        &[
+            cwd.clone(),
+            RuntimePath::from(".klaus"),
+            RuntimePath::from("tool-results"),
+        ],
+    );
+    let spilled = maybe_spill_result(
+        vec![OutputBlock::Text(TextBlock {
+            text: output.clone(),
+            citations: None,
+            harness_envelope: None,
+            message_id: None,
+            phase: None,
+        })],
+        SpillOptions {
+            // The caller already established that this output overflows the
+            // model budget; the plan exists to compute the exact artifact
+            // payload and path.
+            max_chars: 0.0,
+            dir,
+            id: RuntimeString::from_utf8(&id),
+        },
+        |_preview, full_chars, path| {
+            RuntimeString::from_utf8(&format!(
+                "\n\nTool output was truncated. The full {full_chars} chars were saved to "
+            ))
+            .concat(path.as_runtime_string())
+            .concat(&RuntimeString::from(
+                "; read it only if the omitted content is needed.",
+            ))
+        },
+    )
+    .await;
+    match (&spilled.spilled_path, spilled.content.first()) {
+        (Some(_), Some(OutputBlock::Text(note))) => Some(note.text.clone()),
+        _ => None,
+    }
+}
+
+fn bash_spill_path_dialect() -> NodePathDialect {
+    if cfg!(windows) {
+        NodePathDialect::Win32
+    } else {
+        NodePathDialect::Posix
+    }
 }
 
 /// Build the `bash` input JSON Schema (identical to the provider-normalized form).
@@ -563,6 +675,7 @@ impl Tool for BashTool {
         // touched by this command.
         let command_started_at_ms = crate::tools::freshness::now_ms();
 
+        let shell_started_at = std::time::Instant::now();
         let res = run_one(
             &ctx.process_context,
             sandbox_for_run.as_ref(),
@@ -579,13 +692,16 @@ impl Tool for BashTool {
             &on_progress,
         )
         .await;
+        let wall_ms = u64::try_from(shell_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let wall_time = std::time::Duration::from_millis(wall_ms);
 
-        let (_, is_error) = render_bash_outcome_text(
+        let (_, is_error, _) = render_bash_outcome_text(
             &res.output,
             res.exit_code,
             res.timed_out,
             res.aborted,
-            timeout_ms,
+            wall_time,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
         );
         // A command that genuinely failed (not a timeout/abort) MAY have been blocked
         // by the active sandbox rather than failing on its own — surface that so the
@@ -625,6 +741,7 @@ impl Tool for BashTool {
             .await;
             if approved {
                 let process_sandbox = ProcessSandbox::new();
+                let rerun_started_at = std::time::Instant::now();
                 let rerun = run_one(
                     &ctx.process_context,
                     &process_sandbox,
@@ -641,13 +758,21 @@ impl Tool for BashTool {
                     &on_progress,
                 )
                 .await;
-                let (mut rtext, rerun_error) = render_bash_outcome_text(
+                let rerun_wall_ms =
+                    u64::try_from(rerun_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let (mut rtext, rerun_error, rerun_truncated) = render_bash_outcome_text(
                     &rerun.output,
                     rerun.exit_code,
                     rerun.timed_out,
                     rerun.aborted,
-                    timeout_ms,
+                    std::time::Duration::from_millis(rerun_wall_ms),
+                    DEFAULT_OUTPUT_TRUNCATION_POLICY,
                 );
+                if rerun_truncated {
+                    if let Some(note) = spill_truncated_bash_output(&rerun.output, &cwd).await {
+                        rtext = rtext.concat(&note);
+                    }
+                }
                 rtext = rtext.concat(&RuntimeString::from(
                     "\n[Re-ran WITHOUT the sandbox after approval.]",
                 ));
@@ -669,6 +794,7 @@ impl Tool for BashTool {
                 );
                 output.insert("timedOut", RuntimeJson::Bool(rerun.timed_out));
                 output.insert("aborted", RuntimeJson::Bool(rerun.aborted));
+                output.insert("wallTimeMs", RuntimeJson::from(rerun_wall_ms));
                 output.insert("sandboxRetried", RuntimeJson::Bool(true));
                 return Ok(ToolResult {
                     serializable: ToolResultSerializable {
@@ -691,14 +817,20 @@ impl Tool for BashTool {
             }
         }
 
-        let (mut text, reconstructed_is_error) = render_bash_outcome_text(
+        let (mut text, reconstructed_is_error, truncated) = render_bash_outcome_text(
             &res.output,
             res.exit_code,
             res.timed_out,
             res.aborted,
-            timeout_ms,
+            wall_time,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
         );
         debug_assert_eq!(is_error, reconstructed_is_error);
+        if truncated {
+            if let Some(note) = spill_truncated_bash_output(&res.output, &cwd).await {
+                text = text.concat(&note);
+            }
+        }
         if sandbox_denied {
             text = text.concat(&RuntimeString::from_utf8(&format!(
                 "\n[This failure looks like the active sandbox ({kind}) denied the command — e.g. a blocked file write outside the workspace or a forbidden syscall — not a fault in the command itself. The engine will not silently re-run it unsandboxed; if it genuinely needs broader access, relax the sandbox (config sandbox: 'process') or widen the writable roots, then retry.]",
@@ -728,6 +860,7 @@ impl Tool for BashTool {
         );
         output.insert("timedOut", RuntimeJson::Bool(res.timed_out));
         output.insert("aborted", RuntimeJson::Bool(res.aborted));
+        output.insert("wallTimeMs", RuntimeJson::from(wall_ms));
         if sandbox_denied {
             output.insert("sandboxDenied", RuntimeJson::Bool(true));
         }
@@ -742,8 +875,6 @@ mod tests {
     #[cfg(unix)]
     use crate::runtime_process::ParentEnvSnapshot;
     use crate::runtime_values::RuntimeNumber;
-    #[cfg(unix)]
-    use crate::schemas::content::OutputBlock;
     #[cfg(unix)]
     use crate::tools::builtins::test_ctx::make_ctx;
     #[cfg(unix)]
@@ -980,47 +1111,146 @@ mod tests {
     }
 
     #[test]
-    fn foreground_outcome_formatter_binds_failure_suffixes() {
-        for (exit, timed_out, aborted, expected, is_error) in [
-            (Some(0), false, false, "OK".to_owned(), false),
-            (Some(1), false, false, "OK\n[exit code 1]".to_owned(), true),
+    fn foreground_outcome_formatter_renders_metadata_sections() {
+        for (exit, timed_out, aborted, wall_ms, output, expected, is_error) in [
+            (
+                Some(0),
+                false,
+                false,
+                0u64,
+                "OK",
+                "Exit code: 0\nWall time: 0 seconds\nOutput:\nOK",
+                false,
+            ),
+            (
+                Some(1),
+                false,
+                false,
+                0,
+                "OK",
+                "Exit code: 1\nWall time: 0 seconds\nOutput:\nOK",
+                true,
+            ),
             (
                 None,
                 false,
                 false,
-                "(no output)\n[exit code null]".to_owned(),
+                0,
+                "",
+                "Exit code: null\nWall time: 0 seconds\nOutput:\n(no output)",
                 true,
             ),
             (
                 Some(1),
                 true,
                 true,
-                "OK\n[command timed out after 123ms]".to_owned(),
+                123,
+                "OK",
+                "Exit code: 1\nWall time: 0.1 seconds\nOutput:\ncommand timed out after 123 milliseconds\nOK",
                 true,
             ),
             (
                 Some(1),
                 false,
                 true,
-                "OK\n[command aborted]".to_owned(),
+                0,
+                "OK",
+                "Exit code: 1\nWall time: 0 seconds\nOutput:\n[command aborted]\nOK",
                 true,
+            ),
+            (
+                Some(0),
+                false,
+                false,
+                2500,
+                "OK",
+                "Exit code: 0\nWall time: 2.5 seconds\nOutput:\nOK",
+                false,
             ),
         ] {
             assert_eq!(
                 render_bash_outcome_text(
-                    &rs(if expected.starts_with("(no output)") {
-                        ""
-                    } else {
-                        "OK"
-                    }),
+                    &rs(output),
                     exit,
                     timed_out,
                     aborted,
-                    123,
+                    std::time::Duration::from_millis(wall_ms),
+                    DEFAULT_OUTPUT_TRUNCATION_POLICY,
                 ),
-                (rs(expected), is_error)
+                (rs(expected), is_error, false)
             );
         }
+    }
+
+    #[test]
+    fn outcome_middle_truncates_large_output_and_reports_the_original_line_count() {
+        let output = rs((0..2_000).map(|i| format!("line {i}\n")).collect::<String>());
+        let (text, is_error, truncated) = render_bash_outcome_text(
+            &output,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+        );
+        assert!(truncated);
+        assert!(!is_error);
+        let text = text.try_to_utf8().unwrap();
+        assert!(
+            text.starts_with(
+                "Exit code: 0\nWall time: 0 seconds\nTotal output lines: 2000\nOutput:\nline 0\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("chars truncated…"), "{text}");
+        assert!(text.ends_with("line 1999\n"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncated_output_spills_the_full_text_into_the_workspace_artifacts() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let ctx = base_ctx(&cwd, Arc::new(ProcessSandbox::new()));
+        let result = create_bash_tool()
+            .call(
+                rjson!({
+                    "command": "awk 'BEGIN { printf \"HEAD\\n\"; for (i = 0; i < 20000; i++) printf \"x\"; printf \"\\nTAIL\\n\" }'"
+                }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.serializable.is_error, Some(false));
+        assert!(result
+            .serializable
+            .output
+            .get("wallTimeMs")
+            .and_then(RuntimeJson::as_u64)
+            .is_some());
+        let text = text_of(&result);
+        assert!(text.contains("chars truncated…"), "{text}");
+        assert!(
+            text.contains("Tool output was truncated. The full 20011 chars were saved to"),
+            "{text}"
+        );
+        assert!(text.contains(".klaus/tool-results/bash-"), "{text}");
+        let spill_dir = dir.join(".klaus").join("tool-results");
+        let entries: Vec<_> = std::fs::read_dir(&spill_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with("bash-"));
+        let saved = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert_eq!(saved.len(), 20_011);
+        assert!(saved.starts_with("HEAD\n"));
+        assert!(saved.ends_with("\nTAIL\n"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- metadata + schema ----
@@ -1424,9 +1654,7 @@ mod tests {
             self.0.lock().unwrap().clear();
         }
         fn clone_box(&self) -> Box<dyn crate::types::file_state::FileStateCache> {
-            Box::new(Self(std::sync::Mutex::new(
-                self.0.lock().unwrap().clone(),
-            )))
+            Box::new(Self(std::sync::Mutex::new(self.0.lock().unwrap().clone())))
         }
     }
 
@@ -1527,7 +1755,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(text_of(&result), "SINGLE_CHANNEL");
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Exit code: 0\nWall time: ")
+                && text.ends_with(" seconds\nOutput:\nSINGLE_CHANNEL"),
+            "{text}"
+        );
         assert!(emitted.lock().unwrap().is_empty());
         let progressed = progressed.lock().unwrap();
         assert_eq!(progressed.len(), 1, "{progressed:?}");
@@ -1799,8 +2032,18 @@ mod exact_tests {
     #[test]
     fn outcome_text_preserves_exact_output() {
         let output = RuntimeString::from_utf16(vec![b'o' as u16, 0xd800, b'k' as u16]);
-        let (rendered, is_error) = render_bash_outcome_text(&output, Some(0), false, false, 1_000);
-        assert_eq!(rendered, output);
+        let (rendered, is_error, truncated) = render_bash_outcome_text(
+            &output,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+        );
+        let expected =
+            RuntimeString::from("Exit code: 0\nWall time: 0 seconds\nOutput:\n").concat(&output);
+        assert_eq!(rendered, expected);
         assert!(!is_error);
+        assert!(!truncated);
     }
 }

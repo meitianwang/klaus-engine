@@ -171,6 +171,7 @@ fn canonical_test_tool_result(value: &Json) -> Json {
                 "exitCode",
                 "timedOut",
                 "aborted",
+                "wallTimeMs",
                 "sandboxDenied",
                 "sandboxRetried",
             ],
@@ -416,6 +417,7 @@ struct StrictModelRequest {
     skip_cache_write: Option<bool>,
     cache_ttl: Option<StrictCacheTtl>,
     cache_key: Option<String>,
+    cache_domain: Option<String>,
     context_management: Option<StrictContextManagement>,
     thinking_context: Option<StrictThinkingContextPolicy>,
 }
@@ -6445,11 +6447,21 @@ async fn scripted_query_records_each_bash_chunk_once_and_rebuilds_its_result() {
         .find(|message| runtime_json_field_eq(message, "toolUseId", "cmd-1"))
         .and_then(|message| message.pointer("/content/0/text"))
         .and_then(Json::as_str)
+        .map(|value| value.try_to_utf8().unwrap())
         .unwrap();
-    assert_eq!(
-        result_text,
-        "<command_output tool=\"Bash\">\nCOMMAND_OK\n</command_output>"
+    // The wall-time line carries a measured duration; pin the envelope around
+    // it instead of the value.
+    let lines = result_text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 6, "{result_text}");
+    assert_eq!(lines[0], "<command_output tool=\"Bash\">");
+    assert_eq!(lines[1], "Exit code: 0");
+    assert!(
+        lines[2].starts_with("Wall time: ") && lines[2].ends_with(" seconds"),
+        "{result_text}"
     );
+    assert_eq!(lines[3], "Output:");
+    assert_eq!(lines[4], "COMMAND_OK");
+    assert_eq!(lines[5], "</command_output>");
     validate_provider_behavior_trace_contract(&manifest, trace, TraceContractMode::Scripted)
         .await
         .unwrap();

@@ -682,6 +682,30 @@ impl Tool for ReadTool {
             );
         }
 
+        // Model-visible budget: middle-truncate an oversize text body with the
+        // shared policy and keep pagination as the recovery path for the elided
+        // middle. The raw baseline above records the FULL content, so edit
+        // freshness is unaffected by what the model gets to see in one call.
+        // Goal-owned snapshot reads keep their complete-text contract: a
+        // confined session must see the entire objective body in one read, so
+        // the model-visible budget does not apply to them.
+        let numbered = if goal_snapshot.is_some() {
+            numbered
+        } else {
+            let (truncated, read_truncated) =
+                crate::tools::output_truncation::formatted_truncate_runtime_text(
+                    &numbered,
+                    crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+                );
+            if read_truncated {
+                truncated.concat(&RuntimeString::from(
+                    "\nContent truncated. Read a section with the offset and limit parameters, or search it with grep.",
+                ))
+            } else {
+                truncated
+            }
+        };
+
         Ok(text_result(
             read_output(
                 &abs,

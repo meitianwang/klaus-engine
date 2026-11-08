@@ -328,6 +328,7 @@ impl Tool for WrappedMcpTool {
         // Pass the tool-event sink as the MCP progress callback and the turn's abort
         // signal, so a turn abort cancels the in-flight server round-trip. On abort the
         // call rejects, which the executor turns into an interrupted tool_result.
+        let started = std::time::Instant::now();
         let result = (self.call)(
             self.mcp_tool_name.clone(),
             args,
@@ -335,7 +336,31 @@ impl Tool for WrappedMcpTool {
             ctx.signal.clone(),
         )
         .await?;
-        let model_content = map_content(&result, self.max_result_chars, &self.server_name).await;
+        let wall_time = started.elapsed();
+        let mut model_content =
+            map_content(&result, self.max_result_chars, &self.server_name).await;
+        // The wall-time header leads the model-visible payload; the shared
+        // budget (plus the serialization allowance) then consumes blocks in
+        // order, keeping images and reducing the crossing text to a snippet.
+        model_content.insert(
+            0,
+            OutputBlock::Text(TextBlock {
+                text: RuntimeString::from_utf8(&format!(
+                    "Wall time: {:.4} seconds\nOutput:",
+                    wall_time.as_secs_f64()
+                )),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            }),
+        );
+        model_content = crate::tools::output_truncation::truncate_output_blocks(
+            model_content,
+            crate::tools::output_truncation::with_serialization_allowance(
+                crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            ),
+        );
         let is_error = result.is_error.unwrap_or(false);
         let mcp_meta = build_mcp_meta(&result);
         let output = runtime_codec::encode_value(&result).unwrap_or(RuntimeJson::Null);
@@ -979,8 +1004,10 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(text_blocks[0], "A😀");
-        assert_eq!(text_blocks[1], "\n[mcp: result truncated to 44 characters]");
+        assert!(text_blocks[0].starts_with("Wall time: "));
+        assert!(text_blocks[0].ends_with(" seconds\nOutput:"));
+        assert_eq!(text_blocks[1], "A😀");
+        assert_eq!(text_blocks[2], "\n[mcp: result truncated to 44 characters]");
     }
 
     #[tokio::test]
@@ -996,11 +1023,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        assert!(text_blocks[0].starts_with("Wall time: "));
+        assert!(text_blocks[0].ends_with(" seconds\nOutput:"));
         assert_eq!(
-            runtime_json::stringify(&Json::String(text_blocks[0].clone())),
+            runtime_json::stringify(&Json::String(text_blocks[1].clone())),
             RuntimeString::from(r#""A\ud800B""#)
         );
-        assert_eq!(text_blocks[1], "\n[mcp: result truncated to 44 characters]");
+        assert_eq!(text_blocks[2], "\n[mcp: result truncated to 44 characters]");
     }
 
     // ---- progress --------------------------------------------------------------

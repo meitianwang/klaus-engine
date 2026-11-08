@@ -305,9 +305,22 @@ fn tool_meta(tool: &Arc<dyn Tool>, input: &Json) -> Value {
 }
 
 fn serializable(result: ToolResult) -> Value {
+    let mut model_content = result.serializable.model_content;
+    // The wall-time header carries a measured duration; pin the golden to a
+    // fixed rendering so the baseline stays byte-exact.
+    if let Some(crate::schemas::content::OutputBlock::Text(first)) = model_content.first_mut() {
+        if let Ok(utf8) = first.text.try_to_utf8() {
+            if let Some(rest) = utf8.strip_prefix("Wall time: ") {
+                if let Some(tail_index) = rest.find(" seconds\nOutput:") {
+                    let tail = &rest[tail_index..];
+                    first.text = RuntimeString::from_utf8(&format!("Wall time: 0.0000{tail}"));
+                }
+            }
+        }
+    }
     json!({
         "output": result.serializable.output,
-        "modelContent": result.serializable.model_content,
+        "modelContent": model_content,
         "isError": result.serializable.is_error.unwrap_or(false),
         "mcpMeta": result.serializable.mcp_meta,
     })

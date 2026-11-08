@@ -416,6 +416,10 @@
       "modelContent": [
         {
           "type": "text",
+          "text": "Wall time: 0.0000 seconds\nOutput:"
+        },
+        {
+          "type": "text",
           "text": "A😀"
         },
         {

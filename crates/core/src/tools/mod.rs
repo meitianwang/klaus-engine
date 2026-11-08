@@ -9,6 +9,7 @@ pub mod freshness;
 pub mod incremental_buffer;
 pub(crate) mod input_parser;
 pub(crate) mod locale_sort;
+pub mod output_truncation;
 pub mod pool;
 pub mod result_storage;
 pub mod shell;

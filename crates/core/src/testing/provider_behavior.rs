@@ -5442,7 +5442,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "66504b3251000430051f55cb2c26ca4a713d1a9a0900277e1c2eaeab91842ddd";
+    "883783dd1618dd21ae7a76ade03ff9493de065bb41a60e201881275e66cafff6";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -5514,11 +5514,16 @@ fn instruction_descriptor_rule(
     let Some(rule) = rule else {
         return Ok(None);
     };
-    let digest = RuntimeString::from(exact_runtime_json_sha256(source));
-    if rule["sourceSha256"].as_str() != Some(&digest)
-        && rule["targetSha256"].as_str() != Some(&digest)
+    let digest = exact_runtime_json_sha256(source);
+    let digest_key = RuntimeString::from(digest.clone());
+    if rule["sourceSha256"].as_str() != Some(&digest_key)
+        && rule["targetSha256"].as_str() != Some(&digest_key)
     {
-        return Err("instruction descriptor complete predecessor fields or order drifted".into());
+        return Err(format!(
+            "instruction descriptor complete predecessor fields or order drifted for {}/{name_label}: recorded digest {digest} matches neither pinned side",
+            instruction_descriptor_style(style),
+            name_label = name.try_to_utf8().unwrap_or_default()
+        ));
     }
     Ok(Some(rule))
 }
@@ -5532,18 +5537,31 @@ fn checked_instruction_descriptor_target(
         return Ok(None);
     };
     let name = rule["name"].as_str().expect("validated descriptor name");
+    let name_label = name.try_to_utf8().unwrap_or_default();
+    let style_name = instruction_descriptor_style(style);
     let matches = targets
         .iter()
         .filter(|tool| &tool.name == name)
         .collect::<Vec<_>>();
     if matches.len() != 1 {
-        return Err("instruction descriptor target membership drifted".into());
+        return Err(format!(
+            "instruction descriptor target membership drifted for {style_name}/{name_label}: {} catalog matches",
+            matches.len()
+        ));
     }
     let target = runtime_codec::encode_value(matches[0]).map_err(|error| error.to_string())?;
-    if rule["targetSha256"].as_str()
-        != Some(&RuntimeString::from(exact_runtime_json_sha256(&target)))
+    let live_digest = exact_runtime_json_sha256(&target);
+    if !rule["targetSha256"]
+        .as_str()
+        .is_some_and(|value| runtime_eq_utf8(value, &live_digest))
     {
-        return Err("instruction descriptor complete target fields or order drifted".into());
+        let pinned = rule["targetSha256"]
+            .as_str()
+            .and_then(|value| value.try_to_utf8().ok())
+            .unwrap_or_default();
+        return Err(format!(
+            "instruction descriptor complete target fields or order drifted for {style_name}/{name_label}: rule pins {pinned} but this catalog renders {live_digest}"
+        ));
     }
     Ok(Some(target))
 }
@@ -5783,7 +5801,12 @@ fn canonicalize_signed_reference_requests(
             rendered_specs,
             &format!("baseline contract row {row_number} modelRequests[{request_index}]"),
         )?;
-        migrate_baseline_instruction_descriptors(value, rendered_specs, profile.prompt_style)?;
+        migrate_baseline_instruction_descriptors(value, rendered_specs, profile.prompt_style)
+            .map_err(|error| {
+                format!(
+                    "baseline contract row {row_number} modelRequests[{request_index}]: {error}"
+                )
+            })?;
         let mut request = runtime_codec::decode_value::<ModelRequest>(value).map_err(|error| {
             format!(
                 "invalid baseline contract row {row_number} modelRequests[{request_index}]: {error}"
@@ -6830,6 +6853,182 @@ fn migrate_signed_spill_previews(
     Ok(())
 }
 
+/// The bash outcome envelope as predecessor rows recorded it: the raw output
+/// with failure suffixes. Kept frozen here so a migrated row authenticates
+/// against the exact rendering it was produced with.
+fn predecessor_bash_outcome_text(
+    output: &RuntimeString,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    aborted: bool,
+    timeout_ms: u64,
+) -> (RuntimeString, bool) {
+    let is_error = exit_code != Some(0) || timed_out || aborted;
+    let mut text = if output.is_empty() {
+        RuntimeString::from("(no output)")
+    } else {
+        output.clone()
+    };
+    if timed_out {
+        text = text.concat(&RuntimeString::from_utf8(&format!(
+            "\n[command timed out after {timeout_ms}ms]"
+        )));
+    } else if aborted {
+        text = text.concat(&RuntimeString::from("\n[command aborted]"));
+    } else if exit_code != Some(0) {
+        text = text
+            .concat(&RuntimeString::from("\n[exit code "))
+            .concat(&crate::tools::builtins::shell_common::code_str(exit_code))
+            .concat(&RuntimeString::from("]"));
+    }
+    (text, is_error)
+}
+
+/// Rows recorded before the bash outcome envelope carried structured metadata
+/// sections authenticate by re-deriving their exact recorded text from the
+/// predecessor renderer, then adopt the current rendering. Wall time is not
+/// recoverable from a predecessor row, so migrated rows pin the zero-duration
+/// rendering and their recorded results keep no wallTimeMs field; validation
+/// reconstructs the same zero default.
+fn migrate_baseline_bash_outcome_envelopes(
+    trace: &mut ProviderBehaviorTrace,
+    row_number: usize,
+) -> Result<(), String> {
+    let bash_calls = trace
+        .normalized_internal_calls
+        .iter()
+        .filter(|call| runtime_json_field_eq(call, "internalName", "bash"))
+        .map(|call| {
+            let id = require_scalar_string(call, "id", "normalized bash call")
+                .map_err(|error| error.to_string())?;
+            let visible_name = require_string(call, "visibleName", "normalized bash call")
+                .map_err(|error| error.to_string())?
+                .clone();
+            Ok((id, visible_name, call.get("internalInput").cloned()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if bash_calls.is_empty() {
+        return Ok(());
+    }
+    let label = format!("baseline contract row {row_number} bash outcome envelope");
+    let info = ProviderInfo {
+        name: trace.run.provider_info.name.clone(),
+        base_url: None,
+        env_key: None,
+        default_model: trace.run.provider_info.default_model.clone(),
+    };
+    let profile = resolve_provider_behavior_profile(Some(&info), &trace.run.model);
+    // Phase 1: authenticate every predecessor rendering before any rewrite.
+    let mut rewrites = Vec::new();
+    for (id, visible_name, internal_input) in &bash_calls {
+        // require_scalar_string already validated and projected the id.
+        let id_str = id.clone();
+        let output = active_tool_output(&trace.engine_events, &id_str)
+            .map_err(|error| format!("{label}: {error}"))?;
+        let terminal = unique_terminal_tool_item(&trace.engine_events, &id_str)
+            .map_err(|error| format!("{label}: {error}"))?;
+        let result = terminal
+            .get("result")
+            .and_then(Json::as_object)
+            .ok_or_else(|| format!("{label} {id_str} lacks a result object"))?;
+        let aborted = result
+            .get("aborted")
+            .and_then(Json::as_bool)
+            .ok_or_else(|| format!("{label} {id_str} lacks aborted"))?;
+        let timed_out = result
+            .get("timedOut")
+            .and_then(Json::as_bool)
+            .ok_or_else(|| format!("{label} {id_str} lacks timedOut"))?;
+        let exit_code = match result.get("exitCode") {
+            Some(Json::Null) => None,
+            Some(value) => Some(
+                i32::try_from(value.as_i64().ok_or_else(|| {
+                    format!("{label} {id_str} exitCode must be an integer or null")
+                })?)
+                .map_err(|_| format!("{label} {id_str} exitCode is outside i32"))?,
+            ),
+            None => return Err(format!("{label} {id_str} lacks exitCode")),
+        };
+        let timeout_ms = crate::tools::builtins::bash::resolve_bash_timeout(
+            internal_input
+                .as_ref()
+                .and_then(|input| input.get("timeout"))
+                .and_then(Json::as_u64),
+            crate::tools::builtins::bash::DEFAULT_TIMEOUT_MS,
+            None,
+        );
+        let (old_text, is_error) =
+            predecessor_bash_outcome_text(&output, exit_code, timed_out, aborted, timeout_ms);
+        let old_content = runtime_codec::encode_value(&render_tool_result_content(
+            vec![reconstructed_text(old_text)],
+            visible_name,
+            is_error,
+            &profile,
+        ))
+        .map_err(|error| format!("{label}: {error}"))?;
+        let (new_text, _, _) = crate::tools::builtins::bash::render_bash_outcome_text(
+            &output,
+            exit_code,
+            timed_out,
+            aborted,
+            std::time::Duration::ZERO,
+            crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+        );
+        let new_content = runtime_codec::encode_value(&render_tool_result_content(
+            vec![reconstructed_text(new_text)],
+            visible_name,
+            is_error,
+            &profile,
+        ))
+        .map_err(|error| format!("{label}: {error}"))?;
+        rewrites.push((id_str, old_content, new_content));
+    }
+    // Phase 2: commit both carriers together only after every exact
+    // predecessor matched.
+    let mut history = trace.history.clone();
+    let mut requests = trace.model_requests.clone();
+    for (id_str, old_content, new_content) in &rewrites {
+        let mut history_count = 0;
+        for message in history.iter_mut() {
+            if !runtime_json_field_eq(message, "type", "tool_result")
+                || !runtime_json_field_eq(message, "toolUseId", id_str)
+            {
+                continue;
+            }
+            if message.get("content") != Some(old_content) {
+                return Err(format!("{label} correlated predecessor drifted"));
+            }
+            message["content"] = new_content.clone();
+            history_count += 1;
+        }
+        let mut request_count = 0;
+        for request in requests.iter_mut() {
+            let messages = request
+                .get_mut("messages")
+                .and_then(Json::as_array_mut)
+                .ok_or_else(|| format!("{label} request messages drifted"))?;
+            for message in messages.iter_mut() {
+                if !runtime_json_field_eq(message, "type", "tool_result")
+                    || !runtime_json_field_eq(message, "toolUseId", id_str)
+                {
+                    continue;
+                }
+                if message.get("content") != Some(old_content) {
+                    return Err(format!("{label} correlated predecessor drifted"));
+                }
+                message["content"] = new_content.clone();
+                request_count += 1;
+            }
+        }
+        if history_count != 1 || request_count == 0 {
+            return Err(format!("{label} correlated cardinality drifted"));
+        }
+    }
+    trace.history = history;
+    trace.model_requests = requests;
+    Ok(())
+}
+
 fn canonicalize_fixed_ts_reference_trace(
     mut trace: ProviderBehaviorTrace,
     manifest: &ProviderBehaviorManifest,
@@ -6990,6 +7189,7 @@ fn canonicalize_fixed_ts_reference_trace(
     }
     trace.side_effects = canonical_side_effects;
     migrate_signed_spill_previews(&mut trace, row_number)?;
+    migrate_baseline_bash_outcome_envelopes(&mut trace, row_number)?;
     migrate_baseline_fork_child_directives(&mut trace, task, row_number)?;
     Ok(trace)
 }
@@ -7668,12 +7868,31 @@ fn request_metadata_state(
     // skill (e.g. `klaus-docs`) and must not byte-pin to the old recording either.
     // "capability-boundaries" is Klaus's own statement of what counts as a capability
     // and which asset directories are its own; the recording has no such section.
-    const KLAUS_ONLY_SYSTEM_FRAGMENTS: &[&str] =
-        &["browser-surfaces", "capability-boundaries", "reminder"];
+    // "subagent-model-selection" is Klaus's own delegation guidance: the engine
+    // appends it when the session exposes subagent tools, and its text is
+    // rendered from the live model-catalog configuration, so no recorded state
+    // can carry it.
+    const KLAUS_ONLY_SYSTEM_FRAGMENTS: &[&str] = &[
+        "browser-surfaces",
+        "capability-boundaries",
+        "reminder",
+        "subagent-model-selection",
+    ];
+    // The recorded baseline carries an agent-memory guidance part, but the
+    // current engine emits that part only when the session's memory
+    // configuration enables it, which these eval builds do not, so no live
+    // state can carry it either. The guidance text stays bound to the runtime
+    // builder through the agent-memory migration pin and its builder test, and
+    // canonicalized rows keep the migrated part; this drop removes it only
+    // from the fixed-state comparison.
+    const RECORDED_ONLY_SYSTEM_FRAGMENTS: &[&str] = &["memory"];
     normalized_system.retain(|part| {
         !KLAUS_ONLY_SYSTEM_FRAGMENTS
             .iter()
             .any(|name| runtime_eq_utf8(&part.name, name))
+            && !RECORDED_ONLY_SYSTEM_FRAGMENTS
+                .iter()
+                .any(|name| runtime_eq_utf8(&part.name, name))
     });
     let model_suffix = RuntimeString::from_utf8(" - You are powered by the model ")
         .concat(expected_model)
@@ -7713,6 +7932,29 @@ fn request_metadata_state(
     Ok(runtime_json::stringify(&RuntimeJson::Object(
         object.finish(),
     )))
+}
+
+/// Diagnostic aid for metadata mismatches: the system part names of a
+/// serialized request-metadata state, so a failure names the diverging
+/// fragment instead of only a byte offset into a huge serialized state.
+fn metadata_system_part_names(metadata: &RuntimeString) -> Vec<String> {
+    let Ok(parsed) = runtime_json::parse(metadata) else {
+        return Vec::new();
+    };
+    parsed
+        .get("system")
+        .and_then(RuntimeJson::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("name")
+                        .and_then(RuntimeJson::as_str)
+                        .and_then(|name| name.try_to_utf8().ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn trusted_metadata_with_task_plan_reminder(
@@ -7962,9 +8204,11 @@ fn validate_request_tool_contract(
                 .map(|(offset, trusted)| {
                     let start = offset.saturating_sub(80);
                     format!(
-                        "; first differing UTF-16 offset {offset}: actual {:?}, trusted {:?}",
+                        "; first differing UTF-16 offset {offset}: actual {:?}, trusted {:?}; actual system parts {:?}, trusted system parts {:?}",
                         metadata.slice_utf16(start..(offset + 200).min(metadata.len_utf16())),
-                        trusted.slice_utf16(start..(offset + 200).min(trusted.len_utf16()))
+                        trusted.slice_utf16(start..(offset + 200).min(trusted.len_utf16())),
+                        metadata_system_part_names(&metadata),
+                        metadata_system_part_names(trusted),
                     )
                 })
                 .unwrap_or_default();
@@ -11814,12 +12058,16 @@ fn trusted_tool_result_evidence<T: RuntimeLookupKey + ?Sized>(
     ))
 }
 
+/// Reconstructed outcome of one recorded Bash result envelope: the rendered
+/// text, its error flag, and the optional spilled full output as a
+/// (workspace-relative key, content) pair.
+type ReconstructedBashOutcome = (RuntimeString, bool, Option<(RuntimeString, RuntimeString)>);
+
 fn reconstruct_bash_outcome(
     id: &str,
     terminal: &Json,
-    input: &Json,
     output: &RuntimeString,
-) -> Result<(RuntimeString, bool), ProviderBehaviorEvalError> {
+) -> Result<ReconstructedBashOutcome, ProviderBehaviorEvalError> {
     let result = terminal
         .get("result")
         .and_then(Json::as_object)
@@ -11863,6 +12111,7 @@ fn reconstruct_bash_outcome(
             "exitCode",
             "timedOut",
             "aborted",
+            "wallTimeMs",
             "sandboxDenied",
             "sandboxRetried",
         ]
@@ -11877,14 +12126,16 @@ fn reconstruct_bash_outcome(
             "bash terminal result {id} has unsupported opaque sandbox evidence"
         )));
     }
-    let requested_timeout = input.get("timeout").and_then(Json::as_u64);
-    let timeout_ms = crate::tools::builtins::bash::resolve_bash_timeout(
-        requested_timeout,
-        crate::tools::builtins::bash::DEFAULT_TIMEOUT_MS,
-        None,
-    );
-    let (text, is_error) = crate::tools::builtins::bash::render_bash_outcome_text(
-        output, exit_code, timed_out, aborted, timeout_ms,
+    // Predecessor rows carry no wall time; their migrated envelope pins the
+    // zero-duration rendering, so an absent field reconstructs as zero.
+    let wall_ms = result.get("wallTimeMs").and_then(Json::as_u64).unwrap_or(0);
+    let (text, is_error, truncated) = crate::tools::builtins::bash::render_bash_outcome_text(
+        output,
+        exit_code,
+        timed_out,
+        aborted,
+        std::time::Duration::from_millis(wall_ms),
+        crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
     );
     let expected_status = if is_error { "failed" } else { "completed" };
     let expected_error = is_error.then(|| exact_json!({ "message": "tool reported an error" }));
@@ -11897,7 +12148,20 @@ fn reconstruct_bash_outcome(
             "bash terminal result {id} failure semantics differ from exitCode/timedOut/aborted"
         )));
     }
-    Ok((text, is_error))
+    if !truncated {
+        return Ok((text, is_error, None));
+    }
+    // The tool persists the full body of a middle-truncated output under a
+    // content-hash artifact name; both the name and the appended note are
+    // deterministic functions of the recorded output, so reproduce them here.
+    let hash = sha256_hex(&output.to_node_utf8());
+    let name = &hash[..16];
+    let key = RuntimeString::from_utf8(&format!(".klaus/tool-results/bash-{name}.txt"));
+    let note = RuntimeString::from_utf8(&format!(
+        "\n\nTool output was truncated. The full {} chars were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
+        output.len_utf16()
+    ));
+    Ok((text.concat(&note), is_error, Some((key, output.clone()))))
 }
 
 #[derive(Debug, Default)]
@@ -12544,12 +12808,15 @@ async fn validate_tool_result_reconstruction(
                     terminal_event_index: call_terminal_event_index,
                 });
                 let output = active_tool_output(&trace.engine_events, &id)?;
-                let (text, reconstructed_is_error) =
-                    reconstruct_bash_outcome(&id, &terminal, input, &output)?;
+                let (text, reconstructed_is_error, bash_spill) =
+                    reconstruct_bash_outcome(&id, &terminal, &output)?;
                 if is_error != reconstructed_is_error {
                     return Err(ProviderBehaviorEvalError::Task(format!(
                         "bash history tool_result {id} isError differs from reconstructed outcome"
                     )));
+                }
+                if let Some((spill_key, spill_full)) = bash_spill {
+                    files.insert(spill_key, spill_full);
                 }
                 raw_content.push(reconstructed_text(text));
             }
@@ -14135,7 +14402,24 @@ async fn run_task_raw(
         deps.uuid = Some(uuid);
         deps.now = Some(now);
     }
-    let tools = build_eval_tools(task)?;
+    let tools = match build_eval_tools(task)? {
+        Some(tools) => Some(tools),
+        None if task.config.code_mode => {
+            // The session config key that once swapped in the code-mode
+            // surface is retired, so the adapted replay provides the declared
+            // exec/wait pair explicitly on top of the default builtin catalog
+            // that the contract comparison derives. The cell registry mirrors
+            // the exposed surface so a scripted cell can nest the declared
+            // tool calls through the same dispatch as a normal call.
+            let runtime = create_code_mode_tools();
+            let mut surface = build_eval_tools_for_replay(task)?;
+            surface.push(runtime.exec.clone());
+            surface.push(runtime.wait.clone());
+            runtime.set_tool_registry(surface.clone());
+            Some(surface)
+        }
+        None => None,
+    };
     let hooks = build_eval_hooks(&task.hooks)?;
     let (approval_policy, sandbox_mode) = match task.permission_mode {
         EvalPermissionMode::BypassPermissions => ("never", "danger-full-access"),
@@ -18699,6 +18983,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn baseline_bash_rows_adopt_the_structured_outcome_envelope() {
+        for profile in [
+            EvalProfile::Anthropic,
+            EvalProfile::Openai,
+            EvalProfile::Generic,
+        ] {
+            let trace = fixed_ts_contract_trace("command-output-envelope", profile).unwrap();
+            let text = trace
+                .history
+                .iter()
+                .find(|message| {
+                    runtime_json_field_eq(message, "type", "tool_result")
+                        && runtime_json_field_eq(message, "toolUseId", "cmd-1")
+                })
+                .and_then(|message| message.pointer("/content/0/text"))
+                .and_then(Json::as_str)
+                .map(|value| value.try_to_utf8().unwrap())
+                .unwrap();
+            assert!(
+                text.contains("Exit code: 0\nWall time: 0 seconds\nOutput:\nCOMMAND_OK"),
+                "{profile:?}: {text}"
+            );
+            assert!(!text.contains("[exit code"), "{profile:?}: {text}");
+        }
+    }
+
     fn rs(value: &str) -> RuntimeString {
         RuntimeString::from_utf8(value)
     }
@@ -18709,6 +19020,193 @@ mod tests {
         parse_baseline_contract(fixture)
             .expect("baseline contract must parse")
             .swap_remove(0)
+    }
+
+    /// Re-record the approved target of every instruction descriptor rule from
+    /// the live catalog. The target pin binds recorded predecessor shapes to
+    /// the current approved rendering; after an approved tool-surface change,
+    /// refresh the fixture and re-pin `INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256`
+    /// to the printed canonical hash:
+    /// `UPDATE_GOLDEN=1 cargo nextest run --locked -p klaus-agent-core
+    /// --features testing --nocapture instruction_descriptor_migration_targets_re_record`.
+    /// Recorded rows authenticate through the untouched `sourceSha256` side of
+    /// each rule, so re-recording targets never invalidates a predecessor.
+    /// A rule's target always comes from the default catalog of its style, so
+    /// rules can only bridge descriptors recorded by default-catalog tasks;
+    /// custom-tool tasks render their own probes and must be bridged by a
+    /// dedicated migration instead.
+    #[test]
+    fn instruction_descriptor_migration_targets_re_record() {
+        if std::env::var_os("UPDATE_GOLDEN").is_none() {
+            return;
+        }
+        let manifest = load_checked_in_manifest().unwrap();
+        let contract =
+            include_str!("../../tests/fixtures/provider_behavior/v1/baseline.contract.jsonl");
+        let mut catalogs: BTreeMap<&'static str, Vec<ToolSpec>> = BTreeMap::new();
+        for (index, value) in parse_baseline_contract(contract)
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let row = parse_baseline_contract_row(value, index + 1).unwrap();
+            let task = manifest.task(&row.trace.task.name).unwrap();
+            if !task.tools.is_empty() {
+                continue;
+            }
+            let provider_info = ProviderInfo {
+                name: row.trace.run.provider_info.name.clone(),
+                base_url: None,
+                env_key: None,
+                default_model: row.trace.run.provider_info.default_model.clone(),
+            };
+            let profile =
+                resolve_provider_behavior_profile(Some(&provider_info), &row.trace.run.model);
+            let style = instruction_descriptor_style(profile.prompt_style);
+            if catalogs.contains_key(style) {
+                continue;
+            }
+            let replay_tools = build_eval_tools_for_replay(task).unwrap();
+            let internal_specs = replay_tools
+                .iter()
+                .map(|tool| to_tool_spec(tool.as_ref()))
+                .collect::<Vec<_>>();
+            catalogs.insert(
+                style,
+                render_tool_specs_for_behavior(&internal_specs, &profile),
+            );
+        }
+        assert_eq!(
+            catalogs.len(),
+            3,
+            "contract rows must cover all three styles"
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/prompt_policy/instruction-descriptor-migration.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut fixture = runtime_json::parse(&RuntimeString::from_utf8(&text)).unwrap();
+        // Drift report: recorded descriptors that no longer match their own
+        // row's rendered catalog and have no rule yet. Compare against each
+        // row's own catalog because custom-tool tasks render their probes,
+        // which a default-catalog comparison would misreport as drift, and
+        // compare with the same unordered semantic equality the
+        // canonicalization check applies, so entries are exactly the gaps that
+        // check will trip on. Each one needs a rule (or its own dedicated
+        // migration) before its rows canonicalize, so surface the whole set at
+        // re-record time instead of one abort at a time. Names rewritten by a
+        // dedicated migration before the per-tool check still appear here; the
+        // load path is the arbiter.
+        let mut existing_rules = BTreeSet::new();
+        for rule in fixture
+            .get("rules")
+            .and_then(RuntimeJson::as_array)
+            .expect("descriptor fixture rules")
+        {
+            let style = rule
+                .get("style")
+                .and_then(RuntimeJson::as_str)
+                .and_then(|value| value.try_to_utf8().ok())
+                .unwrap_or_default();
+            let name = rule
+                .get("name")
+                .and_then(RuntimeJson::as_str)
+                .and_then(|value| value.try_to_utf8().ok())
+                .unwrap_or_default();
+            existing_rules.insert((style, name));
+        }
+        let mut drift = BTreeSet::new();
+        for (index, value) in parse_baseline_contract(contract)
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let row = parse_baseline_contract_row(value, index + 1).unwrap();
+            let task = manifest.task(&row.trace.task.name).unwrap();
+            let catalog = build_canonical_request_catalog(task, &row.trace.run, index + 1).unwrap();
+            let style = instruction_descriptor_style(catalog.profile.prompt_style);
+            for request in row.trace.model_requests.iter() {
+                let Some(tools) = request.get("tools").and_then(RuntimeJson::as_array) else {
+                    continue;
+                };
+                for tool in tools {
+                    let Some(name) = tool
+                        .get("name")
+                        .and_then(RuntimeJson::as_str)
+                        .and_then(|value| value.try_to_utf8().ok())
+                    else {
+                        continue;
+                    };
+                    if task.config.code_mode && name == "code_exec" {
+                        continue;
+                    }
+                    if existing_rules.contains(&(style.to_string(), name.clone())) {
+                        continue;
+                    }
+                    let Some(spec) = catalog
+                        .canonical_specs
+                        .get(&RuntimeString::from_utf8(&name))
+                    else {
+                        drift.insert(format!(
+                            "row {} {style}/{name} [absent from its rendered catalog]",
+                            index + 1
+                        ));
+                        continue;
+                    };
+                    let live = runtime_codec::encode_value(spec).expect("encodable live spec");
+                    if !live.semantic_eq_unordered(tool) {
+                        drift.insert(format!("row {} {style}/{name}", index + 1));
+                    }
+                }
+            }
+        }
+        eprintln!("descriptor drift without rules: {drift:?}");
+        let mut changed = Vec::new();
+        {
+            let rules = fixture
+                .get_mut("rules")
+                .and_then(RuntimeJson::as_array_mut)
+                .expect("descriptor fixture rules");
+            for rule in rules.iter_mut() {
+                let style = rule
+                    .get("style")
+                    .and_then(RuntimeJson::as_str)
+                    .and_then(|value| value.try_to_utf8().ok())
+                    .expect("descriptor rule style");
+                let name = rule
+                    .get("name")
+                    .and_then(RuntimeJson::as_str)
+                    .and_then(|value| value.try_to_utf8().ok())
+                    .expect("descriptor rule name");
+                let catalog = catalogs
+                    .get(style.as_str())
+                    .unwrap_or_else(|| panic!("no live catalog for style {style}"));
+                let spec = catalog
+                    .iter()
+                    .find(|spec| runtime_eq_utf8(&spec.name, &name))
+                    .unwrap_or_else(|| {
+                        panic!("rule target {style}/{name} missing from the live catalog")
+                    });
+                let target = runtime_codec::encode_value(spec).expect("encodable live spec");
+                let hash = exact_runtime_json_sha256(&target);
+                let unchanged = rule
+                    .get("targetSha256")
+                    .and_then(RuntimeJson::as_str)
+                    .is_some_and(|value| runtime_eq_utf8(value, &hash));
+                rule["target"] = target;
+                rule["targetSha256"] = RuntimeJson::from(hash);
+                if !unchanged {
+                    changed.push(format!("{style}/{name}"));
+                }
+            }
+        }
+        let canonical_hash = exact_runtime_json_sha256(&fixture);
+        let mut bytes = runtime_json::stringify_pretty(&fixture).to_node_utf8();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+        eprintln!(
+            "instruction-descriptor-migration.json: re-recorded {} targets; changed: {changed:?}; new INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256 = {canonical_hash}",
+            changed.len()
+        );
     }
 
     #[test]
@@ -18806,7 +19304,7 @@ mod tests {
             }
         }
         assert_eq!(styles.len(), 3);
-        assert_eq!(tested, 33);
+        assert_eq!(tested, 37);
     }
 
     #[test]
@@ -23580,21 +24078,25 @@ mod tests {
                 .await
                 .unwrap();
         add_live_tool_event_turn_ids(&mut trace);
-        let spill_key = ".klaus/tool-results/cmd-1.txt";
-        // A bare unwrap here says only that the spill is absent. What the run actually left
-        // behind, and what the tool reported, are what tell a missing spill apart from a
-        // command that never produced output.
-        let full = trace
+        // The tool-level spill names its artifact by content hash, so locate it
+        // by prefix. A bare unwrap here says only that the spill is absent.
+        // What the run actually left behind, and what the tool reported, are
+        // what tell a missing spill apart from a command that never produced
+        // output.
+        let spill_key = trace
             .after_files
-            .get(&rs(spill_key))
+            .keys()
+            .find(|key| key.starts_with(".klaus/tool-results/bash-"))
+            .cloned()
             .unwrap_or_else(|| {
                 panic!(
-                    "spill {spill_key} absent; workspace holds {:?}; cmd-1 result {:?}",
+                    "tool-level bash spill absent; workspace holds {:?}; cmd-1 result {:?}",
                     trace.after_files.keys().collect::<Vec<_>>(),
                     history_tool_result(&trace.history, "cmd-1"),
                 )
-            })
-            .clone();
+            });
+        let spill_key_str = spill_key.try_to_utf8().unwrap();
+        let full = trace.after_files.get(&spill_key).unwrap().clone();
         assert!(full.starts_with("COMMAND_OK\n"));
         assert!(full.len_utf16() > 30_000);
         let spilled_history = history_tool_result(&trace.history, "cmd-1").unwrap();
@@ -23603,7 +24105,18 @@ mod tests {
             .and_then(Json::as_str)
             .unwrap();
         assert!(spilled_text.contains("truncated"));
-        assert!(spilled_text.contains("$WORKSPACE/.klaus/tool-results/cmd-1.txt"));
+        assert!(spilled_text.contains(&spill_key_str));
+        assert!(spilled_text.contains("$WORKSPACE/.klaus/tool-results/bash-"));
+        let wall_ms = trace
+            .engine_events
+            .iter()
+            .find(|event| {
+                runtime_json_field_eq(event, "type", "item.completed")
+                    && runtime_json_pointer_eq(event, "/item/id", "cmd-1")
+            })
+            .and_then(|event| event.pointer("/item/result/wallTimeMs"))
+            .and_then(Json::as_u64)
+            .unwrap();
         validate_provider_behavior_trace_contract(&manifest, &trace, TraceContractMode::Live)
             .await
             .unwrap();
@@ -23616,19 +24129,17 @@ mod tests {
             default_model: forged.run.provider_info.default_model.clone(),
         };
         let behavior = resolve_provider_behavior_profile(Some(&info), &forged.run.model);
-        let timeout_ms = crate::tools::builtins::bash::resolve_bash_timeout(
-            None,
-            crate::tools::builtins::bash::DEFAULT_TIMEOUT_MS,
-            None,
-        );
-        let (raw_bash_text, is_error) = crate::tools::builtins::bash::render_bash_outcome_text(
-            &full,
-            Some(0),
-            false,
-            false,
-            timeout_ms,
-        );
+        let (raw_bash_text, is_error, truncated) =
+            crate::tools::builtins::bash::render_bash_outcome_text(
+                &full,
+                Some(0),
+                false,
+                false,
+                std::time::Duration::from_millis(wall_ms),
+                crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            );
         assert!(!is_error);
+        assert!(truncated);
         let visible_name = forged
             .normalized_internal_calls
             .iter()
@@ -23655,10 +24166,10 @@ mod tests {
                 }
             }
         }
-        forged.after_files.remove(&rs(spill_key));
+        forged.after_files.remove(&spill_key);
         forged.side_effects.retain(|effect| {
             !runtime_json_field_eq(effect, "type", "file_change")
-                || !runtime_json_field_eq(effect, "path", spill_key)
+                || !runtime_json_field_eq(effect, "path", &spill_key_str)
         });
 
         let error =
