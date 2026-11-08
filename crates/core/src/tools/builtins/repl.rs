@@ -474,6 +474,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_bindings_bridge_host_mcp_tools_under_identifier_keys() {
+        let mut ctx = make_ctx(".");
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__computer-use__get_app_state",
+                "mcp__computer-use__desktop_click",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        let bindings = tool_bindings(&ctx);
+        let keys: Vec<String> = bindings
+            .iter()
+            .map(|binding| String::from_utf8(binding.key.to_node_utf8()).unwrap())
+            .collect();
+        let names: Vec<String> = bindings
+            .iter()
+            .map(|binding| String::from_utf8(binding.name.to_node_utf8()).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "mcp__computer_use__get_app_state".to_string(),
+                "mcp__computer_use__desktop_click".to_string()
+            ],
+            "host MCP tools enter the REPL under identifier-safe keys"
+        );
+        assert_eq!(
+            names,
+            vec![
+                "mcp__computer-use__get_app_state".to_string(),
+                "mcp__computer-use__desktop_click".to_string()
+            ],
+            "the routed call keeps the catalog tool name"
+        );
+    }
+
+    #[test]
     fn schema_matches_exactly() {
         let schema = create_repl_tool(Arc::new(
             crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
