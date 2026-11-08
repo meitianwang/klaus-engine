@@ -432,6 +432,29 @@ mod tests {
         ctx
     }
 
+    fn browser_ctx(calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>>) -> ToolContext {
+        let mut ctx = make_ctx(".");
+        ctx.invoke_tool = Some(recording_invoke(calls));
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__klaus-browser__ax_state",
+                "mcp__klaus-browser__ax_action",
+                "mcp__klaus-browser__page_text",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        ctx
+    }
+
     // ---- metadata + schema -----------------------------------------------------
 
     #[test]
@@ -448,6 +471,52 @@ mod tests {
         assert!(!tool.is_read_only(&rjson!({})));
         assert!(!tool.is_concurrency_safe(&rjson!({})));
         assert_eq!(tool.is_destructive(&rjson!({})), Some(false));
+    }
+
+    #[test]
+    fn tool_bindings_bridge_host_mcp_tools_under_identifier_keys() {
+        let mut ctx = make_ctx(".");
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__computer-use__get_app_state",
+                "mcp__computer-use__desktop_click",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        let bindings = tool_bindings(&ctx);
+        let keys: Vec<String> = bindings
+            .iter()
+            .map(|binding| String::from_utf8(binding.key.to_node_utf8()).unwrap())
+            .collect();
+        let names: Vec<String> = bindings
+            .iter()
+            .map(|binding| String::from_utf8(binding.name.to_node_utf8()).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "mcp__computer_use__get_app_state".to_string(),
+                "mcp__computer_use__desktop_click".to_string()
+            ],
+            "host MCP tools enter the REPL under identifier-safe keys"
+        );
+        assert_eq!(
+            names,
+            vec![
+                "mcp__computer-use__get_app_state".to_string(),
+                "mcp__computer-use__desktop_click".to_string()
+            ],
+            "the routed call keeps the catalog tool name"
+        );
     }
 
     #[test]
@@ -619,6 +688,113 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].0, rs("read-file"));
         assert_eq!(recorded[0].1, rjson!({ "path": "x" }));
+    }
+
+    // ---- browser prelude ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn browser_prelude_routes_helpers_to_bound_host_tools() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ctx(calls.clone());
+        let res = tool
+            .call(
+                rjson!({ "code": "const r = await browser.getState(); r.tool" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains("mcp__klaus-browser__ax_state"),
+            "the helper routes to the bound host tool: {text}"
+        );
+        assert!(
+            text.contains("browser.docs()"),
+            "first use prints the API pointer: {text}"
+        );
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, rs("mcp__klaus-browser__ax_state"));
+        assert_eq!(recorded[0].1, rjson!({}));
+    }
+
+    #[tokio::test]
+    async fn browser_tab_handles_inject_tab_id_and_map_ax_actions() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ctx(calls.clone());
+        let res = tool
+            .call(
+                rjson!({ "code": "await browser.getTab(7).ax.click(3, { mouseButton: 'right' }); 'done'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, rs("mcp__klaus-browser__ax_action"));
+        assert_eq!(
+            recorded[0].1,
+            rjson!({ "action": "click", "elementIndex": 3, "mouseButton": "right", "tabId": 7 })
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_helpers_refuse_clearly_when_host_tools_are_not_bound() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = repl_ctx(Default::default());
+        let res = tool
+            .call(rjson!({ "code": "await browser.getState()" }), &ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(true));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains("not bound in this REPL session"),
+            "the refusal names the recovery path: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_docs_cover_the_ax_workflow_and_the_note_prints_once() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ctx(Default::default());
+        let docs = tool
+            .call(rjson!({ "code": "browser.docs()" }), &ctx, None)
+            .await
+            .unwrap();
+        let text = String::from_utf8(text_of(&docs).to_node_utf8()).unwrap();
+        assert!(text.contains("tab.ax.click(index"), "{text}");
+        assert!(
+            text.contains("call getState() again"),
+            "the docs teach index re-derivation: {text}"
+        );
+        let second = tool
+            .call(
+                rjson!({ "code": "await browser.getState(); await browser.getState(); 'ok'" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(text_of(&second).to_node_utf8()).unwrap(),
+            "ok",
+            "the first-use note does not repeat on later execs"
+        );
     }
 
     #[tokio::test]
