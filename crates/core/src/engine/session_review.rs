@@ -666,6 +666,7 @@ impl Session {
             agent_tool_policy: self.root_agent_definition.clone(),
             compaction_protected_message_ids: Default::default(),
             context_window: None,
+            precompute: None,
             compaction_history: None,
             recover_compaction_history: None,
             compaction_output: None,

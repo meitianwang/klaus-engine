@@ -406,6 +406,7 @@ fn approval_query_params(
         messages: vec![user_message("mutate twice")],
         compaction_protected_message_ids: std::collections::HashSet::new(),
         context_window: None,
+        precompute: None,
         compaction_history: None,
         recover_compaction_history: None,
         compaction_output: None,

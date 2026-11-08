@@ -62,6 +62,8 @@ use crate::types::tool::{BackgroundTaskRegistry, Tool, ToolContext};
 
 mod compaction;
 mod orchestration;
+mod precompute;
+pub(crate) use precompute::PrecomputeRegistry;
 pub(super) mod request;
 mod result_trim;
 mod streaming;
@@ -353,6 +355,10 @@ pub struct QueryParams {
     pub compaction_protected_message_ids: HashSet<RuntimeString>,
     /// Shared only by queries that own the resumable conversation.
     pub context_window: Option<crate::context::window_usage::ContextWindowUsage>,
+    /// Session-scoped background compaction precompute state. Present only on
+    /// queries that own the resumable conversation; auxiliary and child
+    /// queries keep the synchronous compaction path.
+    pub precompute: Option<Arc<precompute::PrecomputeRegistry>>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub tool_specs: Vec<ToolSpec>,
     /// Optional host callback to recompute the live tool set between turns.

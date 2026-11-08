@@ -3222,6 +3222,7 @@ fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {
     let specs = to_tool_specs(&tools);
     QueryParams {
         retained_tool_tasks: None,
+        precompute: None,
         prepare_request_usage: None,
         multi_agent_instructions: false,
         thread_id: "thread-1".into(),
@@ -12894,4 +12895,367 @@ async fn runtime_global_disable_skips_every_query_compaction_path() {
             pressure
         );
     }
+}
+
+// ---- Background compaction precompute wiring ----
+
+struct PrecomputeBackgroundCompactor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::engine::deps::Compactor for PrecomputeBackgroundCompactor {
+    async fn maybe_compact(
+        &self,
+        _messages: &[Message],
+        _estimated_tokens: u64,
+        _config: &crate::schemas::config::ResolvedConfig,
+        _custom_instructions: Option<&RuntimeString>,
+    ) -> crate::engine::deps::CompactionResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        crate::engine::deps::CompactionResult {
+            messages: vec![Message::CompactBoundary(CompactBoundaryMessage {
+                native_compaction: None,
+                uuid: "bg-boundary".into(),
+                summary: "PRECOMPUTED SUMMARY".into(),
+            })],
+            freed_tokens: 100,
+            compacted: true,
+            reason: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    async fn reactive_compact(
+        &self,
+        messages: &[Message],
+        config: &crate::schemas::config::ResolvedConfig,
+        custom_instructions: Option<&RuntimeString>,
+    ) -> crate::engine::deps::CompactionResult {
+        self.maybe_compact(messages, 0, config, custom_instructions)
+            .await
+    }
+}
+
+struct PrecomputeForegroundCompactor {
+    background: Arc<AtomicUsize>,
+    sync: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::engine::deps::Compactor for PrecomputeForegroundCompactor {
+    fn fork_isolated(
+        &self,
+        _call_model: crate::types::provider::CallModel,
+        _config: &crate::schemas::config::ResolvedConfig,
+    ) -> Result<Arc<dyn crate::engine::deps::Compactor>, String> {
+        Ok(Arc::new(PrecomputeBackgroundCompactor {
+            calls: self.background.clone(),
+        }))
+    }
+
+    async fn maybe_compact(
+        &self,
+        _messages: &[Message],
+        _estimated_tokens: u64,
+        _config: &crate::schemas::config::ResolvedConfig,
+        _custom_instructions: Option<&RuntimeString>,
+    ) -> crate::engine::deps::CompactionResult {
+        self.sync.fetch_add(1, Ordering::SeqCst);
+        crate::engine::deps::CompactionResult {
+            messages: vec![Message::CompactBoundary(CompactBoundaryMessage {
+                native_compaction: None,
+                uuid: "sync-boundary".into(),
+                summary: "SYNC SUMMARY".into(),
+            })],
+            freed_tokens: 100,
+            compacted: true,
+            reason: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    async fn reactive_compact(
+        &self,
+        messages: &[Message],
+        config: &crate::schemas::config::ResolvedConfig,
+        custom_instructions: Option<&RuntimeString>,
+    ) -> crate::engine::deps::CompactionResult {
+        self.maybe_compact(messages, 0, config, custom_instructions)
+            .await
+    }
+}
+
+fn precompute_user(uuid: &str, text: &str) -> Message {
+    Message::User(UserMessage {
+        question_answer: None,
+        uuid: uuid.into(),
+        content: vec![ContentBlock::Text(TextBlock {
+            text: text.into(),
+            citations: None,
+            harness_envelope: None,
+            message_id: None,
+            phase: None,
+        })],
+        is_meta: None,
+    })
+}
+
+fn precompute_assistant(uuid: &str, text: &str) -> Message {
+    Message::Assistant(AssistantMessage {
+        uuid: uuid.into(),
+        content: vec![ContentBlock::Text(TextBlock {
+            text: text.into(),
+            citations: None,
+            harness_envelope: None,
+            message_id: None,
+            phase: None,
+        })],
+        model: "fake-model".into(),
+        usage: None,
+    })
+}
+
+fn precompute_turn_deps(background: Arc<AtomicUsize>, sync: Arc<AtomicUsize>) -> EngineDeps {
+    let mut deps = deps_with(Box::new(
+        |_request: ModelRequest, _signal: AbortSignal| -> crate::types::provider::ModelStream {
+            Box::pin(futures::stream::iter(vec![
+                ev::message_start(None),
+                ev::text("turn response"),
+                ev::stop(Some(ModelStopReason::EndTurn), None),
+            ]))
+        },
+    ));
+    deps.compactor = Arc::new(PrecomputeForegroundCompactor { background, sync });
+    deps
+}
+
+fn precompute_params(
+    messages: Vec<Message>,
+    registry: &Arc<super::PrecomputeRegistry>,
+    window: &crate::context::window_usage::ContextWindowUsage,
+    config: &crate::schemas::config::ResolvedConfig,
+    captured: &Arc<Mutex<Vec<Message>>>,
+) -> QueryParams {
+    let mut params = mk_params(messages, Vec::new());
+    params.config = config.clone();
+    params.context_window = Some(window.clone());
+    params.precompute = Some(registry.clone());
+    let captured = captured.clone();
+    params.on_compaction = Some(immediate_compaction_observer(move |record| {
+        *captured.lock().unwrap() = record.replacement_history;
+    }));
+    params
+}
+
+fn precompute_window(
+    state: Arc<Mutex<crate::context::window_usage::WindowUsageState>>,
+) -> crate::context::window_usage::ContextWindowUsage {
+    crate::context::window_usage::ContextWindowUsage::new(
+        state,
+        Arc::new(|_state| Box::pin(async {})),
+    )
+}
+
+#[tokio::test]
+async fn precompute_arms_invisibly_and_applies_at_the_boundary() {
+    let registry: Arc<super::PrecomputeRegistry> = Arc::new(super::PrecomputeRegistry::default());
+    let background = Arc::new(AtomicUsize::new(0));
+    let sync = Arc::new(AtomicUsize::new(0));
+    let window_state = Arc::new(Mutex::new(crate::context::window_usage::WindowUsageState {
+        active_tokens: Some(8_000),
+        prefill_input_tokens: None,
+        window_number: 0,
+    }));
+    let window = precompute_window(window_state.clone());
+    let mut config = crate::schemas::config::default_config();
+    config.auto_compact_window = Some(20_000);
+    let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+
+    // Turn 1: inside the precompute lead window, below the compaction
+    // boundary. The background checkpoint must stay invisible.
+    let params = precompute_params(
+        vec![precompute_user("u1", "first question")],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let events: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::CompactionProgress { .. })),
+        "background arming must stay invisible: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Compaction { .. })),
+        "background arming must not compact: {events:?}"
+    );
+
+    // Turn 2 crosses the automatic-compaction boundary: the armed checkpoint
+    // is applied and the messages after its boundary stay verbatim.
+    window_state.lock().unwrap().active_tokens = Some(21_000);
+    let params = precompute_params(
+        vec![
+            precompute_user("u1", "first question"),
+            precompute_assistant("a1", "turn response"),
+            precompute_user("u2", "second question"),
+        ],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let events: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+
+    let phase_count = |phase: &str| {
+        events
+            .iter()
+            .filter(|event| match event {
+                EngineEvent::CompactionProgress { phase: actual } => {
+                    actual.try_to_utf8().unwrap() == phase
+                }
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(phase_count("started"), 1, "{events:?}");
+    assert_eq!(phase_count("completed"), 1, "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Compaction { .. }))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    // The background summary ran exactly once; the foreground never summarized.
+    assert_eq!(background.load(Ordering::SeqCst), 1);
+    assert_eq!(sync.load(Ordering::SeqCst), 0);
+    // Applied history = the checkpoint followed by the post-boundary messages.
+    let history = captured.lock().unwrap().clone();
+    let uuids: Vec<String> = history
+        .iter()
+        .map(|message| super::query_message_uuid(message).try_to_utf8().unwrap())
+        .collect();
+    assert_eq!(
+        uuids,
+        vec![
+            "bg-boundary".to_string(),
+            "a1".to_string(),
+            "u2".to_string()
+        ]
+    );
+    assert!(matches!(&history[0], Message::CompactBoundary(boundary)
+        if boundary.summary.try_to_utf8().unwrap().contains("PRECOMPUTED")));
+}
+
+#[tokio::test]
+async fn precompute_falls_back_to_synchronous_when_the_boundary_is_gone() {
+    let registry: Arc<super::PrecomputeRegistry> = Arc::new(super::PrecomputeRegistry::default());
+    let background = Arc::new(AtomicUsize::new(0));
+    let sync = Arc::new(AtomicUsize::new(0));
+    let window_state = Arc::new(Mutex::new(crate::context::window_usage::WindowUsageState {
+        active_tokens: Some(8_000),
+        prefill_input_tokens: None,
+        window_number: 0,
+    }));
+    let window = precompute_window(window_state.clone());
+    let mut config = crate::schemas::config::default_config();
+    config.auto_compact_window = Some(20_000);
+    let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+
+    // Arm the background checkpoint in turn 1.
+    let params = precompute_params(
+        vec![precompute_user("u1", "first question")],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let _: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+
+    // Turn 2's history no longer contains the armed boundary (as after a
+    // rewind): the synchronous compaction must run unchanged.
+    window_state.lock().unwrap().active_tokens = Some(21_000);
+    let params = precompute_params(
+        vec![
+            precompute_user("x1", "unrelated first"),
+            precompute_user("x2", "unrelated second"),
+        ],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let events: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+
+    assert_eq!(background.load(Ordering::SeqCst), 1);
+    assert_eq!(sync.load(Ordering::SeqCst), 1);
+    let started = events
+        .iter()
+        .filter(|event| {
+            matches!(event, EngineEvent::CompactionProgress { phase }
+                if phase.try_to_utf8().unwrap() == "started")
+        })
+        .count();
+    let completed = events
+        .iter()
+        .filter(|event| {
+            matches!(event, EngineEvent::CompactionProgress { phase }
+                if phase.try_to_utf8().unwrap() == "completed")
+        })
+        .count();
+    assert_eq!(started, 1, "{events:?}");
+    assert_eq!(completed, 1, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    let history = captured.lock().unwrap().clone();
+    assert!(
+        history.iter().any(|message| matches!(
+            message,
+            Message::CompactBoundary(boundary)
+                if boundary.summary.try_to_utf8().unwrap().contains("SYNC SUMMARY")
+        )),
+        "{history:?}"
+    );
 }

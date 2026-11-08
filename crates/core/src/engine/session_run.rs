@@ -1850,6 +1850,7 @@ impl Session {
             messages: model_history,
             compaction_protected_message_ids: planning_protected,
             context_window: Some(this.context_window()),
+            precompute: Some(this.precompute_registry()),
             compaction_history: Some({
                 let session = Arc::downgrade(&this);
                 Arc::new(move || {

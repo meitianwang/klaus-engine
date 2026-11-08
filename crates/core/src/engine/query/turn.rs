@@ -2481,41 +2481,76 @@ async fn run_turn_compaction_check(
             .as_ref()
             .and_then(|state| state.prefill()),
     );
-    if !config.compaction_disabled && config.auto_compaction && status.token_limit_reached {
-        shared
-            .deps()
-            .compactor
-            .prepare_request(&prepared.request, &shared.params.signal);
-        shared
-            .deps()
-            .compactor
-            .bind_output_observer(shared.params.compaction_output.clone());
-        if let Err(error) = run_turn_compact(
-            shared,
-            cwd,
-            thread_id,
-            turn_user_uuid,
-            &prepared.profile,
-            messages,
-            prefix_tokens,
-            CompactionPhase::BeforeRequest,
-        )
-        .await
-        {
-            emit_compaction_failure(shared, error);
-            return false;
+    if !config.compaction_disabled && config.auto_compaction {
+        if !status.token_limit_reached {
+            // Arm the background checkpoint summary while there is still lead
+            // room before the automatic-compaction boundary.
+            maybe_arm_compaction_precompute(
+                shared,
+                &status,
+                &config,
+                messages,
+                &prepared.request,
+                prefix_tokens,
+                cwd,
+                thread_id,
+            );
+        } else {
+            match consume_precomputed_compaction(
+                shared,
+                cwd,
+                thread_id,
+                turn_user_uuid,
+                &prepared.profile,
+                messages,
+                prefix_tokens,
+                &config,
+            )
+            .await
+            {
+                Some(Ok(())) => {}
+                Some(Err(failure)) => {
+                    emit_compaction_failure(shared, failure);
+                    return false;
+                }
+                None => {
+                    shared
+                        .deps()
+                        .compactor
+                        .prepare_request(&prepared.request, &shared.params.signal);
+                    shared
+                        .deps()
+                        .compactor
+                        .bind_output_observer(shared.params.compaction_output.clone());
+                    if let Err(error) = run_turn_compact(
+                        shared,
+                        cwd,
+                        thread_id,
+                        turn_user_uuid,
+                        &prepared.profile,
+                        messages,
+                        prefix_tokens,
+                        CompactionPhase::BeforeRequest,
+                    )
+                    .await
+                    {
+                        emit_compaction_failure(shared, error);
+                        return false;
+                    }
+                }
+            }
+            if !refresh_captured_system_prompt(shared, system_prompt).await {
+                emit_compaction_failure(shared, CompactionFailure::Aborted);
+                return false;
+            }
+            *prepared = shared.prepare(
+                messages,
+                system_prompt,
+                effective_max_output,
+                tool_specs,
+                Some(turn_override),
+            );
         }
-        if !refresh_captured_system_prompt(shared, system_prompt).await {
-            emit_compaction_failure(shared, CompactionFailure::Aborted);
-            return false;
-        }
-        *prepared = shared.prepare(
-            messages,
-            system_prompt,
-            effective_max_output,
-            tool_specs,
-            Some(turn_override),
-        );
     }
     let prefix_tokens = fixed_prefix_tokens(&prepared.request);
     apply_total_tokens_reminder(
@@ -3307,9 +3342,62 @@ async fn run_turn_compact(
     shared.q.push(EngineEvent::CompactionProgress {
         phase: "completed".into(),
     });
+    finish_turn_compact(
+        shared,
+        cwd,
+        thread_id,
+        turn_user_uuid,
+        profile,
+        messages,
+        prefix_tokens,
+        result,
+        CompactedReplacement::RefreshUserHistory,
+        phase,
+        compactable,
+        protected,
+        source_ids,
+        before,
+        staged_output,
+    )
+    .await
+}
+
+/// How the compacted replacement history is derived from the summary result.
+enum CompactedReplacement {
+    /// Model-summary path: re-read the authoritative user input around the new
+    /// checkpoint.
+    RefreshUserHistory,
+    /// Precomputed path: the splice already contains the retained tail and
+    /// every message that arrived after the checkpoint boundary.
+    Verbatim,
+}
+
+/// Apply a completed compaction result: validate it, rebuild the history,
+/// replay staged summary output, persist the checkpoint and run the
+/// PostCompact hook. Shared by the synchronous path and the precomputed
+/// checkpoint path so both produce the identical visible sequence.
+#[allow(clippy::too_many_arguments)]
+async fn finish_turn_compact(
+    shared: &Arc<Shared>,
+    cwd: &RuntimePath,
+    thread_id: &RuntimeString,
+    turn_user_uuid: &Option<RuntimeString>,
+    profile: &ProviderBehaviorProfile,
+    messages: &mut Vec<Message>,
+    prefix_tokens: u64,
+    result: crate::engine::deps::CompactionResult,
+    replacement_mode: CompactedReplacement,
+    phase: CompactionPhase,
+    compactable: Vec<Message>,
+    protected: Vec<Message>,
+    source_ids: Vec<RuntimeString>,
+    before: u64,
+    staged_output: Option<Arc<Mutex<Vec<Message>>>>,
+) -> Result<(), CompactionFailure> {
     if shared.params.signal.is_cancelled() {
         return Err(CompactionFailure::Aborted);
     }
+    let config = shared.config();
     if !result.compacted {
         if result.diagnostics.iter().any(|item| {
             item.kind == crate::context::compact::outcome::CompactionDiagnosticKind::PromptTooLong
@@ -3356,24 +3444,29 @@ async fn run_turn_compact(
     if !result.has_new_checkpoint(&compactable) {
         return Err("reactive-compaction-no-progress".into());
     }
-    let authoritative = shared
-        .params
-        .compaction_history
-        .as_ref()
-        .map_or_else(|| compactable.clone(), |snapshot| snapshot());
-    let authoritative: Vec<_> = authoritative
-        .into_iter()
-        .filter(|message| {
-            !shared
+    let replacement = match replacement_mode {
+        CompactedReplacement::RefreshUserHistory => {
+            let authoritative = shared
                 .params
-                .compaction_protected_message_ids
-                .contains(super::query_message_uuid(message))
-        })
-        .collect();
-    let replacement = crate::context::compact::full_compact::refresh_local_user_history(
-        &authoritative,
-        result.messages,
-    );
+                .compaction_history
+                .as_ref()
+                .map_or_else(|| compactable.clone(), |snapshot| snapshot());
+            let authoritative: Vec<_> = authoritative
+                .into_iter()
+                .filter(|message| {
+                    !shared
+                        .params
+                        .compaction_protected_message_ids
+                        .contains(super::query_message_uuid(message))
+                })
+                .collect();
+            crate::context::compact::full_compact::refresh_local_user_history(
+                &authoritative,
+                result.messages,
+            )
+        }
+        CompactedReplacement::Verbatim => result.messages,
+    };
     let mut candidate =
         restore_compaction_protected(replacement, protected, turn_user_uuid.as_ref());
     invalidate_context_usage(&mut candidate);
@@ -3448,6 +3541,225 @@ async fn run_turn_compact(
         }
     }
     Ok(())
+}
+
+/// Apply a precomputed checkpoint with the same visible sequence the
+/// synchronous path produces: hook notifications, progress events, staged
+/// summary output, persistence and the PostCompact hook.
+#[allow(clippy::too_many_arguments)]
+async fn apply_precomputed_compaction(
+    shared: &Arc<Shared>,
+    cwd: &RuntimePath,
+    thread_id: &RuntimeString,
+    turn_user_uuid: &Option<RuntimeString>,
+    profile: &ProviderBehaviorProfile,
+    messages: &mut Vec<Message>,
+    prefix_tokens: u64,
+    swap: super::precompute::PrecomputedSwap,
+) -> Result<(), CompactionFailure> {
+    if shared.params.signal.is_cancelled() {
+        return Err(CompactionFailure::Aborted);
+    }
+    tracing::info!(
+        lead_ms = swap.lead_ms,
+        total_ms = swap.total_ms,
+        messages_since = swap.messages_since,
+        borrowed = swap.borrowed,
+        "applying precomputed compaction checkpoint"
+    );
+    // Replay the PreCompact hook notifications captured at arm time so they
+    // keep the position the synchronous path gives them.
+    for message in swap.hook_notifications {
+        notify(&shared.q, NotificationLevel::Info, message);
+    }
+    let (compactable, protected) =
+        split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
+    let before = crate::context::tokens::estimate_context_tokens(messages);
+    let source_ids: Vec<RuntimeString> = messages
+        .iter()
+        .map(super::query_message_uuid)
+        .cloned()
+        .collect();
+    shared.q.push(EngineEvent::CompactionProgress {
+        phase: "started".into(),
+    });
+    shared.q.push(EngineEvent::CompactionProgress {
+        phase: "completed".into(),
+    });
+    let staged_output = Arc::new(Mutex::new(swap.staged_output));
+    finish_turn_compact(
+        shared,
+        cwd,
+        thread_id,
+        turn_user_uuid,
+        profile,
+        messages,
+        prefix_tokens,
+        swap.result,
+        CompactedReplacement::Verbatim,
+        CompactionPhase::BeforeRequest,
+        compactable,
+        protected,
+        source_ids,
+        before,
+        Some(staged_output),
+    )
+    .await
+}
+
+/// Try to apply the background-precomputed checkpoint at the compaction
+/// boundary. `None` means no usable checkpoint exists and the caller runs the
+/// synchronous compaction unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn consume_precomputed_compaction(
+    shared: &Arc<Shared>,
+    cwd: &RuntimePath,
+    thread_id: &RuntimeString,
+    turn_user_uuid: &Option<RuntimeString>,
+    profile: &ProviderBehaviorProfile,
+    messages: &mut Vec<Message>,
+    prefix_tokens: u64,
+    config: &crate::schemas::config::ResolvedConfig,
+) -> Option<Result<(), CompactionFailure>> {
+    let registry = shared.params.precompute.clone()?;
+    let agent_key = shared
+        .params
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| RuntimeString::from("main"));
+    let (compactable, _protected) =
+        split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
+    let now = shared.deps().now.clone();
+    match registry
+        .consume(
+            &agent_key,
+            &compactable,
+            config,
+            &shared.params.signal,
+            now.as_ref(),
+        )
+        .await
+    {
+        super::precompute::PrecomputeConsume::Miss => None,
+        super::precompute::PrecomputeConsume::Aborted => Some(Err(CompactionFailure::Aborted)),
+        super::precompute::PrecomputeConsume::Hit(swap) => Some(
+            apply_precomputed_compaction(
+                shared,
+                cwd,
+                thread_id,
+                turn_user_uuid,
+                profile,
+                messages,
+                prefix_tokens,
+                *swap,
+            )
+            .await,
+        ),
+    }
+}
+
+/// Arm one background checkpoint summary while the context is inside the
+/// precompute lead window but has not reached the compaction boundary. The
+/// background pass never emits user-visible events on its own.
+#[allow(clippy::too_many_arguments)]
+fn maybe_arm_compaction_precompute(
+    shared: &Arc<Shared>,
+    status: &crate::context::compact::policy::ContextWindowTokenStatus,
+    config: &crate::schemas::config::ResolvedConfig,
+    messages: &[Message],
+    request: &crate::types::provider::ModelRequest,
+    prefix_tokens: u64,
+    cwd: &RuntimePath,
+    thread_id: &RuntimeString,
+) {
+    let Some(registry) = shared.params.precompute.as_ref() else {
+        return;
+    };
+    let Some(threshold) =
+        crate::context::compact::policy::precompute_arm_threshold(status.auto_compact_scope_limit)
+    else {
+        return;
+    };
+    if status.auto_compact_scope_tokens < threshold {
+        return;
+    }
+    let deps = shared.deps();
+    // Native remote checkpoints are stateful on the provider side; sessions
+    // bound to them keep the synchronous compaction path.
+    if deps.compactor.native_summary_active() {
+        return;
+    }
+    let now = deps.now.clone();
+    let Ok(compactor) = deps.compactor.fork_isolated(deps.call_model, config) else {
+        return;
+    };
+    let (compactable, _protected) =
+        split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
+    if compactable.is_empty() {
+        return;
+    }
+    let agent_key = shared
+        .params
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| RuntimeString::from("main"));
+    let hook = shared
+        .params
+        .hook_bus
+        .as_ref()
+        .filter(|bus| bus.has(HookEvent::PreCompact))
+        .map(|bus| precompute_hook_runner(bus.clone(), cwd.clone(), thread_id.clone()));
+    registry.arm(super::precompute::PrecomputeArm {
+        agent_key,
+        pre_compact_tokens: crate::context::tokens::estimate_context_tokens(&compactable),
+        estimated_tokens: estimate_context_tokens_with_prefix(messages, prefix_tokens),
+        snapshot: compactable,
+        model: config.model.clone(),
+        config: config.clone(),
+        request: request.clone(),
+        compactor,
+        hook,
+        now,
+    });
+}
+
+/// Build the PreCompact hook runner for the background precompute task. The
+/// notifications are captured, not emitted: the apply step replays them so
+/// their visible position matches the synchronous path.
+fn precompute_hook_runner(
+    bus: Arc<crate::hooks::bus::HookBus>,
+    cwd: RuntimePath,
+    thread_id: RuntimeString,
+) -> super::precompute::PrecomputeHook {
+    Arc::new(move |signal: crate::types::abort::AbortSignal| {
+        let bus = bus.clone();
+        let cwd = cwd.clone();
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            let mut input = base_hook_input(HookEvent::PreCompact, &cwd, &thread_id);
+            input.trigger = Some(HookTrigger::Auto);
+            let outcome = tokio::select! {
+                biased;
+                _ = signal.cancelled() => {
+                    return super::precompute::PrecomputeHookOutcome {
+                        blocked: false,
+                        notifications: Vec::new(),
+                        instructions: None,
+                    };
+                }
+                outcome = bus.dispatch(HookEvent::PreCompact, &input) => outcome,
+            };
+            super::precompute::PrecomputeHookOutcome {
+                blocked: outcome.aborted || outcome.blocked,
+                notifications: outcome.system_messages,
+                instructions: if outcome.additional_context.is_empty() {
+                    None
+                } else {
+                    Some(join_runtime_strings(&outcome.additional_context, "\n"))
+                },
+            }
+        })
+    })
 }
 
 /// Numbered phase 5 of the turn loop: fold queued inline input into the final

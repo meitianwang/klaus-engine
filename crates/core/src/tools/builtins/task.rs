@@ -1045,6 +1045,7 @@ pub(super) async fn dispatch_native_message_tool(
     let recorded = messages.clone();
     let params = QueryParams {
         retained_tool_tasks: None,
+        precompute: None,
         prepare_request_usage: None,
         multi_agent_instructions: true,
         thread_id: "native-input-thread".into(),

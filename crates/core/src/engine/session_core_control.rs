@@ -3940,6 +3940,7 @@ impl Session {
             messages,
             compaction_protected_message_ids: HashSet::new(),
             context_window: None,
+            precompute: None,
             compaction_history: None,
             recover_compaction_history: None,
             compaction_output: None,

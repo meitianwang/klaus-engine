@@ -373,6 +373,7 @@ impl Session {
             messages: history.lock_recover().clone(),
             compaction_protected_message_ids: protected_message_ids,
             context_window: None,
+            precompute: None,
             compaction_history: None,
             recover_compaction_history: None,
             compaction_output: None,

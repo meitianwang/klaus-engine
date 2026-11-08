@@ -2418,6 +2418,7 @@ impl Session {
                 messages: messages_snapshot,
                 compaction_protected_message_ids: HashSet::new(),
                 context_window: None,
+                precompute: None,
                 compaction_history: Some({
                     let transcript = transcript.clone();
                     Arc::new(move || transcript.lock_recover().clone())

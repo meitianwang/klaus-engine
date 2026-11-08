@@ -146,6 +146,14 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    /// True when a summary would run through the provider's native remote
+    /// compaction channel instead of a model request. Native checkpoints are
+    /// stateful on the provider side, so background precomputation stays off
+    /// for them and the synchronous path keeps owning that channel.
+    fn native_summary_active(&self) -> bool {
+        false
+    }
+
     /// Supply the live request prefix for a cache-preserving summary fork.
     fn prepare_request(
         &self,

@@ -153,6 +153,21 @@ impl FullCompactor {
         *self.provider.lock().unwrap() = Some(provider);
     }
 
+    /// True when a summary would run through the provider's native remote
+    /// compaction channel instead of a model request. Native checkpoints are
+    /// stateful on the provider side, so background precomputation stays off
+    /// for them and the synchronous path keeps owning that channel.
+    pub(super) fn native_summary_active(&self) -> bool {
+        self.provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|provider| {
+                provider.remote_compaction_support(&self.model)
+                    != RemoteCompactionSupport::Unsupported
+            })
+    }
+
     pub(super) fn request_snapshot(&self) -> Option<ModelRequest> {
         self.request.lock().unwrap().clone()
     }

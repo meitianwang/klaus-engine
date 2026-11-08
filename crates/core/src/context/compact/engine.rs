@@ -45,6 +45,12 @@ pub trait Compactor: Send + Sync {
 
     fn bind_native_provider(&self, _provider: Arc<dyn ModelProvider>) {}
 
+    /// True when a summary would run through the provider's native remote
+    /// compaction channel instead of a model request.
+    fn native_summary_active(&self) -> bool {
+        false
+    }
+
     async fn local_compact(
         &self,
         messages: Vec<Message>,
@@ -194,6 +200,10 @@ pub fn create_compactor(options: CompactorOptions) -> RealCompactor {
 impl Compactor for RealCompactor {
     fn bind_native_provider(&self, provider: Arc<dyn ModelProvider>) {
         self.full.bind_native_provider(provider);
+    }
+
+    fn native_summary_active(&self) -> bool {
+        self.full.native_summary_active()
     }
 
     fn fork_isolated(

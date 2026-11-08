@@ -1332,6 +1332,7 @@ impl Session {
                 uuid: deps.uuid.clone(),
                 now: deps.now.clone(),
             },
+            precompute: Arc::new(crate::engine::query::PrecomputeRegistry::default()),
             config: init.config.clone(),
             tools: init.tools.clone(),
             host_refresh_tools: init.refresh_tools,

@@ -452,6 +452,9 @@ impl Compactor for RealCompactorBridge {
     fn reactive_enabled(&self) -> bool {
         self.0.reactive_enabled()
     }
+    fn native_summary_active(&self) -> bool {
+        self.0.native_summary_active()
+    }
     async fn manual_compact(
         &self,
         messages: &[Message],

@@ -1246,6 +1246,9 @@ pub struct Session {
     inference_admission: Arc<Mutex<InferenceAdmission>>,
     inference_changed: tokio::sync::Notify,
     deps: SessionIdentityDeps,
+    /// Session-scoped background compaction precompute state. Lives as long as
+    /// the session; dropping it cancels every in-flight background summary.
+    precompute: Arc<crate::engine::query::PrecomputeRegistry>,
     // Structural session configuration. Read model-dependent fields from the
     // current inference bundle; this initial model only identifies the cached
     // construction-time environment prompt that may need rebuilding.
@@ -1444,6 +1447,11 @@ impl TurnIndex {
 }
 
 impl Session {
+    /// The session-scoped background compaction precompute registry.
+    pub(crate) fn precompute_registry(&self) -> Arc<crate::engine::query::PrecomputeRegistry> {
+        self.precompute.clone()
+    }
+
     /// Snapshot of the turn index for `get_history` replies.
     pub fn turn_index_snapshot(&self) -> TurnIndex {
         // A rollout without a terminal lifecycle record is interrupted only

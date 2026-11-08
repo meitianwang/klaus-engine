@@ -4,6 +4,10 @@ use crate::schemas::config::{AutoCompactScope, ResolvedConfig};
 
 const USABLE_WINDOW_PERCENT: u64 = 95;
 const AUTO_COMPACT_WINDOW_PERCENT: u64 = 90;
+/// Share of the automatic-compaction boundary held back as the precompute lead.
+const PRECOMPUTE_BUFFER_FRACTION_PERCENT: u64 = 20;
+/// Absolute token reserve before the automatic-compaction boundary.
+const PRECOMPUTE_RESERVE_TOKENS: u64 = 13_000;
 
 fn percent_of(tokens: u64, percent: u64) -> u64 {
     (u128::from(tokens) * u128::from(percent) / 100) as u64
@@ -132,4 +136,45 @@ pub fn hard_block_threshold(config: &ResolvedConfig) -> f64 {
 
 pub fn preflight_threshold(config: &ResolvedConfig) -> f64 {
     trigger_threshold(config).min(hard_block_threshold(config))
+}
+
+/// The scope-token count at which background precomputation of the compaction
+/// summary arms: the earlier of a proportional buffer and an absolute reserve
+/// below the automatic-compaction boundary. Boundaries at or below the reserve
+/// leave no room for a lead, so they never arm.
+pub fn precompute_arm_threshold(auto_compact_scope_limit: u64) -> Option<u64> {
+    if auto_compact_scope_limit <= PRECOMPUTE_RESERVE_TOKENS {
+        return None;
+    }
+    // Round-half-up, matching the proportional buffer's reference semantics.
+    let buffered = auto_compact_scope_limit
+        - (auto_compact_scope_limit * PRECOMPUTE_BUFFER_FRACTION_PERCENT + 50) / 100;
+    Some(buffered.min(auto_compact_scope_limit - PRECOMPUTE_RESERVE_TOKENS))
+}
+
+#[cfg(test)]
+mod precompute_threshold_tests {
+    use super::precompute_arm_threshold;
+
+    #[test]
+    fn proportional_buffer_wins_on_large_windows() {
+        // 180k boundary: min(180k - 36k, 180k - 13k) = 144k.
+        assert_eq!(precompute_arm_threshold(180_000), Some(144_000));
+        // 20k boundary: min(20k - 4k, 20k - 13k) = 7k (reserve wins).
+        assert_eq!(precompute_arm_threshold(20_000), Some(7_000));
+    }
+
+    #[test]
+    fn small_boundaries_never_arm() {
+        assert_eq!(precompute_arm_threshold(13_000), None);
+        assert_eq!(precompute_arm_threshold(0), None);
+    }
+
+    #[test]
+    fn rounding_is_half_up() {
+        // 16_385 * 20% = 3277.0 -> buffered = 13_108; reserve = 3_385.
+        assert_eq!(precompute_arm_threshold(16_385), Some(3_385));
+        // 65_125 * 20% = 13_025 exactly.
+        assert_eq!(precompute_arm_threshold(65_125), Some(52_100));
+    }
 }
