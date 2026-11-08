@@ -19,6 +19,9 @@ mod rf4a2eb9d_request_rotation_isolation;
 #[path = "regressions/r20261105_compaction_output_limit.rs"]
 mod r20261105_compaction_output_limit;
 
+#[path = "regressions/r20261108_compaction_tooluse_stop.rs"]
+mod r20261108_compaction_tooluse_stop;
+
 #[path = "regressions/r20261102_managed_browser_approval.rs"]
 mod r20261102_managed_browser_approval;
 

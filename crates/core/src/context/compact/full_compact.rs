@@ -314,9 +314,13 @@ impl FullCompactor {
                     != RemoteCompactionSupport::Unsupported
             }) {
                 let mut request = self.summary_request(&messages, config, instructions);
-                request.tools = self
-                    .request_snapshot()
+                let snapshot = self.request_snapshot();
+                request.tools = snapshot
+                    .clone()
                     .map(|request| request.tools)
+                    .unwrap_or_default();
+                request.deferred_tools = snapshot
+                    .map(|request| request.deferred_tools)
                     .unwrap_or_default();
                 // Native compaction has its own trigger item, supplied by the transport.
                 request.messages.pop();
@@ -439,6 +443,7 @@ impl FullCompactor {
             question_answer: None,
         }));
         request.tools.clear();
+        request.deferred_tools.clear();
         request.tool_choice = None;
         request.output_schema = None;
         request.web_search = None;
@@ -570,13 +575,23 @@ impl FullCompactor {
                 Some(ModelStreamEvent::MessageStop { stop_reason, .. }) => {
                     let has_text = text.try_to_utf8().is_ok_and(|text| !text.trim().is_empty());
                     let output_truncated = stop_reason == ModelStopReason::MaxTokens;
-                    if stop_reason != ModelStopReason::EndTurn && !(output_truncated && has_text) {
+                    // A summary request never offers tools, so a tool-call stop
+                    // carries no actionable payload; streamed summary text still
+                    // is the summary. Gateways that surface tool-call framing on
+                    // tool-less requests must not kill the turn when text arrived.
+                    let tool_call_ignored = stop_reason == ModelStopReason::ToolUse;
+                    if stop_reason != ModelStopReason::EndTurn
+                        && !((output_truncated || tool_call_ignored) && has_text)
+                    {
                         let message = match stop_reason {
                             ModelStopReason::MaxTokens => {
                                 "The summary response reached the output token limit without producing usable text.".into()
                             }
                             ModelStopReason::Refusal => {
                                 "The model refused the summary request.".into()
+                            }
+                            ModelStopReason::ToolUse => {
+                                "The summary response stopped with a tool call and produced no usable text.".into()
                             }
                             _ => format!("The summary response stopped with {stop_reason:?}."),
                         };
@@ -646,6 +661,15 @@ impl FullCompactor {
                                 CompactionDiagnosticKind::OutputTruncated,
                                 Some(
                                     "The summary reached the output token limit; its partial text was retained."
+                                        .into(),
+                                ),
+                            )]
+                        } else if tool_call_ignored {
+                            vec![CompactionDiagnostic::new(
+                                CompactionDiagnosticStage::Summary,
+                                CompactionDiagnosticKind::ProviderError,
+                                Some(
+                                    "The summary response stopped with a tool call on a tool-less summary request; its text was retained and the tool call ignored."
                                         .into(),
                                 ),
                             )]
