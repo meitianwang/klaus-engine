@@ -37,7 +37,8 @@ use crate::tools::build_tool::text_result;
 use crate::tools::builtins::code_mode::create_code_mode_tools;
 use crate::tools::builtins::index::{default_builtins, BuiltinsOptions};
 use crate::tools::builtins::tool_search::{
-    create_tool_search_tool, ensure_tool_search, with_deferred_tools,
+    create_tool_search_tool, ensure_tool_search, limit_alias_description, limit_description,
+    with_deferred_tools, DEFAULT_MAX_RESULTS,
 };
 use crate::tools::builtins::write::create_write_tool;
 use crate::tools::pool::{find_tool, to_tool_spec};
@@ -3213,6 +3214,98 @@ fn migrate_baseline_write_schemas_in_events(
     Ok(())
 }
 
+/// The default `tool_search` result limit when the signed baselines were
+/// recorded. The schema renders the effective default into the `limit` and
+/// `max_results` descriptions, so baselines still carry the predecessor text
+/// after the live default moved.
+const PINNED_TOOL_SEARCH_PREDECESSOR_DEFAULT: usize = 10;
+
+/// Adopt the live `tool_search` limit descriptions wherever the signed baseline
+/// embeds the predecessor default-limit text.
+///
+/// Only the two description strings are rewritten, and only while they still
+/// match the pinned predecessor; descriptors that already carry the live text
+/// pass through untouched, and any other text is a hard error so a future
+/// default change cannot slip through without a deliberate migration update.
+/// Everything else in the descriptor (and every other tool) stays byte-identical.
+fn migrate_baseline_tool_search_default_limit(
+    value: &mut RuntimeJson,
+    context: &str,
+) -> Result<(), String> {
+    match value {
+        RuntimeJson::Object(object) => {
+            let is_tool_search_descriptor = object
+                .get("name")
+                .and_then(RuntimeJson::as_str)
+                .is_some_and(|name| name == "tool_search");
+            if is_tool_search_descriptor {
+                // Ends before the walk below: `get_mut` and `values_mut` cannot
+                // both borrow the object.
+                if let Some(schema) = object.get_mut("inputSchema") {
+                    rewrite_tool_search_limit_descriptions(schema, context)?;
+                }
+            }
+            for child in object.values_mut() {
+                migrate_baseline_tool_search_default_limit(child, context)?;
+            }
+        }
+        RuntimeJson::Array(items) => {
+            for item in items {
+                migrate_baseline_tool_search_default_limit(item, context)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_tool_search_limit_descriptions(
+    schema: &mut RuntimeJson,
+    context: &str,
+) -> Result<(), String> {
+    let Some(properties) = schema.get_mut("properties") else {
+        return Ok(());
+    };
+    // The provider-native tool-search wire descriptor shares the tool name but
+    // renders its own fixed limit copy without the `max_results` alias, and it
+    // does not embed the builtin default; skip it.
+    if properties.get("max_results").is_none() {
+        return Ok(());
+    }
+    let rewrites = [
+        (
+            "limit",
+            limit_description(PINNED_TOOL_SEARCH_PREDECESSOR_DEFAULT),
+            limit_description(DEFAULT_MAX_RESULTS),
+        ),
+        (
+            "max_results",
+            limit_alias_description(PINNED_TOOL_SEARCH_PREDECESSOR_DEFAULT),
+            limit_alias_description(DEFAULT_MAX_RESULTS),
+        ),
+    ];
+    for (key, predecessor, live) in rewrites {
+        let Some(description) = properties
+            .get_mut(key)
+            .and_then(|property| property.get_mut("description"))
+        else {
+            continue;
+        };
+        let RuntimeJson::String(text) = description else {
+            continue;
+        };
+        if *text == predecessor {
+            *text = RuntimeString::from(live);
+        } else if *text != live {
+            return Err(format!(
+                "{context} tool_search {key} description drifted from the pinned predecessor: {}",
+                runtime_diagnostic(text)
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Fixed current contracts are independent of the live planning tool factory.
 fn fixed_default_update_plan_raw_spec() -> RuntimeJson {
     runtime_json::parse(&RuntimeString::from(r#"{"name":"update_plan","description":"Updates the task plan.\nProvide an optional explanation and an ordered list of plan items, each with a step and a pending, in_progress, or completed status.\nAt most one step can be in_progress at a time.\nThis is an execution checklist and progress tool, separate from a proposed plan artifact. It does not enter or exit Plan mode and is not allowed in Plan mode.","inputSchema":{"type":"object","properties":{"explanation":{"type":"string","description":"Optional explanation for this plan update."},"plan":{"type":"array","description":"The ordered list of progress steps.","items":{"type":"object","properties":{"step":{"type":"string","minLength":1,"description":"Task step text."},"status":{"type":"string","enum":["pending","in_progress","completed"],"description":"Step status."}},"required":["step","status"],"additionalProperties":false}}},"required":["plan"],"additionalProperties":false}}"#))
@@ -5442,7 +5535,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "883783dd1618dd21ae7a76ade03ff9493de065bb41a60e201881275e66cafff6";
+    "19fcb71d1244143413b8a1ce7b0edfeed499b4eef9308331449e97467be5d75e";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -5807,6 +5900,15 @@ fn canonicalize_signed_reference_requests(
                     "baseline contract row {row_number} modelRequests[{request_index}]: {error}"
                 )
             })?;
+        // After the rule-based instruction-descriptor migration above, whose
+        // digest checks must still see the signed bytes; before the decode and
+        // per-tool comparison below, which need the live default-limit text.
+        // Recorded tool catalogs captured in the previous live shape still
+        // carry the predecessor limit description strings.
+        migrate_baseline_tool_search_default_limit(
+            value,
+            &format!("baseline contract row {row_number} modelRequests[{request_index}]"),
+        )?;
         let mut request = runtime_codec::decode_value::<ModelRequest>(value).map_err(|error| {
             format!(
                 "invalid baseline contract row {row_number} modelRequests[{request_index}]: {error}"

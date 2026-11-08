@@ -62,13 +62,13 @@
     "runtimeLock": {
       "file": "crates/sdk/assets/exact-browser-runtime-assets-v1/exact-browser-runtime-assets.lock.json",
       "length": 12275,
-      "sha256": "ff06182e2fe6704e6f2580812b0792ad22f036fef80a89fd7bcdec6bef4d9af2",
-      "candidateSha256": "811112e2396345934723d61d00e86659881765027a5381774ca76be0822edd97",
-      "publishedSha256": "93a37f14f8935025e10f5b8435c1ab00b19f9b3a928176bfb960a570cde8372c",
+      "sha256": "f507a8c26487e3877d9d5e5898a592df75d979168474a1e69346f4e20d6759ac",
+      "candidateSha256": "65997edc8a5d63348549d285a34c436c150dc218b21a568598ab5a24348782b7",
+      "publishedSha256": "3586fd818dbc71d0ccd67924fe7fe8f299e4f5f595e133c9711d60c75e723438",
       "sourceGraphSha256": "32ee6f234ce63fd7541d4aefa7530207f0b224d1a1300a4776b65b761f63d710",
       "processPatchSha256": "e8a9b0f23b425c210985bc8c59b0361b90a3bc76f020a510d8ee8c5b13cd3866",
       "patchedGraphSha256": "cc6f05347e0682dcb48867f0731e8ab39b33018503528de153a78fc005e889a0",
-      "addonSourceClosureSha256": "93cb2ad77fd5667e22cb9ebaa4e2789102be1a651cb7977cd2ea9965d792289b"
+      "addonSourceClosureSha256": "a9f4394db855d8d4094e99033415b6b96ab99d297c1bd951a207bccefcbc471b"
     },
     "nativeHostDistribution": {
       "manifestFile": "klaus-browser-native-host.distribution.json",

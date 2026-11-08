@@ -2294,7 +2294,7 @@
       "style": "generic",
       "name": "tool_search",
       "sourceSha256": "4dd9f7ad006135918594ab10f99b4b94a5f8116e3f222395b1527f0278d77524",
-      "targetSha256": "563f88a1a9484a8777f9b1f624a732a7f0a8bbc4ffd97db0d74bfbc994e38268",
+      "targetSha256": "c0dbbe1496a8cca6eb7f69a638eeed4c4cf53cb9ded65005744e973f6a7da517",
       "source": {
         "name": "tool_search",
         "description": "Search for additional (deferred) tools by capability keywords, or load exact deferred tools with select:<tool_name>.",
@@ -2338,13 +2338,13 @@
               "type": "integer",
               "exclusiveMinimum": 0,
               "maximum": 9007199254740991,
-              "description": "Maximum number of tools to return. Defaults to 10."
+              "description": "Maximum number of tools to return. Defaults to 8."
             },
             "max_results": {
               "type": "integer",
               "exclusiveMinimum": 0,
               "maximum": 9007199254740991,
-              "description": "Alias for limit. Defaults to 10."
+              "description": "Alias for limit. Defaults to 8."
             }
           },
           "required": [

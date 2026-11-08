@@ -42,6 +42,8 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["h
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 futures = "0.3"
+# Relevance ranking for the deferred-tool search corpus.
+bm25 = "2.3.2"
 async-trait = "0.1"
 regex = "1"
 similar = "2.7"

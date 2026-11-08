@@ -25,10 +25,21 @@ use crate::types::tool::{
 };
 
 /// Default number of results `tool_search` returns.
-pub(crate) const DEFAULT_MAX_RESULTS: usize = 10;
+pub(crate) const DEFAULT_MAX_RESULTS: usize = 8;
 /// Default tool-count threshold above which tools are deferred.
 const DEFAULT_THRESHOLD: usize = 30;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Canonical description for the `limit` property, rendered with the effective
+/// default. Baseline migrations compare against this exact text.
+pub(crate) fn limit_description(default_max_results: usize) -> String {
+    format!("Maximum number of tools to return. Defaults to {default_max_results}.")
+}
+
+/// Canonical description for the `max_results` alias property.
+pub(crate) fn limit_alias_description(default_max_results: usize) -> String {
+    format!("Alias for limit. Defaults to {default_max_results}.")
+}
 
 /// Build the tool's closed input JSON Schema.
 fn build_input_schema(default_max_results: usize) -> JsonSchema {
@@ -43,19 +54,13 @@ fn build_input_schema(default_max_results: usize) -> JsonSchema {
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": JS_MAX_SAFE_INTEGER,
-                "description": format!(
-                    "Maximum number of tools to return. Defaults to {}.",
-                    default_max_results
-                )
+                "description": limit_description(default_max_results)
             },
             "max_results": {
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": JS_MAX_SAFE_INTEGER,
-                "description": format!(
-                    "Alias for limit. Defaults to {}.",
-                    default_max_results
-                )
+                "description": limit_alias_description(default_max_results)
             }
         },
         "required": ["query"],
@@ -531,16 +536,7 @@ fn find_catalog_tool<'a>(
 /// Score a catalog entry: reject any missing required term, then add one point
 /// for every required/optional token found in name, description, or search hint.
 fn score(tool: &ToolCatalogEntry, required: &[RuntimeString], optional: &[RuntimeString]) -> i64 {
-    let separator = RuntimeString::from(" ");
-    let hint = tool.search_hint.clone().unwrap_or_default();
-    let haystack = lowercase_runtime(
-        &tool
-            .name
-            .concat(&separator)
-            .concat(&tool.description)
-            .concat(&separator)
-            .concat(&hint),
-    );
+    let haystack = substring_haystack(tool);
     if required
         .iter()
         .any(|token| !contains_runtime(&haystack, token))
@@ -554,6 +550,121 @@ fn score(tool: &ToolCatalogEntry, required: &[RuntimeString], optional: &[Runtim
         }
     }
     s
+}
+
+/// The lowercased name/description/search-hint haystack behind substring
+/// scoring and required-term admission.
+fn substring_haystack(tool: &ToolCatalogEntry) -> RuntimeString {
+    let separator = RuntimeString::from(" ");
+    let hint = tool.search_hint.clone().unwrap_or_default();
+    lowercase_runtime(
+        &tool
+            .name
+            .concat(&separator)
+            .concat(&tool.description)
+            .concat(&separator)
+            .concat(&hint),
+    )
+}
+
+/// True when every `+`-marked required term appears in the substring haystack;
+/// a missing required term keeps the entry out of the results entirely.
+fn required_terms_present(tool: &ToolCatalogEntry, required: &[RuntimeString]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let haystack = substring_haystack(tool);
+    required
+        .iter()
+        .all(|token| contains_runtime(&haystack, token))
+}
+
+/// The indexed text of one catalog entry: catalog and rendered-spec identity
+/// plus the recursive parameter vocabulary of the input schema, so a query can
+/// match on parameter names and descriptions as well.
+fn entry_search_text(tool: &ToolCatalogEntry) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    push_search_part(&mut parts, search_utf8(&tool.name));
+    push_search_part(&mut parts, search_utf8(&tool.name).replace('_', " "));
+    push_search_part(&mut parts, search_utf8(&tool.description));
+    if let Some(hint) = &tool.search_hint {
+        push_search_part(&mut parts, search_utf8(hint));
+    }
+    if let Some(spec) = &tool.spec {
+        push_search_part(&mut parts, search_utf8(&spec.name));
+        push_search_part(&mut parts, search_utf8(&spec.name).replace('_', " "));
+        push_search_part(&mut parts, search_utf8(&spec.description));
+        append_schema_search_text(&spec.input_schema, &mut parts);
+    }
+    parts.join(" ")
+}
+
+fn search_utf8(value: &RuntimeString) -> String {
+    value.try_to_utf8().unwrap_or_default()
+}
+
+fn push_search_part(parts: &mut Vec<String>, part: String) {
+    let part = part.trim();
+    if !part.is_empty() {
+        parts.push(part.to_string());
+    }
+}
+
+/// Recursive JSON-Schema vocabulary: descriptions, property names, array item
+/// schemas and any-of variants.
+fn append_schema_search_text(schema: &RuntimeJson, parts: &mut Vec<String>) {
+    if let Some(description) = schema.get("description").and_then(RuntimeJson::as_str) {
+        push_search_part(parts, search_utf8(description));
+    }
+    if let Some(properties) = schema.get("properties").and_then(RuntimeJson::as_object) {
+        for (name, sub) in properties.entries() {
+            // Both forms: the relevance tokenizer does not split on underscores,
+            // so snake_case parameter names need the spaced variant to match
+            // single-word queries.
+            push_search_part(parts, search_utf8(&name));
+            push_search_part(parts, search_utf8(&name).replace('_', " "));
+            append_schema_search_text(sub, parts);
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        append_schema_search_text(items, parts);
+    }
+    if let Some(variants) = schema.get("anyOf").and_then(RuntimeJson::as_array) {
+        for variant in variants {
+            append_schema_search_text(variant, parts);
+        }
+    }
+}
+
+/// BM25 relevance scores for the candidate corpus, keyed by corpus position.
+/// The English tokenizer is fitted to the candidate corpus itself so term
+/// frequencies reflect the live deferred inventory.
+fn bm25_rank_scores(
+    candidates: &[&ToolCatalogEntry],
+    query: &RuntimeString,
+) -> std::collections::HashMap<usize, f32> {
+    use bm25::{EmbedderBuilder, Language, Scorer};
+    if candidates.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let corpus = candidates
+        .iter()
+        .map(|tool| entry_search_text(tool))
+        .collect::<Vec<_>>();
+    let corpus_refs = corpus.iter().map(|text| text.as_str()).collect::<Vec<_>>();
+    let embedder: bm25::Embedder =
+        EmbedderBuilder::with_fit_to_corpus(Language::English, &corpus_refs).build();
+    let mut scorer: Scorer<usize> = Scorer::new();
+    for (id, text) in corpus_refs.iter().enumerate() {
+        scorer.upsert(&id, embedder.embed(text));
+    }
+    let query_text = search_utf8(query);
+    scorer
+        .matches(&embedder.embed(&query_text))
+        .into_iter()
+        .filter(|document| document.score > 0.0)
+        .map(|document| (document.id, document.score))
+        .collect()
 }
 
 fn to_search_output_tool(tool: &ToolCatalogEntry) -> Json {
@@ -777,19 +888,44 @@ pub(crate) fn resolve_tool_search(
     }
 
     let (required, optional) = parse_keywords(query);
-    let mut scored: Vec<(&ToolCatalogEntry, i64)> = catalog
+    // Admission keeps the existing required-term semantics: an entry missing a
+    // `+`-marked term never surfaces regardless of relevance ranking.
+    let candidates: Vec<(usize, &ToolCatalogEntry)> = catalog
         .iter()
-        .filter(|tool| tool.exposure == ToolExposure::Deferred)
-        .map(|tool| {
-            let score = score(tool, &required, &optional);
-            (tool, score)
-        })
-        .filter(|(_, score)| *score > 0)
+        .enumerate()
+        .filter(|(_, tool)| tool.exposure == ToolExposure::Deferred)
+        .filter(|(_, tool)| required_terms_present(tool, &required))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let relevance = bm25_rank_scores(
+        &candidates.iter().map(|(_, tool)| *tool).collect::<Vec<_>>(),
+        query,
+    );
+    let mut ranked: Vec<(usize, &ToolCatalogEntry, f32, i64)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(corpus_id, (index, tool))| {
+            (
+                index,
+                tool,
+                relevance.get(&corpus_id).copied().unwrap_or(0.0),
+                score(tool, &required, &optional),
+            )
+        })
+        .filter(|(_, _, relevance, substring)| *relevance > 0.0 || *substring > 0)
+        .collect();
+    // Relevance ranking: BM25 first; the substring hit count breaks relevance
+    // ties and carries scripts the English tokenizer cannot segment; catalog
+    // order keeps the result deterministic.
+    ranked.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.3.cmp(&a.3))
+            .then(a.0.cmp(&b.0))
+    });
+    let mut scored: Vec<&ToolCatalogEntry> =
+        ranked.into_iter().map(|(_, tool, _, _)| tool).collect();
     scored.truncate(js_slice_end(scored.len(), max_results));
-    let selected =
-        expand_atomic_surface_groups(scored.iter().map(|(tool, _)| *tool).collect(), &catalog);
+    let selected = expand_atomic_surface_groups(scored, &catalog);
 
     let matched = selected
         .iter()
@@ -1648,10 +1784,10 @@ mod tests {
         let surfaced = with_catalog(
             &mut ctx,
             vec![
-                entry("web_a", "web", ToolExposure::Deferred),
-                entry("web_b", "web", ToolExposure::Deferred),
-                entry("web_c", "web", ToolExposure::Deferred),
-                entry("web_d", "web", ToolExposure::Deferred),
+                entry("web_alpha", "web", ToolExposure::Deferred),
+                entry("web_beta", "web", ToolExposure::Deferred),
+                entry("web_gamma", "web", ToolExposure::Deferred),
+                entry("web_delta", "web", ToolExposure::Deferred),
             ],
         );
 
@@ -1661,22 +1797,28 @@ mod tests {
             rjson!({ "query": "web", "limit": 1, "max_results": 2 }),
         )
         .await;
-        assert_eq!(explicit.serializable.output["matched"], rjson!(["web_a"]));
-        assert_eq!(*surfaced.lock().unwrap(), vec!["web_a"]);
+        assert_eq!(
+            explicit.serializable.output["matched"],
+            rjson!(["web_alpha"])
+        );
+        assert_eq!(*surfaced.lock().unwrap(), vec!["web_alpha"]);
 
         let alias = call_search(&tool, &ctx, rjson!({ "query": "web", "max_results": 2 })).await;
         assert_eq!(
             alias.serializable.output["matched"],
-            rjson!(["web_a", "web_b"])
+            rjson!(["web_alpha", "web_beta"])
         );
-        assert_eq!(*surfaced.lock().unwrap(), vec!["web_a", "web_b"]);
+        assert_eq!(*surfaced.lock().unwrap(), vec!["web_alpha", "web_beta"]);
 
         let configured = call_search(&tool, &ctx, rjson!({ "query": "web" })).await;
         assert_eq!(
             configured.serializable.output["matched"],
-            rjson!(["web_a", "web_b", "web_c"])
+            rjson!(["web_alpha", "web_beta", "web_gamma"])
         );
-        assert_eq!(*surfaced.lock().unwrap(), vec!["web_a", "web_b", "web_c"]);
+        assert_eq!(
+            *surfaced.lock().unwrap(),
+            vec!["web_alpha", "web_beta", "web_gamma"]
+        );
     }
 
     #[tokio::test]
@@ -2285,6 +2427,93 @@ mod tests {
             *surfaced.lock().unwrap(),
             vec!["name_everywhere", "must_name", "desc_tool", "search_tool"]
         );
+    }
+
+    #[tokio::test]
+    async fn keyword_search_matches_parameter_vocabulary_from_input_schema() {
+        let tool = create_tool_search_tool(None);
+        let mut ctx = mk_ctx();
+        // Neither the catalog identity nor the rendered spec text mentions the
+        // queried capability; only the input-schema property name carries it.
+        let mut catalog_entry = entry(
+            "cluster_deploy",
+            "deploy the service",
+            ToolExposure::Deferred,
+        );
+        catalog_entry.spec = Some(ToolSpec {
+            name: rs("cluster_deploy"),
+            description: rs("deploy the service"),
+            input_schema: rjson!({
+                "type": "object",
+                "properties": {
+                    "kubernetes_cluster": {
+                        "type": "string",
+                        "description": "target cluster name"
+                    }
+                }
+            }),
+            kind: ToolSpecKind::Function,
+            format: None,
+        });
+        let surfaced = with_catalog(&mut ctx, vec![catalog_entry]);
+
+        let res = call_search(&tool, &ctx, rjson!({ "query": "kubernetes" })).await;
+
+        assert_eq!(
+            res.serializable.output["matched"],
+            rjson!(["cluster_deploy"])
+        );
+        assert_eq!(*surfaced.lock().unwrap(), vec!["cluster_deploy"]);
+    }
+
+    #[tokio::test]
+    async fn keyword_search_keeps_cjk_substring_matching() {
+        let tool = create_tool_search_tool(None);
+        let mut ctx = mk_ctx();
+        // The relevance tokenizer segments English only; CJK queries must keep
+        // matching through the substring scorer.
+        let surfaced = with_catalog(
+            &mut ctx,
+            vec![
+                entry(
+                    "phone_install",
+                    "在手机上安装并签名应用",
+                    ToolExposure::Deferred,
+                ),
+                entry("unrelated", "deploy the service", ToolExposure::Deferred),
+            ],
+        );
+
+        let res = call_search(&tool, &ctx, rjson!({ "query": "手机" })).await;
+
+        assert_eq!(
+            res.serializable.output["matched"],
+            rjson!(["phone_install"])
+        );
+        assert_eq!(*surfaced.lock().unwrap(), vec!["phone_install"]);
+    }
+
+    #[tokio::test]
+    async fn default_limit_caps_keyword_results_at_eight() {
+        assert_eq!(DEFAULT_MAX_RESULTS, 8);
+        let tool = create_tool_search_tool(None);
+        let mut ctx = mk_ctx();
+        let catalog = (0..10)
+            .map(|index| {
+                entry(
+                    &format!("deploy_target_{index}"),
+                    "deploy the service",
+                    ToolExposure::Deferred,
+                )
+            })
+            .collect();
+        let surfaced = with_catalog(&mut ctx, catalog);
+
+        let res = call_search(&tool, &ctx, rjson!({ "query": "deploy" })).await;
+
+        let matched = res.serializable.output["matched"].as_array().unwrap();
+        assert_eq!(matched.len(), 8);
+        assert_eq!(surfaced.lock().unwrap().len(), 8);
     }
 
     #[tokio::test]
