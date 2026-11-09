@@ -692,7 +692,7 @@ impl Fixture {
             .await
             .expect("endpoint teardown completes")
             .unwrap();
-        let source_thread = self
+        let mut source_thread = self
             .store
             .read_thread("side")
             .await
