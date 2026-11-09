@@ -13,9 +13,10 @@
 //! The `(info, key)` pair is derived once per credential (login, adopt, token
 //! refresh) and stored beside the profile as `encrypt_user_info` / `key`; only
 //! the payload and signature are rebuilt per request. Qoder seals its access
-//! token into `info`; QwenWork 1.1.32 instead seals the account's organization
-//! and data-policy context. Both shapes are pinned below rather than being
-//! treated as interchangeable just because the outer COSY envelope is shared.
+//! token and identity fields into `info`; QwenWork seals the access token
+//! alongside the account's organization and data-policy context. Both shapes are
+//! pinned below rather than being treated as interchangeable just because the
+//! outer COSY envelope is shared.
 //!
 //! This replaces executing Qoder's own `qoder_auth` wasm module. That module
 //! ships *inside an installed qodercli*, which meant the Qoder provider could
@@ -270,12 +271,23 @@ fn sealed_profile_json(user_info: &Value) -> String {
     ])
 }
 
-/// QwenWork 1.1.32 deliberately seals a different four-field profile. Keep the
-/// boolean as a boolean and preserve the organization-tag JSON value: changing
-/// either into a display string produces a valid-looking blob that upstream
-/// cannot associate with the selected enterprise identity.
+/// QwenWork seals the OAuth token alongside the account's organization and
+/// data-policy context. Keep the boolean as a boolean and preserve the
+/// organization-tag JSON value: changing either into a display string produces a
+/// valid-looking blob that upstream cannot associate with the selected
+/// enterprise identity, and omitting `security_oauth_token` is rejected by
+/// `gateway.qwenwork.cn` with HTTP 401 code 105 (`Login required`).
 fn qwenwork_sealed_profile_json(user_info: &Value) -> String {
     let mut fields = vec![("uid", Value::String(string_field(user_info, "uid")))];
+    let token = string_field(user_info, "security_oauth_token");
+    let token = if token.is_empty() {
+        string_field(user_info, "access_token")
+    } else {
+        token
+    };
+    if !token.is_empty() {
+        fields.push(("security_oauth_token", Value::String(token)));
+    }
     if let Some(organization_id) = user_info
         .get("organization_id")
         .and_then(Value::as_str)
@@ -853,18 +865,18 @@ mod tests {
     }
 
     #[test]
-    fn qwenwork_runtime_profile_uses_the_official_four_field_shape() {
+    fn qwenwork_runtime_profile_seals_token_and_enterprise_metadata() {
         let profile = json!({
             "uid": "user-1",
             "organization_id": "org-1",
             "organization_tags": ["tag-a", "tag-b"],
             "data_policy_agreed": true,
-            "security_oauth_token": "must-not-be-sealed",
-            "name": "Must Not Be Sealed",
+            "security_oauth_token": "tok-1",
+            "name": "Display Name",
         });
         assert_eq!(
             qwenwork_sealed_profile_json(&profile),
-            r#"{"uid":"user-1","organization_id":"org-1","organization_tags":["tag-a","tag-b"],"data_policy_agreed":true}"#
+            r#"{"uid":"user-1","security_oauth_token":"tok-1","organization_id":"org-1","organization_tags":["tag-a","tag-b"],"data_policy_agreed":true}"#
         );
     }
 

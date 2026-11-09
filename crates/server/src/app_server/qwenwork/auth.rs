@@ -241,6 +241,24 @@ pub(crate) fn credential() -> Option<(String, Value)> {
         return None;
     }
     normalize_expiry(&mut user_info);
+    // Repair profiles sealed before `security_oauth_token` was included in the
+    // QwenWork runtime payload: base64 ciphertext that is no longer than the raw
+    // token cannot contain that token and would be rejected with HTTP 401/105.
+    let token_len = access_token_of(&user_info).len();
+    let encrypted_len = user_info
+        .get("encrypt_user_info")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0);
+    if token_len > 32
+        && encrypted_len > 0
+        && encrypted_len <= token_len
+        && regenerate_runtime_fields(&mut user_info).is_ok()
+    {
+        if let Ok(_guard) = store_mutation().try_lock() {
+            let _ = write_store_locked(&machine_id, &user_info);
+        }
+    }
     Some((machine_id, user_info))
 }
 
@@ -417,11 +435,32 @@ fn adopt(mut user_info: Value, machine_id: String) -> Result<Value, Value> {
             "error": "qwenwork_client_credentials_have_no_token"
         }));
     }
-    if first_string(&user_info, &["uid", "id"]).is_none() {
+    let Some(incoming_uid) = first_string(&user_info, &["uid", "id"]) else {
         return Ok(json!({
             "ok": false,
             "error": "qwenwork_client_credentials_invalid"
         }));
+    };
+    if let Some((stored_machine_id, mut stored_info)) = credential() {
+        let same_uid =
+            first_string(&stored_info, &["uid", "id"]).as_deref() == Some(incoming_uid.as_str());
+        let stored_expire = stored_info.get("expire_time").and_then(Value::as_i64);
+        let incoming_expire = user_info.get("expire_time").and_then(Value::as_i64);
+        if same_uid
+            && matches!(
+                (stored_expire, incoming_expire),
+                (Some(stored), Some(incoming)) if stored > incoming
+            )
+        {
+            if let Err(error) = regenerate_runtime_fields(&mut stored_info) {
+                return Ok(json!({ "ok": false, "error": error }));
+            }
+            if let Err(error) = write_store(&stored_machine_id, &stored_info) {
+                return Ok(json!({ "ok": false, "error": error }));
+            }
+            super::catalog::forget_context();
+            return Ok(json!({ "ok": true, "account": account_label(&stored_info) }));
+        }
     }
     if let Err(error) = regenerate_runtime_fields(&mut user_info) {
         return Ok(json!({ "ok": false, "error": error }));
@@ -1541,5 +1580,55 @@ mod tests {
             json!({"ok": false, "error": "qwenwork_local_pat_requires_sign_in"})
         );
         assert!(credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn repairs_short_runtime_payload_and_preserves_fresher_refreshed_token_on_readopt() {
+        let _lock = super::super::test_env_lock().lock().await;
+        let fixture = tempfile::tempdir().expect("fixture");
+        super::super::set_config_root(fixture.path());
+        let long_token = "t".repeat(120);
+        write_store(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            &json!({
+                "uid": "fixture-user",
+                "name": "Fixture User",
+                "security_oauth_token": long_token,
+                "access_token": long_token,
+                "refresh_token": "fresh-refresh",
+                "expire_time": 1_900_000_500_i64,
+                "encrypt_user_info": "short-legacy-blob",
+                "key": "short-legacy-key"
+            }),
+        )
+        .expect("seed legacy store");
+
+        let (_, repaired) = credential().expect("repaired credential");
+        assert!(
+            repaired["encrypt_user_info"]
+                .as_str()
+                .expect("encrypted string")
+                .len()
+                > long_token.len()
+        );
+
+        let result = adopt_credential(
+            json!({
+                "uid": "fixture-user",
+                "name": "Fixture User",
+                "security_oauth_token": "stale-token",
+                "access_token": "stale-token",
+                "refresh_token": "spent-refresh",
+                "expire_time": 1_900_000_100_i64
+            }),
+            Some("01234567-89ab-cdef-0123-456789abcdef".into()),
+        )
+        .expect("adoption response");
+        assert_eq!(result["ok"], true);
+        let (_, preserved) = credential().expect("preserved credential");
+        assert_eq!(preserved["security_oauth_token"], json!(long_token));
+        assert_eq!(preserved["refresh_token"], json!("fresh-refresh"));
+        assert_eq!(preserved["expire_time"], json!(1_900_000_500_i64));
+        logout().expect("logout");
     }
 }
