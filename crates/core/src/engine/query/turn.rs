@@ -4482,11 +4482,18 @@ fn reasoning_over_limit_request(question: &RuntimeString) -> ElicitRequest {
     options.push(RuntimeJson::Object(stop));
     entry.insert("options", RuntimeJson::Array(options));
     entry.insert("multiSelect", RuntimeJson::Bool(false));
+    // Caller attribution the client uses to localize this engine-authored card;
+    // metadata is never read back as an answer.
+    let mut metadata = RuntimeObject::new();
+    metadata.insert(
+        "kind",
+        RuntimeJson::String(RuntimeString::from("reasoning_over_limit")),
+    );
     ElicitRequest {
         prompt: question.clone(),
         questions: Some(vec![entry]),
         attachments_supported: None,
-        metadata: None,
+        metadata: Some(metadata),
         options: None,
         multi_select: None,
     }
