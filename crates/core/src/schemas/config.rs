@@ -1467,6 +1467,11 @@ pub struct EngineConfig {
     /// Retired input accepted when loading older settings; it has no effect.
     #[serde(skip_serializing)]
     pub precompute_buffer_fraction: Option<f64>,
+    /// Precompute the automatic-compaction summary in the background while
+    /// the context is still inside the lead window before the compaction
+    /// boundary. Only applies when automatic compaction is enabled; off by
+    /// default, so an unconfigured session keeps the synchronous path.
+    pub precompute_compaction: bool,
     /// Developer diagnostics: record how every model request settled (raw
     /// finish reason, stream framing, usage, timing) into
     /// `<config home>/logs/provider-trace.log`. Off by default; the provider
@@ -1732,6 +1737,7 @@ impl Default for EngineConfig {
             compact_cold_cleanup: false,
             context_hints: true,
             precompute_buffer_fraction: None,
+            precompute_compaction: false,
             provider_trace: false,
             early_microcompact: false,
             idle_microcompact: false,

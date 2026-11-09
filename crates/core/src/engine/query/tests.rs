@@ -13070,6 +13070,7 @@ async fn precompute_arms_invisibly_and_applies_at_the_boundary() {
     let window = precompute_window(window_state.clone());
     let mut config = crate::schemas::config::default_config();
     config.auto_compact_window = Some(20_000);
+    config.precompute_compaction = true;
     let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
 
     // Turn 1: inside the precompute lead window, below the compaction
@@ -13188,6 +13189,7 @@ async fn precompute_falls_back_to_synchronous_when_the_boundary_is_gone() {
     let window = precompute_window(window_state.clone());
     let mut config = crate::schemas::config::default_config();
     config.auto_compact_window = Some(20_000);
+    config.precompute_compaction = true;
     let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
 
     // Arm the background checkpoint in turn 1.
@@ -13243,6 +13245,90 @@ async fn precompute_falls_back_to_synchronous_when_the_boundary_is_gone() {
         .count();
     assert_eq!(started, 1, "{events:?}");
     assert_eq!(completed, 1, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    let history = captured.lock().unwrap().clone();
+    assert!(
+        history.iter().any(|message| matches!(
+            message,
+            Message::CompactBoundary(boundary)
+                if boundary.summary.try_to_utf8().unwrap().contains("SYNC SUMMARY")
+        )),
+        "{history:?}"
+    );
+}
+
+#[tokio::test]
+async fn precompute_stays_inert_until_the_config_enables_it() {
+    let registry: Arc<super::PrecomputeRegistry> = Arc::new(super::PrecomputeRegistry::default());
+    let background = Arc::new(AtomicUsize::new(0));
+    let sync = Arc::new(AtomicUsize::new(0));
+    let window_state = Arc::new(Mutex::new(crate::context::window_usage::WindowUsageState {
+        active_tokens: Some(8_000),
+        prefill_input_tokens: None,
+        window_number: 0,
+    }));
+    let window = precompute_window(window_state.clone());
+    let mut config = crate::schemas::config::default_config();
+    config.auto_compact_window = Some(20_000);
+    // The gate deliberately stays at its default (off): an unconfigured
+    // session must never arm a background summary.
+    let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
+
+    // Turn 1 sits inside the lead window where an enabled session would arm.
+    let params = precompute_params(
+        vec![precompute_user("u1", "first question")],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let events: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(background.load(Ordering::SeqCst), 0);
+    assert_eq!(sync.load(Ordering::SeqCst), 0);
+
+    // Turn 2 crosses the boundary: the synchronous compaction runs unchanged.
+    window_state.lock().unwrap().active_tokens = Some(21_000);
+    let params = precompute_params(
+        vec![
+            precompute_user("u1", "first question"),
+            precompute_assistant("a1", "turn response"),
+            precompute_user("u2", "second question"),
+        ],
+        &registry,
+        &window,
+        &config,
+        &captured,
+    );
+    let events: Vec<EngineEvent> = super::query_isolated(
+        params,
+        precompute_turn_deps(background.clone(), sync.clone()),
+    )
+    .collect()
+    .await;
+    assert_eq!(background.load(Ordering::SeqCst), 0);
+    assert_eq!(sync.load(Ordering::SeqCst), 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Compaction { .. })),
+        "the boundary must still compact synchronously: {events:?}"
+    );
     assert!(
         events
             .iter()

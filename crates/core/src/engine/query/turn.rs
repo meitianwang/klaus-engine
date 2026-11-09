@@ -3621,6 +3621,12 @@ async fn consume_precomputed_compaction(
     prefix_tokens: u64,
     config: &crate::schemas::config::ResolvedConfig,
 ) -> Option<Result<(), CompactionFailure>> {
+    // The gate is checked on both ends so a session that disables precompute
+    // mid-flight never applies an entry armed while it was enabled; the
+    // boundary falls back to the synchronous compaction unchanged.
+    if !config.precompute_compaction {
+        return None;
+    }
     let registry = shared.params.precompute.clone()?;
     let agent_key = shared
         .params
@@ -3660,7 +3666,9 @@ async fn consume_precomputed_compaction(
 
 /// Arm one background checkpoint summary while the context is inside the
 /// precompute lead window but has not reached the compaction boundary. The
-/// background pass never emits user-visible events on its own.
+/// background pass never emits user-visible events on its own. Arming is
+/// opt-in through `precompute_compaction`; without it every boundary keeps
+/// the synchronous compaction path unchanged.
 #[allow(clippy::too_many_arguments)]
 fn maybe_arm_compaction_precompute(
     shared: &Arc<Shared>,
@@ -3672,6 +3680,9 @@ fn maybe_arm_compaction_precompute(
     cwd: &RuntimePath,
     thread_id: &RuntimeString,
 ) {
+    if !config.precompute_compaction {
+        return;
+    }
     let Some(registry) = shared.params.precompute.as_ref() else {
         return;
     };
