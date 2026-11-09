@@ -1962,7 +1962,7 @@ impl ProtocolServer {
             if init.provider.is_none() {
                 session
                     .prepare_inference_targets(&mut targets, &mut None)
-                    .await?;
+                    .await;
                 return session.reconfigure_tier_targets(
                     targets.ok_or("tier-only model reconfiguration requires modelTierTargets")?,
                     expected_revision,
@@ -2025,10 +2025,8 @@ impl ProtocolServer {
                 .await?;
             session
                 .prepare_inference_targets(&mut targets, &mut advisor_target)
-                .await?;
-            session
-                .prepare_feature_targets(&mut feature_targets)
-                .await?;
+                .await;
+            session.prepare_feature_targets(&mut feature_targets).await;
             if self.is_closing() {
                 return Err("cannot reconfigure a closing protocol session".to_string());
             }
@@ -9173,10 +9171,10 @@ impl ServerInner {
             .clone();
         session
             .prepare_inference_targets(&mut prepared.targets, &mut prepared.advisor_target)
-            .await?;
+            .await;
         session
             .prepare_feature_targets(&mut prepared.feature_targets)
-            .await?;
+            .await;
         session.install_inference_targets(
             prepared.targets,
             model_source_from_init(&prepared.raw)?,

@@ -220,6 +220,9 @@ mod r20260922_readonly_side_question;
 #[path = "../../tests/r20260907_model_selection_source.rs"]
 mod r20260907_model_selection_source;
 
+#[path = "../../tests/r20261109_auxiliary_target_degradation.rs"]
+mod r20261109_auxiliary_target_degradation;
+
 #[path = "../../tests/r20260908_mcp_control_dispatch.rs"]
 mod r20260908_mcp_control_dispatch;
 

@@ -322,50 +322,100 @@ pub(super) fn prepare_feature_requirements_sync(
     Ok(())
 }
 
+/// Degrade a ready slot whose asynchronous preparation failed.
+///
+/// Auxiliary paths keep the conversation usable: tiers and the advisor report
+/// at use time, feature slots follow the main model, and session publication
+/// never fails on them. Only the conversation's own model gates startup.
+fn degrade_preparation_failure(
+    slot: &mut Option<InferenceTargetState>,
+    slot_name: &str,
+    error: String,
+) {
+    let Some(InferenceTargetState::Ready(target)) = slot else {
+        return;
+    };
+    let source = target.source.clone();
+    let model_id = target.model_id.clone();
+    eprintln!(
+        "[session-targets] {slot_name} target preparation failed; degrading to unavailable: source={source} model={model_id} error={error}"
+    );
+    *slot = Some(InferenceTargetState::Unavailable {
+        source,
+        model_id,
+        code: "target-preparation-failed".into(),
+        message: error,
+    });
+}
+
 impl Session {
+    /// Prepare managed-review requirements for every ready slot concurrently.
+    ///
+    /// A slot whose preparation fails degrades to
+    /// [`InferenceTargetState::Unavailable`] instead of failing the caller, so
+    /// a revoked subscription login on an auxiliary source cannot block the
+    /// conversation's own model.
+    async fn prepare_slot_requirements(
+        &self,
+        slots: &mut [(&'static str, &mut Option<InferenceTargetState>)],
+    ) {
+        let results = futures::future::join_all(slots.iter().enumerate().filter_map(
+            |(index, (_name, slot))| match slot {
+                Some(InferenceTargetState::Ready(target)) => {
+                    let provider = target.provider.clone();
+                    Some(async move { (index, self.prepare_review_requirements(provider).await) })
+                }
+                _ => None,
+            },
+        ))
+        .await;
+        for (index, result) in results {
+            let Some((name, slot)) = slots.get_mut(index) else {
+                continue;
+            };
+            match result {
+                Ok(requirements) => {
+                    if let Some(InferenceTargetState::Ready(target)) = slot {
+                        target.review_requirements = Some(requirements);
+                    }
+                }
+                Err(error) => degrade_preparation_failure(slot, name, error),
+            }
+        }
+    }
+
     /// Prepares each selected account before an auxiliary target can be published.
+    ///
+    /// Preparation failures degrade the affected slot instead of failing; see
+    /// [`degrade_preparation_failure`].
     pub async fn prepare_inference_targets(
         &self,
         targets: &mut Option<InferenceTargets>,
         advisor: &mut Option<InferenceTargetState>,
-    ) -> Result<(), String> {
-        let mut states = targets
-            .as_mut()
-            .map(|targets| vec![&mut targets.high, &mut targets.medium, &mut targets.low])
-            .unwrap_or_default();
-        states.push(advisor);
-        futures::future::try_join_all(states.into_iter().filter_map(|state| match state {
-            Some(InferenceTargetState::Ready(target)) => Some(async move {
-                target.review_requirements = Some(
-                    self.prepare_review_requirements(target.provider.clone())
-                        .await?,
-                );
-                Ok::<_, String>(())
-            }),
-            _ => None,
-        }))
-        .await?;
-        Ok(())
+    ) {
+        let mut slots: Vec<(&'static str, &mut Option<InferenceTargetState>)> =
+            match targets.as_mut() {
+                Some(targets) => vec![
+                    ("high", &mut targets.high),
+                    ("medium", &mut targets.medium),
+                    ("low", &mut targets.low),
+                ],
+                None => Vec::new(),
+            };
+        slots.push(("advisor", advisor));
+        self.prepare_slot_requirements(&mut slots).await;
     }
     /// Prepares each configured feature account before its target can be published.
-    pub async fn prepare_feature_targets(
-        &self,
-        features: &mut FeatureTargets,
-    ) -> Result<(), String> {
-        futures::future::try_join_all(features.slots_mut().into_iter().filter_map(|state| {
-            match state {
-                Some(InferenceTargetState::Ready(target)) => Some(async move {
-                    target.review_requirements = Some(
-                        self.prepare_review_requirements(target.provider.clone())
-                            .await?,
-                    );
-                    Ok::<_, String>(())
-                }),
-                _ => None,
-            }
-        }))
-        .await?;
-        Ok(())
+    ///
+    /// Preparation failures degrade the affected slot instead of failing; see
+    /// [`degrade_preparation_failure`].
+    pub async fn prepare_feature_targets(&self, features: &mut FeatureTargets) {
+        let mut slots: Vec<(&'static str, &mut Option<InferenceTargetState>)> = vec![
+            ("title", &mut features.title),
+            ("prediction", &mut features.prediction),
+            ("memory", &mut features.memory),
+        ];
+        self.prepare_slot_requirements(&mut slots).await;
     }
     /// Tier-only changes replace the immutable bundle while active requests and
     /// running children retain their already captured provider and limits.
