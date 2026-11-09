@@ -943,6 +943,173 @@ mod tests {
         );
     }
 
+    /// Browser catalog extended with the wait/locator/capability/management
+    /// surfaces the navigation, evaluation and capability sugars route through.
+    fn browser_ext_ctx(
+        calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>>,
+    ) -> ToolContext {
+        let mut ctx = browser_ctx(calls);
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__klaus-browser__ax_state",
+                "mcp__klaus-browser__ax_action",
+                "mcp__klaus-browser__page_text",
+                "mcp__klaus-browser__wait_for",
+                "mcp__klaus-browser__locator",
+                "mcp__klaus-browser__capabilities",
+                "mcp__klaus-browser__management",
+                "mcp__klaus-browser__tabs",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn browser_prelude_expect_navigation_arms_the_wait_before_the_action() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ext_ctx(calls.clone());
+        let script = "const first = await browser.expectNavigation(() => browser.action('click', { elementIndex: 3 }), { url: 'https://next*', waitUntil: 'domcontentloaded', timeoutMs: 4321 }); const second = await browser.expectNavigation(() => browser.action('press_key', { key: 'Return' })); first.tool + '|' + second.tool";
+        let arg = runtime_json::parse(&rs(&format!(r#"{{ "code": {:?} }}"#, script)))
+            .expect("call arg parses");
+        let res = tool.call(arg, &ctx, None).await.unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains("mcp__klaus-browser__ax_action|mcp__klaus-browser__ax_action"),
+            "expectNavigation resolves to the action result: {text}"
+        );
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(
+            recorded[0],
+            (
+                rs("mcp__klaus-browser__wait_for"),
+                rjson!({ "url": "https://next*", "loadState": "domcontentloaded", "timeoutMs": 4321 })
+            )
+        );
+        assert_eq!(
+            recorded[1],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "click", "elementIndex": 3 })
+            )
+        );
+        assert_eq!(
+            recorded[2],
+            (
+                rs("mcp__klaus-browser__wait_for"),
+                rjson!({ "loadState": "load" })
+            )
+        );
+        assert_eq!(recorded[3].0, rs("mcp__klaus-browser__ax_action"));
+    }
+
+    #[tokio::test]
+    async fn browser_prelude_locator_eval_sugar_serializes_function_and_arg() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ext_ctx(calls.clone());
+        let script = "await browser.locatorEval({ role: 'button', name: 'Go' }, (el, arg) => el.id + arg, 7); await browser.locatorEvalAll('#rows .row', function (els, arg) { return els.length; }, 'x', { limit: 5 }); 'done'";
+        let arg = runtime_json::parse(&rs(&format!(r#"{{ "code": {:?} }}"#, script)))
+            .expect("call arg parses");
+        let res = tool.call(arg, &ctx, None).await.unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0],
+            (
+                rs("mcp__klaus-browser__locator"),
+                rjson!({ "role": "button", "name": "Go", "action": "evaluate", "script": "(el, arg) => el.id + arg", "scriptKind": "function", "arg": 7 })
+            )
+        );
+        assert_eq!(
+            recorded[1],
+            (
+                rs("mcp__klaus-browser__locator"),
+                rjson!({ "selector": "#rows .row", "action": "evaluate_all", "script": "function (els, arg) { return els.length; }", "scriptKind": "function", "arg": "x", "limit": 5 })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_prelude_capabilities_management_namespaces_are_guarded_and_route() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = browser_ext_ctx(calls.clone());
+        let script = "const cap = await browser.capabilities.get('management'); const ns = cap.tabs; const guarded = [ns.then, ns.toJSON, ns.toString, ns.hasOwnProperty, ns.constructor].every((v) => v === undefined); await ns.query({ windowId: 2 }); await cap.getAuditTrail(); await browser.capabilities.list(); const tabCap = await browser.getTab(4).capabilities.get('cdp'); const tabUrl = await browser.getTab(4).url(); guarded + ':' + typeof cap.documentation + ':' + tabCap.id + ':' + typeof tabCap.getAuditTrail + ':' + tabUrl";
+        let arg = runtime_json::parse(&rs(&format!(r#"{{ "code": {:?} }}"#, script)))
+            .expect("call arg parses");
+        let res = tool.call(arg, &ctx, None).await.unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            text.contains("true:function:cdp:undefined:null"),
+            "reserved keys stay inert and non-management capabilities carry no namespace: {text}"
+        );
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 6);
+        assert_eq!(
+            recorded[0],
+            (
+                rs("mcp__klaus-browser__capabilities"),
+                rjson!({ "action": "get", "id": "management" })
+            )
+        );
+        assert_eq!(
+            recorded[1],
+            (
+                rs("mcp__klaus-browser__management"),
+                rjson!({ "action": "call", "namespace": "tabs", "method": "query", "args": [{ "windowId": 2 }] })
+            )
+        );
+        assert_eq!(
+            recorded[2],
+            (
+                rs("mcp__klaus-browser__management"),
+                rjson!({ "action": "audit_trail" })
+            )
+        );
+        assert_eq!(
+            recorded[3],
+            (
+                rs("mcp__klaus-browser__capabilities"),
+                rjson!({ "action": "list" })
+            )
+        );
+        assert_eq!(
+            recorded[4],
+            (
+                rs("mcp__klaus-browser__capabilities"),
+                rjson!({ "action": "get", "id": "cdp", "tabId": 4 })
+            )
+        );
+        assert_eq!(
+            recorded[5],
+            (
+                rs("mcp__klaus-browser__tabs"),
+                rjson!({ "action": "get", "tabId": 4 })
+            )
+        );
+    }
+
     #[tokio::test]
     async fn nested_tool_image_blocks_propagate_to_repl_result() {
         let tool = create_repl_tool(Arc::new(

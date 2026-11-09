@@ -41,6 +41,17 @@
     return out;
   }
 
+  // Locator-scoped evaluation sugar: a function argument is serialized and
+  // invoked in the page as (element, arg) / (elements, arg); a string stays a
+  // plain expression evaluated with element/elements/arg in scope.
+  function locatorEvalArgs(action, criteria, fn, arg, opts) {
+    const base = typeof criteria === 'string' ? { selector: criteria } : criteria;
+    const isFunction = typeof fn === 'function';
+    return merge(base, { action, script: isFunction ? fn.toString() : String(fn) },
+      isFunction ? { scriptKind: 'function' } : null,
+      arg !== undefined ? { arg } : null, opts);
+  }
+
   const DOCS = [
     'browser - hierarchical browser control for the REPL.',
     '',
@@ -77,12 +88,26 @@
     'Session-wide variants act on the active tab; every one also exists on tab handles:',
     '  browser.navigate(url) / goto(url) / back() / forward() / reload()',
     '  browser.click(opts) / type(text, opts) / find(query) / eval(script) / waitFor(opts)',
+    '                                   waitFor accepts {url, loadState} together: the URL must match and',
+    '                                   the load state must settle.',
+    '  browser.expectNavigation(action, opts?)  Await a navigation the action triggers (race-free: the wait',
+    '                                   is armed before the action runs); opts {url, waitUntil, timeoutMs};',
+    '                                   resolves to the action result.',
+    '  browser.locatorEval(criteria, fn, arg?) / locatorEvalAll(criteria, fn, arg?)',
+    '                                   Run fn as (element, arg) against exactly one match, or as (elements,',
+    '                                   arg) against all matches. criteria: selector string or locator object',
+    "                                   {role, name, text, selector, and:[...], within, nth, ...}.",
     '  browser.content.text() / .read() / .snapshot() / .export(opts) / .exportGsuite(type)',
     '  browser.content.youtubeTranscript(opts?) / .exportYouTubeTranscript(opts?)',
     '  browser.clipboard.read() / .readText() / .write(text) / .writeText(text)',
     '  browser.dev.console(opts) / .logs(opts) / .network(opts) / .cdp(method, params)',
     '  browser.tabs.list() / .new(url) / .get(tabId) / .select(tabId) / .close(opts) / .selected() / .content(opts)',
-    '  browser.capabilities() / browser.listBrowsers() / browser.selectBrowser(opts) / browser.nameSession(name)',
+    '  tab.info() / tab.url() / tab.title()   Current metadata row, URL or title of this tab.',
+    '  browser.capabilities() / .list() / .get(id)   Declared capability ids with descriptions;',
+    '                                   .get(id).documentation() returns usage text (also on tab handles).',
+    "                                   .get('management') adds bookmarks/tabGroups/tabs/windows namespaces",
+    '                                   and getAuditTrail() - external Chrome with an up-to-date extension.',
+    '  browser.listBrowsers() / browser.selectBrowser(opts) / browser.nameSession(name)',
     '',
     'Discipline:',
     '  - Indices belong to the state that returned them. After any action or navigation,',
@@ -140,6 +165,52 @@
       network: (opts) => scope('network', opts),
       cdp: (method, params, opts) => scope('cdp', merge({ method, params }, opts)),
     };
+  }
+
+  const MANAGEMENT_NAMESPACES = ['bookmarks', 'tabGroups', 'tabs', 'windows'];
+  // Property reads that must never turn into a management call: promise
+  // assimilation, JSON serialization and Object.prototype probes.
+  const MANAGEMENT_RESERVED_KEYS = new Set(['then', 'toJSON', 'constructor', 'hasOwnProperty',
+    'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString', 'toString', 'valueOf', '__proto__']);
+
+  function managementNamespace(scope, namespace) {
+    return new Proxy({}, {
+      get(_target, method) {
+        if (typeof method !== 'string' || MANAGEMENT_RESERVED_KEYS.has(method)) return undefined;
+        return function () {
+          return scope('management', { action: 'call', namespace, method, args: Array.prototype.slice.call(arguments) });
+        };
+      },
+      has(_target, method) {
+        return typeof method === 'string' && !MANAGEMENT_RESERVED_KEYS.has(method);
+      },
+    });
+  }
+
+  function capabilityValue(raw) {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && raw.value !== undefined) return raw.value;
+    return raw;
+  }
+
+  function capabilitiesGroup(scope) {
+    const capabilities = (opts) => scope('capabilities', opts);
+    capabilities.list = (opts) => scope('capabilities', merge({ action: 'list' }, opts));
+    capabilities.get = async (id, opts) => {
+      const requested = String(id);
+      const entry = capabilityValue(await scope('capabilities', merge({ action: 'get', id: requested }, opts)));
+      const info = entry && typeof entry === 'object' ? entry : {};
+      const text = typeof info.documentation === 'string' ? info.documentation : '';
+      const capability = {
+        id: typeof info.id === 'string' ? info.id : requested,
+        description: typeof info.description === 'string' ? info.description : '',
+        documentation: () => text,
+      };
+      if (requested !== 'management') return capability;
+      for (const namespace of MANAGEMENT_NAMESPACES) capability[namespace] = managementNamespace(scope, namespace);
+      capability.getAuditTrail = (auditOpts) => scope('management', merge({ action: 'audit_trail' }, auditOpts));
+      return capability;
+    };
+    return capabilities;
   }
 
   function axArgs(modeOrOpts, maybeOpts) {
@@ -241,7 +312,20 @@
       setChecked: (checked, opts) => scope('set_checked', merge({ checked }, opts)),
       computer: (action, opts) => scope('computer', merge({ action }, opts)),
       waitFor: (opts) => scope('wait_for', opts),
+      expectNavigation: (action, opts) => {
+        // Race-free composition: the navigation wait is armed before the action
+        // runs, so even an instant navigation cannot slip between the two.
+        const options = opts && typeof opts === 'object' ? opts : {};
+        const waitArgs = options.url !== undefined && options.url !== null
+          ? merge({ url: options.url }, options.waitUntil !== undefined && options.waitUntil !== null ? { loadState: options.waitUntil } : null)
+          : { loadState: options.waitUntil || 'load' };
+        const waiting = scope('wait_for', merge(waitArgs,
+          options.timeoutMs !== undefined && options.timeoutMs !== null ? { timeoutMs: options.timeoutMs } : null));
+        return Promise.all([Promise.resolve().then(action), waiting]).then((results) => results[0]);
+      },
       locator: (opts) => scope('locator', opts),
+      locatorEval: (criteria, fn, arg, opts) => scope('locator', locatorEvalArgs('evaluate', criteria, fn, arg, opts)),
+      locatorEvalAll: (criteria, fn, arg, opts) => scope('locator', locatorEvalArgs('evaluate_all', criteria, fn, arg, opts)),
       elementInfo: (opts) => scope('element_info', opts),
       download: (opts) => scope('download', opts),
       upload: (files, opts) => scope('file_upload', merge({ files }, opts)),
@@ -265,11 +349,21 @@
     const tab = {
       id: tabId === undefined ? null : tabId,
       browserId: browserId === undefined ? null : browserId,
+      info: (opts) => scope('tabs', merge({ action: 'get' }, opts)),
+      url: async (opts) => {
+        const row = capabilityValue(await scope('tabs', merge({ action: 'get' }, opts)));
+        return row && typeof row === 'object' && row.url !== undefined ? row.url : null;
+      },
+      title: async (opts) => {
+        const row = capabilityValue(await scope('tabs', merge({ action: 'get' }, opts)));
+        return row && typeof row === 'object' && row.title !== undefined ? row.title : null;
+      },
       ax: axGroup(scope),
       cua: cuaGroup(scope),
       content: contentGroup(scope),
       clipboard: clipboardGroup(scope),
       dev: devGroup(scope),
+      capabilities: capabilitiesGroup(scope),
       close: (opts) => scope('close', merge({ target: 'tab' }, opts)),
     };
     return Object.assign(tab, pageGroup(scope));
@@ -302,7 +396,7 @@
     },
     history: (opts) => call('history', opts),
     nameSession: (name, opts) => call('tabs', merge({ action: 'name_session', name }, opts)),
-    capabilities: (opts) => call('capabilities', opts),
+    capabilities: capabilitiesGroup(sessionScope),
     listBrowsers: (opts) => call('list_connected_browsers', opts),
     selectBrowser: (opts) => call('select_browser', typeof opts === 'string' ? { browserId: opts } : opts),
     ax: axGroup(sessionScope),
