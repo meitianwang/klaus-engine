@@ -89,6 +89,24 @@ pub(super) fn client() -> reqwest::Client {
         .clone()
 }
 
+/// Client for inference streams. It carries no total request timeout: the
+/// engine-level idle/total stream budgets govern a long-running response, and
+/// an adapter-side deadline must not cut the stream short before them.
+pub(super) fn stream_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 pub(super) fn cloud_headers(
     credential: &auth::Credential,
 ) -> Result<reqwest::header::HeaderMap, String> {

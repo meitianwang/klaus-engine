@@ -104,6 +104,21 @@ pub(super) fn client() -> reqwest::Client {
         })
         .clone()
 }
+/// Client for inference streams. It carries no total request timeout: the
+/// engine-level idle/total stream budgets govern a long-running response, and
+/// an adapter-side deadline must not cut the stream short before them.
+pub(super) fn stream_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
 pub(super) fn headers(c: &auth::Credential) -> Result<reqwest::header::HeaderMap, String> {
     use reqwest::header::{HeaderMap, HeaderValue};
     let mut headers = HeaderMap::new();

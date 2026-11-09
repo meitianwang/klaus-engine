@@ -163,12 +163,15 @@ async fn handle(
     let (tx, rx) = mpsc::channel::<Bytes>(16);
     tokio::spawn(async move {
         // Closing the response body drops the receiver. Cancel upstream even
-        // while waiting for run admission or a silent backend.
+        // while waiting for run admission or a silent backend. The run itself
+        // carries no adapter-side deadline: engine-level stream budgets decide
+        // when an inference stream ends.
         tokio::select! {
             _ = tx.closed() => {},
-            result = tokio::time::timeout(Duration::from_secs(600), run(body, &tx)) => {
-                let error = match result { Ok(Ok(())) => return, Ok(Err(error)) => error, Err(_) => "cursor_inference_timeout".into() };
-                let _ = emit(&tx, super::responses::public_error(&error)).await;
+            result = run(body, &tx) => {
+                if let Err(error) = result {
+                    let _ = emit(&tx, super::responses::public_error(&error)).await;
+                }
             }
         }
     });

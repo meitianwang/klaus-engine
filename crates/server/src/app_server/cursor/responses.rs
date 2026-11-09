@@ -282,7 +282,6 @@ pub(super) fn public_error(error: &str) -> Value {
                 | "cursor_network_error"
                 | "cursor_response_read_failed"
                 | "cursor_inference_incomplete"
-                | "cursor_inference_timeout"
         )
     {
         "overloaded_error"

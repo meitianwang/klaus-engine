@@ -1,5 +1,5 @@
 //! Loopback transport for source-scoped request and replay policies.
-use super::{auth, catalog, client, headers, runtime_base};
+use super::{auth, catalog, headers, runtime_base, stream_client};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
@@ -77,7 +77,11 @@ pub(super) async fn ensure_started(generation: &str) -> Result<(String, String),
                 let connection = hyper::server::conn::http1::Builder::new()
                     .keep_alive(false)
                     .serve_connection(TokioIo::new(socket), service);
-                let _ = tokio::time::timeout(Duration::from_secs(600), connection).await;
+                // No adapter-side connection deadline: a served inference
+                // stream lives as long as the engine-level stream budgets
+                // allow, and keep_alive(false) closes the socket after each
+                // response so nothing lingers idle.
+                let _ = connection.await;
             });
         }
     });
@@ -462,11 +466,10 @@ async fn handle(
     if !auth::is_current(&generation) {
         return Ok(error(StatusCode::UNAUTHORIZED, "kiro_credential_changed"));
     }
-    let request = client()
+    let request = stream_client()
         .post(format!("{}/v1/responses", runtime_base(&c)))
         .headers(h)
-        .json(&body)
-        .timeout(Duration::from_secs(600));
+        .json(&body);
     let upstream = match tokio::select! {r=request.send()=>r,_=changes.changed()=>return Ok(error(StatusCode::UNAUTHORIZED,"kiro_credential_changed"))}
     {
         Ok(v) => v,

@@ -1,6 +1,6 @@
 //! Loopback-only translation of the source's model wire, without another agent runtime.
 
-use super::{auth, catalog, client, cloud_base, cloud_headers};
+use super::{auth, catalog, cloud_base, cloud_headers, stream_client};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
@@ -87,7 +87,11 @@ pub(super) async fn ensure_started(generation: &str) -> Result<(String, String),
                 let connection = hyper::server::conn::http1::Builder::new()
                     .keep_alive(false)
                     .serve_connection(TokioIo::new(socket), service);
-                let _ = tokio::time::timeout(Duration::from_secs(600), connection).await;
+                // No adapter-side connection deadline: a served inference
+                // stream lives as long as the engine-level stream budgets
+                // allow, and keep_alive(false) closes the socket after each
+                // response so nothing lingers idle.
+                let _ = connection.await;
             });
         }
     });
@@ -243,11 +247,10 @@ async fn handle(
     if !auth::is_current(&generation) {
         return Ok(error(StatusCode::UNAUTHORIZED, "trae_credential_changed"));
     }
-    let outgoing = client()
+    let outgoing = stream_client()
         .post(format!("{}/api/ide/v2/llm_raw_chat", cloud_base()))
         .headers(headers)
-        .json(&body)
-        .timeout(Duration::from_secs(600));
+        .json(&body);
     let upstream = match tokio::select! {
         result=outgoing.send()=>result,
         _=changes.changed()=>return Ok(error(StatusCode::UNAUTHORIZED,"trae_credential_changed")),
@@ -287,14 +290,18 @@ async fn handle(
         let initial=json!({"id":state.id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]});
         yield Ok::<Frame<Bytes>,Infallible>(Frame::data(Bytes::from(format!("data: {initial}\n\n"))));
         loop {
+            // No adapter-side frame deadline: the engine-level idle stream
+            // budget owns a stalled upstream and cancels it by dropping this
+            // request, so a per-frame cap here must not fire first and turn a
+            // recoverable stall into a terminal transport error.
             let next=tokio::select! {
-                result=tokio::time::timeout(Duration::from_secs(90),source.next())=>result,
+                result=source.next()=>result,
                 _=changes.changed()=>{
                     yield Ok(Frame::data(Bytes::from(stream_error("trae_credential_changed"))));
                     return;
                 }
             };
-            let chunk=match next {Ok(Some(Ok(value)))=>value,Ok(None)=>break,_=>{yield Ok(Frame::data(Bytes::from(stream_interrupted("trae_stream_transport_failed",&state.model,&state.account))));return;}};
+            let chunk=match next {Some(Ok(value))=>value,None=>break,Some(Err(_))=>{yield Ok(Frame::data(Bytes::from(stream_interrupted("trae_stream_transport_failed",&state.model,&state.account))));return;}};
             if !auth::is_current(&generation){yield Ok(Frame::data(Bytes::from(stream_error("trae_credential_changed"))));return;}
             total=total.saturating_add(chunk.len());
             if total>64*1024*1024||pending.len().saturating_add(chunk.len())>2*1024*1024{

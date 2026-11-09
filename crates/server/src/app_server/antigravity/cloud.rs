@@ -51,14 +51,24 @@ pub(super) fn client_identity() -> String {
 }
 
 pub(super) fn http_client() -> Result<reqwest::Client, String> {
-    // Model discovery and inference share the hub protocol identity.
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(180))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(client_identity())
-        .build()
-        .map_err(|_| "antigravity_transport_unavailable".into())
+    // Model discovery and inference share the hub protocol identity, and one
+    // pooled client keeps connections warm across calls. No total request
+    // timeout is set here: control-plane RPCs cap each request themselves, and
+    // inference streams stay open so the engine-level idle/total stream budgets
+    // govern them instead of an adapter-side deadline cutting them short.
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(client_identity())
+                .build()
+                .map_err(|_| "antigravity_transport_unavailable".into())
+        })
+        .clone()
 }
 
 pub(super) fn api_base() -> Result<String, String> {
@@ -221,6 +231,19 @@ fn service_error(
                 ]
                 .iter()
                 .any(|word| lower.contains(word)))));
+    // Upstream capacity verdicts arrive shaped like ordinary refusals but clear
+    // on their own, so the retry schedule can wait them out instead of failing
+    // the turn fast. HTTP 408 is the service's own request-timeout verdict.
+    let transient_overload = status == Some(408)
+        || matches!(
+            service_code,
+            Some(
+                "PREFILL_QUEUE_OVERLOADED"
+                    | "DECODE_PREEMPTED"
+                    | "TPU_EXECUTE_ERROR"
+                    | "MODEL_CAPACITY_EXHAUSTED"
+            )
+        );
     let tag = if context_overflow {
         "model_context_window_exceeded"
     } else if status == Some(401) || service_code == Some("UNAUTHENTICATED") || auth_reason {
@@ -232,6 +255,7 @@ fn service_error(
     } else if status == Some(403) || service_code == Some("PERMISSION_DENIED") {
         "antigravity_auth_required"
     } else if status.is_some_and(|status| status >= 500)
+        || transient_overload
         || matches!(
             service_code,
             Some("UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED")
@@ -313,6 +337,18 @@ fn error_details(error: &GeminiApiError) -> RawProviderError {
         ),
         (None, "antigravity_stream_interrupted") => format!(
             "{}: network stream interrupted while reading response",
+            error.message
+        ),
+        // A transport failure below produced no response bytes, so no output or
+        // tool side effect was consumed: it re-enters the engine retry schedule
+        // with network semantics, and the stage label stays as a URL-free
+        // diagnostic.
+        (None, "antigravity_transport_unavailable (connect)") => format!(
+            "{}: network connection failed before the request was delivered",
+            error.message
+        ),
+        (None, "antigravity_transport_unavailable (sent)") => format!(
+            "{}: network transport failed while awaiting the first response byte",
             error.message
         ),
         _ => error.message.clone(),
@@ -428,10 +464,14 @@ async fn send_once(
     };
     let url = format!("{base}/v1internal:{method}{suffix}");
     let http = http_client().map_err(api_error)?;
-    let mut request = http
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body);
+    let mut request = http.post(url).header("content-type", "application/json");
+    if method != "streamGenerateContent" {
+        // Control-plane RPCs stay bounded. The inference stream carries no
+        // adapter-side total deadline: engine-level idle/total stream budgets
+        // own it, and a long prefill or generation must not be cut short here.
+        request = request.timeout(std::time::Duration::from_secs(180));
+    }
+    let mut request = request.body(body);
     for (name, value) in extra_headers {
         if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("host") {
             continue;
@@ -896,7 +936,9 @@ mod tests {
     use super::*;
 
     // A truncated cloud response was classified as Unknown and skipped the
-    // engine's bounded stream recovery. Only response-read failures are transient.
+    // engine's bounded stream recovery. Response-read and transport failures
+    // below the first response byte carry network semantics so the engine
+    // retry schedule owns recovery; local verdicts stay terminal.
     #[test]
     fn interrupted_streams_enter_recovery_without_retrying_local_refusals() {
         use klaus_agent_core::provider::classify::classify_error;
@@ -906,6 +948,8 @@ mod tests {
         for key in [
             "antigravity_stream_incomplete",
             "antigravity_stream_interrupted",
+            "antigravity_transport_unavailable (connect)",
+            "antigravity_transport_unavailable (sent)",
         ] {
             let classified = classify_error(&error_details(&api_error(key)));
             assert_eq!(classified.kind, ProviderErrorKind::Network, "{key}");
@@ -919,12 +963,64 @@ mod tests {
             "antigravity_stream_invalid",
             "antigravity_stream_response_too_large",
             "antigravity_stream_frame_too_large",
-            "antigravity_transport_unavailable (sent)",
         ] {
             let classified = classify_error(&error_details(&api_error(key)));
             assert!(!is_retryable(&classified), "{key}");
             assert_eq!(classified.message, key);
         }
+    }
+
+    // Upstream capacity verdicts clear on their own, so they must reach the
+    // engine retry schedule as overload instead of failing the turn fast as a
+    // request fault — on the refusal path and inside the stream alike.
+    #[test]
+    fn transient_capacity_verdicts_stay_retryable() {
+        use klaus_agent_core::provider::classify::classify_error;
+        use klaus_agent_core::provider::retry::is_retryable;
+        use klaus_agent_core::types::errors::ProviderErrorKind;
+
+        for service_status in [
+            "PREFILL_QUEUE_OVERLOADED",
+            "DECODE_PREEMPTED",
+            "TPU_EXECUTE_ERROR",
+            "MODEL_CAPACITY_EXHAUSTED",
+        ] {
+            let bytes = serde_json::to_vec(&json!({
+                "error": {
+                    "code": 400,
+                    "status": service_status,
+                    "message": "Upstream capacity is temporarily busy."
+                }
+            }))
+            .unwrap();
+            for error in [
+                service_error(Some(400), &bytes, Default::default()),
+                decode_frame(&bytes, None).unwrap_err(),
+            ] {
+                let classified = classify_error(&error_details(&error));
+                assert_eq!(
+                    classified.kind,
+                    ProviderErrorKind::Overloaded,
+                    "{service_status}"
+                );
+                assert_eq!(
+                    classified.code.as_ref().unwrap(),
+                    "antigravity_service_unavailable"
+                );
+                assert!(is_retryable(&classified), "{service_status}");
+            }
+        }
+        let classified = classify_error(&error_details(&service_error(
+            Some(408),
+            b"{}",
+            Default::default(),
+        )));
+        assert_eq!(classified.kind, ProviderErrorKind::Overloaded);
+        assert_eq!(
+            classified.code.as_ref().unwrap(),
+            "antigravity_service_unavailable"
+        );
+        assert!(is_retryable(&classified));
     }
 
     #[test]
