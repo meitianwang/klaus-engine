@@ -361,7 +361,7 @@ impl Session {
                 let tier = ["low", "medium", "high"]
                     .iter()
                     .any(|tier| selection == *tier);
-                let selection_policy = if opts.model.is_some() {
+                let selection_policy = if opts.model.is_some() && !opts.feature_target_model {
                     if bundle.config.subagent_model_catalog {
                         if tier || bundle.config.subagent_model_options.is_empty() {
                             return Err("Model-directory mode requires an available concrete model from the captured directory.".into());

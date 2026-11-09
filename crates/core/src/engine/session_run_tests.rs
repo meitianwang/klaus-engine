@@ -17438,8 +17438,10 @@ async fn title_generation_runs_on_the_low_tier_model() {
 
 /// The memory-maintenance fork (extraction / consolidation / dream) is pure
 /// background work: it runs on the LOW tier.
+/// The memory model setting's default (no configured target) keeps maintenance
+/// on the session's main model even when model tiers are configured.
 #[tokio::test]
-async fn memory_extraction_fork_runs_on_the_low_tier_model() {
+async fn memory_extraction_fork_follows_the_main_model_when_no_memory_target_is_set() {
     let root = temp_store_dir();
     let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
         layout: SyncTestMemoryLayout {
@@ -17494,7 +17496,142 @@ async fn memory_extraction_fork_runs_on_the_low_tier_model() {
 
     let requests = requests.lock().unwrap();
     assert!(!requests.is_empty());
-    assert!(requests.iter().all(|req| req.model == "low-model"));
+    assert!(
+        requests.iter().all(|req| req.model == "main-model"),
+        "an unset memory model setting follows the session's main model, not a configured tier"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A configured memory model (ready feature target) must reach the maintenance
+/// fork: the admission policy for user-requested subagent model selections must
+/// not intercept internal feature-slot selections.
+#[tokio::test]
+async fn memory_extraction_fork_runs_on_the_configured_memory_feature_target() {
+    use super::{FeatureTargets, InferenceTarget, InferenceTargetState};
+    use crate::provider::anthropic::{AnthropicProvider, AnthropicProviderOptions};
+    use crate::types::provider::ModelCapabilities;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let server_capture = captured.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let mut length = 0usize;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            server_capture.lock().unwrap().push(body);
+            let error = serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":"fixture memory target rejected"}}).to_string();
+            let reply = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", error.len(), error);
+            reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+        }
+    });
+    let root = temp_store_dir();
+    let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
+        layout: SyncTestMemoryLayout {
+            base: root.to_string_lossy().into_owned(),
+        },
+        plans: Mutex::new(Vec::new()),
+        applies: Mutex::new(Vec::new()),
+        apply_results: Mutex::new(Vec::new()),
+    });
+    let mut config = default_config();
+    config.model = "main-model".into();
+    config.agent_memory = true;
+    config.auto_memory = true;
+    config.max_retries = 0;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        recording_deps(Arc::new(Mutex::new(Vec::new())), vec![text_turn("done")]),
+        config,
+        Vec::new(),
+        Some(host),
+        None,
+        None,
+        Some(vec![Message::User(UserMessage {
+            question_answer: None,
+            uuid: "feature-target-fork-input".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "remember something".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_meta: None,
+        })]),
+        None,
+    );
+    session
+        .install_feature_targets(FeatureTargets {
+            memory: Some(InferenceTargetState::Ready(InferenceTarget {
+                source: "custom".into(),
+                model_id: "memory-target-entry".into(),
+                model: "memory-target-wire".into(),
+                provider: Arc::new(AnthropicProvider::new(AnthropicProviderOptions {
+                    api_key: Some("memory-target-key".into()),
+                    base_url: Some(url),
+                    default_model: Some("memory-target-wire".into()),
+                    capabilities: Some(ModelCapabilities {
+                        tools: Some(true),
+                        context_window: Some(20_000),
+                        max_output_tokens: Some(333),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                pricing: Vec::new(),
+                review_requirements: None,
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+
+    session.maybe_extract_memories();
+    tokio::time::timeout(CROSS_THREAD_LIVENESS_TIMEOUT, async {
+        while session
+            .memory_scheduler
+            .extraction_in_progress
+            .load(Ordering::SeqCst)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feature-target extraction should terminate");
+    server.abort();
+
+    let bodies = captured.lock().unwrap();
+    assert!(
+        !bodies.is_empty(),
+        "the configured memory model must receive the maintenance fork's requests"
+    );
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body["model"].as_str() == Some("memory-target-wire")),
+        "the maintenance fork must ride the configured memory model"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -439,8 +439,8 @@ impl Session {
 
     /// The explicit child selection for a feature slot: the ready target's
     /// source-qualified identity (which the frozen-slot scan reuses), or
-    /// "inherit" so the child stays on the session's main model regardless of
-    /// any default sub-agent model.
+    /// "inherit" so an unset or unavailable slot keeps the child on the
+    /// session's main model, exactly as the memory model setting promises.
     pub(super) fn feature_model_selection(&self, slot: FeatureSlot) -> RuntimeString {
         match self.inference_snapshot().feature_targets.get(slot) {
             Some(InferenceTargetState::Ready(target)) => {

@@ -1955,10 +1955,11 @@ impl Session {
             tools: Some(tools),
             memory_dir: Some(RuntimePath::from(dir)),
             // Memory extraction/consolidation/dream are background maintenance
-            // on a named feature target: a ready slot rides its own frozen
-            // model, and an unset or unavailable slot keeps the fork on the
-            // session's main model.
+            // on the configured memory model: a ready slot rides its own frozen
+            // target, and an unset or unavailable slot follows the session's
+            // main model, matching the memory model setting.
             model: Some(self.feature_model_selection(FeatureSlot::Memory)),
+            feature_target_model: true,
             ..Default::default()
         };
         let captured_turns = Arc::new(Mutex::new(Vec::new()));

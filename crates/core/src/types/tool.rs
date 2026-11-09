@@ -383,6 +383,11 @@ pub struct SpawnSubAgentOptions {
     /// restricting which tools it can see.
     pub auto_allow_tools: Option<Vec<RuntimeString>>,
     pub model: Option<RuntimeString>,
+    /// The `model` selection is an internal feature-slot target (background
+    /// memory maintenance forks), not a user-requested subagent model: it skips
+    /// the tier-only subagent model policy and resolves against the captured
+    /// feature targets, falling back to the parent bundle when unavailable.
+    pub feature_target_model: bool,
     /// Canonical policy restrictions, intersected with the parent authority.
     pub runtime_policy: Option<crate::engine::session::RuntimePolicyUpdate>,
     /// Per-call reasoning effort for the child.
