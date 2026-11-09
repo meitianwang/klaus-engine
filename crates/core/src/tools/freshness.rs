@@ -354,7 +354,8 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_detects_files_modified_after_the_command_started() {
-        let dir = std::env::temp_dir().join(format!("klaus-freshness-sweep-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("klaus-freshness-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("tracked.txt");
         std::fs::write(&file, "original").unwrap();
@@ -370,14 +371,12 @@ mod tests {
             path.as_runtime_string().try_to_utf8().unwrap()
         );
         // A command that cannot modify files skips the sweep entirely.
-        let skipped =
-            tracked_files_modified_since(&RuntimeString::from("ls -la"), 2.0, &c).await;
+        let skipped = tracked_files_modified_since(&RuntimeString::from("ls -la"), 2.0, &c).await;
         assert!(skipped.is_empty());
         // A baseline already at (or past) the on-disk mtime is not stale.
         let disk = metadata_mtime_ms(&std::fs::metadata(&file).unwrap());
         c.record(&path, disk + 1000.0, full("original"));
-        let fresh =
-            tracked_files_modified_since(&RuntimeString::from("cargo fmt"), 2.0, &c).await;
+        let fresh = tracked_files_modified_since(&RuntimeString::from("cargo fmt"), 2.0, &c).await;
         assert!(fresh.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -404,7 +403,10 @@ mod tests {
         assert!(stale_read_hint(&[], &cwd).is_none());
         // A path outside cwd stays absolute.
         let outside = vec![RuntimePath::from("/elsewhere/x.txt")];
-        let hint = stale_read_hint(&outside, &cwd).unwrap().try_to_utf8().unwrap();
+        let hint = stale_read_hint(&outside, &cwd)
+            .unwrap()
+            .try_to_utf8()
+            .unwrap();
         assert!(hint.contains("/elsewhere/x.txt"), "{hint}");
     }
 }

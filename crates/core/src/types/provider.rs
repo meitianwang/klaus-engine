@@ -912,7 +912,7 @@ impl RuntimeDecode for ModelRequest {
                 skip_cache_write: object.optional("skipCacheWrite", &[])?,
                 cache_ttl: object.optional("cacheTtl", &[])?,
                 cache_key: object.optional("cacheKey", &[])?,
-            cache_domain: object.optional("cacheDomain", &[])?,
+                cache_domain: object.optional("cacheDomain", &[])?,
                 context_management: object.optional("contextManagement", &[])?,
                 context_hints: None,
                 thinking_context: object.optional("thinkingContext", &[])?,

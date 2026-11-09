@@ -1184,7 +1184,9 @@ mod tests {
 
     #[test]
     fn outcome_middle_truncates_large_output_and_reports_the_original_line_count() {
-        let output = rs((0..2_000).map(|i| format!("line {i}\n")).collect::<String>());
+        let output = rs((0..2_000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>());
         let (text, is_error, truncated) = render_bash_outcome_text(
             &output,
             Some(0),
