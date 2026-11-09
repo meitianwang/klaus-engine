@@ -698,7 +698,83 @@ fn adapt_anthropic_parts(parts: &mut Vec<RuntimeJson>) {
         }
         completed.push(part);
     }
-    *parts = completed;
+
+    // The cloud service attaches at most one `thinking.signature` per model
+    // Content (on the first `thought: true` part). When a turn emits multiple
+    // signed thought runs (for example, a `thinking` run followed by a
+    // `narration` run), leaving a second `thought: true` part in the same
+    // Content produces an unsigned `thinking` block that Anthropic rejects with
+    // `thinking.signature: Field required`. Coalesce all `thought: true` parts
+    // into the first signed thought part and drop unsigned thought parts when
+    // no signed thought part exists.
+    let mut primary_thought_index: Option<usize> = None;
+    let mut pending_thought_text = RuntimeString::default();
+    let mut coalesced: Vec<RuntimeJson> = Vec::with_capacity(completed.len());
+    for mut part in completed {
+        if part.get("thought").and_then(RuntimeJson::as_bool) == Some(true) {
+            let text = part
+                .get("text")
+                .and_then(RuntimeJson::as_string)
+                .cloned()
+                .unwrap_or_default();
+            let has_signature = part
+                .get("thoughtSignature")
+                .and_then(RuntimeJson::as_string)
+                .is_some_and(|sig| !sig.is_empty());
+            if primary_thought_index.is_none() && has_signature {
+                let merged_text = if pending_thought_text.is_empty() {
+                    text
+                } else {
+                    std::mem::take(&mut pending_thought_text).concat(&text)
+                };
+                if !merged_text.is_empty() {
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.insert("text", RuntimeJson::String(merged_text));
+                    }
+                    primary_thought_index = Some(coalesced.len());
+                    coalesced.push(part);
+                }
+            } else if let Some(idx) = primary_thought_index {
+                if !text.is_empty() {
+                    let existing = coalesced[idx]
+                        .get("text")
+                        .and_then(RuntimeJson::as_string)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(obj) = coalesced[idx].as_object_mut() {
+                        obj.insert("text", RuntimeJson::String(existing.concat(&text)));
+                    }
+                }
+            } else if !text.is_empty() {
+                pending_thought_text = pending_thought_text.concat(&text);
+            }
+        } else {
+            coalesced.push(part);
+        }
+    }
+
+    // Parallel tool results with inlineData/text attachments must keep all
+    // `functionResponse` parts contiguous at the front of the user Content so
+    // the translated Anthropic user message has all `tool_result` blocks
+    // immediately after the assistant `tool_use` turn.
+    if coalesced
+        .iter()
+        .any(|part| part.get("functionResponse").is_some())
+    {
+        let mut responses = Vec::with_capacity(coalesced.len());
+        let mut attachments = Vec::new();
+        for part in coalesced {
+            if part.get("functionResponse").is_some() {
+                responses.push(part);
+            } else {
+                attachments.push(part);
+            }
+        }
+        responses.extend(attachments);
+        *parts = responses;
+    } else {
+        *parts = coalesced;
+    }
 }
 
 fn adapt_model_request(request: &mut RuntimeJson, details: &Value) -> Result<(), GeminiApiError> {
@@ -1361,14 +1437,14 @@ mod tests {
         .unwrap();
         let contents = request.get("contents").unwrap().as_array().unwrap();
         let parts = contents[0].get("parts").unwrap().as_array().unwrap();
-        assert_eq!(parts.len(), 5);
+        assert_eq!(parts.len(), 4);
         assert_eq!(
             parts[0].get("text").unwrap().as_string().unwrap(),
             "visible prefix"
         );
         assert_eq!(
             parts[1].get("text").unwrap().as_string().unwrap(),
-            "signed thought"
+            "signed thoughtNew reasoning"
         );
         assert_eq!(
             parts[1]
@@ -1378,22 +1454,10 @@ mod tests {
                 .unwrap(),
             "previous-signature"
         );
+        assert!(parts[2].get("functionCall").is_some());
+        assert!(parts[2].get("thoughtSignature").is_none());
         assert_eq!(
-            parts[2].get("text").unwrap().as_string().unwrap(),
-            "New reasoning"
-        );
-        assert_eq!(
-            parts[2]
-                .get("thoughtSignature")
-                .unwrap()
-                .as_string()
-                .unwrap(),
-            "new-signature/+=="
-        );
-        assert!(parts[3].get("functionCall").is_some());
-        assert!(parts[3].get("thoughtSignature").is_none());
-        assert_eq!(
-            parts[4]
+            parts[3]
                 .get("thoughtSignature")
                 .unwrap()
                 .as_string()
@@ -1411,6 +1475,66 @@ mod tests {
             google,
             runtime_codec::decode_text::<RuntimeJson>(&RuntimeString::from(base.to_string()))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn anthropic_parallel_function_responses_precede_inline_data_attachments() {
+        let base = json!({"contents":[{"role":"user","parts":[
+            {"functionResponse":{"id":"call_1","name":"read","response":{"output":""}}},
+            {"inlineData":{"mimeType":"image/png","data":"aW1nMQ=="}},
+            {"functionResponse":{"id":"call_2","name":"read","response":{"output":""}}},
+            {"inlineData":{"mimeType":"image/png","data":"aW1nMg=="}}
+        ]}]});
+        let mut request: RuntimeJson =
+            runtime_codec::decode_text(&RuntimeString::from(base.to_string())).unwrap();
+        adapt_model_request(
+            &mut request,
+            &json!({"modelProvider":"MODEL_PROVIDER_ANTHROPIC"}),
+        )
+        .unwrap();
+        let contents = request.get("contents").unwrap().as_array().unwrap();
+        let parts = contents[0].get("parts").unwrap().as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(
+            parts[0]
+                .get("functionResponse")
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "call_1"
+        );
+        assert_eq!(
+            parts[1]
+                .get("functionResponse")
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "call_2"
+        );
+        assert_eq!(
+            parts[2]
+                .get("inlineData")
+                .unwrap()
+                .get("data")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "aW1nMQ=="
+        );
+        assert_eq!(
+            parts[3]
+                .get("inlineData")
+                .unwrap()
+                .get("data")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+            "aW1nMg=="
         );
     }
 

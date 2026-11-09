@@ -654,7 +654,9 @@ fn dialect(init: Option<&GeminiThinkingInit>) -> GeminiThinkingDialect {
 }
 
 pub(super) fn model_details(generation: &str, model: &str) -> Option<Value> {
-    let payload = cached_payload(generation)?.payload;
+    let payload = cached_payload(generation)
+        .map(|cached| cached.payload)
+        .unwrap_or_else(catalog::bundled_payload);
     catalog::model_details(&payload, model)
 }
 
