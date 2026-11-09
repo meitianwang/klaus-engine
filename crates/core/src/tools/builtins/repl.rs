@@ -17,11 +17,14 @@ use crate::engine::code_mode::runtime::repl_session::{
 };
 use crate::engine::code_mode::session::{CodeModeSessionProvider, ReplSessionHandle};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString};
+use crate::schemas::content::OutputBlock;
 use crate::tools::build_tool::text_result;
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
 use crate::types::permission::{PermissionReason, PermissionResult};
-use crate::types::tool::{Tool, ToolContext, ToolProgress, ToolResult};
+use crate::types::tool::{
+    BoxFuture, InvokeToolFn, InvokeToolResult, Tool, ToolContext, ToolProgress, ToolResult,
+};
 
 /// A name → identifier-safe key for the `tools` bridge (most engine tool names
 /// already are): every unit outside `[A-Za-z0-9_$]` becomes `_`.
@@ -312,6 +315,33 @@ impl Tool for ReplTool {
             })
             .unwrap_or(REPL_DEFAULT_TIMEOUT_MS);
         let handle = self.handle().await.map_err(ToolError::new)?;
+        let images: Arc<std::sync::Mutex<Vec<OutputBlock>>> = Arc::default();
+        let invoke_tool = ctx.invoke_tool.clone().map(|inner| {
+            let images = Arc::clone(&images);
+            Arc::new(move |name: RuntimeString, arg: RuntimeJson| {
+                let inner = Arc::clone(&inner);
+                let images = Arc::clone(&images);
+                let future: BoxFuture<'static, Result<InvokeToolResult, ToolError>> =
+                    Box::pin(async move {
+                        let result = inner(name, arg).await?;
+                        if !result.is_error {
+                            let captured: Vec<OutputBlock> = result
+                                .content
+                                .iter()
+                                .filter(|block| matches!(block, OutputBlock::Image(_)))
+                                .cloned()
+                                .collect();
+                            if !captured.is_empty() {
+                                if let Ok(mut guard) = images.lock() {
+                                    guard.extend(captured);
+                                }
+                            }
+                        }
+                        Ok(result)
+                    });
+                future
+            }) as InvokeToolFn
+        });
         let outcome = handle
             .execute(
                 ReplExecRequest {
@@ -319,14 +349,20 @@ impl Tool for ReplTool {
                     timeout_ms,
                     tools: tool_bindings(ctx),
                 },
-                ctx.invoke_tool.clone(),
+                invoke_tool,
                 &ctx.signal,
             )
             .await
             .map_err(ToolError::new)?;
         let text = render_repl_text(&outcome);
         let is_error = outcome.error.is_some();
-        Ok(text_result(repl_output(&code, &outcome), text, is_error))
+        let mut result = text_result(repl_output(&code, &outcome), text, is_error);
+        if let Ok(mut guard) = images.lock() {
+            if !guard.is_empty() {
+                result.serializable.model_content.extend(guard.drain(..));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -334,11 +370,8 @@ impl Tool for ReplTool {
 mod tests {
     use super::*;
     use crate::runtime_values::runtime_json;
-    use crate::schemas::content::OutputBlock;
     use crate::tools::builtins::test_ctx::make_ctx;
-    use crate::types::tool::{
-        BoxFuture, InvokeToolFn, InvokeToolResult, ToolCatalogEntry, ToolExposure,
-    };
+    use crate::types::tool::{ToolCatalogEntry, ToolExposure};
     use std::sync::Mutex;
 
     macro_rules! rjson {
@@ -795,6 +828,185 @@ mod tests {
             "ok",
             "the first-use note does not repeat on later execs"
         );
+    }
+
+    #[tokio::test]
+    async fn browser_prelude_positional_ax_helpers_and_non_duplicating_write() {
+        let calls: std::sync::Arc<Mutex<Vec<(RuntimeString, RuntimeJson)>>> = Default::default();
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let mut ctx = browser_ctx(calls.clone());
+        ctx.tool_catalog = Some(Box::new(|| {
+            [
+                "mcp__klaus-browser__ax_state",
+                "mcp__klaus-browser__ax_action",
+                "mcp__klaus-browser__navigate",
+                "REPL",
+            ]
+            .into_iter()
+            .map(|name| ToolCatalogEntry {
+                name: rs(name),
+                description: rs("d"),
+                search_hint: None,
+                exposure: ToolExposure::Direct,
+                spec: None,
+            })
+            .collect()
+        }));
+        let script = [
+            "const tab = browser.getTab(9);",
+            "await tab.goto('https://example.invalid');",
+            "await tab.ax.click([120, 240], { key: 'super', duration: 0.5 });",
+            "await tab.ax.typeText(null, 'hello');",
+            "await tab.ax.pressKey(4, 'Return', { duration: 0.5 });",
+            "await tab.ax.paste(4, 'clip', { format: 'html' });",
+            "await tab.ax.scroll([300, 400], 'down', 2);",
+            "await tab.ax.performSecondaryAction(4, 'Expand');",
+            "await tab.ax.get('screenshot');",
+            "await tab.ax.write('state', { disableDiffing: true });",
+        ]
+        .join(" ");
+        let arg = runtime_json::parse(&rs(&format!(r#"{{ "code": {:?} }}"#, script)))
+            .expect("call arg parses");
+        let res = tool.call(arg, &ctx, None).await.unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = String::from_utf8(text_of(&res).to_node_utf8()).unwrap();
+        assert!(
+            !text.contains("result:"),
+            "ax.write resolves to undefined so the state is not duplicated in result: {text}"
+        );
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 9);
+        assert_eq!(
+            recorded[0],
+            (
+                rs("mcp__klaus-browser__navigate"),
+                rjson!({ "url": "https://example.invalid", "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[1],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "click", "point": [120, 240], "key": "super", "duration": 0.5, "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[2],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "type_text", "text": "hello", "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[3],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "press_key", "elementIndex": 4, "key": "Return", "duration": 0.5, "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[4],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "paste", "elementIndex": 4, "text": "clip", "format": "html", "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[5],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "scroll", "direction": "down", "point": [300, 400], "pages": 2, "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[6],
+            (
+                rs("mcp__klaus-browser__ax_action"),
+                rjson!({ "action": "secondary_action", "elementIndex": 4, "name": "Expand", "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[7],
+            (
+                rs("mcp__klaus-browser__ax_state"),
+                rjson!({ "mode": "screenshot", "emitImage": false, "tabId": 9 })
+            )
+        );
+        assert_eq!(
+            recorded[8],
+            (
+                rs("mcp__klaus-browser__ax_state"),
+                rjson!({ "mode": "state", "disableDiffing": true, "tabId": 9 })
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_image_blocks_propagate_to_repl_result() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let mut ctx = make_ctx(".");
+        ctx.invoke_tool = Some(Arc::new(|_name: RuntimeString, _arg: RuntimeJson| {
+            Box::pin(async move {
+                Ok(InvokeToolResult {
+                    is_error: false,
+                    output: None,
+                    content: vec![
+                        OutputBlock::Text(crate::schemas::content::TextBlock {
+                            text: rs(
+                                "Title: Demo\nURL: https://example.invalid/\n\n[0] button \"Go\"",
+                            ),
+                            citations: None,
+                            harness_envelope: None,
+                            message_id: None,
+                            phase: None,
+                        }),
+                        OutputBlock::Image(crate::schemas::content::ImageBlock {
+                            detail: None,
+                            mime_type: rs("image/jpeg"),
+                            base64: rs("aGVsbG8="),
+                            source_path: None,
+                        }),
+                    ],
+                })
+            }) as BoxFuture<'static, Result<InvokeToolResult, ToolError>>
+        }));
+        ctx.tool_catalog = Some(Box::new(|| {
+            ["mcp__klaus-browser__ax_state", "REPL"]
+                .into_iter()
+                .map(|name| ToolCatalogEntry {
+                    name: rs(name),
+                    description: rs("d"),
+                    search_hint: None,
+                    exposure: ToolExposure::Direct,
+                    spec: None,
+                })
+                .collect()
+        }));
+        let res = tool
+            .call(
+                rjson!({ "code": "await browser.ax.write('both')" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        assert_eq!(
+            res.serializable.model_content.len(),
+            2,
+            "the text block is followed by the nested tool's image block"
+        );
+        match &res.serializable.model_content[1] {
+            OutputBlock::Image(image) => {
+                assert_eq!(image.mime_type, rs("image/jpeg"));
+                assert_eq!(image.base64, rs("aGVsbG8="));
+            }
+            other => panic!("expected an ImageBlock, got {other:?}"),
+        }
     }
 
     // ---- computer prelude ------------------------------------------------------
