@@ -4897,16 +4897,20 @@ impl Session {
     }
 
     /// A named atomic start must not accept a factory that ignored its side intent.
-    pub fn validate_ephemeral_side_task(&self, parent_thread_id: &str) -> Result<(), String> {
-        if self.persistence.store.is_some()
-            || self.persistence.rollout.is_some()
-            || self.meta.role != Some(crate::schemas::rollout::SessionRole::SideTask)
+    pub fn validate_side_task_identity(&self, parent_thread_id: &str) -> Result<(), String> {
+        if self.meta.role != Some(crate::schemas::rollout::SessionRole::SideTask)
             || self.meta.parent_thread_id.as_ref() != Some(&RuntimeString::from(parent_thread_id))
             || self.meta.forked_from_id.is_some()
         {
-            return Err("endpoint factory did not create an ephemeral side task".to_string());
+            return Err("endpoint factory did not create the requested side task".to_string());
         }
         Ok(())
+    }
+
+    /// Whether this session is the ephemeral side-task variant that persists
+    /// nothing, as opposed to a persisted side thread with its own rollout.
+    pub fn is_ephemeral(&self) -> bool {
+        self.persistence.store.is_none() && self.persistence.rollout.is_none()
     }
 
     /// Capture a complete idle transcript under the same lock that admits

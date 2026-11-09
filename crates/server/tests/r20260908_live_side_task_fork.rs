@@ -692,10 +692,17 @@ impl Fixture {
             .await
             .expect("endpoint teardown completes")
             .unwrap();
-        assert!(
-            self.store.read_thread("side").await.is_err(),
-            "source stays ephemeral"
+        let source_thread = self
+            .store
+            .read_thread("side")
+            .await
+            .expect("a persisted side task keeps its own thread");
+        assert_eq!(
+            source_thread.meta.role,
+            Some(klaus_agent_core::schemas::rollout::SessionRole::SideTask),
+            "the source thread keeps the side-task role"
         );
+        let _ = &mut source_thread;
         drop(self.config_home_guard);
     }
 }

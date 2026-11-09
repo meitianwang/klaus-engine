@@ -247,7 +247,11 @@ fn engine_sessions_with_config_root(
                 if let Some(side) = side_task {
                     let sopts = session_options()?;
                     return match side.live_snapshot {
-                        Some(snapshot) => agent.create_side_task_from_live(&snapshot, sopts).await,
+                        Some(snapshot) => {
+                            agent
+                                .create_side_task_from_live(&snapshot, sopts, store.clone())
+                                .await
+                        }
                         None => {
                             let store =
                                 store.ok_or_else(|| boxed("side task requires a session store"))?;

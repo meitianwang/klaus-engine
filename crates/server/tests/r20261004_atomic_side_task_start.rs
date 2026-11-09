@@ -348,7 +348,7 @@ impl Fixture {
     }
 }
 
-fn assert_started(reply: &Value, id: &str) {
+fn assert_started(reply: &Value, id: &str, ephemeral: bool) {
     assert!(reply.get("error").is_none(), "{reply}");
     assert_eq!(reply["result"]["sessionId"], id, "{reply}");
     assert_eq!(reply["result"]["initialized"]["threadId"], id, "{reply}");
@@ -360,7 +360,10 @@ fn assert_started(reply: &Value, id: &str) {
         reply["result"]["initialized"]["role"], "side_task",
         "{reply}"
     );
-    assert_eq!(reply["result"]["initialized"]["ephemeral"], true, "{reply}");
+    assert_eq!(
+        reply["result"]["initialized"]["ephemeral"], ephemeral,
+        "{reply}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -383,7 +386,7 @@ async fn live_side_start_uses_only_completed_context_while_parent_runs_without_a
         .await
         .unwrap();
     let side_reply = fixture.start_side(11, "side", true).await;
-    assert_started(&side_reply, "side");
+    assert_started(&side_reply, "side", true);
     let side = fixture.session("side");
     assert_eq!(message_ids(&side.history()), completed_ids());
     assert!(side.visible_history().is_empty());
@@ -428,7 +431,7 @@ async fn an_active_first_parent_turn_does_not_become_inherited_context() {
     tokio::time::timeout(REPLY_TIMEOUT, fixture.parent_entered.notified())
         .await
         .unwrap();
-    assert_started(&fixture.start_side(11, "side", false).await, "side");
+    assert_started(&fixture.start_side(11, "side", false).await, "side", true);
     assert!(fixture.session("side").history().is_empty());
     run_turn(&mut fixture.client, 12, "side", "first side request").await;
     assert_visible_side_turn(&fixture.session("side"), "first side request");
@@ -455,6 +458,15 @@ async fn cold_and_unmaterialized_parents_use_persisted_context_without_parent_st
         assert_started(
             &fixture.start_side(10, "side", unmaterialized).await,
             "side",
+            false,
+        );
+        let side_rollout = std::fs::read_dir(fixture.root.path().join("sessions"))
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .any(|name| name.to_string_lossy().ends_with("-side.jsonl"));
+        assert!(
+            side_rollout,
+            "a side task started with a session store persists its own thread"
         );
         assert_eq!(
             message_ids(&fixture.session("side").history()),
@@ -500,7 +512,7 @@ async fn invalid_sources_and_duplicate_destinations_preserve_the_existing_side()
         .await;
         assert_eq!(reply["error"]["code"], code, "{reply}");
     }
-    assert_started(&fixture.start_side(13, "side", true).await, "side");
+    assert_started(&fixture.start_side(13, "side", true).await, "side", true);
     let before = fixture.session("side");
     let repeated = fixture.start_side(14, "side", true).await;
     assert_eq!(
@@ -533,7 +545,7 @@ async fn a_factory_that_ignores_side_intent_is_rejected_and_the_identity_can_be_
     .await;
     assert_eq!(gone["error"]["code"], wire::UNKNOWN_SESSION, "{gone}");
     fixture.ignore_side.store(false, Ordering::SeqCst);
-    assert_started(&fixture.start_side(12, "side", true).await, "side");
+    assert_started(&fixture.start_side(12, "side", true).await, "side", true);
     fixture.client.close().await;
 }
 
@@ -545,7 +557,7 @@ async fn closing_an_atomic_side_endpoint_releases_its_identity() {
     })
     .await;
     fixture.start_parent(true).await;
-    assert_started(&fixture.start_side(10, "side", true).await, "side");
+    assert_started(&fixture.start_side(10, "side", true).await, "side", true);
     let closed = request(
         &mut fixture.client,
         11,
@@ -562,7 +574,7 @@ async fn closing_an_atomic_side_endpoint_releases_its_identity() {
     )
     .await;
     assert_eq!(gone["error"]["code"], wire::UNKNOWN_SESSION, "{gone}");
-    assert_started(&fixture.start_side(13, "side", true).await, "side");
+    assert_started(&fixture.start_side(13, "side", true).await, "side", true);
     fixture.client.close().await;
 }
 
@@ -670,7 +682,7 @@ async fn closing_during_a_blocked_side_factory_settles_all_replies_and_allows_sa
     .await;
     assert_eq!(gone["error"]["code"], wire::UNKNOWN_SESSION, "{gone}");
     fixture.side_factory.blocked.store(false, Ordering::SeqCst);
-    assert_started(&fixture.start_side(15, "side", true).await, "side");
+    assert_started(&fixture.start_side(15, "side", true).await, "side", true);
     run_turn(
         &mut fixture.client,
         16,

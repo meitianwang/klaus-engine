@@ -9227,7 +9227,7 @@ async fn materialize_session(
         session.flush_persistent_fork(snapshot).await?;
     }
     if let Some((parent_thread_id, target_thread_id)) = side_identity {
-        session.validate_ephemeral_side_task(parent_thread_id)?;
+        session.validate_side_task_identity(parent_thread_id)?;
         let thread_id = session
             .id
             .try_to_utf8()
@@ -9246,7 +9246,7 @@ async fn materialize_session(
             "threadId": thread_id,
             "role": "side_task",
             "parentThreadId": parent,
-            "ephemeral": true,
+            "ephemeral": session.is_ephemeral(),
         })));
     }
     Ok(None)

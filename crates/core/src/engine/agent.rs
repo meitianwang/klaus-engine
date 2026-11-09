@@ -2916,11 +2916,29 @@ impl Agent {
         store: Arc<dyn SessionStore>,
         mut sopts: StartSessionOptions,
     ) -> std::io::Result<Arc<Session>> {
+        let role = sopts.session_role.unwrap_or(SessionRole::Main);
+        self.mint_new_thread_rollout(store, &mut sopts, role)
+            .await?;
+        self.start_persisted_session(sopts).await
+    }
+
+    /// Mint the rollout for a NEW persisted thread (an ordinary open, or a
+    /// persisted side task) and attach it plus the store to `sopts`.
+    ///
+    /// A SEEDED persisted session (a fork, or a side task inheriting its parent's
+    /// completed prefix) must persist its inherited history, or a later
+    /// `resume_session` would silently drop everything before the seed point.
+    async fn mint_new_thread_rollout(
+        &self,
+        store: Arc<dyn SessionStore>,
+        sopts: &mut StartSessionOptions,
+        role: SessionRole,
+    ) -> std::io::Result<()> {
         let provider = sopts
             .provider
             .clone()
             .unwrap_or_else(|| self.opts.provider.clone());
-        let mut config = self.resolve_session_config(&sopts);
+        let mut config = self.resolve_session_config(sopts);
         let refreshed = self
             .refreshed_plugins
             .read()
@@ -2930,7 +2948,7 @@ impl Agent {
             .as_ref()
             .map(|state| &state.sources)
             .unwrap_or(&self.extension_sources);
-        let (registry_agents, _) = self.agent_definitions_for_session(&sopts, sources);
+        let (registry_agents, _) = self.agent_definitions_for_session(sopts, sources);
         Self::resolve_root_agent_definition(
             sopts.agent_definition_name.as_ref(),
             &registry_agents,
@@ -2948,7 +2966,6 @@ impl Agent {
             .clone()
             .unwrap_or_else(|| RuntimeString::from(new_uuid()));
         let now = (deps.now)();
-        let role = sopts.session_role.unwrap_or(SessionRole::Main);
         let meta = SessionMeta {
             id: id.clone(),
             created_at: now,
@@ -2967,9 +2984,6 @@ impl Agent {
             host_metadata: None,
         };
         let rollout: RolloutSink = Arc::from(store.create(meta).await?);
-        let rollout_cleanup = rollout.clone();
-        // A SEEDED persisted session (a fork) must persist its inherited prefix, or a
-        // later `resume_session` would silently drop everything before the fork point.
         if let Some(history) = &sopts.initial_history {
             for m in history {
                 rollout.append_message(m.clone()).await;
@@ -2979,6 +2993,19 @@ impl Agent {
         sopts.cwd = Some(cwd);
         sopts.rollout = Some(rollout);
         sopts.store = Some(store);
+        Ok(())
+    }
+
+    /// Start a session whose rollout was just minted: persist the initial review
+    /// checkpoint, and drain the minted rollout when startup fails.
+    async fn start_persisted_session(
+        &self,
+        sopts: StartSessionOptions,
+    ) -> std::io::Result<Arc<Session>> {
+        let rollout_cleanup = sopts
+            .rollout
+            .clone()
+            .expect("a persisted start carries its minted rollout");
         let has_initial_review_context = sopts.initial_approval_context.is_some();
         match self.try_start_session_async(sopts).await {
             Ok(session) => {
@@ -3004,13 +3031,15 @@ impl Agent {
         }
     }
 
-    /// Start an ephemeral side task off a persisted parent thread.
+    /// Start a side task off a persisted parent thread.
     ///
     /// A side task inherits the parent's completed context prefix as hidden context
-    /// prefix and then lives only in memory: no rollout is created, so nothing is
-    /// written to disk and the task cannot outlive this process. The host owns the
-    /// side task's lifetime and idle expiry; the engine only records the role so the
-    /// turn loop can inject the side-task system prompt.
+    /// prefix. With a session store it persists its own rollout under its side
+    /// thread id — the side-task role keeps it out of the default listing — so
+    /// close/resume and crash recovery rebuild it exactly like an ordinary
+    /// thread. Without a store it stays the ephemeral variant that persists
+    /// nothing. The host owns the side task's lifetime and idle expiry; the
+    /// engine records the role so the turn loop can inject the side-task prompt.
     pub async fn create_side_task(
         &self,
         store: Arc<dyn SessionStore>,
@@ -3029,8 +3058,14 @@ impl Agent {
                 })?
                 .prefix_for_messages(&inherited)
                 .checkpoint();
-        self.start_side_task(resumed.meta.id, inherited, approval_context, sopts)
-            .await
+        self.start_side_task(
+            resumed.meta.id,
+            inherited,
+            approval_context,
+            sopts,
+            Some(store),
+        )
+        .await
     }
 
     /// Create an ephemeral side task from an engine-captured completed context prefix.
@@ -3039,6 +3074,7 @@ impl Agent {
         &self,
         snapshot: &super::session::LiveSideTaskSnapshot,
         mut sopts: StartSessionOptions,
+        store: Option<Arc<dyn SessionStore>>,
     ) -> std::io::Result<Arc<Session>> {
         sopts.cwd = sopts.cwd.or_else(|| Some(snapshot.cwd.clone()));
         self.start_side_task(
@@ -3046,6 +3082,7 @@ impl Agent {
             snapshot.history.clone(),
             snapshot.approval_context.clone(),
             sopts,
+            store,
         )
         .await
     }
@@ -3056,6 +3093,7 @@ impl Agent {
         inherited: Vec<Message>,
         approval_context: super::approval_capture::ReviewParentCheckpoint,
         mut sopts: StartSessionOptions,
+        store: Option<Arc<dyn SessionStore>>,
     ) -> std::io::Result<Arc<Session>> {
         if sopts.id.as_ref() == Some(&parent_thread_id) {
             return Err(std::io::Error::new(
@@ -3096,12 +3134,24 @@ impl Agent {
                     .unwrap_or_else(default_cwd),
             );
         }
-        // No rollout and no store: an ephemeral session persists nothing.
-        sopts.rollout = None;
-        sopts.store = None;
-        self.try_start_session_async(sopts)
-            .await
-            .map_err(SessionInitError::into_io_error)
+        match store {
+            Some(store) => {
+                // Persisted side task: its own rollout under the side thread id.
+                // The side-task role keeps it out of the default listing while
+                // close/resume and crash recovery rebuild it like any thread.
+                self.mint_new_thread_rollout(store, &mut sopts, SessionRole::SideTask)
+                    .await?;
+                self.start_persisted_session(sopts).await
+            }
+            None => {
+                // No session store: the ephemeral variant persists nothing.
+                sopts.rollout = None;
+                sopts.store = None;
+                self.try_start_session_async(sopts)
+                    .await
+                    .map_err(SessionInitError::into_io_error)
+            }
+        }
     }
 
     /// Fork a persisted session into a new rollout while retaining the source
