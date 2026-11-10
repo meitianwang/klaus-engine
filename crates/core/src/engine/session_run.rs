@@ -2952,6 +2952,7 @@ impl Session {
                             }
                         }
                         this.maybe_extract_memories();
+                        this.maybe_extract_session_memory();
                         this.maybe_auto_dream();
                     }
                 }

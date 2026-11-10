@@ -80,6 +80,19 @@ pub type UuidFn = Box<dyn Fn() -> String + Send + Sync>;
 pub type CompactionOutputSink =
     Arc<dyn Fn(Message) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// Optional hook allowing the owning session to satisfy compaction from its
+/// continuously maintained per-session running notes (`summary.md`) before
+/// falling back to a full-history model summarization request.
+#[async_trait::async_trait]
+pub trait SessionMemoryCompactProvider: Send + Sync {
+    async fn try_compact_with_session_memory(
+        &self,
+        messages: &[Message],
+        config: &ResolvedConfig,
+        instructions: Option<&RuntimeString>,
+    ) -> Option<CompactionResult>;
+}
+
 /// Construction options for [`create_full_compactor`].
 pub struct FullCompactorOptions {
     pub call_model: CallModel,
@@ -107,6 +120,7 @@ pub struct FullCompactor {
     signal: Mutex<AbortSignal>,
     provider: Mutex<Option<Arc<dyn ModelProvider>>>,
     output: Mutex<Option<CompactionOutputSink>>,
+    session_memory: Mutex<Option<Arc<dyn SessionMemoryCompactProvider>>>,
 }
 
 impl std::fmt::Debug for FullCompactor {
@@ -127,6 +141,7 @@ pub fn create_full_compactor(options: FullCompactorOptions) -> FullCompactor {
         signal: Mutex::new(AbortSignal::new()),
         provider: Mutex::new(None),
         output: Mutex::new(None),
+        session_memory: Mutex::new(None),
     }
 }
 
@@ -146,7 +161,16 @@ impl FullCompactor {
             signal: Mutex::new(AbortSignal::new()),
             provider: Mutex::new(None),
             output: Mutex::new(None),
+            session_memory: Mutex::new(None),
         }
+    }
+
+    pub(super) fn retain_session_memory_from(&self, other: &Self) {
+        *self.session_memory.lock().unwrap() = other.session_memory.lock().unwrap().clone();
+    }
+
+    pub fn bind_session_memory(&self, provider: Option<Arc<dyn SessionMemoryCompactProvider>>) {
+        *self.session_memory.lock().unwrap() = provider;
     }
 
     pub fn bind_native_provider(&self, provider: Arc<dyn ModelProvider>) {
@@ -373,6 +397,19 @@ impl FullCompactor {
                     }
                 })
                 .await;
+            }
+            if instructions.is_none() {
+                let sm_provider = self.session_memory.lock().unwrap().clone();
+                if let Some(sm_provider) = sm_provider {
+                    if let Some(sm_result) = sm_provider
+                        .try_compact_with_session_memory(&messages, config, instructions)
+                        .await
+                    {
+                        if sm_result.compacted {
+                            return sm_result;
+                        }
+                    }
+                }
             }
         }
         let mut request = self.summary_request(&messages, config, instructions);

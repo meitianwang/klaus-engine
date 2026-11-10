@@ -680,6 +680,18 @@ pub(crate) struct SessionMemoryScheduler {
     dream_in_progress: AtomicBool,
     next_dream_owner: AtomicU64,
     active_dream_owner: AtomicU64,
+    session_memory_config: Mutex<crate::memory::session_memory::SessionMemoryConfig>,
+    session_memory_compact_config: Mutex<crate::memory::session_memory::SessionMemoryCompactConfig>,
+    session_memory_initialized: AtomicBool,
+    tokens_at_last_session_memory: AtomicU64,
+    last_session_memory_cursor_uuid: Mutex<Option<RuntimeString>>,
+    last_summarized_message_id: Mutex<Option<RuntimeString>>,
+    session_memory_started_at: AtomicI64,
+    session_memory_in_progress: AtomicBool,
+    session_memory_settled: Arc<tokio::sync::Notify>,
+    /// Cancellation handle for the in-flight session-notes fork, so shutdown
+    /// can abort it like every other maintenance task.
+    session_memory_abort: Mutex<Option<CancellationToken>>,
 }
 
 /// The session's live turn-loop runtime cluster: the ordered live-turn stack
@@ -1548,6 +1560,27 @@ pub(crate) struct ActiveOutputStyle {
 pub(crate) enum SlashCommandOutcome {
     Prompt(Vec<ContentBlock>),
     Local(LocalRunOutcome),
+}
+
+pub(crate) struct SessionMemoryCompactAdapter {
+    pub(crate) session: Weak<Session>,
+}
+
+#[async_trait::async_trait]
+impl crate::context::compact::full_compact::SessionMemoryCompactProvider
+    for SessionMemoryCompactAdapter
+{
+    async fn try_compact_with_session_memory(
+        &self,
+        messages: &[Message],
+        config: &ResolvedConfig,
+        instructions: Option<&RuntimeString>,
+    ) -> Option<crate::context::compact::full_compact::CompactionResult> {
+        let session = self.session.upgrade()?;
+        session
+            .try_session_memory_compaction(messages, config, instructions)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------

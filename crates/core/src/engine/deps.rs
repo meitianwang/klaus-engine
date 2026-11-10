@@ -146,6 +146,14 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    fn bind_session_memory(
+        &self,
+        _provider: Option<
+            Arc<dyn crate::context::compact::full_compact::SessionMemoryCompactProvider>,
+        >,
+    ) {
+    }
+
     /// True when a summary would run through the provider's native remote
     /// compaction channel instead of a model request. Native checkpoints are
     /// stateful on the provider side, so background precomputation stays off

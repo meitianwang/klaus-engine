@@ -446,6 +446,14 @@ impl Compactor for RealCompactorBridge {
     ) {
         self.0.bind_output_observer(observer);
     }
+    fn bind_session_memory(
+        &self,
+        provider: Option<
+            Arc<dyn crate::context::compact::full_compact::SessionMemoryCompactProvider>,
+        >,
+    ) {
+        self.0.bind_session_memory(provider);
+    }
     fn prepare_request(&self, request: &ModelRequest, signal: &AbortSignal) {
         self.0.prepare_request(request, signal);
     }

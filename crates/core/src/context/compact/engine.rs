@@ -128,6 +128,14 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    fn bind_session_memory(
+        &self,
+        _provider: Option<
+            Arc<dyn crate::context::compact::full_compact::SessionMemoryCompactProvider>,
+        >,
+    ) {
+    }
+
     /// Supply the live request prefix for a cache-preserving summary fork.
     fn prepare_request(
         &self,
@@ -223,6 +231,7 @@ impl Compactor for RealCompactor {
     ) -> Result<Arc<dyn Compactor>, String> {
         let mut full = self.full.rebind_model(call_model, config);
         full.pin_summary_target(config);
+        full.retain_session_memory_from(&self.full);
         Ok(Arc::new(Self {
             full: Arc::new(full),
         }))
@@ -238,6 +247,13 @@ impl Compactor for RealCompactor {
 
     fn bind_output_observer(&self, observer: Option<super::full_compact::CompactionOutputSink>) {
         self.full.bind_output_observer(observer);
+    }
+
+    fn bind_session_memory(
+        &self,
+        provider: Option<Arc<dyn super::full_compact::SessionMemoryCompactProvider>>,
+    ) {
+        self.full.bind_session_memory(provider);
     }
 
     fn prepare_request(

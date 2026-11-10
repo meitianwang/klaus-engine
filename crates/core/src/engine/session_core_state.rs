@@ -406,6 +406,108 @@ impl SessionMemoryScheduler {
     pub(crate) fn set_last_memory_uuid(&self, uuid: Option<RuntimeString>) {
         *self.last_memory_message_uuid.lock_recover() = uuid;
     }
+
+    // ---- per-session running notes (SessionMemory) ----
+
+    pub(crate) fn session_memory_config(
+        &self,
+    ) -> crate::memory::session_memory::SessionMemoryConfig {
+        *self.session_memory_config.lock_recover()
+    }
+
+    pub(crate) fn set_session_memory_config(
+        &self,
+        config: crate::memory::session_memory::SessionMemoryConfig,
+    ) {
+        *self.session_memory_config.lock_recover() = config;
+    }
+
+    pub(crate) fn session_memory_compact_config(
+        &self,
+    ) -> crate::memory::session_memory::SessionMemoryCompactConfig {
+        *self.session_memory_compact_config.lock_recover()
+    }
+
+    pub(crate) fn set_session_memory_compact_config(
+        &self,
+        config: crate::memory::session_memory::SessionMemoryCompactConfig,
+    ) {
+        *self.session_memory_compact_config.lock_recover() = config;
+    }
+
+    pub(crate) fn is_session_memory_initialized(&self) -> bool {
+        self.session_memory_initialized.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_session_memory_initialized(&self) {
+        self.session_memory_initialized
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn tokens_at_last_session_memory(&self) -> u64 {
+        self.tokens_at_last_session_memory.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_session_memory_token_count(&self, tokens: u64) {
+        self.tokens_at_last_session_memory
+            .store(tokens, Ordering::SeqCst);
+    }
+
+    pub(crate) fn last_session_memory_cursor_uuid(&self) -> Option<RuntimeString> {
+        self.last_session_memory_cursor_uuid.lock_recover().clone()
+    }
+
+    pub(crate) fn set_last_session_memory_cursor_uuid(&self, uuid: Option<RuntimeString>) {
+        *self.last_session_memory_cursor_uuid.lock_recover() = uuid;
+    }
+
+    pub(crate) fn last_summarized_message_id(&self) -> Option<RuntimeString> {
+        self.last_summarized_message_id.lock_recover().clone()
+    }
+
+    pub(crate) fn set_last_summarized_message_id(&self, uuid: Option<RuntimeString>) {
+        *self.last_summarized_message_id.lock_recover() = uuid;
+    }
+
+    pub(crate) fn try_begin_session_memory(&self, now_ms: i64) -> bool {
+        if self
+            .session_memory_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.session_memory_started_at
+                .store(now_ms.max(1), Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn finish_session_memory(&self) {
+        self.session_memory_started_at.store(0, Ordering::SeqCst);
+        self.session_memory_in_progress
+            .store(false, Ordering::SeqCst);
+        self.session_memory_settled.notify_waiters();
+    }
+
+    pub(crate) fn session_memory_started_at(&self) -> i64 {
+        self.session_memory_started_at.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn session_memory_settled(&self) -> Arc<tokio::sync::Notify> {
+        self.session_memory_settled.clone()
+    }
+
+    pub(crate) fn set_session_memory_abort(
+        &self,
+        token: Option<tokio_util::sync::CancellationToken>,
+    ) {
+        *self.session_memory_abort.lock_recover() = token;
+    }
+
+    pub(crate) fn take_session_memory_abort(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.session_memory_abort.lock_recover().take()
+    }
 }
 
 impl SessionMaintenanceState {
@@ -1527,6 +1629,20 @@ impl Session {
                 dream_in_progress: AtomicBool::new(false),
                 next_dream_owner: AtomicU64::new(1),
                 active_dream_owner: AtomicU64::new(0),
+                session_memory_config: Mutex::new(
+                    crate::memory::session_memory::SessionMemoryConfig::default(),
+                ),
+                session_memory_compact_config: Mutex::new(
+                    crate::memory::session_memory::SessionMemoryCompactConfig::default(),
+                ),
+                session_memory_initialized: AtomicBool::new(false),
+                tokens_at_last_session_memory: AtomicU64::new(0),
+                last_session_memory_cursor_uuid: Mutex::new(None),
+                last_summarized_message_id: Mutex::new(None),
+                session_memory_started_at: AtomicI64::new(0),
+                session_memory_in_progress: AtomicBool::new(false),
+                session_memory_settled: Arc::new(tokio::sync::Notify::new()),
+                session_memory_abort: Mutex::new(None),
             },
             #[cfg(test)]
             dream_before_lock_hook: Mutex::new(None),
@@ -1591,6 +1707,17 @@ impl Session {
         // This prevents constructor return from racing an eager visible
         // mutation before protocol has installed its ordered sink.
         session.snapshot.set_self_ref(Arc::downgrade(&session));
+        if session.meta.role.is_none() {
+            session
+                .inference
+                .read()
+                .unwrap()
+                .deps
+                .compactor
+                .bind_session_memory(Some(Arc::new(super::SessionMemoryCompactAdapter {
+                    session: Arc::downgrade(&session),
+                })));
+        }
         // Scheduled prompts: auto-start the cron scheduler when the project
         // file already has tasks (CronCreate starts it lazily otherwise).
         session.start_cron_scheduler_if_project_has_tasks();
@@ -1613,10 +1740,12 @@ impl Session {
             if let Some(dir) = this.memory_roots.main().cloned() {
                 let session = Arc::downgrade(this);
                 let now = this.deps.now.clone();
+                let now_for_usage = now.clone();
                 out.push(Arc::new(create_memory_recall_reminder_provider(
                     MemoryRecallDeps {
                         recall: Box::new(move |query: RuntimeString, ctx: RecallContext| {
                             let dir = dir.clone();
+                            let now_for_usage = now_for_usage.clone();
                             let capture = session
                                 .upgrade()
                                 .ok_or_else(|| "memory recall session closed".to_string())
@@ -1629,10 +1758,10 @@ impl Session {
                                 let call_model = bundle.deps.call_model_owned();
                                 let model = bundle.config.model.clone();
                                 let store = TypedMemoryStore::new(TypedMemoryStoreOptions {
-                                    dir: Some(RuntimePath::from(dir)),
+                                    dir: Some(RuntimePath::from(dir.clone())),
                                     redact_secrets: None,
                                 });
-                                store
+                                let picked = store
                                     .recall_semantic(
                                         &query,
                                         RecallSemanticOptions {
@@ -1645,7 +1774,33 @@ impl Session {
                                         },
                                     )
                                     .await
-                                    .map_err(|e| Box::new(e) as RecallError)
+                                    .map_err(|e| Box::new(e) as RecallError)?;
+                                if !picked.is_empty() {
+                                    // Record recall usage so consolidation can tell
+                                    // proven core memories from stale ones. The
+                                    // ledger is best-effort statistics; a failure
+                                    // here must never fail the recall itself.
+                                    let stems: Vec<String> = picked
+                                        .iter()
+                                        .filter_map(|record| {
+                                            record.path.try_to_utf8().ok().and_then(|path| {
+                                                std::path::Path::new(&path)
+                                                    .file_stem()
+                                                    .map(|stem| stem.to_string_lossy().into_owned())
+                                            })
+                                        })
+                                        .collect();
+                                    let usage_dir = dir.clone();
+                                    tokio::spawn(async move {
+                                        crate::memory::usage::record_usage(
+                                            &usage_dir,
+                                            &stems,
+                                            now_for_usage(),
+                                        )
+                                        .await;
+                                    });
+                                }
+                                Ok(picked)
                             })
                         }),
                         now: Box::new(move || now()),

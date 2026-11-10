@@ -1,10 +1,13 @@
 pub mod agent_memory;
+pub mod baseline;
 pub mod consolidation_lock;
 pub mod maintenance;
 pub mod memory_age;
 pub mod memory_recall_reminder;
 pub mod pinned_root;
+pub mod session_memory;
 pub mod snapshot_decision;
 pub mod store;
 pub mod sync;
 pub mod types;
+pub mod usage;

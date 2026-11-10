@@ -11192,7 +11192,7 @@ async fn shutdown_cancels_auto_memory_with_one_terminal_and_keeps_the_cursor() {
         None,
         Some(vec![
             fork_user("memory-cursor-before-shutdown"),
-            fork_user("memory-after-cursor"),
+            fork_user_text("memory-after-cursor", "memory after the cursor"),
         ]),
         None,
     );
@@ -11293,7 +11293,10 @@ async fn auto_memory_provider_panic_is_terminal_and_releases_single_flight_for_r
         Some(host),
         None,
         None,
-        Some(vec![fork_user("panic-memory-input")]),
+        Some(vec![fork_user_text(
+            "panic-memory-input",
+            "panic memory input message",
+        )]),
         None,
     );
 
@@ -13716,7 +13719,10 @@ async fn auto_memory_turn_count_excludes_transient_provider_retries() {
         Some(host),
         None,
         None,
-        Some(vec![fork_user("retry-count-input")]),
+        Some(vec![fork_user_text(
+            "retry-count-input",
+            "retry count input message",
+        )]),
         None,
     );
 
@@ -13791,7 +13797,10 @@ async fn auto_memory_fails_at_five_turn_budget_without_advancing_cursor() {
         Some(host),
         None,
         None,
-        Some(vec![fork_user("five-turn-budget-input")]),
+        Some(vec![fork_user_text(
+            "five-turn-budget-input",
+            "five turn budget input message",
+        )]),
         None,
     );
 
@@ -15514,11 +15523,18 @@ async fn dropping_an_older_overlapping_turn_keeps_the_newer_turn_active() {
 }
 
 fn fork_user(id: &str) -> Message {
+    fork_user_text(id, id)
+}
+
+/// A user message whose uuid and text differ. The auto-memory prose gate skips
+/// one- or two-word turns, so tests that must reach the extraction fork need
+/// substantive text while keeping a stable single-token uuid for assertions.
+fn fork_user_text(id: &str, text: &str) -> Message {
     Message::User(UserMessage {
         question_answer: None,
         uuid: id.into(),
         content: vec![ContentBlock::Text(TextBlock {
-            text: id.into(),
+            text: text.into(),
             citations: None,
             harness_envelope: None,
             message_id: None,
@@ -17880,4 +17896,421 @@ async fn internal_shell_notice_retains_harness_provenance_in_the_queue() {
         matches!(blocks.as_slice(), [ContentBlock::Text(text)] if text.harness_envelope == Some(crate::schemas::content::HarnessEnvelope::SystemReminder) && text.text.contains("fixture-shell"))
     );
     session.dispose().await;
+}
+
+// ---- per-session running notes (session memory) regressions ----
+
+fn assistant_with_tool_use(id: &str, tool_name: &str, call_id: &str) -> Message {
+    let mut message = fork_assistant(id);
+    if let Message::Assistant(message) = &mut message {
+        message.content.push(ContentBlock::ToolUse(
+            crate::schemas::content::ToolUseBlock {
+                id: call_id.into(),
+                name: tool_name.into(),
+                input: RuntimeJson::Object(RuntimeObject::new()),
+                tool_kind: None,
+                thought_signature: None,
+            },
+        ));
+    }
+    message
+}
+
+fn big_assistant(id: &str, text_len: usize) -> Message {
+    let mut message = fork_assistant(id);
+    if let Message::Assistant(message) = &mut message {
+        message.content = vec![ContentBlock::Text(TextBlock {
+            text: "x".repeat(text_len).into(),
+            citations: None,
+            harness_envelope: None,
+            message_id: None,
+            phase: None,
+        })];
+    }
+    message
+}
+
+async fn wait_for_auto_memory_skip(session: &Arc<Session>) {
+    tokio::time::timeout(CROSS_THREAD_LIVENESS_TIMEOUT, async {
+        loop {
+            let recorded = session
+                .memory_maintenance_snapshot()
+                .map(|snapshot| !snapshot.auto_memory_runs.is_empty())
+                .unwrap_or(false);
+            if recorded {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the skip run must be recorded");
+}
+
+async fn wait_for_auto_memory_skip_with_cursor(session: &Arc<Session>, expected_cursor: &str) {
+    let expected = RuntimeString::from(expected_cursor);
+    tokio::time::timeout(CROSS_THREAD_LIVENESS_TIMEOUT, async {
+        loop {
+            let recorded = session
+                .memory_maintenance_snapshot()
+                .map(|snapshot| !snapshot.auto_memory_runs.is_empty())
+                .unwrap_or(false);
+            if recorded && session.memory_message_cursor() == Some(expected.clone()) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the skip run and its cursor commit must be recorded");
+}
+
+/// The auto-memory prose gate must skip one- or two-word user turns without
+/// forking: nothing substantive was said since the cursor, so a fork would
+/// re-mine the same conversation for the price of a model call. The durable
+/// cursor deliberately does NOT advance, so the short turns are still mined
+/// together with the next substantive message.
+#[tokio::test]
+async fn auto_memory_prose_gate_skips_short_turns_without_a_model_call() {
+    let root = temp_store_dir();
+    let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
+        layout: SyncTestMemoryLayout {
+            base: root.to_string_lossy().into_owned(),
+        },
+        plans: Mutex::new(Vec::new()),
+        applies: Mutex::new(Vec::new()),
+        apply_results: Mutex::new(Vec::new()),
+    });
+    std::fs::create_dir_all(host.layout().dir_for("main", AgentMemoryScope::Project)).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = default_config();
+    config.agent_memory = true;
+    config.auto_memory = true;
+    config.max_retries = 0;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        counting_dream_deps(calls.clone(), 0),
+        config,
+        Vec::new(),
+        Some(host),
+        None,
+        None,
+        Some(vec![fork_user_text("prose-gate-word", "ok")]),
+        None,
+    );
+
+    session.maybe_extract_memories();
+    wait_for_auto_memory_skip(&session).await;
+
+    let snapshot = session.memory_maintenance_snapshot().unwrap();
+    assert_eq!(snapshot.auto_memory_runs.len(), 1);
+    let run = &snapshot.auto_memory_runs[0];
+    assert_eq!(run.status, MemoryMaintenanceStatus::Skipped);
+    assert_eq!(run.reason, Some(AutoMemoryRunReason::EmptyInput));
+    assert_eq!(run.cursor_message_uuid, None);
+    assert_eq!(
+        session.memory_message_cursor(),
+        None,
+        "the prose gate must not move the durable cursor"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the prose gate must never reach the model"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A successful `save_memory` call inside the mined window counts as a direct
+/// memory write: the main agent already persisted memory itself, so the
+/// background extraction must stand down instead of mining the same turn.
+#[tokio::test]
+async fn successful_save_memory_call_skips_extraction_as_a_direct_memory_write() {
+    let root = temp_store_dir();
+    let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
+        layout: SyncTestMemoryLayout {
+            base: root.to_string_lossy().into_owned(),
+        },
+        plans: Mutex::new(Vec::new()),
+        applies: Mutex::new(Vec::new()),
+        apply_results: Mutex::new(Vec::new()),
+    });
+    std::fs::create_dir_all(host.layout().dir_for("main", AgentMemoryScope::Project)).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = default_config();
+    config.agent_memory = true;
+    config.auto_memory = true;
+    config.max_retries = 0;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        counting_dream_deps(calls.clone(), 0),
+        config,
+        Vec::new(),
+        Some(host),
+        None,
+        None,
+        Some(vec![
+            fork_user_text("smx-user", "please remember this preference"),
+            assistant_with_tool_use("smx-assistant", "save_memory", "call-smx-result"),
+            fork_tool_result("smx-result"),
+        ]),
+        None,
+    );
+
+    session.maybe_extract_memories();
+    wait_for_auto_memory_skip_with_cursor(&session, "smx-result").await;
+
+    let snapshot = session.memory_maintenance_snapshot().unwrap();
+    assert_eq!(snapshot.auto_memory_runs.len(), 1);
+    let run = &snapshot.auto_memory_runs[0];
+    assert_eq!(run.status, MemoryMaintenanceStatus::Skipped);
+    assert_eq!(run.reason, Some(AutoMemoryRunReason::DirectMemoryWrite));
+    assert_eq!(run.cursor_message_uuid, Some("smx-result".into()));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a direct memory write must never spawn a model fork"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Compaction must be able to fuse the per-session running notes: when the
+/// notes file holds real content, `try_session_memory_compaction` replaces the
+/// summarized prefix with the notes carried on the compact boundary, keeps the
+/// recent tail, never splits a tool_use/tool_result pair, and never calls the
+/// model. Explicit compaction instructions bypass the notes path entirely.
+#[tokio::test]
+async fn session_memory_compaction_fuses_notes_and_preserves_tool_pairs() {
+    let root = temp_store_dir();
+    let config_home = root.join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
+    let _config_guard = ConfigEnvGuard::set(config_home.to_string_lossy().as_ref());
+    let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
+        layout: SyncTestMemoryLayout {
+            base: root.to_string_lossy().into_owned(),
+        },
+        plans: Mutex::new(Vec::new()),
+        applies: Mutex::new(Vec::new()),
+        apply_results: Mutex::new(Vec::new()),
+    });
+    let memory_dir = PathBuf::from(host.layout().dir_for("main", AgentMemoryScope::Project));
+    std::fs::create_dir_all(&memory_dir).unwrap();
+    let notes_path = crate::memory::session_memory::session_memory_path(
+        memory_dir.to_str().expect("scalar host path"),
+        "s1",
+    );
+    std::fs::create_dir_all(notes_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &notes_path,
+        "# Session Notes\n\nSeeded summary content for the fusion test.\n",
+    )
+    .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = default_config();
+    config.agent_memory = true;
+    config.max_retries = 0;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        counting_dream_deps(calls.clone(), 0),
+        config,
+        Vec::new(),
+        Some(host),
+        None,
+        None,
+        None,
+        None,
+    );
+    session.set_session_memory_compact_config(
+        crate::memory::session_memory::SessionMemoryCompactConfig {
+            min_tokens: 0,
+            min_text_block_messages: 0,
+            max_tokens: 1_000_000,
+        },
+    );
+    session
+        .memory_scheduler
+        .set_last_summarized_message_id(Some("smc-m3".into()));
+
+    let messages = vec![
+        fork_user_text("smc-m0", "initial request text"),
+        big_assistant("smc-m1", 20_000),
+        fork_user_text("smc-m2", "follow up question text"),
+        assistant_with_tool_use("smc-m3", "read", "call-smc-m4"),
+        fork_tool_result("smc-m4"),
+        fork_user_text("smc-m5", "another user message"),
+        fork_assistant("smc-m6"),
+    ];
+
+    let result = session
+        .try_session_memory_compaction(&messages, &default_config(), None)
+        .await
+        .expect("seeded running notes must drive compaction");
+    assert!(result.compacted);
+    assert!(
+        result.freed_tokens > 0,
+        "the bulky summarized prefix must free tokens"
+    );
+    assert_eq!(result.messages.len(), 7);
+    assert_eq!(
+        message_uuid(&result.messages[0]),
+        &RuntimeString::from("smc-m0")
+    );
+    assert_eq!(
+        message_uuid(&result.messages[1]),
+        &RuntimeString::from("smc-m2")
+    );
+    let Message::CompactBoundary(boundary) = &result.messages[2] else {
+        panic!("the notes must ride a compact boundary");
+    };
+    let summary_text = boundary
+        .summary
+        .try_to_utf8()
+        .expect("summary must be valid text");
+    assert!(summary_text.contains("Seeded summary content"));
+    // The kept tail starts with the assistant tool_use whose result follows:
+    // the invariant adjustment pulled the cut back so the pair survives.
+    assert_eq!(
+        message_uuid(&result.messages[3]),
+        &RuntimeString::from("smc-m3")
+    );
+    let Message::Assistant(kept_assistant) = &result.messages[3] else {
+        panic!("expected the tool_use assistant message");
+    };
+    assert!(kept_assistant.content.iter().any(|block| matches!(
+        block,
+        ContentBlock::ToolUse(tool_use) if tool_use.id == "call-smc-m4"
+    )));
+    let Message::ToolResult(kept_result) = &result.messages[4] else {
+        panic!("expected the paired tool result");
+    };
+    assert_eq!(kept_result.tool_use_id, RuntimeString::from("call-smc-m4"));
+    assert_eq!(
+        message_uuid(&result.messages[5]),
+        &RuntimeString::from("smc-m5")
+    );
+    assert_eq!(
+        message_uuid(&result.messages[6]),
+        &RuntimeString::from("smc-m6")
+    );
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|m| message_uuid(m) == &RuntimeString::from("smc-m1")),
+        "the bulky summarized assistant message must be dropped"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "notes fusion must not call the model"
+    );
+
+    assert!(
+        session
+            .try_session_memory_compaction(
+                &messages,
+                &default_config(),
+                Some(&RuntimeString::from("custom compaction instructions")),
+            )
+            .await
+            .is_none(),
+        "explicit compaction instructions must bypass the notes path"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Manual running-notes extraction must create the notes file inside the
+/// pinned memory root, let the restricted fork rewrite it, and advance the
+/// summarized-message cursor to the end of history when the last assistant
+/// turn is complete (no dangling tool calls).
+#[tokio::test]
+async fn manual_session_memory_extraction_updates_notes_and_advances_the_cursor() {
+    let root = temp_store_dir();
+    let config_home = root.join("config");
+    std::fs::create_dir_all(&config_home).unwrap();
+    let _config_guard = ConfigEnvGuard::set(config_home.to_string_lossy().as_ref());
+    let host: Arc<dyn AgentMemoryHost> = Arc::new(SyncTestMemoryHost {
+        layout: SyncTestMemoryLayout {
+            base: root.to_string_lossy().into_owned(),
+        },
+        plans: Mutex::new(Vec::new()),
+        applies: Mutex::new(Vec::new()),
+        apply_results: Mutex::new(Vec::new()),
+    });
+    let memory_dir = PathBuf::from(host.layout().dir_for("main", AgentMemoryScope::Project));
+    std::fs::create_dir_all(&memory_dir).unwrap();
+    let notes_path = crate::memory::session_memory::session_memory_path(
+        memory_dir.to_str().expect("scalar host path"),
+        "s1",
+    );
+    let notes_rel = ".session-memory/s1/summary.md";
+
+    let mut edit_input = RuntimeObject::new();
+    edit_input.insert(
+        "path",
+        RuntimeJson::String(RuntimeString::from(notes_rel.to_string())),
+    );
+    edit_input.insert(
+        "oldString",
+        RuntimeJson::String(RuntimeString::from(
+            "_A short and distinctive 5-10 word descriptive title for the session. Super info dense, no filler_"
+                .to_string(),
+        )),
+    );
+    edit_input.insert(
+        "newString",
+        RuntimeJson::String(RuntimeString::from(
+            "_Updated by the restricted memory fork fixture_".to_string(),
+        )),
+    );
+    let mut edit_turn = vec![ev::message_start(None)];
+    edit_turn.extend(exact_tool_use_events(
+        "smnow-edit",
+        "edit",
+        &RuntimeJson::Object(edit_input),
+    ));
+    edit_turn.push(ev::stop(Some(ModelStopReason::ToolUse), None));
+
+    let mut config = default_config();
+    config.agent_memory = true;
+    config.auto_memory = true;
+    config.max_retries = 0;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        mk_deps(vec![edit_turn, text_turn("done")]),
+        config,
+        vec![
+            crate::tools::builtins::edit::create_edit_tool(),
+            create_write_tool(),
+        ],
+        Some(host),
+        None,
+        None,
+        Some(vec![
+            fork_user_text("smnow-user", "please summarize this session"),
+            fork_assistant("smnow-assistant"),
+        ]),
+        None,
+    );
+
+    let returned = session
+        .extract_session_memory_now()
+        .await
+        .expect("manual running-notes extraction must succeed");
+    assert_eq!(returned, notes_path);
+    let content = std::fs::read_to_string(&notes_path).unwrap();
+    assert!(
+        content.contains("Updated by the restricted memory fork fixture"),
+        "the fork's edit must land in the notes file"
+    );
+    assert_eq!(
+        session.memory_scheduler.last_summarized_message_id(),
+        Some("smnow-assistant".into())
+    );
+    assert!(
+        session.memory_scheduler.tokens_at_last_session_memory() > 0,
+        "the extraction must record the summarized token watermark"
+    );
+    std::fs::remove_dir_all(root).ok();
 }

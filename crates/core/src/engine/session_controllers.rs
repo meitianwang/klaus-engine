@@ -1,6 +1,7 @@
 use super::base_hook_input;
 use super::build_consolidation_prompt;
 use super::build_extraction_prompt;
+use super::build_memory_manifest;
 use super::extract_dream_summary;
 use super::join_runtime_strings;
 use super::memory_fork_tool_mutates;
@@ -1501,10 +1502,16 @@ impl Session {
                 let ContentBlock::ToolUse(tu) = b else {
                     continue;
                 };
-                if tu.name != "write" && tu.name != "edit" {
+                if !successful_results.contains(&tu.id) {
                     continue;
                 }
-                if !successful_results.contains(&tu.id) {
+                // The dedicated memory tool writes the user-tier memory file:
+                // the main agent already handled memory this turn, so the
+                // background extraction would be redundant.
+                if tu.name == "save_memory" {
+                    return true;
+                }
+                if tu.name != "write" && tu.name != "edit" {
                     continue;
                 }
                 if let Some(p) = tu.input.get("path").and_then(|v| v.as_str()) {
@@ -1516,6 +1523,30 @@ impl Session {
             }
         }
         false
+    }
+
+    /// Whether any user message in `msgs` carries substantive prose worth
+    /// mining. Meta messages are the machine talking to itself, and a one- or
+    /// two-word turn ("yes", "go on", "fix it") holds nothing durable —
+    /// extracting from those spends a forked model call rediscovering what the
+    /// last run already found.
+    pub(crate) fn has_user_prose_since(msgs: &[Message]) -> bool {
+        const MIN_PROSE_WORDS: usize = 3;
+        msgs.iter().any(|message| {
+            let Message::User(user) = message else {
+                return false;
+            };
+            if user.is_meta == Some(true) {
+                return false;
+            }
+            user.content.iter().any(|block| match block {
+                ContentBlock::Text(text) => text
+                    .text
+                    .try_to_utf8()
+                    .is_ok_and(|raw| raw.split_whitespace().count() >= MIN_PROSE_WORDS),
+                _ => false,
+            })
+        })
     }
 
     /// Auto-memory extraction: at a completed main-loop turn, fire-and-forget a
@@ -1587,6 +1618,23 @@ impl Session {
                 now,
                 AutoMemoryRunReason::DirectMemoryWrite,
                 cursor_to_commit,
+            );
+            return;
+        }
+        if !Self::has_user_prose_since(&since) {
+            // Nothing the user said since the last run can hold a new memory,
+            // so a fork would re-mine the same conversation for the price of a
+            // model call. The cursor deliberately does NOT advance: the
+            // authoritative lifecycle only commits cursors on Completed or
+            // direct-write skips, and keeping the window means the short turns
+            // are still mined together with the next substantive one instead
+            // of being dismissed alone. Re-checking the gate is cheap.
+            self.schedule_auto_memory_skip(
+                Some(&dir),
+                &since,
+                now,
+                AutoMemoryRunReason::EmptyInput,
+                None,
             );
             return;
         }
@@ -1830,9 +1878,13 @@ impl Session {
         abort: AbortSignal,
         inference: Arc<super::InferenceActivityGuard>,
     ) -> Result<RestrictedMemoryForkOutcome, RestrictedMemoryForkError> {
+        // Pre-inject the catalog of existing memory files so the fork updates a
+        // topic instead of duplicating it, and spends its limited turns on
+        // writes instead of discovery.
+        let manifest = build_memory_manifest(dir).await;
         self.run_restricted_memory_fork(
             dir,
-            &build_extraction_prompt(dir, recent),
+            &build_extraction_prompt(dir, recent, &manifest),
             RestrictedMemoryForkOptions {
                 pinned_root: None,
                 max_turns_override: Some(5),
@@ -1847,6 +1899,300 @@ impl Session {
             inference,
         )
         .await
+    }
+
+    // ---- per-session running notes (SessionMemory) & compaction fusion ----
+
+    /// Configure the thresholds for background per-session notes extraction.
+    pub fn set_session_memory_config(
+        &self,
+        config: crate::memory::session_memory::SessionMemoryConfig,
+    ) {
+        self.memory_scheduler.set_session_memory_config(config);
+    }
+
+    /// Current threshold configuration for background per-session notes extraction.
+    pub fn session_memory_config(&self) -> crate::memory::session_memory::SessionMemoryConfig {
+        self.memory_scheduler.session_memory_config()
+    }
+
+    /// Configure the thresholds for preserving recent messages during
+    /// session-memory-backed compaction.
+    pub fn set_session_memory_compact_config(
+        &self,
+        config: crate::memory::session_memory::SessionMemoryCompactConfig,
+    ) {
+        self.memory_scheduler
+            .set_session_memory_compact_config(config);
+    }
+
+    /// Current threshold configuration for session-memory-backed compaction.
+    pub fn session_memory_compact_config(
+        &self,
+    ) -> crate::memory::session_memory::SessionMemoryCompactConfig {
+        self.memory_scheduler.session_memory_compact_config()
+    }
+
+    /// Evaluate whether the current conversation history meets the thresholds
+    /// to trigger a background per-session running-notes update.
+    pub fn should_extract_session_memory(&self, messages: &[Message]) -> bool {
+        let cfg = self.memory_scheduler.session_memory_config();
+        let current_tokens = crate::context::tokens::estimate_messages_tokens(messages);
+        if !self.memory_scheduler.is_session_memory_initialized() {
+            if current_tokens < cfg.minimum_message_tokens_to_init {
+                return false;
+            }
+            self.memory_scheduler.mark_session_memory_initialized();
+        }
+        let tokens_since =
+            current_tokens.saturating_sub(self.memory_scheduler.tokens_at_last_session_memory());
+        let has_met_token_threshold = tokens_since >= cfg.minimum_tokens_between_update;
+        if !has_met_token_threshold {
+            return false;
+        }
+        let last_cursor = self.memory_scheduler.last_session_memory_cursor_uuid();
+        let tool_calls_since =
+            crate::memory::session_memory::count_tool_calls_since(messages, last_cursor.as_ref());
+        let has_met_tool_call_threshold = tool_calls_since >= cfg.tool_calls_between_updates;
+        let has_tool_calls_in_last_turn =
+            crate::memory::session_memory::has_tool_calls_in_last_assistant_turn(messages);
+        let should_extract = has_met_tool_call_threshold || !has_tool_calls_in_last_turn;
+        if should_extract {
+            if let Some(last) = messages.last() {
+                self.memory_scheduler
+                    .set_last_session_memory_cursor_uuid(Some(message_uuid(last).clone()));
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Periodically maintain a per-session running notes file (`summary.md`) in
+    /// the background when auto-memory and auto-compaction are active.
+    pub(crate) fn maybe_extract_session_memory(self: &Arc<Self>) {
+        if self.meta.role.is_some()
+            || !self.config.auto_memory
+            || !self.config.auto_compaction
+            || self.config.compaction_disabled
+        {
+            return;
+        }
+        let Some(dir) = self.memory_roots.main().cloned() else {
+            return;
+        };
+        let Ok(inference) = self.begin_inference_activity() else {
+            return;
+        };
+        let inference = Arc::new(inference);
+        let Some(admission) = self.maintenance_admission.begin() else {
+            return;
+        };
+        if self.lifecycle.is_disposed() {
+            return;
+        }
+        let hist = self.conversation.history.lock_recover().clone();
+        if !self.should_extract_session_memory(&hist) {
+            return;
+        }
+        let now = (self.deps.now)();
+        if !self.memory_scheduler.try_begin_session_memory(now) {
+            return;
+        }
+        let this = self.clone();
+        let abort = CancellationToken::new();
+        self.memory_scheduler
+            .set_session_memory_abort(Some(abort.clone()));
+        tokio::spawn(async move {
+            let _admission = admission;
+            let _ = std::panic::AssertUnwindSafe(
+                this.run_session_memory_extraction_with_capture(&dir, abort, inference),
+            )
+            .catch_unwind()
+            .await;
+            this.memory_scheduler.set_session_memory_abort(None);
+            this.memory_scheduler.finish_session_memory();
+        });
+    }
+
+    /// Manually trigger per-session running-notes extraction, bypassing token
+    /// and tool-call thresholds (used by `/summary` or explicit callers).
+    pub async fn extract_session_memory_now(
+        self: &Arc<Self>,
+    ) -> Result<std::path::PathBuf, String> {
+        let Some(dir) = self.memory_roots.main().cloned() else {
+            return Err("No memory directory configured for this session".to_string());
+        };
+        if self.conversation.history.lock_recover().is_empty() {
+            return Err("No messages to summarize".to_string());
+        }
+        let abort = CancellationToken::new();
+        let inference = self.capture_inference(&abort).await?;
+        let now = (self.deps.now)();
+        let began = self.memory_scheduler.try_begin_session_memory(now);
+        let result = self
+            .run_session_memory_extraction_with_capture(&dir, abort, inference)
+            .await;
+        if began {
+            self.memory_scheduler.finish_session_memory();
+        }
+        result
+    }
+
+    pub(crate) async fn run_session_memory_extraction_with_capture(
+        self: &Arc<Self>,
+        dir: &str,
+        abort: AbortSignal,
+        inference: Arc<super::InferenceActivityGuard>,
+    ) -> Result<std::path::PathBuf, String> {
+        let session_id = runtime_session_id_to_session_store_host(&self.id);
+        let (notes_path, current_notes) =
+            crate::memory::session_memory::setup_session_memory_file(dir, &session_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        let notes_path_str = notes_path.to_string_lossy().into_owned();
+        let prompt = crate::memory::session_memory::build_session_memory_update_prompt(
+            &current_notes,
+            &notes_path_str,
+        )
+        .await;
+        self.run_restricted_memory_fork(
+            dir,
+            &RuntimeString::from(prompt),
+            RestrictedMemoryForkOptions {
+                pinned_root: None,
+                max_turns_override: Some(3),
+                capture_dream_turns: false,
+                // The pass owes updated notes: a failed write means the summary
+                // never landed, so the summarization cursor must not advance
+                // past messages the notes do not actually cover.
+                mutation_failure_is_terminal: true,
+            },
+            abort,
+            inference,
+        )
+        .await
+        .map_err(|e| e.message)?;
+
+        let hist = self.conversation.history.lock_recover().clone();
+        let current_tokens = crate::context::tokens::estimate_messages_tokens(&hist);
+        self.memory_scheduler
+            .record_session_memory_token_count(current_tokens);
+        if !crate::memory::session_memory::has_tool_calls_in_last_assistant_turn(&hist) {
+            if let Some(last) = hist.last() {
+                self.memory_scheduler
+                    .set_last_summarized_message_id(Some(message_uuid(last).clone()));
+            }
+        }
+        Ok(notes_path)
+    }
+
+    /// Wait for any in-progress session-memory extraction to finish, up to
+    /// 15 seconds, unless the extraction has been running for over 60 seconds
+    /// (stale).
+    pub async fn wait_for_session_memory_extraction(&self) {
+        let notified = self.memory_scheduler.session_memory_settled();
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(
+                crate::memory::session_memory::EXTRACTION_WAIT_TIMEOUT_MS,
+            );
+        loop {
+            let started_at = self.memory_scheduler.session_memory_started_at();
+            if started_at <= 0 {
+                return;
+            }
+            let now = (self.deps.now)();
+            if now.saturating_sub(started_at)
+                > crate::memory::session_memory::EXTRACTION_STALE_THRESHOLD_MS
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let wait = notified.notified();
+            if self.memory_scheduler.session_memory_started_at() <= 0 {
+                return;
+            }
+            let _ = tokio::time::timeout_at(deadline, wait).await;
+        }
+    }
+
+    /// Attempt to satisfy context compaction using the session's structured
+    /// running notes (`summary.md`) and a preserved suffix of recent messages.
+    pub async fn try_session_memory_compaction(
+        &self,
+        messages: &[Message],
+        config: &crate::schemas::config::ResolvedConfig,
+        instructions: Option<&RuntimeString>,
+    ) -> Option<crate::context::compact::full_compact::CompactionResult> {
+        if config.compaction_disabled || instructions.is_some() || messages.is_empty() {
+            return None;
+        }
+        let dir = self.memory_roots.main()?;
+        self.wait_for_session_memory_extraction().await;
+        let session_id = runtime_session_id_to_session_store_host(&self.id);
+        let path = crate::memory::session_memory::session_memory_path(dir, &session_id);
+        let content = tokio::fs::read_to_string(&path).await.ok()?;
+        if crate::memory::session_memory::is_session_memory_empty(&content).await {
+            return None;
+        }
+
+        let last_summarized_index =
+            if let Some(summarized_id) = self.memory_scheduler.last_summarized_message_id() {
+                let idx = messages
+                    .iter()
+                    .position(|m| message_uuid(m) == &summarized_id)?;
+                Some(idx)
+            } else {
+                Some(messages.len().saturating_sub(1))
+            };
+
+        let sm_compact_cfg = self.memory_scheduler.session_memory_compact_config();
+        let start_index = crate::memory::session_memory::calculate_messages_to_keep_index(
+            messages,
+            last_summarized_index,
+            &sm_compact_cfg,
+        );
+
+        let (mut summary_content, was_truncated) =
+            crate::memory::session_memory::truncate_session_memory_for_compact(&content);
+        if was_truncated {
+            summary_content.push_str(&format!(
+                "\n\nSome session memory sections were truncated for length. The full session memory can be viewed at: {}",
+                path.display()
+            ));
+        }
+
+        let mut replacement =
+            crate::context::compact::full_compact::retained_user_messages(&messages[..start_index]);
+        replacement.push(Message::CompactBoundary(
+            crate::schemas::message::CompactBoundaryMessage {
+                uuid: (self.deps.uuid)().into(),
+                summary: summary_content.into(),
+                native_compaction: None,
+            },
+        ));
+        replacement.extend(
+            messages[start_index..]
+                .iter()
+                .filter(|m| !matches!(m, Message::CompactBoundary(_)))
+                .cloned(),
+        );
+        crate::context::tokens::invalidate_context_usage(&mut replacement);
+
+        let before_tokens = crate::context::tokens::estimate_messages_tokens(messages);
+        let after_tokens = crate::context::tokens::estimate_messages_tokens(&replacement);
+        if after_tokens >= before_tokens {
+            return None;
+        }
+
+        Some(crate::context::compact::full_compact::CompactionResult {
+            messages: replacement,
+            freed_tokens: before_tokens.saturating_sub(after_tokens),
+            compacted: true,
+            reason: None,
+            diagnostics: Vec::new(),
+        })
     }
 
     /// Spawn a restricted memory-maintenance fork (extraction or consolidation)
@@ -2796,10 +3142,17 @@ impl Session {
         inference: Arc<super::InferenceActivityGuard>,
     ) -> Result<RestrictedMemoryForkOutcome, RestrictedMemoryForkError> {
         let pinned_root = lock.pinned_root();
+        // Change-focused consolidation: generate the baseline diff and the
+        // recall-usage report before the fork so the pass reviews what actually
+        // changed, then re-baseline after success.
+        if let Err(error) = crate::memory::baseline::prepare_workspace_diff(dir).await {
+            tracing::warn!("failed to prepare the memory workspace diff: {error}");
+        }
+        let health_report = crate::memory::usage::build_health_report(dir, now).await;
         match self
             .run_restricted_memory_fork(
                 dir,
-                &build_consolidation_prompt(dir),
+                &build_consolidation_prompt(dir, &health_report),
                 RestrictedMemoryForkOptions {
                     pinned_root: Some(pinned_root),
                     max_turns_override: Some(DREAM_MAX_TURNS),
@@ -2835,6 +3188,15 @@ impl Session {
                         turn_count: result.turn_count,
                         turns: result.turns,
                     });
+                }
+                // The pass succeeded: the live directory becomes the baseline
+                // the next change report is measured against, and the report
+                // itself is a prompt artifact that must not survive into it.
+                if let Err(error) = crate::memory::baseline::commit_baseline(dir).await {
+                    tracing::warn!("failed to commit the memory baseline: {error}");
+                }
+                if let Err(error) = crate::memory::baseline::remove_workspace_diff(dir).await {
+                    tracing::warn!("failed to remove the memory workspace diff: {error}");
                 }
                 if let Err(error) = record_consolidation(dir, now as f64, lock).await {
                     return Err(RestrictedMemoryForkError {
@@ -3269,6 +3631,9 @@ impl Session {
             let pending = std::mem::take(&mut registry.handles);
             for entry in self.subagents.background_agents.lock_recover().values() {
                 entry.abort.cancel();
+            }
+            if let Some(token) = self.memory_scheduler.take_session_memory_abort() {
+                token.cancel();
             }
             pending
         };
