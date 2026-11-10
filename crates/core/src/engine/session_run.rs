@@ -1583,8 +1583,11 @@ impl Session {
                             .content
                             .iter()
                             .any(|block| matches!(block, ContentBlock::ToolUse(_)));
+                        // Stable answer text tagged as a partial answer may be
+                        // followed by more output or tools, so on its own it
+                        // never stamps the turn's final message.
                         let has_text = assistant.content.iter().any(|block| matches!(block,
-                            ContentBlock::Text(text) if text.phase.as_ref().is_none_or(|phase| phase != "commentary")));
+                            ContentBlock::Text(text) if text.phase.as_ref().is_none_or(|phase| phase != "commentary" && phase != "partial_answer")));
                         let has_explicit_final = assistant.content.iter().any(|block| matches!(block,
                             ContentBlock::Text(text) if text.phase.as_ref().is_some_and(|phase| phase == "final_answer")));
                         let mut index = this.turn_index.lock_recover();

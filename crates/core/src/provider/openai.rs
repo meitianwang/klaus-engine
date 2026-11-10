@@ -3865,7 +3865,9 @@ fn response_text_message(
     let phase = item
         .get("phase")
         .and_then(Value::as_str)
-        .filter(|phase| *phase == "commentary" || *phase == "final_answer")
+        .filter(|phase| {
+            *phase == "commentary" || *phase == "partial_answer" || *phase == "final_answer"
+        })
         .cloned();
     let previous = state.text_messages.get(id);
     let resolved = phase.or_else(|| previous.cloned().flatten());
@@ -10552,6 +10554,35 @@ mod tests {
         assert!(duplicate_done.is_empty());
         assert!(late_delta.is_empty());
         assert!(late_input_done.is_empty());
+    }
+
+    #[test]
+    fn responses_partial_answer_phase_survives_item_events() {
+        let events = map_responses_events(
+            &mut ResponsesState::default(),
+            &[
+                json!({"type":"response.output_item.added","item":{"type":"message","id":"m1","phase":"partial_answer"}}),
+                json!({"type":"response.output_text.delta","item_id":"m1","delta":"Interim"}),
+                json!({"type":"response.output_item.done","item":{"type":"message","id":"m1","phase":"partial_answer"}}),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                ModelStreamEvent::TextMessage {
+                    id: "m1".into(),
+                    phase: Some("partial_answer".into())
+                },
+                ModelStreamEvent::TextDelta {
+                    text: "Interim".into()
+                },
+                ModelStreamEvent::TextMessageCompleted {
+                    id: "m1".into(),
+                    phase: Some("partial_answer".into()),
+                    text: "Interim".into()
+                },
+            ]
+        );
     }
 
     #[test]
