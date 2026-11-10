@@ -61,6 +61,8 @@ mod goals;
 mod queue;
 #[path = "realtime.rs"]
 mod realtime;
+#[path = "session_unload.rs"]
+mod session_unload;
 #[path = "text_completion.rs"]
 mod text_completion;
 use exact_payload::{field as exact_field, text as exact_text, Payload};
@@ -111,6 +113,10 @@ pub struct AppServerOptions {
     /// budget to exercise the stalled-startup path without sitting through
     /// the production deadline.
     pub startup_init_ack_budget: Option<std::time::Duration>,
+    /// Quiet period before an unwatched, idle session is unloaded by the
+    /// endpoint. `None` resolves the configured delay (default 1800 seconds);
+    /// tests inject a smaller delay to exercise the unload path.
+    pub session_unload_delay: Option<std::time::Duration>,
 }
 
 /// Response shapes that must settle in the sole ordered event pump.
@@ -415,6 +421,20 @@ pub(super) struct AppServerState {
     /// suppressed until `session/subscribe` re-arms them. Request/reply traffic
     /// is unaffected — only the event stream is gated.
     unsubscribed_sessions: Mutex<HashSet<String>>,
+    /// Per-session subscription state feeding the idle-unload machine: `true`
+    /// while a client watches the session's event stream.
+    session_subscriptions: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+    /// Per-session lifecycle status feeding the idle-unload machine and the
+    /// broadcast `session/statusChanged` notification.
+    session_status: session_unload::SessionStatusRegistry,
+    /// Sessions currently being unloaded; `session/subscribe` and
+    /// `session/start` refuse them until teardown finishes.
+    pending_session_unloads: Mutex<HashSet<String>>,
+    /// Cancellation tokens for the per-session idle-unload watchers.
+    unload_watchers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    /// Endpoint override for the unload quiet period; `None` resolves from the
+    /// engine configuration file.
+    session_unload_delay_override: Option<std::time::Duration>,
     /// Whether this connection opted into the Thread/Turn/Item product surface.
     product_events: AtomicBool,
     /// Whether session notifications include `streamId` / `streamRevision`.
@@ -685,6 +705,10 @@ async fn run_app_server_inner<I, O>(
         pending_reverse: Mutex::new(HashMap::new()),
         notification_opt_out: Mutex::new(HashSet::new()),
         unsubscribed_sessions: Mutex::new(HashSet::new()),
+        session_subscriptions: Mutex::new(HashMap::new()),
+        session_status: session_unload::SessionStatusRegistry::default(),
+        pending_session_unloads: Mutex::new(HashSet::new()),
+        unload_watchers: Mutex::new(HashMap::new()),
         product_events: AtomicBool::new(false),
         revisioned_session_events: AtomicBool::new(false),
         inflight_heavy: AtomicU64::new(0),
@@ -714,6 +738,7 @@ async fn run_app_server_inner<I, O>(
         startup_init_ack_budget: opts
             .startup_init_ack_budget
             .unwrap_or_else(|| std::time::Duration::from_secs(STARTUP_INIT_ACK_BUDGET_SECS)),
+        session_unload_delay_override: opts.session_unload_delay,
     });
 
     on_state(state.clone());
@@ -806,6 +831,15 @@ async fn run_app_server_inner<I, O>(
     }
 
     state.connection_closed.store(true, Ordering::Release);
+    // The connection is gone: every session loses its subscriber, and every
+    // idle-unload watcher must stop — a watcher holds endpoint state open,
+    // and the drain below shuts every session down anyway.
+    for tx in state.session_subscriptions.lock().unwrap().values() {
+        let _ = tx.send(false);
+    }
+    for (_, cancel) in state.unload_watchers.lock().unwrap().drain() {
+        let _ = cancel.send(());
+    }
     let drain_deadline = tokio::time::Instant::now() + CONNECTION_DRAIN_BUDGET;
     // EOF closes input admission, but a half-closed client can still read every
     // accepted reply. Preserve those continuations within one connection budget.
@@ -2153,6 +2187,9 @@ async fn start_named_turn(
     let Some(handle) = state.session(session_id) else {
         return send_unknown_session(state, id, session_id).await;
     };
+    // Admitting a turn re-arms the event stream, so a headless turn on an
+    // unwatched session still reaches the client.
+    session_unload::rearm_subscription(state, session_id, &handle);
     let turn_id = match submission {
         Some(requested) => {
             if requested.is_empty() {
@@ -2179,6 +2216,7 @@ async fn start_named_turn(
             .send(wire::error_response(id, wire::ENGINE_ERROR, error))
             .await;
     }
+    session_unload::refresh_status(state, session_id).await;
     state
         .send(wire::response(
             id,
@@ -2195,6 +2233,9 @@ async fn submit_named_turn(state: Arc<AppServerState>, id: Value, params: wire::
     let Some(handle) = state.session(&params.session_id) else {
         return send_unknown_session(&state, &id, &params.session_id).await;
     };
+    // Admitting a turn re-arms the event stream, so a headless turn on an
+    // unwatched session still reaches the client.
+    session_unload::rearm_subscription(&state, &params.session_id, &handle);
     let submission_id = params
         .submission_id
         .clone()
@@ -2264,6 +2305,7 @@ async fn submit_named_turn(state: Arc<AppServerState>, id: Value, params: wire::
             ))
             .await;
     }
+    let status_session_id = params.session_id.clone();
     tokio::spawn(async move {
         let outcome = handle
             .ps
@@ -2332,6 +2374,7 @@ async fn submit_named_turn(state: Arc<AppServerState>, id: Value, params: wire::
         if status != wire::TurnSubmitStatus::Started {
             handle.turns.lock().unwrap().remove(&submission_id);
         }
+        session_unload::refresh_status(&state, &status_session_id).await;
         state
             .send(wire::response(
                 &id,
@@ -3925,12 +3968,32 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                 Ok(params) => params,
                 Err(error) => return send_invalid_params(&state, &id, &error).await,
             };
-            if state.session(&params.session_id).is_none() {
+            let Some(handle) = state.session(&params.session_id) else {
                 return send_unknown_session(&state, &id, &params.session_id).await;
-            }
+            };
             // Event-stream gate only: request/reply traffic for the session is
             // unaffected either way.
             let subscribed = method == "session/subscribe";
+            if subscribed
+                && state
+                    .pending_session_unloads
+                    .lock()
+                    .unwrap()
+                    .contains(&params.session_id)
+            {
+                // The session is mid-unload; the client retries and either
+                // re-attaches or rebuilds once teardown finishes.
+                return state
+                    .send(wire::error_response(
+                        &id,
+                        wire::INVALID_REQUEST,
+                        &format!(
+                            "session {} is closing; retry after the session is closed",
+                            params.session_id
+                        ),
+                    ))
+                    .await;
+            }
             {
                 let mut gated = state.unsubscribed_sessions.lock().unwrap();
                 if subscribed {
@@ -3938,6 +4001,17 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                 } else {
                     gated.insert(params.session_id.clone());
                 }
+            }
+            if let Some(tx) = state
+                .session_subscriptions
+                .lock()
+                .unwrap()
+                .get(&params.session_id)
+            {
+                let _ = tx.send(subscribed);
+            }
+            if subscribed {
+                session_unload::ensure_watcher(&state, &params.session_id, &handle);
             }
             let result = wire::SessionSubscriptionResult {
                 session_id: params.session_id,
@@ -4025,6 +4099,8 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                                 sessions.remove(&params.session_id);
                             }
                         }
+                        session_unload::discard_session_bookkeeping(&state, &params.session_id)
+                            .await;
                         state.send(wire::response(&id, serde_json::json!({}))).await
                     }
                     Err(error) => {
@@ -8670,6 +8746,26 @@ async fn session_start_side_task(
             "side-task ids must be nonempty without surrounding whitespace, and the child must differ from its parent",
         ).await;
     }
+    // A parent mid-unload cannot own a new side task; the client retries and
+    // either re-attaches or rebuilds once teardown finishes.
+    let pending_parent = params
+        .source_session_id
+        .as_deref()
+        .unwrap_or(params.parent_thread_id.as_str());
+    if state
+        .pending_session_unloads
+        .lock()
+        .unwrap()
+        .contains(pending_parent)
+    {
+        return state
+            .send(wire::error_response(
+                &id,
+                wire::INVALID_REQUEST,
+                &format!("session {pending_parent} is closing; retry after the session is closed"),
+            ))
+            .await;
+    }
     let source = match params.source_session_id.as_ref() {
         Some(source_id) => {
             let Some(source) = state.session(source_id) else {
@@ -8839,6 +8935,23 @@ async fn session_start_impl(
             return;
         }
     };
+
+    if state
+        .pending_session_unloads
+        .lock()
+        .unwrap()
+        .contains(&session_id)
+    {
+        // The named session is mid-unload; the client retries and resumes from
+        // stored history once teardown finishes.
+        return state
+            .send(wire::error_response(
+                &id,
+                wire::INVALID_REQUEST,
+                &format!("session {session_id} is closing; retry after the session is closed"),
+            ))
+            .await;
+    }
 
     // Startup diagnostics: a session/start that stalls used to surface only as
     // the host's silent 60s deadline with nothing in the engine log. One stderr
@@ -9053,7 +9166,7 @@ async fn session_start_impl(
         start_stage.elapsed().as_millis()
     );
     if let Err(error) = seeded {
-        remove_owned_session(&state, &session_id, &handle);
+        remove_owned_session(&state, &session_id, &handle).await;
         let _ = handle.ps.shutdown_and_wait().await;
         state
             .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
@@ -9069,7 +9182,7 @@ async fn session_start_impl(
     // run the session on whatever provider the endpoint defaults to, which is a
     // different model and possibly a different account than the caller asked for.
     if let Err(error) = resolve_raw_model_provider(&state, &mut init).await {
-        remove_owned_session(&state, &session_id, &handle);
+        remove_owned_session(&state, &session_id, &handle).await;
         let _ = handle.ps.shutdown_and_wait().await;
         state
             .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
@@ -9103,13 +9216,35 @@ async fn session_start_impl(
             );
             let event = event.value;
             if let Some(error) = exact_text(exact_field(&event, "error")) {
-                remove_owned_session(&state, &session_id, &handle);
+                remove_owned_session(&state, &session_id, &handle).await;
                 let _ = handle.ps.shutdown_and_wait().await;
                 state
                     .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
                     .await;
                 return;
             }
+            // Idle-unload bookkeeping: the session is live now — it starts
+            // subscribed and idle, and its watcher unloads it once it stays
+            // unwatched and quiet for the delay. A start that fails before this
+            // point never registers and broadcasts nothing.
+            state.session_status.register(&session_id);
+            state
+                .notify(
+                    "session/statusChanged",
+                    serde_json::to_value(wire::SessionStatusChangedNotification {
+                        session_id: session_id.clone(),
+                        status: wire::SessionStatus::Idle,
+                    })
+                    .expect("session status notification serializes"),
+                )
+                .await;
+            state
+                .session_subscriptions
+                .lock()
+                .unwrap()
+                .insert(session_id.clone(), tokio::sync::watch::channel(true).0);
+            session_unload::ensure_watcher(&state, &session_id, &handle);
+
             let mut initialized = exact_field(&event, "initialized").clone();
             if materialize_fork || materialize_side_task {
                 // Unlike ordinary lazy session/start, a live fork must return
@@ -9127,7 +9262,7 @@ async fn session_start_impl(
                 .await;
                 match materialized {
                     Err(error) => {
-                        remove_owned_session(&state, &session_id, &handle);
+                        remove_owned_session(&state, &session_id, &handle).await;
                         let _ = handle.ps.shutdown_and_wait().await;
                         state
                             .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
@@ -9174,7 +9309,7 @@ async fn session_start_impl(
                 .await;
         }
         Ok(Err(_)) => {
-            remove_owned_session(&state, &session_id, &handle);
+            remove_owned_session(&state, &session_id, &handle).await;
             state
                 .send(wire::error_response(
                     &id,
@@ -9188,7 +9323,7 @@ async fn session_start_impl(
                 "[session-start] {session_id} stage=init-ack-budget-exceeded elapsedMs={}",
                 start_stage.elapsed().as_millis()
             );
-            remove_owned_session(&state, &session_id, &handle);
+            remove_owned_session(&state, &session_id, &handle).await;
             state.send(wire::error_response(
                 &id,
                 wire::ENGINE_ERROR,
@@ -9207,13 +9342,27 @@ async fn session_start_impl(
     }
 }
 
-fn remove_owned_session(state: &AppServerState, session_id: &str, handle: &Arc<SessionHandle>) {
-    let mut sessions = state.sessions.lock().unwrap();
-    if sessions
-        .get(session_id)
-        .is_some_and(|current| Arc::ptr_eq(current, handle))
-    {
-        sessions.remove(session_id);
+async fn remove_owned_session(
+    state: &Arc<AppServerState>,
+    session_id: &str,
+    handle: &Arc<SessionHandle>,
+) {
+    let removed = {
+        let mut sessions = state.sessions.lock().unwrap();
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            sessions.remove(session_id);
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        // A session that never went live must not leave idle-unload
+        // bookkeeping behind.
+        session_unload::discard_session_bookkeeping(state, session_id).await;
     }
 }
 
@@ -9696,6 +9845,7 @@ async fn pump_session_events(
         }
         if !submission_id.is_empty() && kind.as_deref() == Some("turn.started") {
             handle.turns.lock().unwrap().insert(submission_id.clone());
+            session_unload::refresh_status(&state, &session_id).await;
         }
         let observed = {
             let mut items = handle.read_items.lock().unwrap();
@@ -9729,7 +9879,13 @@ async fn pump_session_events(
         if exact_field(exact_field(&event, "pendingResume"), "started").as_bool() == Some(false)
             || event.get("error").is_some()
         {
-            handle.turns.lock().unwrap().remove(&submission_id);
+            // The turns guard must drop before the status recomputation:
+            // it locks the same mutex, and a std guard held across the await
+            // would deadlock the pump.
+            let removed = handle.turns.lock().unwrap().remove(&submission_id);
+            if removed {
+                session_unload::refresh_status(&state, &session_id).await;
+            }
         }
         if kind.as_deref() == Some("approval.requested") {
             if let Some(request) = exact_field(&event, "event").get("request") {
@@ -9830,6 +9986,9 @@ async fn pump_session_events(
         if kind.as_deref() == Some("turn.failed") {
             handle.turns.lock().unwrap().remove(&submission_id);
             handle.read_items.lock().unwrap().finish(&submission_id);
+        }
+        if tracked_turn_completed || kind.as_deref() == Some("turn.failed") {
+            session_unload::refresh_status(&state, &session_id).await;
         }
         if tracked_turn_completed {
             handle.read_items.lock().unwrap().finish(&submission_id);
@@ -10257,7 +10416,7 @@ async fn send_reverse_request_runtime(
     state.pending_reverse.lock().unwrap().insert(
         reverse_id,
         PendingReverse {
-            session_id: session_id.into(),
+            session_id: session_id.to_string(),
             kind,
         },
     );
@@ -10268,6 +10427,7 @@ async fn send_reverse_request_runtime(
             ("params", params),
         ]))
         .await;
+    session_unload::refresh_status(state, session_id).await;
 }
 
 /// The client answered (or failed) a reverse request: translate its response
@@ -10284,6 +10444,15 @@ fn handle_reverse_response(
     let Some(pending) = pending else {
         return;
     };
+    {
+        // Answering the request flipped the session's lifecycle status;
+        // publish it without blocking the response path on the broadcast.
+        let state = Arc::clone(state);
+        let session_id = pending.session_id.clone();
+        tokio::spawn(async move {
+            session_unload::refresh_status(&state, &session_id).await;
+        });
+    }
     let Some(handle) = state.session(&pending.session_id) else {
         return;
     };

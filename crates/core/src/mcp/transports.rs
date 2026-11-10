@@ -19,7 +19,8 @@ use crate::mcp::oauth::{
     auth, AuthOptions, AuthResult, McpFetch, OAuthClientProvider, OAuthTokens,
 };
 use crate::runtime_process::{
-    RuntimeChildStdin, RuntimeEnv, RuntimeProcessContext, RuntimeSignal, SpawnedRuntimeProcess,
+    RuntimeChildStdin, RuntimeEnv, RuntimeProcessContext, RuntimeProcessController, RuntimeSignal,
+    SignalDelivery, SpawnedRuntimeProcess,
 };
 use crate::runtime_values::{runtime_json, NodeBufferUtf8, RuntimeJson, RuntimeString, WhatwgUtf8};
 use crate::types::abort::AbortSignal;
@@ -33,6 +34,16 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
 const HTTP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Grace period between the polite termination signal and the forced kill of
+/// an MCP server's process group.
+const MCP_PROCESS_TERM_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound on waiting for an MCP server to exit after its streams close before
+/// the transport falls back to a hard kill.
+const MCP_TRANSPORT_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Time queued stderr lines get to arrive after the reader is stopped, even
+/// when a spawned descendant still holds the pipe open.
+const MCP_STDERR_DRAIN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -685,6 +696,13 @@ pub struct StdioTransport {
     child: AsyncMutex<Option<SpawnedRuntimeProcess>>,
     stdin: AsyncMutex<Option<RuntimeChildStdin>>,
     started: AtomicBool,
+    /// Clone of the child's signal controller, held outside the async mutex so
+    /// termination (and `Drop`) can act without awaiting.
+    controller: Mutex<Option<RuntimeProcessController>>,
+    /// Stop signal for the stderr reader task.
+    stderr_stop: Mutex<Option<tokio::sync::watch::Sender<()>>>,
+    /// Makes termination idempotent: the signals go out at most once.
+    terminated: AtomicBool,
 }
 
 impl StdioTransport {
@@ -702,6 +720,9 @@ impl StdioTransport {
             child: AsyncMutex::new(None),
             stdin: AsyncMutex::new(None),
             started: AtomicBool::new(false),
+            controller: Mutex::new(None),
+            stderr_stop: Mutex::new(None),
+            terminated: AtomicBool::new(false),
         }
     }
 }
@@ -724,14 +745,46 @@ impl Transport for StdioTransport {
             )
             .await
             .map_err(|e| McpError::new(format!("failed to spawn MCP server: {e}")))?;
+        *self.controller.lock().unwrap() = Some(child.controller());
         let stdout = child
             .take_stdout()
             .ok_or_else(|| McpError::new("child stdout unavailable"))?;
-        // Drain stderr so a chatty child never blocks on a full pipe.
+        // Drain stderr so a chatty child never blocks on a full pipe, keeping
+        // the lines as diagnostics. A stopped reader drains briefly and exits
+        // even when a spawned descendant still holds the pipe open.
         if let Some(stderr) = child.take_stderr() {
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(());
+            *self.stderr_stop.lock().unwrap() = Some(stop_tx);
+            let program_name = self.command.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(_)) = lines.next_line().await {}
+                let drain_deadline = tokio::time::sleep(MCP_STDERR_DRAIN_GRACE_PERIOD);
+                tokio::pin!(drain_deadline);
+                let mut draining = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut drain_deadline, if draining => break,
+                        _ = stop_rx.changed(), if !draining => {
+                            draining = true;
+                            drain_deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + MCP_STDERR_DRAIN_GRACE_PERIOD);
+                        }
+                        line = lines.next_line() => match line {
+                            Ok(Some(line)) => {
+                                tracing::info!("MCP server stderr ({program_name}): {line}");
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed to read MCP server stderr ({program_name}): {error}"
+                                );
+                                break;
+                            }
+                        },
+                    }
+                }
             });
         }
         let stdin = child
@@ -796,12 +849,65 @@ impl Transport for StdioTransport {
     }
 
     async fn close(&self) -> McpResult<()> {
+        // Stop the server tree first so nothing keeps writing into streams
+        // that are about to go away.
+        self.terminate();
         *self.stdin.lock().await = None;
         if let Some(mut child) = self.child.lock().await.take() {
-            child.controller().signal(RuntimeSignal::Kill);
-            let _ = child.wait().await;
+            // The group already received the terminate-then-kill escalation;
+            // this bounded wait only covers a server wedged past every signal.
+            if tokio::time::timeout(MCP_TRANSPORT_CLOSE_WAIT, child.wait())
+                .await
+                .is_err()
+            {
+                child.controller().signal(RuntimeSignal::Kill);
+                let _ = child.wait().await;
+            }
         }
         Ok(())
+    }
+}
+
+impl StdioTransport {
+    /// Idempotently stop the server's process tree: a polite signal first,
+    /// then a forced kill of the whole group after a grace period. The
+    /// escalation runs on a plain thread so it survives task cancellation and
+    /// runtime shutdown ordering.
+    fn terminate(&self) {
+        if self.terminated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(controller) = self.controller.lock().unwrap().clone() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                if controller.signal(RuntimeSignal::Terminate) == SignalDelivery::Delivered {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(MCP_PROCESS_TERM_GRACE_PERIOD);
+                        controller.signal(RuntimeSignal::Kill);
+                    });
+                }
+            }
+            #[cfg(windows)]
+            {
+                // Windows tree control is one pinned hard action.
+                controller.signal(RuntimeSignal::Kill);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+            {
+                let _ = controller;
+            }
+        }
+        if let Some(stop) = self.stderr_stop.lock().unwrap().clone() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // A transport dropped without `close` (error paths, manager teardown
+        // ordering) must not leave its server tree running.
+        self.terminate();
     }
 }
 

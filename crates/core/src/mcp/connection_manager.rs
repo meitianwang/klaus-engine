@@ -478,7 +478,14 @@ impl McpConnectionManager {
     pub async fn shutdown(&mut self) {
         let clients: Vec<ManagedClient> =
             self.entries.iter().map(|(_, e)| e.client.clone()).collect();
-        futures::future::join_all(clients.iter().map(|c| c.close())).await;
+        // Cleanup runs as its own task so an interrupt that cancels the
+        // requesting shutdown cannot abandon server processes mid-close.
+        let shutdown_task = tokio::spawn(async move {
+            futures::future::join_all(clients.iter().map(|c| c.close())).await;
+        });
+        if let Err(error) = shutdown_task.await {
+            tracing::warn!("MCP client shutdown task failed: {error}");
+        }
         for (_, e) in &mut self.entries {
             e.client.state = McpConnectionState::Closed;
         }

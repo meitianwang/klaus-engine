@@ -28,7 +28,10 @@ use super::plan::{
     Rust193SpawnPreimage,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::reaper::{RuntimeChild, RuntimeChildController, RuntimeDropAction};
+use super::reaper::{
+    DirectChildActionResult, RuntimeChild, RuntimeChildController, RuntimeDropAction,
+    SignalActionResult,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::spawn::{SharedRuntimeSpawner, SharedSpawnPolicy};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1823,6 +1826,18 @@ impl RuntimeProcessContext {
         request.image_dialect = ProcessImageDialect::Node20Libuv146;
         request.environment_dialect = EnvironmentImageDialect::Node20ParentSnapshot;
         request.environment_guard = ProcessEnvironmentGuard::None;
+        // An MCP server owns a process tree: the configured command plus
+        // anything it spawns. Give the tree its own group so teardown can
+        // signal every member, and aim controller signals at the whole group.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            request.topology = ProcessTopology::UnixNewProcessGroup;
+            request.kill_target = KillTarget::UnixProcessGroup;
+        }
+        #[cfg(windows)]
+        {
+            request.kill_target = KillTarget::WindowsProcessTree;
+        }
         self.spawner().spawn(request).await
     }
 }
@@ -4465,7 +4480,12 @@ pub(crate) struct RuntimeProcessController {
 }
 
 impl RuntimeProcessController {
-    pub(crate) fn signal(&self, signal: RuntimeSignal) {
+    /// Deliver a signal per this controller's kill target.
+    ///
+    /// The returned delivery reports whether a live process (or its group)
+    /// received the signal, so a caller can decide whether a forced-kill
+    /// escalation is still needed. Windows control actions are always final.
+    pub(crate) fn signal(&self, signal: RuntimeSignal) -> SignalDelivery {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let signal = match signal {
@@ -4477,7 +4497,25 @@ impl RuntimeProcessController {
                 RuntimeSignal::User1 => libc::SIGUSR1,
                 RuntimeSignal::User2 => libc::SIGUSR2,
             };
-            let _ = self.inner.signal(self.target, signal);
+            return match self.inner.signal(self.target, signal) {
+                DirectChildActionResult::Delivered => SignalDelivery::Delivered,
+                DirectChildActionResult::ProcessGroup {
+                    group,
+                    direct_child_fallback,
+                } => {
+                    if group == SignalActionResult::Delivered
+                        || matches!(direct_child_fallback, Some(SignalActionResult::Delivered))
+                    {
+                        SignalDelivery::Delivered
+                    } else {
+                        SignalDelivery::NotDelivered
+                    }
+                }
+                DirectChildActionResult::AlreadyGone
+                | DirectChildActionResult::Failed { .. }
+                | DirectChildActionResult::SkippedTerminal
+                | DirectChildActionResult::SkippedDisarmed => SignalDelivery::NotDelivered,
+            };
         }
         #[cfg(windows)]
         {
@@ -4494,7 +4532,7 @@ impl RuntimeProcessController {
                     klaus_sandbox_win::protocol::ControlMessage::Terminate
                 };
                 if write_windows_sandbox_runtime_control(control, message).is_ok() {
-                    return;
+                    return SignalDelivery::Delivered;
                 }
             }
             match self.target {
@@ -4524,7 +4562,10 @@ impl RuntimeProcessController {
                     unreachable!("Unix process-group target reached Windows controller")
                 }
             }
+            return SignalDelivery::Delivered;
         }
+        #[allow(unreachable_code)]
+        SignalDelivery::NotDelivered
     }
 
     fn try_wait_terminal(
@@ -4608,6 +4649,16 @@ pub(crate) enum RuntimeSignal {
     User1,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     User2,
+}
+
+/// Whether a controller signal reached a live process (or its whole group).
+///
+/// Callers that escalate from a polite termination to a forced kill use this
+/// to skip the escalation when the target is already gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SignalDelivery {
+    Delivered,
+    NotDelivered,
 }
 
 pub(crate) struct SpawnedRuntimeProcess {

@@ -629,6 +629,7 @@ impl Fixture {
                 permission_rules_path: Some(root.path().join("rules.json")),
                 config_path: Some(root.path().join("config.toml")),
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
             },
         ));
         let mut client = TestClient {

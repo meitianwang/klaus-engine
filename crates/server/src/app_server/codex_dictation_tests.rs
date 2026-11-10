@@ -34,6 +34,7 @@ impl Client {
             permission_rules_path: Some(root.join("rules.json")),
             config_path: Some(root.join("config.toml")),
             startup_init_ack_budget: None,
+            session_unload_delay: None,
         };
         let mut speech_options = subscription_speech::Options::default();
         speech_options.codex_stream_url = endpoint;

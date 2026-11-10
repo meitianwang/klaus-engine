@@ -118,6 +118,17 @@ pub fn schema_bundle() -> Value {
             "turn/completed": {
                 "params": schema_for!(wire::TurnCompletedNotification),
             },
+            // Broadcast when the endpoint unloads an idle session: its engine
+            // runtime and child processes are gone, and the next open resumes
+            // from stored history.
+            "session/closed": {
+                "params": schema_for!(wire::SessionClosedNotification),
+            },
+            // Broadcast on session lifecycle transitions even to unsubscribed
+            // clients so list surfaces stay current.
+            "session/statusChanged": {
+                "params": schema_for!(wire::SessionStatusChangedNotification),
+            },
             // Broadcast the instant a delete commits: clients treat it as the
             // authoritative removal instead of deducing it from their reply.
             "thread/deleted": {

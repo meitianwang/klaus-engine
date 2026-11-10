@@ -356,6 +356,36 @@ impl TestClient {
                 permission_rules_path,
                 config_path,
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
+            },
+        ));
+        Self {
+            writer: client_write,
+            lines: BufReader::new(client_read).lines(),
+            server,
+            diagnostic: None,
+        }
+    }
+
+    /// [`start_full`] with an explicit idle-unload quiet period, for tests
+    /// that exercise the unload path without waiting out the default delay.
+    fn start_with_unload_delay(create_session: CreateSession, delay: Duration) -> Self {
+        let (client_side, server_side) = tokio::io::duplex(1 << 20);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let server = tokio::spawn(run_app_server(
+            server_read,
+            server_write,
+            AppServerOptions {
+                windows_sandbox_context: None,
+                create_session,
+                credential_store: None,
+                lifecycle: None,
+                plugin_admin: None,
+                permission_rules_path: None,
+                config_path: None,
+                startup_init_ack_budget: None,
+                session_unload_delay: Some(delay),
             },
         ));
         Self {
@@ -388,6 +418,7 @@ impl TestClient {
                 permission_rules_path: None,
                 config_path,
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
             },
         ));
         Self {
@@ -1181,6 +1212,111 @@ async fn full_turn_round_trip_streams_events_and_completes() {
         .await;
     let (response, _) = client.response_for(4).await;
     assert!(response.get("result").is_some());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn idle_session_unloads_after_the_quiet_period() {
+    let mut client = TestClient::start_with_unload_delay(
+        make_create_session(&["hi"]),
+        Duration::from_millis(50),
+    );
+    client.initialize().await;
+    client
+        .send(json!({ "id": 2, "method": "session/start", "params": { "init": {} } }))
+        .await;
+    let (response, _) = client.response_for(2).await;
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .send(json!({
+            "id": 3,
+            "method": "session/unsubscribe",
+            "params": { "sessionId": session_id }
+        }))
+        .await;
+    let (response, _) = client.response_for(3).await;
+    assert_eq!(response["result"]["subscribed"], json!(false));
+
+    // The endpoint unloads the unwatched, idle session and broadcasts it.
+    let mut saw_not_loaded = false;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(20), client.next_message())
+            .await
+            .expect("session/closed notification after the quiet period");
+        match message.get("method").and_then(Value::as_str) {
+            Some("session/statusChanged") => {
+                assert_eq!(message["params"]["sessionId"], json!(session_id));
+                if message["params"]["status"]["type"] == json!("notLoaded") {
+                    saw_not_loaded = true;
+                }
+            }
+            Some("session/closed") => {
+                assert_eq!(message["params"]["sessionId"], json!(session_id));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_not_loaded,
+        "unload broadcasts the notLoaded status before session/closed"
+    );
+
+    // The session is gone: re-subscribing reports an unknown session.
+    client
+        .send(json!({
+            "id": 4,
+            "method": "session/subscribe",
+            "params": { "sessionId": session_id }
+        }))
+        .await;
+    let (response, _) = client.response_for(4).await;
+    assert_eq!(response["error"]["code"], json!(-32004));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn watched_session_stays_loaded_past_the_quiet_period() {
+    let mut client = TestClient::start_with_unload_delay(
+        make_create_session(&["hi"]),
+        Duration::from_millis(50),
+    );
+    client.initialize().await;
+    client
+        .send(json!({ "id": 2, "method": "session/start", "params": { "init": {} } }))
+        .await;
+    let (response, _) = client.response_for(2).await;
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stay subscribed: the quiet period must never start.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    while let Ok(message) =
+        tokio::time::timeout(Duration::from_millis(100), client.next_message()).await
+    {
+        assert_ne!(
+            message.get("method").and_then(Value::as_str),
+            Some("session/closed"),
+            "a subscribed session must not be unloaded"
+        );
+    }
+
+    // The session still answers.
+    client
+        .send(json!({
+            "id": 5,
+            "method": "session/subscribe",
+            "params": { "sessionId": session_id }
+        }))
+        .await;
+    let (response, _) = client.response_for(5).await;
+    assert_eq!(response["result"]["subscribed"], json!(true));
     client.close().await;
 }
 

@@ -77,6 +77,7 @@ fn start(context: Context, path: PathBuf) -> TestClient {
             permission_rules_path: None,
             config_path: Some(path),
             startup_init_ack_budget: None,
+            session_unload_delay: None,
         },
     ));
     TestClient {

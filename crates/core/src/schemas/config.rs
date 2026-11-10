@@ -1539,6 +1539,11 @@ pub struct EngineConfig {
     /// Total configured threads, including the primary thread's reserved place.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_threads_per_session: Option<u32>,
+    /// Seconds the endpoint keeps an unwatched, idle session loaded before
+    /// unloading it. Unloading tears the session down through the same path an
+    /// explicit close uses and reclaims the child processes it owns; the next
+    /// open resumes from stored history.
+    pub session_unload_delay_secs: u64,
     /// A supplied delegation hint overrides effort-dependent hints, including when empty.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -1698,6 +1703,7 @@ impl Default for EngineConfig {
             plans_directory: None,
             effort: None,
             ultra_mode: false,
+            session_unload_delay_secs: 1800,
             default_subagent_model: None,
             subagent_model_catalog: false,
             subagent_model_options: Vec::new(),

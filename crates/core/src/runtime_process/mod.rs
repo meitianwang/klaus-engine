@@ -228,7 +228,7 @@ pub(crate) use runtime_spawner::{
     parent_runtime_env_value, RuntimeChildPtyReader, RuntimeChildPtyWriter,
     RuntimeCompletedProcessRequest, RuntimeCompletedProcessSurface, RuntimeProcessController,
     RuntimeProcessSurface, RuntimeSignal, RuntimeSpawnError, RuntimeSpawnRequest, RuntimeStdio,
-    SpawnedRuntimeProcess, SHELL_ENV_SNAPSHOT_MAX_STDOUT_BYTES,
+    SignalDelivery, SpawnedRuntimeProcess, SHELL_ENV_SNAPSHOT_MAX_STDOUT_BYTES,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use runtime_spawner::{

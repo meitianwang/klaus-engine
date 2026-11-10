@@ -92,6 +92,7 @@ fn client_with_observer(
         permission_rules_path: Some(root.join("permissions.json")),
         config_path: Some(root.join("config.json")),
         startup_init_ack_budget: None,
+        session_unload_delay: None,
     };
     let server = tokio::spawn(async move {
         match observer {

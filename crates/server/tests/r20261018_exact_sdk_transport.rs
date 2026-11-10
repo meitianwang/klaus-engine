@@ -194,6 +194,7 @@ async fn remote_typed_planning_and_split_stream_retain_exact_text() {
             permission_rules_path: Some(dir.path().join("permissions.json")),
             config_path: Some(dir.path().join("config.json")),
             startup_init_ack_budget: None,
+            session_unload_delay: None,
         })
         .await;
         let connection = connect_facade(&server_url, ConnectOptions::default())

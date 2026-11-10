@@ -61,6 +61,7 @@ impl Client {
                 permission_rules_path: Some(root.join("rules.json")),
                 config_path: Some(config_path),
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
             },
             Default::default(),
             options,

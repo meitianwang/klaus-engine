@@ -177,6 +177,7 @@ impl Fixture {
                 permission_rules_path: Some(self.root.path().join("rules.json")),
                 config_path: Some(self.root.path().join("config.json")),
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
             },
             self.options.clone(),
         ));

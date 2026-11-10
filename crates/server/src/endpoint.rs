@@ -254,6 +254,7 @@ impl Endpoint {
             permission_rules_path: None,
             config_path: None,
             startup_init_ack_budget: None,
+            session_unload_delay: None,
         }
     }
 

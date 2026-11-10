@@ -73,6 +73,7 @@ async fn a_stalled_startup_credential_read_fails_with_the_init_ack_budget_error(
             permission_rules_path: Some(temp.path().join("rules.json")),
             config_path: Some(temp.path().join("config.toml")),
             startup_init_ack_budget: Some(Duration::from_millis(500)),
+            session_unload_delay: None,
         },
     ));
     let mut lines = BufReader::new(client_read).lines();

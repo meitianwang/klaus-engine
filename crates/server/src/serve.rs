@@ -547,6 +547,7 @@ async fn run_ws_session<S>(
                 permission_rules_path: None,
                 config_path: None,
                 startup_init_ack_budget: None,
+                session_unload_delay: None,
             },
         )
         .await;

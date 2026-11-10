@@ -3349,6 +3349,48 @@ pub struct ThreadDeletedNotification {
     pub thread_id: String,
 }
 
+/// `session/closed` notification: the endpoint unloaded an idle session. Its
+/// engine runtime and child processes are gone; opening the session again
+/// resumes it from stored history.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClosedNotification {
+    pub session_id: String,
+}
+
+/// One reason a session counts as active: it is waiting for a client answer.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionActiveFlag {
+    WaitingOnApproval,
+    WaitingOnUserInput,
+}
+
+/// Lifecycle status of one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SessionStatus {
+    NotLoaded,
+    Idle,
+    Active {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_flags: Vec<SessionActiveFlag>,
+    },
+}
+
+/// `session/statusChanged` notification: broadcast on every lifecycle
+/// transition, including to clients that unsubscribed from the session's
+/// event stream, so list surfaces stay current while a session is
+/// unload-eligible.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusChangedNotification {
+    pub session_id: String,
+    pub status: SessionStatus,
+}
+
 /// `thread/started` product notification (requires `productEvents`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

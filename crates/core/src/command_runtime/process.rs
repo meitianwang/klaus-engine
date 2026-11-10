@@ -1142,7 +1142,7 @@ impl LocalExecProcessRegistry {
         };
         match signal {
             ProcessSignal::Interrupt => controller.signal(RuntimeSignal::Interrupt),
-        }
+        };
         Ok(true)
     }
 

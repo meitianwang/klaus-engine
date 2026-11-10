@@ -162,6 +162,7 @@ async fn public_named_ingress_validates_controls_after_exact_content() {
             permission_rules_path: Some(root.path().join("permission-rules.json")),
             config_path: Some(root.path().join("config.json")),
             startup_init_ack_budget: None,
+            session_unload_delay: None,
         },
     ));
     let mut lines = BufReader::new(read).lines();
