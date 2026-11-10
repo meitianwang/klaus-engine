@@ -13,9 +13,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::loader::{Skill, model_invocable};
+use super::loader::{model_invocable, Skill};
 use crate::permission::bash::node_path::is_absolute;
-use crate::runtime_values::{RuntimeString, runtime_codec, runtime_json};
+use crate::runtime_values::{runtime_codec, runtime_json, RuntimeString};
 use crate::schemas::content::{ContentBlock, HarnessEnvelope};
 use crate::schemas::message::Message;
 use crate::types::reminder::{ReminderContext, ReminderProvider};
@@ -737,7 +737,11 @@ impl SkillListingReminderProvider {
             .concat(&RuntimeString::from(LISTING_PREAMBLE))
             .concat(&RuntimeString::from("\n"))
             .concat(&body);
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 }
 
@@ -782,7 +786,7 @@ pub fn create_skill_listing_reminder_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_values::{RuntimeJson, runtime_json};
+    use crate::runtime_values::{runtime_json, RuntimeJson};
     use std::sync::Arc;
 
     fn skill(name: &str, description: &str) -> Skill {
@@ -917,12 +921,10 @@ mod tests {
         let edited = provider.tick().unwrap();
         assert!(edited.contains("replaces all previous skill listings"));
         skills.lock().unwrap().clear();
-        assert!(
-            provider
-                .tick()
-                .unwrap()
-                .contains("No skills are currently available")
-        );
+        assert!(provider
+            .tick()
+            .unwrap()
+            .contains("No skills are currently available"));
         assert_eq!(provider.tick(), None);
         skills.lock().unwrap().push(skill("draft", "Write again"));
         assert!(provider.tick().unwrap().contains("- draft: Write again"));
