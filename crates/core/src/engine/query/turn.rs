@@ -3666,9 +3666,9 @@ async fn consume_precomputed_compaction(
 
 /// Arm one background checkpoint summary while the context is inside the
 /// precompute lead window but has not reached the compaction boundary. The
-/// background pass never emits user-visible events on its own. Arming is
-/// opt-in through `precompute_compaction`; without it every boundary keeps
-/// the synchronous compaction path unchanged.
+/// background pass never emits user-visible events on its own. Enabled by
+/// default through `precompute_compaction`; disabling it keeps the synchronous
+/// compaction path unchanged.
 #[allow(clippy::too_many_arguments)]
 fn maybe_arm_compaction_precompute(
     shared: &Arc<Shared>,
@@ -3686,12 +3686,25 @@ fn maybe_arm_compaction_precompute(
     let Some(registry) = shared.params.precompute.as_ref() else {
         return;
     };
-    let Some(threshold) =
-        crate::context::compact::policy::precompute_arm_threshold(status.auto_compact_scope_limit)
+    let (scope_tokens, scope_limit) = match config.auto_compact_scope {
+        crate::schemas::config::AutoCompactScope::Total => (
+            status
+                .auto_compact_scope_tokens
+                .saturating_sub(prefix_tokens),
+            status
+                .auto_compact_scope_limit
+                .saturating_sub(prefix_tokens),
+        ),
+        crate::schemas::config::AutoCompactScope::BodyAfterPrefix => (
+            status.auto_compact_scope_tokens,
+            status.auto_compact_scope_limit,
+        ),
+    };
+    let Some(threshold) = crate::context::compact::policy::precompute_arm_threshold(scope_limit)
     else {
         return;
     };
-    if status.auto_compact_scope_tokens < threshold {
+    if scope_tokens < threshold {
         return;
     }
     let deps = shared.deps();
@@ -3706,7 +3719,10 @@ fn maybe_arm_compaction_precompute(
     };
     let (compactable, _protected) =
         split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
-    if compactable.is_empty() {
+    if !compactable
+        .iter()
+        .any(|message| matches!(message, Message::Assistant(_)))
+    {
         return;
     }
     let agent_key = shared

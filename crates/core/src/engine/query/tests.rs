@@ -13070,13 +13070,16 @@ async fn precompute_arms_invisibly_and_applies_at_the_boundary() {
     let window = precompute_window(window_state.clone());
     let mut config = crate::schemas::config::default_config();
     config.auto_compact_window = Some(20_000);
-    config.precompute_compaction = true;
     let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
 
     // Turn 1: inside the precompute lead window, below the compaction
     // boundary. The background checkpoint must stay invisible.
     let params = precompute_params(
-        vec![precompute_user("u1", "first question")],
+        vec![
+            precompute_user("u0", "earlier question"),
+            precompute_assistant("a0", "earlier response"),
+            precompute_user("u1", "first question"),
+        ],
         &registry,
         &window,
         &config,
@@ -13112,6 +13115,8 @@ async fn precompute_arms_invisibly_and_applies_at_the_boundary() {
     window_state.lock().unwrap().active_tokens = Some(21_000);
     let params = precompute_params(
         vec![
+            precompute_user("u0", "earlier question"),
+            precompute_assistant("a0", "earlier response"),
             precompute_user("u1", "first question"),
             precompute_assistant("a1", "turn response"),
             precompute_user("u2", "second question"),
@@ -13189,12 +13194,15 @@ async fn precompute_falls_back_to_synchronous_when_the_boundary_is_gone() {
     let window = precompute_window(window_state.clone());
     let mut config = crate::schemas::config::default_config();
     config.auto_compact_window = Some(20_000);
-    config.precompute_compaction = true;
     let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
 
     // Arm the background checkpoint in turn 1.
     let params = precompute_params(
-        vec![precompute_user("u1", "first question")],
+        vec![
+            precompute_user("u0", "earlier question"),
+            precompute_assistant("a0", "earlier response"),
+            precompute_user("u1", "first question"),
+        ],
         &registry,
         &window,
         &config,
@@ -13275,13 +13283,16 @@ async fn precompute_stays_inert_until_the_config_enables_it() {
     let window = precompute_window(window_state.clone());
     let mut config = crate::schemas::config::default_config();
     config.auto_compact_window = Some(20_000);
-    // The gate deliberately stays at its default (off): an unconfigured
-    // session must never arm a background summary.
+    config.precompute_compaction = false;
     let captured = Arc::new(Mutex::new(Vec::<Message>::new()));
 
     // Turn 1 sits inside the lead window where an enabled session would arm.
     let params = precompute_params(
-        vec![precompute_user("u1", "first question")],
+        vec![
+            precompute_user("u0", "earlier question"),
+            precompute_assistant("a0", "earlier response"),
+            precompute_user("u1", "first question"),
+        ],
         &registry,
         &window,
         &config,

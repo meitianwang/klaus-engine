@@ -1469,8 +1469,8 @@ pub struct EngineConfig {
     pub precompute_buffer_fraction: Option<f64>,
     /// Precompute the automatic-compaction summary in the background while
     /// the context is still inside the lead window before the compaction
-    /// boundary. Only applies when automatic compaction is enabled; off by
-    /// default, so an unconfigured session keeps the synchronous path.
+    /// boundary. Only applies when automatic compaction is enabled; on by
+    /// default, and setting it to `false` keeps the synchronous path.
     pub precompute_compaction: bool,
     /// Developer diagnostics: record how every model request settled (raw
     /// finish reason, stream framing, usage, timing) into
@@ -1737,7 +1737,7 @@ impl Default for EngineConfig {
             compact_cold_cleanup: false,
             context_hints: true,
             precompute_buffer_fraction: None,
-            precompute_compaction: false,
+            precompute_compaction: true,
             provider_trace: false,
             early_microcompact: false,
             idle_microcompact: false,
@@ -2151,6 +2151,7 @@ mod tests {
         assert!(!cfg.idle_microcompact);
         assert_eq!(cfg.idle_microcompact_gap_minutes, 60);
         assert_eq!(cfg.idle_microcompact_keep_recent, 5);
+        assert!(cfg.precompute_compaction);
         assert!(cfg.manage_thinking_context);
         assert!(cfg.memory.enabled);
         assert!(cfg.mcp_catalog.enabled);
