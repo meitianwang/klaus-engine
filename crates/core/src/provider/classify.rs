@@ -331,6 +331,7 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
             | "antigravity_model_not_offered"
             | "antigravity_model_unlisted"
             | "antigravity_request_rejected"
+            | "antigravity_region_unsupported"
             | "image_preprocessing_failed",
         ) => Some(ProviderErrorKind::InvalidRequest),
         Some("antigravity_auth_required") => Some(ProviderErrorKind::Auth),
@@ -1089,6 +1090,11 @@ mod tests {
             (
                 400,
                 "antigravity_request_rejected",
+                ProviderErrorKind::InvalidRequest,
+            ),
+            (
+                400,
+                "antigravity_region_unsupported",
                 ProviderErrorKind::InvalidRequest,
             ),
             (

@@ -100,12 +100,13 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 9] = [
+const ERROR_TAGS: [&str; 10] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
     "antigravity_model_unlisted",
     "antigravity_quota_exhausted",
     "antigravity_request_rejected",
+    "antigravity_region_unsupported",
     "antigravity_auth_required",
     "antigravity_rate_limited",
     "antigravity_service_unavailable",
@@ -231,6 +232,16 @@ fn service_error(
                 ]
                 .iter()
                 .any(|word| lower.contains(word)))));
+    // A region eligibility verdict rejects the request's egress location, not
+    // its content: the localized sentence must point at the network path
+    // instead of inviting the user to rewrite the message. The verdict flips
+    // with the egress route (proxy or VPN up/down), so it arrives through the
+    // same refusal shape as content rejections while needing its own wording.
+    let region_unsupported = lower.contains("location is not supported")
+        && matches!(
+            service_code,
+            Some("FAILED_PRECONDITION" | "PERMISSION_DENIED")
+        );
     // Upstream capacity verdicts arrive shaped like ordinary refusals but clear
     // on their own, so the retry schedule can wait them out instead of failing
     // the turn fast. HTTP 408 is the service's own request-timeout verdict.
@@ -264,6 +275,8 @@ fn service_error(
         "antigravity_service_unavailable"
     } else if explicit_rate || status == Some(429) || service_code == Some("RESOURCE_EXHAUSTED") {
         "antigravity_rate_limited"
+    } else if region_unsupported {
+        "antigravity_region_unsupported"
     } else {
         "antigravity_request_rejected"
     };
@@ -1155,6 +1168,13 @@ mod tests {
                 "INVALID_ARGUMENT",
                 "Invalid generation configuration.",
                 "antigravity_request_rejected",
+                ProviderErrorKind::InvalidRequest,
+            ),
+            (
+                400,
+                "FAILED_PRECONDITION",
+                "User location is not supported for the API use.",
+                "antigravity_region_unsupported",
                 ProviderErrorKind::InvalidRequest,
             ),
         ] {
