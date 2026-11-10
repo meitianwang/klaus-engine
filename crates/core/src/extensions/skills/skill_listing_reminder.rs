@@ -8,14 +8,14 @@
 //! including an explicit removal notice when the last available skill disappears.
 //! Budget overflow remains eligible for a later reminder in the same generation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::loader::{model_invocable, Skill};
+use super::loader::{Skill, model_invocable};
 use crate::permission::bash::node_path::is_absolute;
-use crate::runtime_values::{runtime_codec, runtime_json, RuntimeString};
+use crate::runtime_values::{RuntimeString, runtime_codec, runtime_json};
 use crate::schemas::content::{ContentBlock, HarnessEnvelope};
 use crate::schemas::message::Message;
 use crate::types::reminder::{ReminderContext, ReminderProvider};
@@ -94,72 +94,323 @@ fn locator(s: &Skill) -> Option<RuntimeString> {
     is_absolute(&host).then(|| s.path.clone())
 }
 
-/// One `- name: description` line, with the description capped at `desc_max`
-/// and the location appended when `with_path` and the skill has one.
-fn render_line(s: &Skill, desc_max: usize, with_path: bool) -> RuntimeString {
-    let mut line = RuntimeString::from("- ")
-        .concat(&s.name)
-        .concat(&RuntimeString::from(": "))
-        .concat(&truncate(&describe(s), desc_max));
-    if with_path {
-        if let Some(path) = locator(s) {
-            line = line
-                .concat(&RuntimeString::from(" ("))
-                .concat(&path)
-                .concat(&RuntimeString::from(")"));
+/// The alias prefix for a filesystem root, so a listing's roots are named `r0`,
+/// `r1`, … in first-seen order.
+const ALIAS_PREFIX: &str = "r";
+
+/// One root → alias assignment in a listing.
+struct AliasRoot {
+    name: String,
+    value: String,
+}
+
+/// The root aliases one listing shares across its lines.
+///
+/// Every line repeats the directory its `SKILL.md` lives under, so a machine with
+/// skills in the usual handful of places repeats the same long prefixes once per
+/// skill. Naming each prefix once and spelling a location `r0/<suffix>` keeps the
+/// location — the model needs it to open a skill's supporting files — for a
+/// fraction of the width, and width is what decides how much description the
+/// listing's budget can still afford.
+#[derive(Default)]
+struct AliasPlan {
+    roots: Vec<AliasRoot>,
+}
+
+impl AliasPlan {
+    /// Assign aliases in listing order: the first root seen is `r0`, the next
+    /// unseen one `r1`, and so on. A skill without a real path contributes no root
+    /// and keeps rendering without a location.
+    fn build(skills: &[Skill]) -> Self {
+        let roots: Vec<Option<String>> = skills.iter().map(alias_root_of).collect();
+
+        // How many skills share each plugin-cache version directory, which decides
+        // whether that root is worth an alias of its own.
+        let mut version_counts: HashMap<String, usize> = HashMap::new();
+        for root in roots.iter().flatten() {
+            if let Some(version) = plugin_version_base(root) {
+                *version_counts.entry(version).or_insert(0) += 1;
+            }
         }
+
+        let mut plan = Self::default();
+        for root in roots.into_iter().flatten() {
+            // A plugin-cache root only one skill uses contributes its marketplace
+            // directory instead, so sibling plugins of one marketplace share a
+            // single alias rather than each spending a table line on a deep path.
+            let shared = match plugin_version_base(&root) {
+                Some(version) if version_counts.get(&version).copied().unwrap_or_default() <= 1 => {
+                    plugin_marketplace_base(&root).unwrap_or(root)
+                }
+                _ => root,
+            };
+            if !plan.roots.iter().any(|known| known.value == shared) {
+                let name = format!("{ALIAS_PREFIX}{}", plan.roots.len());
+                plan.roots.push(AliasRoot {
+                    name,
+                    value: shared,
+                });
+            }
+        }
+        plan
+    }
+
+    /// The shortest spelling of `locator` under this plan: the LONGEST matching
+    /// root wins, so a deeper root is never shadowed by a shorter one that happens
+    /// to be its prefix. `None` leaves the caller with the absolute path.
+    fn shorten(&self, locator: &str) -> Option<String> {
+        self.roots
+            .iter()
+            .filter_map(|root| {
+                let suffix = locator
+                    .strip_prefix(root.value.trim_end_matches('/'))?
+                    .strip_prefix('/')?;
+                Some((root, suffix))
+            })
+            .max_by_key(|(root, _)| root.value.len())
+            .map(|(root, suffix)| format!("{}/{suffix}", root.name))
+    }
+
+    /// The `- \`r0\` = \`/absolute/root\`` table lines for the roots a listing
+    /// actually spelled, so no alias is declared that no line uses.
+    fn root_lines_for(&self, used: &HashSet<String>) -> Vec<String> {
+        self.roots
+            .iter()
+            .filter(|root| used.contains(&root.name))
+            .map(|root| format!("- `{}` = `{}`", root.name, root.value))
+            .collect()
+    }
+}
+
+/// The directory a skill was discovered under: the parent of the skill's own
+/// directory. `None` when the path has no room for both, which keeps a one-level
+/// path from aliasing against an empty root.
+fn alias_root_of(s: &Skill) -> Option<String> {
+    let host = locator(s)?.try_to_utf8().ok()?.replace('\\', "/");
+    let skill_dir = host.rsplit_once('/')?.0;
+    let root = skill_dir.rsplit_once('/')?.0;
+    (!root.is_empty()).then(|| root.to_string())
+}
+
+/// The `plugins/cache/<marketplace>` prefix of a path inside a plugin cache.
+fn plugin_marketplace_base(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    (2..parts.len()).find_map(|index| {
+        (parts[index - 1] == "cache" && parts[index - 2] == "plugins" && !parts[index].is_empty())
+            .then(|| parts[..=index].join("/"))
+    })
+}
+
+/// The `plugins/cache/<marketplace>/<plugin>/<version>` prefix of a path inside a
+/// plugin cache: the deepest part of the root every skill of one installed plugin
+/// version has in common.
+fn plugin_version_base(path: &str) -> Option<String> {
+    let base = plugin_marketplace_base(path)?;
+    let mut rest = path.strip_prefix(&base)?.strip_prefix('/')?.split('/');
+    let plugin = rest.next().filter(|part| !part.is_empty())?;
+    let version = rest.next().filter(|part| !part.is_empty())?;
+    Some(format!("{base}/{plugin}/{version}"))
+}
+
+/// One `- name: description (location)` line, with the description capped at
+/// `desc_max` and the location appended when the skill has one to show. A zero cap
+/// leaves `- name: (location)`: the location outlives the description.
+fn render_line(s: &Skill, desc_max: usize, location: Option<&RuntimeString>) -> RuntimeString {
+    let description = truncate(&describe(s), desc_max);
+    let mut line = RuntimeString::from("- ").concat(&s.name);
+    if description.is_empty() {
+        line = line.concat(&RuntimeString::from(":"));
+    } else {
+        line = line.concat(&RuntimeString::from(": ")).concat(&description);
+    }
+    if let Some(location) = location {
+        line = line
+            .concat(&RuntimeString::from(" ("))
+            .concat(location)
+            .concat(&RuntimeString::from(")"));
     }
     line
 }
 
 /// The rendered width of a listing: the lines plus the newlines joining them.
 fn listing_width(lines: &[RuntimeString]) -> usize {
-    lines.iter().map(RuntimeString::len_utf16).sum::<usize>() + lines.len().saturating_sub(1)
+    combined_width(lines, &[])
 }
 
-/// Render `- name: description (path)` lines within `budget` chars, degrading in
-/// four steps: full descriptions with locations → the same without locations →
-/// descriptions shrunk to an even share of the budget → names only when even
-/// that share is below the floor. Locations go first because a description is
-/// what lets the model pick the right skill, so a location must never cost one a
-/// single character. Returns the rendered text AND the skills actually NAMED in
-/// it — so the caller can mark only those as "sent" (a skill collapsed into the
-/// `… (+N more)` marker stays unsent and gets another chance to be named on a
-/// later, roomier turn).
-fn render_listing(skills: &[Skill], budget: usize) -> (RuntimeString, Vec<&Skill>) {
-    for with_path in [true, false] {
-        let lines: Vec<RuntimeString> = skills
-            .iter()
-            .map(|s| render_line(s, MAX_DESC_CHARS, with_path))
-            .collect();
-        if listing_width(&lines) <= budget {
-            return (join_runtime_strings(&lines, "\n"), skills.iter().collect());
-        }
+/// The width of two line groups joined into one listing by newlines.
+fn combined_width(first: &[RuntimeString], second: &[RuntimeString]) -> usize {
+    first
+        .iter()
+        .chain(second.iter())
+        .map(RuntimeString::len_utf16)
+        .sum::<usize>()
+        + (first.len() + second.len()).saturating_sub(1)
+}
+
+/// Per-line fixed cost at one location spelling: "- " + name + ": " + the
+/// " (" + location + ")" suffix when there is one + the joining newline.
+fn line_overhead(name: &RuntimeString, location: Option<&RuntimeString>) -> usize {
+    name_overhead(name) + location.map_or(0, |location| location.len_utf16() + 3)
+}
+
+/// Description characters the budget cut across `skills` at a `desc_max` cap: what
+/// a shortened line lost, and — at a zero cap — every description of every line.
+fn truncated_desc_chars(skills: &[&Skill], desc_max: usize) -> usize {
+    skills
+        .iter()
+        .map(|s| {
+            let described = describe(s);
+            u16_len(&described).saturating_sub(u16_len(&truncate(&described, desc_max)))
+        })
+        .sum()
+}
+
+/// The listing's location spelling plus the alias table that spelling needs.
+struct FirstStep {
+    locations: Vec<Option<RuntimeString>>,
+    root_lines: Vec<RuntimeString>,
+    /// Width the table adds to the listing, joining newline included.
+    cost: usize,
+}
+
+/// Spell the locations: as aliases under `plan` when the listing can afford the
+/// table, as absolute paths otherwise. A plan that buys nothing — no roots, or a
+/// table that alone would eat the budget — falls back to absolute paths, so
+/// aliasing can only ever be a saving.
+fn first_step(skills: &[Skill], budget: usize, plan: Option<&AliasPlan>) -> FirstStep {
+    let absolute = FirstStep {
+        locations: skills.iter().map(locator).collect(),
+        root_lines: Vec::new(),
+        cost: 0,
+    };
+    let Some(plan) = plan.filter(|plan| !plan.roots.is_empty()) else {
+        return absolute;
+    };
+
+    let mut used = HashSet::new();
+    let locations = skills
+        .iter()
+        .map(|skill| {
+            let path = locator(skill)?;
+            let host = path.try_to_utf8().ok()?.replace('\\', "/");
+            let alias = plan.shorten(&host)?;
+            used.insert(alias.split_once('/')?.0.to_string());
+            Some(RuntimeString::from(alias))
+        })
+        .collect::<Vec<_>>();
+    let root_lines = plan
+        .root_lines_for(&used)
+        .into_iter()
+        .map(RuntimeString::from)
+        .collect::<Vec<_>>();
+    if root_lines.is_empty() {
+        return absolute;
+    }
+    let cost = listing_width(&root_lines) + 1;
+    if cost >= budget {
+        return absolute;
+    }
+    FirstStep {
+        locations,
+        root_lines,
+        cost,
+    }
+}
+
+/// One rendered listing: the alias table (empty when locations are absolute or
+/// absent), the skill lines, and what the render cost the budget.
+struct Listing<'a> {
+    root_lines: Vec<RuntimeString>,
+    lines: Vec<RuntimeString>,
+    named: Vec<&'a Skill>,
+    truncated_desc_chars: usize,
+}
+
+impl Listing<'_> {
+    fn text(&self) -> RuntimeString {
+        let mut all = self.root_lines.clone();
+        all.extend(self.lines.iter().cloned());
+        join_runtime_strings(&all, "\n")
     }
 
-    let overhead: usize = skills.iter().map(|s| name_overhead(&s.name)).sum();
-    // Signed division: `budget - overhead` may be negative; only a per_desc at or
-    // above the floor (necessarily positive) is used as a truncate width, where
+    fn width(&self) -> usize {
+        combined_width(&self.root_lines, &self.lines)
+    }
+}
+
+/// Whether `candidate` earns its place over `current`: more skills named first,
+/// then fewer description characters cut, then less width spent. Aliasing is only
+/// a means to those ends, so it never wins on its own.
+fn listing_is_better(candidate: &Listing<'_>, current: &Listing<'_>) -> bool {
+    if candidate.named.len() != current.named.len() {
+        return candidate.named.len() > current.named.len();
+    }
+    if candidate.truncated_desc_chars != current.truncated_desc_chars {
+        return candidate.truncated_desc_chars < current.truncated_desc_chars;
+    }
+    candidate.width() < current.width()
+}
+
+/// The ladder for one location spelling: `plan` aliases the locations, `None`
+/// spells them out.
+fn render_ladder<'a>(skills: &'a [Skill], budget: usize, plan: Option<&AliasPlan>) -> Listing<'a> {
+    let first = first_step(skills, budget, plan);
+    let line_budget = budget.saturating_sub(first.cost);
+    let all: Vec<&Skill> = skills.iter().collect();
+
+    // Step 1: full descriptions with locations.
+    let lines: Vec<RuntimeString> = skills
+        .iter()
+        .zip(&first.locations)
+        .map(|(s, location)| render_line(s, MAX_DESC_CHARS, location.as_ref()))
+        .collect();
+    if listing_width(&lines) <= line_budget {
+        let truncated = truncated_desc_chars(&all, MAX_DESC_CHARS);
+        return Listing {
+            root_lines: first.root_lines,
+            lines,
+            named: all,
+            truncated_desc_chars: truncated,
+        };
+    }
+
+    // Step 2: locations stay and the descriptions absorb the pressure. A location
+    // is what lets the model open the skill's own supporting files, and the alias
+    // table has already bought it for a fraction of its absolute cost.
+    let overhead: usize = skills
+        .iter()
+        .zip(&first.locations)
+        .map(|(s, location)| line_overhead(&s.name, location.as_ref()))
+        .sum();
+    // Signed division: `line_budget - overhead` may be negative; only a per_desc at
+    // or above the floor (necessarily positive) is used as a truncate width, where
     // truncation toward zero and floor agree.
-    let per_desc = (budget as i64 - overhead as i64) / (skills.len() as i64);
+    let per_desc = (line_budget as i64 - overhead as i64) / (skills.len() as i64);
     if per_desc >= MIN_DESC_CHARS as i64 {
         let lines = skills
             .iter()
-            .map(|s| render_line(s, per_desc as usize, false))
+            .zip(&first.locations)
+            .map(|(s, location)| render_line(s, per_desc as usize, location.as_ref()))
             .collect::<Vec<_>>();
-        return (join_runtime_strings(&lines, "\n"), skills.iter().collect());
+        let truncated = truncated_desc_chars(&all, per_desc as usize);
+        return Listing {
+            root_lines: first.root_lines,
+            lines,
+            named: all,
+            truncated_desc_chars: truncated,
+        };
     }
 
-    // Names only: even a description share is below the floor. Emit as many names
-    // as fit the budget (always at least one), then a "+N more" marker — so the
-    // listing still respects the budget instead of dumping every name unbounded.
+    // Step 3: descriptions are gone. Emit as many `- name: (location)` lines as fit
+    // the budget (always at least one), then a "+N more" marker — so the listing
+    // still respects the budget instead of dumping every name unbounded.
     let mut lines: Vec<RuntimeString> = Vec::new();
     let mut named: Vec<&Skill> = Vec::new();
     let mut width: usize = 0;
-    for (i, s) in skills.iter().enumerate() {
-        let line = RuntimeString::from("- ").concat(&s.name);
-        let cost = line.len_utf16() + if !lines.is_empty() { 1 } else { 0 };
-        if !lines.is_empty() && width + cost > budget {
+    for (i, (s, location)) in skills.iter().zip(&first.locations).enumerate() {
+        let line = render_line(s, 0, location.as_ref());
+        let cost = line.len_utf16() + usize::from(!lines.is_empty());
+        if !lines.is_empty() && width + cost > line_budget {
             lines.push(RuntimeString::from(format!(
                 "… (+{} more)",
                 skills.len() - i
@@ -170,7 +421,46 @@ fn render_listing(skills: &[Skill], budget: usize) -> (RuntimeString, Vec<&Skill
         named.push(s);
         width += cost;
     }
-    (join_runtime_strings(&lines, "\n"), named)
+    Listing {
+        root_lines: first.root_lines,
+        lines,
+        named,
+        // Nothing behind the marker was described either, so every description in
+        // the catalog counts as cut.
+        truncated_desc_chars: truncated_desc_chars(&all, 0),
+    }
+}
+
+/// Render `- name: description (location)` lines within `budget` chars, degrading
+/// in three steps: full descriptions with locations → the same locations with
+/// descriptions shrunk to an even share of the budget → locations without
+/// descriptions when even that share is below the floor. A location outlives the
+/// prose at every step, because the model needs it to open the skill's own
+/// supporting files; what gives way is the description that helps it choose, and a
+/// location too expensive to spell out is aliased against a root table instead of
+/// dropped. Both spellings are rendered and the better one wins, so aliasing is
+/// kept only when it actually names more skills, cuts less description, or costs
+/// less width. Returns the rendered text AND the skills actually NAMED in it — so
+/// the caller can mark only those as "sent" (a skill collapsed into the
+/// `… (+N more)` marker stays unsent and gets another chance to be named on a
+/// later, roomier turn).
+///
+/// `plan` is numbered against the WHOLE catalog, not just `skills`: a listing too
+/// large for one budget is emitted as several pages, and `r0` has to name the same
+/// root on every one of them.
+fn render_listing<'a>(
+    skills: &'a [Skill],
+    budget: usize,
+    plan: &AliasPlan,
+) -> (RuntimeString, Vec<&'a Skill>) {
+    let absolute = render_ladder(skills, budget, None);
+    let aliased = render_ladder(skills, budget, Some(plan));
+    let best = if listing_is_better(&aliased, &absolute) {
+        aliased
+    } else {
+        absolute
+    };
+    (best.text(), best.named)
 }
 
 fn join_runtime_strings(values: &[RuntimeString], separator: &str) -> RuntimeString {
@@ -367,7 +657,10 @@ impl SkillListingReminderProvider {
                 0,
             )
         } else {
-            let (body, named) = render_listing(&skills[offset..end], budget);
+            // Numbered against the whole catalog so every page of one listing
+            // agrees on what each alias names.
+            let plan = AliasPlan::build(&skills);
+            let (body, named) = render_listing(&skills[offset..end], budget, &plan);
             (
                 RuntimeString::from(LISTING_PREAMBLE)
                     .concat(&RuntimeString::from("\n"))
@@ -412,6 +705,9 @@ impl SkillListingReminderProvider {
                 "The available skill catalog has changed. No skills are currently available. Previous skill listings no longer apply.",
             ));
         }
+        // Numbered against the whole catalog, not just this turn's fresh slice, so
+        // an alias names the same root across listings.
+        let plan = AliasPlan::build(&skills);
         let fresh: Vec<Skill> = skills
             .into_iter()
             .filter(|s| !state.sent.contains(&s.name))
@@ -426,7 +722,7 @@ impl SkillListingReminderProvider {
                     .as_ref()
                     .map_or(self.budget, |get_window| char_budget(get_window()))
             });
-        let (body, named) = render_listing(&fresh, budget);
+        let (body, named) = render_listing(&fresh, budget, &plan);
         // Mark only the skills actually NAMED this turn as sent — a skill hidden
         // behind the `… (+N more)` marker stays fresh so a later turn can name it.
         for s in &named {
@@ -441,11 +737,7 @@ impl SkillListingReminderProvider {
             .concat(&RuntimeString::from(LISTING_PREAMBLE))
             .concat(&RuntimeString::from("\n"))
             .concat(&body);
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 }
 
@@ -490,7 +782,7 @@ pub fn create_skill_listing_reminder_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_values::{runtime_json, RuntimeJson};
+    use crate::runtime_values::{RuntimeJson, runtime_json};
     use std::sync::Arc;
 
     fn skill(name: &str, description: &str) -> Skill {
@@ -506,6 +798,15 @@ mod tests {
     fn skill_when(name: &str, description: &str, when_to_use: &str) -> Skill {
         Skill {
             when_to_use: Some(RuntimeString::from(when_to_use)),
+            ..skill(name, description)
+        }
+    }
+
+    /// A skill under an explicit root, so a test can choose how long the shared
+    /// prefix — and therefore the alias saving — is.
+    fn skill_at(name: &str, description: &str, root: &str) -> Skill {
+        Skill {
+            path: RuntimeString::from(format!("{root}/{name}/SKILL.md")),
             ..skill(name, description)
         }
     }
@@ -616,10 +917,12 @@ mod tests {
         let edited = provider.tick().unwrap();
         assert!(edited.contains("replaces all previous skill listings"));
         skills.lock().unwrap().clear();
-        assert!(provider
-            .tick()
-            .unwrap()
-            .contains("No skills are currently available"));
+        assert!(
+            provider
+                .tick()
+                .unwrap()
+                .contains("No skills are currently available")
+        );
         assert_eq!(provider.tick(), None);
         skills.lock().unwrap().push(skill("draft", "Write again"));
         assert!(provider.tick().unwrap().contains("- draft: Write again"));
@@ -776,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_locations_before_shortening_descriptions() {
+    fn shortens_descriptions_before_giving_up_locations() {
         let p = create_skill_listing_reminder_provider(
             || {
                 vec![
@@ -784,18 +1087,21 @@ mod tests {
                     skill("beta", "another fairly wordy description here"),
                 ]
             },
-            // 100-char budget: the two lines fit at 86 chars without their
-            // locations but need 135 with them.
-            Some(2500),
+            // 120-char budget: both full descriptions plus both locations need 135,
+            // while both locations plus an even description share need 120.
+            Some(3000),
         );
-        let text = p.tick().unwrap_or_default();
-        assert!(text.contains("- alpha: a fairly wordy description here\n"));
-        assert!(text.ends_with("- beta: another fairly wordy description here"));
-        assert!(!text.contains("SKILL.md"));
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        // The location is what lets the model open the skill's own supporting files,
+        // so the description gives way first.
+        assert!(text.contains("(/skills/alpha/SKILL.md)"), "{text}");
+        assert!(text.contains("(/skills/beta/SKILL.md)"), "{text}");
+        assert!(!text.contains("description here"), "{text}");
+        assert!(text.contains("- alpha: a fairly wordy"), "{text}");
     }
 
     #[test]
-    fn degrades_to_names_only_under_a_tiny_budget() {
+    fn degrades_to_locations_without_descriptions_under_a_tiny_budget() {
         let p = create_skill_listing_reminder_provider(
             || {
                 vec![
@@ -804,12 +1110,13 @@ mod tests {
                     skill("gamma", "yet another wordy description here"),
                 ]
             },
-            Some(1000), // ~10 char budget → names only
+            Some(1000), // 40-char budget → no description survives
         );
-        let text = p.tick().unwrap_or_default();
-        assert!(text.contains("- alpha"));
-        assert!(!text.contains("- alpha:")); // no description
-        assert!(!text.contains("wordy"));
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(text.contains("- alpha:"), "{text}");
+        assert!(!text.contains("wordy"), "{text}");
+        // The location is the last thing the listing gives up.
+        assert!(text.contains("SKILL.md"), "{text}");
     }
 
     #[test]
@@ -819,11 +1126,12 @@ mod tests {
     }
 
     #[test]
-    fn caps_the_names_only_listing_to_the_budget_with_a_plus_n_more_marker() {
+    fn caps_the_description_less_listing_to_the_budget_with_a_plus_n_more_marker() {
         let many: Vec<Skill> = (0..100)
             .map(|i| skill(&format!("skill{i}"), "a wordy description here"))
             .collect();
-        // budget = 1000 * 4 * 0.01 = 40 chars → names only, must not dump all 100.
+        // budget = 1000 * 4 * 0.01 = 40 chars → no description fits, and the
+        // listing must not dump all 100 lines either.
         let p = create_skill_listing_reminder_provider(move || many.clone(), Some(1000));
         let text = p.tick().unwrap_or_default();
         let listing = text.slice_utf16(LISTING_PREAMBLE.encode_utf16().count() + 1..);
@@ -850,5 +1158,186 @@ mod tests {
         assert!(!turn2.contains("- skill0\n"));
         assert!(!turn2.ends_with("- skill0"));
         assert!(turn2.contains("- skill"));
+    }
+
+    /// A root shared by several skills is declared once and aliased per line, which
+    /// is what keeps locations cheap enough to stay in the listing.
+    #[test]
+    fn aliases_a_shared_root_so_locations_stay_affordable() {
+        let root = "/Users/someone/projects/workspace/shared-agent-skills";
+        let skills = vec![
+            skill_at("alpha", "a fairly wordy description here", root),
+            skill_at("beta", "another fairly wordy description", root),
+        ];
+        // 250-char budget: both lines fit either way, so the cheaper spelling wins.
+        let p = create_skill_listing_reminder_provider(move || skills.clone(), Some(6250));
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(text.contains(&format!("- `r0` = `{root}`")), "{text}");
+        assert!(text.contains("(r0/alpha/SKILL.md)"), "{text}");
+        assert!(text.contains("(r0/beta/SKILL.md)"), "{text}");
+        assert!(
+            !text.contains(&format!("({root}/alpha/SKILL.md)")),
+            "{text}"
+        );
+        // An alias is never used before the line that declares it.
+        assert!(
+            text.find("- `r0` =").unwrap() < text.find("(r0/alpha").unwrap(),
+            "{text}"
+        );
+        // The saving goes to the listing, not away from it: descriptions survive.
+        assert!(text.contains("a fairly wordy description here"), "{text}");
+    }
+
+    /// The catalog-scale case the alias table exists for: many skills under one deep
+    /// root, where spelling every location out pushes the listing past its budget
+    /// and costs the descriptions, while a single table line keeps both.
+    #[test]
+    fn aliases_keep_locations_and_descriptions_at_catalog_scale() {
+        let root = "/Users/someone/.klaus/plugins/cache/official-market/ppt/.generations/1.3.4/generation-1/package/skills";
+        let description: String = (0..120).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let skills = (0..12)
+            .map(|i| skill_at(&format!("skill{i:02}"), &description, root))
+            .collect::<Vec<_>>();
+        // 2500-char budget: absolute locations force the descriptions down to an even
+        // share, while the aliased listing still affords every one in full.
+        let p = create_skill_listing_reminder_provider(move || skills.clone(), Some(62_500));
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(text.contains(&format!("- `r0` = `{root}`")), "{text}");
+        assert!(
+            text.contains(&format!("- skill00: {description} (r0/skill00/SKILL.md)")),
+            "{text}"
+        );
+        assert!(text.contains("- skill11:"), "{text}");
+        assert!(
+            !text.contains(&format!("({root}/skill00/SKILL.md)")),
+            "{text}"
+        );
+    }
+
+    /// A deeper root must never be shadowed by a shorter one that is its prefix.
+    #[test]
+    fn the_longest_matching_root_wins() {
+        let skills = vec![
+            skill_at("alpha", "d", "/agent/skills"),
+            skill_at("beta", "d", "/agent/skills/nested/deeper"),
+        ];
+        let plan = AliasPlan::build(&skills);
+        assert_eq!(
+            plan.shorten("/agent/skills/alpha/SKILL.md").as_deref(),
+            Some("r0/alpha/SKILL.md")
+        );
+        assert_eq!(
+            plan.shorten("/agent/skills/nested/deeper/beta/SKILL.md")
+                .as_deref(),
+            Some("r1/beta/SKILL.md")
+        );
+        assert_eq!(plan.shorten("/elsewhere/gamma/SKILL.md"), None);
+    }
+
+    /// One skill under a plugin-cache version contributes the marketplace directory
+    /// instead, so sibling plugins of that marketplace can share a single alias.
+    #[test]
+    fn a_lone_plugin_skill_aliases_its_marketplace_directory() {
+        let marketplace = "/home/u/.klaus/plugins/cache/official-market";
+        let root = format!("{marketplace}/ppt/.generations/1.3.4/generation-1/package/skills");
+        let skills = vec![skill_at("ppt", "d", &root)];
+        let plan = AliasPlan::build(&skills);
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].value, marketplace);
+        assert_eq!(
+            plan.shorten(&format!("{root}/ppt/SKILL.md")).as_deref(),
+            Some("r0/ppt/.generations/1.3.4/generation-1/package/skills/ppt/SKILL.md")
+        );
+    }
+
+    /// A root several skills share is already worth its own alias, so it is kept.
+    #[test]
+    fn a_plugin_several_skills_share_keeps_its_own_root() {
+        let marketplace = "/home/u/.klaus/plugins/cache/official-market";
+        let root =
+            format!("{marketplace}/iphoneuse/.generations/0.3.14/generation-1/package/skills");
+        let skills = vec![
+            skill_at("iphone-use", "d", &root),
+            skill_at("iphone-use-setup", "d", &root),
+        ];
+        let plan = AliasPlan::build(&skills);
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].value, root);
+        assert_eq!(
+            plan.shorten(&format!("{root}/iphone-use/SKILL.md"))
+                .as_deref(),
+            Some("r0/iphone-use/SKILL.md")
+        );
+    }
+
+    /// A table the budget cannot afford would cost more than the locations it
+    /// saves, so the listing spells the paths out instead.
+    #[test]
+    fn a_table_the_budget_cannot_afford_leaves_absolute_paths() {
+        let root = "/Users/someone/projects/workspace/shared-agent-skills";
+        let skills = vec![skill_at("alpha", "a fairly wordy description here", root)];
+        // 60-char budget, shorter than the one table line.
+        let p = create_skill_listing_reminder_provider(move || skills.clone(), Some(1500));
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(text.contains(&format!("({root}/alpha/SKILL.md)")), "{text}");
+        assert!(!text.contains("`r0`"), "{text}");
+    }
+
+    /// A location that is not a real file path gets no alias, because an alias
+    /// would dress up a path the model cannot open.
+    #[test]
+    fn a_location_that_is_not_a_real_path_gets_no_alias() {
+        let skills = vec![
+            Skill {
+                path: RuntimeString::from("<builtin>/deep-research/SKILL.md"),
+                ..skill("deep-research", "research deeply")
+            },
+            skill_at("alpha", "a description", "/agent/skills"),
+        ];
+        let plan = AliasPlan::build(&skills);
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].value, "/agent/skills");
+    }
+
+    /// A listing too large for one budget is emitted as several pages, and every
+    /// page has to agree on what an alias names — numbering is taken from the whole
+    /// catalog, not from the slice a page happens to render.
+    #[test]
+    fn pages_of_one_listing_agree_on_alias_numbers() {
+        let first_root = "/Users/someone/projects/first-root";
+        let second_root = "/Users/someone/projects/second-root";
+        let description = "a fairly wordy description here";
+        let skills = (1..=6)
+            .map(|i| skill_at(&format!("a{i}"), description, first_root))
+            .chain((1..=6).map(|i| skill_at(&format!("b{i}"), description, second_root)))
+            .collect::<Vec<_>>();
+        // 250-char budget (window 6250 × 4 chars/token × 1%): the aliased spelling
+        // names all six skills of the first root where the absolute one names four,
+        // so page one covers exactly the first root and the rest is paged.
+        let p = create_skill_listing_reminder_provider(move || skills.clone(), Some(6250));
+        let mut ctx = context(vec![user("first")]);
+        let first = p.retained_listing(&ctx, Some(6250)).unwrap();
+        let first = first.try_to_utf8().unwrap();
+        assert!(
+            first.contains(&format!("- `r0` = `{first_root}`")),
+            "{first}"
+        );
+        assert!(first.contains("(r0/a1/SKILL.md)"), "{first}");
+        assert!(first.contains("… (+"), "{first}");
+
+        ctx.messages
+            .push(catalog_message(RuntimeString::from(first.as_str())));
+        ctx.messages.push(user("second"));
+        let second = p.retained_listing(&ctx, Some(6250)).unwrap();
+        let second = second.try_to_utf8().unwrap();
+        assert!(
+            second.contains(&format!("- `r1` = `{second_root}`")),
+            "{second}"
+        );
+        assert!(
+            !second.contains("`r0`"),
+            "the second page must not renumber the second root as r0: {second}"
+        );
+        assert!(second.contains("(r1/b1/SKILL.md)"), "{second}");
     }
 }
