@@ -14,7 +14,7 @@ use crate::fs::path_safety::{writable_roots, writes_are_unconfined, PathContext}
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimePath, RuntimeString};
 use crate::tools::build_tool::text_result;
 use crate::tools::output_truncation::{
-    format_output_omission_marker, formatted_truncate_text, truncate_text,
+    format_output_omission_marker, formatted_truncate_tail_text, truncate_tail_text,
     with_serialization_allowance, TruncationPolicy, DEFAULT_OUTPUT_TRUNCATION_POLICY,
 };
 use crate::tools::shell_session::{
@@ -83,6 +83,8 @@ fn model_output_policy() -> TruncationPolicy {
 
 /// Renders one session response body under a policy, keeping the explicit
 /// omission marker when the collection window dropped bytes from the middle.
+/// Model-facing truncation keeps the newest tail of the body: a session's
+/// final state and error diagnostics land at the end of its output.
 /// Non-scalar runtime text (lone surrogates from lossy sources) passes through
 /// unchanged: byte budgets are undefined for it and a lossy rewrite would
 /// corrupt the only record of the value.
@@ -96,7 +98,7 @@ fn truncated_session_output(
         return body.clone();
     };
     let Some(omitted) = omitted_bytes else {
-        return RuntimeString::from_utf8(&formatted_truncate_text(&text, policy));
+        return RuntimeString::from_utf8(&formatted_truncate_tail_text(&text, policy));
     };
     let marker = format_output_omission_marker(omitted);
     if text.len() <= policy.byte_budget() {
@@ -106,7 +108,7 @@ fn truncated_session_output(
             RuntimeString::from_utf8(&format!("{marker}\n{text}"))
         };
     }
-    let truncated = truncate_text(&text, policy);
+    let truncated = truncate_tail_text(&text, policy);
     let omission_notice = if truncated.contains(&marker) {
         String::new()
     } else {
@@ -984,6 +986,41 @@ mod tests {
             ))),
             r#""\ud800""#
         );
+    }
+
+    #[test]
+    fn session_output_truncation_keeps_the_newest_tail() {
+        let body = rs(format!("HEAD_SENTINEL\n{}\nFINAL_LINE", "y".repeat(20_000)));
+        let rendered = truncated_session_output(&body, model_output_policy(), None, 5_007);
+        let text = rendered.try_to_utf8().unwrap();
+        // Body: 14 + 20,000 + 11 = 20,025 bytes over the 10,000-byte policy:
+        // the newest tail survives and the elided head is marked.
+        assert!(
+            text.starts_with(
+                "Warning: truncated output (original token count: 5007)\nTotal output lines: 3\n\n…"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("chars truncated…"), "{text}");
+        assert!(text.ends_with("FINAL_LINE"), "{text}");
+        assert!(!text.contains("HEAD_SENTINEL"), "{text}");
+    }
+
+    #[test]
+    fn session_output_keeps_the_collection_omission_notice_when_tail_truncation_drops_it() {
+        let marker = format_output_omission_marker(1234);
+        let body = rs(format!("HEAD\n{marker}\n{}", "z".repeat(20_000)));
+        let rendered = truncated_session_output(&body, model_output_policy(), Some(1234), 6_000);
+        let text = rendered.try_to_utf8().unwrap();
+        // The collection marker sat in the elided head, so the notice is
+        // re-prepended ahead of the tail-truncated body.
+        assert!(
+            text.starts_with(&format!(
+                "Warning: truncated output (original token count: 6000)\n{marker}\n\n…"
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with("zzzz"), "{text}");
     }
 
     #[cfg(unix)]

@@ -1,12 +1,20 @@
 //! Shared byte/token truncation for model-visible tool output.
 //!
 //! One policy type expresses every model-visible output budget: raw bytes or
-//! approximate tokens (4 bytes per token). Middle truncation keeps the head and
-//! the tail of an oversized body — where the invocation context and the final
-//! error usually are — and marks the elided span with its size, so the model
-//! sees both the shape of the loss and enough content to act on. Surfaces that
-//! own a recovery path (pagination, on-disk artifacts) pair this with their own
-//! guidance so the elided middle stays reachable.
+//! approximate tokens (4 bytes per token). Two directions share that policy and
+//! the same marker discipline:
+//!
+//! - Middle truncation keeps the head and the tail of an oversized body — where
+//!   the invocation context and the final error usually are — and marks the
+//!   elided span with its size, so the model sees both the shape of the loss
+//!   and enough content to act on. Surfaces that own a recovery path
+//!   (pagination, on-disk artifacts) pair this with their own guidance so the
+//!   elided middle stays reachable.
+//! - Tail truncation keeps only the newest end of the body and marks the elided
+//!   head with its size. Command surfaces use it because a command's final
+//!   state and error diagnostics land at the end of its output while the head
+//!   is mostly progress; they pair it with an on-disk spill of the full output
+//!   so the elided head stays reachable.
 
 use std::ops::Mul;
 use std::ops::Range;
@@ -186,6 +194,103 @@ pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> Strin
     let original_token_count = approx_token_count(content);
     let total_lines = content.lines().count();
     let result = truncate_text(content, policy);
+    format!(
+        "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
+    )
+}
+
+/// Plans the tail token truncation: the whole retained budget goes to the end
+/// of the body and the head is elided. The marker sits outside the
+/// retained-text budget, just as it does in [`plan_token_truncation`].
+pub fn plan_tail_token_truncation(s: &str, max_tokens: usize) -> Option<TextTruncation> {
+    let max_bytes = approx_bytes_for_tokens(max_tokens);
+    if s.len() <= max_bytes {
+        return None;
+    }
+    let removed = 0..s.ceil_char_boundary(s.len() - max_bytes);
+    let removed_tokens = approx_tokens_from_byte_count(s.len() - max_bytes);
+    Some(TextTruncation {
+        removed,
+        marker: format!("…{removed_tokens} tokens truncated…"),
+    })
+}
+
+/// Retain at most `max_bytes` from a string's end and add a character-count
+/// marker outside that budget. The head is the elided side: on command surfaces
+/// the newest bytes carry the final state and the error diagnostics.
+///
+/// Use [`truncate_tail_with_marker`] when the complete result must fit a hard
+/// byte limit.
+pub fn truncate_tail_chars(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let suffix_start = s.ceil_char_boundary(s.len() - max_bytes);
+    let removed_chars = s[..suffix_start].chars().count();
+    assemble_truncated_output(
+        "",
+        &s[suffix_start..],
+        &format!("…{removed_chars} chars truncated…"),
+    )
+}
+
+/// Truncate the head of a UTF-8 string so the result, including `marker`, is
+/// at most `max_bytes` bytes, retaining the newest tail.
+///
+/// Returns the original string when it already fits. If the marker itself does
+/// not fit, returns the longest original suffix that does: a tail-preserving
+/// surface keeps the newest bytes because they are the payload, so the
+/// fallback stays on the same side instead of degrading to the oldest head.
+pub fn truncate_tail_with_marker(s: &str, max_bytes: usize, marker: &str) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let Some(content_budget) = max_bytes.checked_sub(marker.len()) else {
+        return s[s.ceil_char_boundary(s.len() - max_bytes)..].to_string();
+    };
+    let suffix_start = s.ceil_char_boundary(s.len().saturating_sub(content_budget));
+
+    assemble_truncated_output("", &s[suffix_start..], marker)
+}
+
+/// Tail counterpart of [`truncate_middle_with_token_budget`]: retain at most
+/// `max_tokens` approximate tokens from the end of the string. Returns the
+/// possibly truncated string and `Some(original_token_count)` if truncation
+/// occurred; otherwise returns the original string and `None`.
+pub fn truncate_tail_with_token_budget(s: &str, max_tokens: usize) -> (String, Option<u64>) {
+    let Some(truncation) = plan_tail_token_truncation(s, max_tokens) else {
+        return (s.to_string(), None);
+    };
+    let truncated = assemble_truncated_output("", &s[truncation.removed.end..], &truncation.marker);
+    let total_tokens = u64::try_from(approx_token_count(s)).unwrap_or(u64::MAX);
+
+    if truncated == s {
+        (truncated, None)
+    } else {
+        (truncated, Some(total_tokens))
+    }
+}
+
+/// [`truncate_text`] for command surfaces: the same policy dispatch, but the
+/// retained slice is the tail of the body instead of both ends.
+pub fn truncate_tail_text(content: &str, policy: TruncationPolicy) -> String {
+    match policy {
+        TruncationPolicy::Bytes(bytes) => truncate_tail_chars(content, bytes),
+        TruncationPolicy::Tokens(tokens) => truncate_tail_with_token_budget(content, tokens).0,
+    }
+}
+
+/// [`formatted_truncate_text`] for command surfaces: the same loss-metadata
+/// header over a tail-truncated body.
+pub fn formatted_truncate_tail_text(content: &str, policy: TruncationPolicy) -> String {
+    if content.len() <= policy.byte_budget() {
+        return content.to_string();
+    }
+
+    let original_token_count = approx_token_count(content);
+    let total_lines = content.lines().count();
+    let result = truncate_tail_text(content, policy);
     format!(
         "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
     )
@@ -561,5 +666,103 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(block_text(&out[0]), "one");
         assert_eq!(block_text(&out[1]), "two");
+    }
+
+    #[test]
+    fn tail_truncation_keeps_the_newest_bytes_and_counts_the_removed_chars() {
+        let source = "abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(truncate_tail_chars(source, source.len()), source);
+        assert_eq!(truncate_tail_chars(source, 64), source);
+        let truncated = truncate_tail_chars(source, 10);
+        // The newest 10 bytes are retained; the 22 removed head chars are
+        // marked.
+        assert_eq!(truncated, "…22 chars truncated…wxyz012345");
+    }
+
+    #[test]
+    fn tail_truncation_respects_multibyte_boundaries() {
+        // 6 chars × 2 bytes = 12 bytes; a 7-byte budget must not split a
+        // char, so the newest three whole chars (6 bytes) are retained.
+        let source = "éééééé";
+        let truncated = truncate_tail_chars(source, 7);
+        assert_eq!(truncated, "…3 chars truncated…ééé");
+    }
+
+    #[test]
+    fn tail_tiny_budgets_degrade_to_the_marker_and_a_sliver() {
+        assert_eq!(truncate_tail_chars("hello", 1), "…4 chars truncated…o");
+        assert_eq!(truncate_tail_chars("hello", 0), "…5 chars truncated…");
+    }
+
+    #[test]
+    fn tail_with_marker_keeps_the_whole_result_inside_the_hard_limit() {
+        let source = "abcdefghijklmnopqrstuvwxyz";
+        let marker = "[cut]";
+        let truncated = truncate_tail_with_marker(source, 15, marker);
+        assert!(truncated.len() <= 15);
+        assert!(truncated.contains(marker));
+        assert!(truncated.ends_with("vwxyz"));
+        assert_eq!(truncated, "[cut]qrstuvwxyz");
+        // An oversized marker leaves the longest fitting suffix: on a
+        // tail-keeping surface the newest bytes are the payload.
+        let huge_marker = "0123456789abcdef";
+        assert_eq!(
+            truncate_tail_with_marker(source, 10, huge_marker),
+            "qrstuvwxyz"
+        );
+        // A string that fits is returned unchanged.
+        assert_eq!(truncate_tail_with_marker("short", 15, marker), "short");
+    }
+
+    #[test]
+    fn tail_token_budget_truncation_reports_the_original_token_count() {
+        let source = "x".repeat(1_000);
+        let (unchanged, tokens) = truncate_tail_with_token_budget(&source, 250);
+        assert_eq!(unchanged, source);
+        assert_eq!(tokens, None);
+
+        let (truncated, tokens) = truncate_tail_with_token_budget(&source, 100);
+        assert_eq!(tokens, Some(250));
+        assert!(truncated.contains("…150 tokens truncated…"));
+        assert!(!truncated.starts_with('x'));
+        assert!(truncated.ends_with('x'));
+        // The retained text stays within the token budget; the marker sits
+        // outside it.
+        let retained = truncated.replace("…150 tokens truncated…", "");
+        assert_eq!(retained.len(), 400);
+    }
+
+    #[test]
+    fn tail_plan_elides_from_the_beginning_of_the_body() {
+        let source = "x".repeat(1_000);
+        let plan = plan_tail_token_truncation(&source, 100).unwrap();
+        assert_eq!(plan.removed, 0..600);
+        assert_eq!(plan.marker, "…150 tokens truncated…");
+        assert!(plan_tail_token_truncation(&source, 250).is_none());
+    }
+
+    #[test]
+    fn tail_dispatch_and_formatted_header_lead_with_the_loss_metadata() {
+        let source = "y".repeat(500);
+        let by_bytes = truncate_tail_text(&source, TruncationPolicy::Bytes(100));
+        assert!(by_bytes.starts_with("…400 chars truncated…"));
+        assert!(by_bytes.ends_with('y'));
+        let by_tokens = truncate_tail_text(&source, TruncationPolicy::Tokens(25));
+        assert!(by_tokens.contains("tokens truncated…"));
+
+        let fits = "small body";
+        assert_eq!(
+            formatted_truncate_tail_text(fits, TruncationPolicy::Bytes(100)),
+            fits
+        );
+        let source = format!("first line\n{}\nlast line", "z".repeat(500));
+        let formatted = formatted_truncate_tail_text(&source, TruncationPolicy::Bytes(100));
+        assert!(formatted.starts_with(
+            "Warning: truncated output (original token count: 131)\nTotal output lines: 3\n\n…"
+        ));
+        assert!(formatted.contains("chars truncated…"));
+        assert!(formatted.ends_with("last line"));
+        // The head is the elided side for command output.
+        assert!(!formatted.contains("first line"));
     }
 }

@@ -12253,7 +12253,7 @@ fn reconstruct_bash_outcome(
     if !truncated {
         return Ok((text, is_error, None));
     }
-    // The tool persists the full body of a middle-truncated output under a
+    // The tool persists the full body of a truncated output under a
     // content-hash artifact name; both the name and the appended note are
     // deterministic functions of the recorded output, so reproduce them here.
     let hash = sha256_hex(&output.to_node_utf8());

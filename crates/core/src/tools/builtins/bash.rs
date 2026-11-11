@@ -30,7 +30,7 @@ use crate::tools::builtins::shell_common::{
 };
 use crate::tools::exec::{run_shell, OutputStream, RunShellOptions, RunShellResult};
 use crate::tools::output_truncation::{
-    truncate_text, TruncationPolicy, DEFAULT_OUTPUT_TRUNCATION_POLICY,
+    truncate_tail_text, TruncationPolicy, DEFAULT_OUTPUT_TRUNCATION_POLICY,
 };
 use crate::tools::result_storage::{maybe_spill_result, SpillOptions};
 use crate::types::abort::AbortSignal;
@@ -136,10 +136,12 @@ pub fn resolve_bash_timeout(
 
 /// Render the model-visible outcome of one foreground command as structured
 /// sections: exit code, wall time, the original line count when truncation
-/// changed it, and the output body under the shared truncation policy. Failure
-/// context (timeout, abort) leads the body so it survives middle truncation of
-/// a large output. Returns the text, whether the outcome is an error, and
-/// whether the body was truncated.
+/// changed it, and the output body under the shared truncation policy. An
+/// oversized body keeps its newest tail: a command's final state and error
+/// diagnostics land at the end of its output. Failure context (timeout,
+/// abort) is re-prepended after truncation so it survives an output of any
+/// size. Returns the text, whether the outcome is an error, and whether the
+/// body was truncated.
 ///
 /// `wall_time` must be the millisecond-quantized duration that is also recorded
 /// in the result payload, so any consumer can re-render the exact text from the
@@ -158,18 +160,22 @@ pub(crate) fn render_bash_outcome_text(
     } else {
         output.clone()
     };
-    let content = if timed_out {
-        RuntimeString::from_utf8(&format!(
+    let failure_prefix = if timed_out {
+        format!(
             "command timed out after {} milliseconds\n",
             wall_time.as_millis()
-        ))
-        .concat(&base)
+        )
     } else if aborted {
-        RuntimeString::from("[command aborted]\n").concat(&base)
+        "[command aborted]\n".to_string()
     } else {
-        base
+        String::new()
     };
-    // Middle truncation works on UTF-8 bytes; non-scalar runtime text (lone
+    let content = if failure_prefix.is_empty() {
+        base
+    } else {
+        RuntimeString::from_utf8(&failure_prefix).concat(&base)
+    };
+    // Tail truncation works on UTF-8 bytes; non-scalar runtime text (lone
     // surrogates from lossy sources) has no UTF-8 length and passes through
     // unchanged instead of being corrupted by a lossy rewrite.
     let mut total_lines_section = None;
@@ -177,7 +183,13 @@ pub(crate) fn render_bash_outcome_text(
     let body = match content.try_to_utf8() {
         Ok(utf8) if utf8.len() > policy.byte_budget() => {
             let total_lines = utf8.lines().count();
-            let formatted = truncate_text(&utf8, policy);
+            // Truncate the command output alone and re-prepend the failure
+            // context: tail truncation elides the head, so a prefix inside
+            // the truncated body would be the first thing lost.
+            let formatted = format!(
+                "{failure_prefix}{}",
+                truncate_tail_text(&utf8[failure_prefix.len()..], policy)
+            );
             if total_lines != formatted.lines().count() {
                 total_lines_section = Some(format!("Total output lines: {total_lines}"));
             }
@@ -204,7 +216,7 @@ pub(crate) fn render_bash_outcome_text(
     )
 }
 
-/// Persist the FULL output of a middle-truncated command beside the session's
+/// Persist the FULL output of a truncated command beside the session's
 /// other tool-result artifacts and return the reference note to append
 /// (leading newlines included). The artifact name is the content hash, so
 /// identical output re-spills onto the same file deterministically and an
@@ -1183,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn outcome_middle_truncates_large_output_and_reports_the_original_line_count() {
+    fn outcome_tail_truncates_large_output_and_reports_the_original_line_count() {
         let output = rs((0..2_000)
             .map(|i| format!("line {i}\n"))
             .collect::<String>());
@@ -1198,14 +1210,42 @@ mod tests {
         assert!(truncated);
         assert!(!is_error);
         let text = text.try_to_utf8().unwrap();
+        // The body totals 18,890 bytes; the retained newest 10,000 start
+        // exactly at "line 1000", and the elided head is marked with its
+        // size.
         assert!(
             text.starts_with(
-                "Exit code: 0\nWall time: 0 seconds\nTotal output lines: 2000\nOutput:\nline 0\n"
+                "Exit code: 0\nWall time: 0 seconds\nTotal output lines: 2000\nOutput:\n…8890 chars truncated…line 1000\n"
             ),
             "{text}"
         );
-        assert!(text.contains("chars truncated…"), "{text}");
         assert!(text.ends_with("line 1999\n"), "{text}");
+        assert!(!text.contains("line 0\n"), "{text}");
+    }
+
+    #[test]
+    fn outcome_keeps_failure_context_ahead_of_a_tail_truncated_body() {
+        let output = rs("x".repeat(20_000));
+        let (text, is_error, truncated) = render_bash_outcome_text(
+            &output,
+            Some(0),
+            true,
+            false,
+            std::time::Duration::from_millis(123),
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+        );
+        assert!(truncated);
+        assert!(is_error);
+        let text = text.try_to_utf8().unwrap();
+        // The timeout notice is re-prepended after truncation, so it survives
+        // even though the head of the body is the elided side.
+        assert!(
+            text.contains(
+                "Output:\ncommand timed out after 123 milliseconds\n…10000 chars truncated…"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with("xxxx"), "{text}");
     }
 
     #[cfg(unix)]
