@@ -701,10 +701,8 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
     })).is_err());
 }
 
-/// A credential swap aborts the live stream. A complete frame followed by a
-/// clean EOF and no finish reason completes; that close is not a truncation.
 #[tokio::test]
-async fn credential_change_aborts_a_live_stream_and_clean_eof_without_finish_reason_completes() {
+async fn buffered_cloud_frames_and_premature_eof_cannot_publish_success() {
     use klaus_agent_core::provider::gemini::GeminiClient;
     let fixture = fixture().await;
     let root = tempfile::tempdir().unwrap();
@@ -767,8 +765,12 @@ async fn credential_change_aborts_a_live_stream_and_clean_eof_without_finish_rea
         .unwrap()
         .collect()
         .await;
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert!(events[0].is_ok());
+    assert_eq!(
+        events[1].as_ref().unwrap_err().message,
+        "antigravity_stream_incomplete"
+    );
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
@@ -1233,4 +1235,38 @@ async fn a_connect_stage_failure_replays_once_and_reports_the_stage() {
         remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
         auth::logout().await.unwrap();
     }
+}
+
+#[test]
+fn recommended_sort_section_curates_the_menu_inventory() {
+    let payload = json!({
+        "defaultAgentModelId": "m-b-medium",
+        "agentModelSorts": [
+            {"displayName": "Recommended", "groups": [{"modelIds": ["m-b-medium", "m-b-high"]}]},
+            {"displayName": "Archive", "groups": [{"modelIds": ["m-c-medium"]}]}
+        ],
+        "models": {
+            "m-b-medium": {"displayName": "M B (Medium)"},
+            "m-b-high": {"displayName": "M B (High)"},
+            "m-a-low": {"displayName": "M A (Low)"},
+            "m-c-medium": {"displayName": "M C (Medium)"}
+        }
+    });
+    let flagged = |rows: &[Value], key: &str| {
+        rows.iter()
+            .find(|row| row.get("key").and_then(Value::as_str) == Some(key))
+            .is_some_and(|row| row.get("inRecommendedSort").and_then(Value::as_bool) == Some(true))
+    };
+    let rows = super::catalog::normalize_models(&payload);
+    // The recommended section's first group is the curated menu inventory.
+    assert!(flagged(&rows, "m-b-medium"));
+    assert!(flagged(&rows, "m-b-high"));
+    // Ungrouped models and later sections carry no curation marker.
+    assert!(!flagged(&rows, "m-a-low"));
+    assert!(!flagged(&rows, "m-c-medium"));
+    // A payload without sort sections carries no curation at all.
+    let bare = super::catalog::normalize_models(&json!({
+        "models": {"m-b-medium": {"displayName": "M B (Medium)"}}
+    }));
+    assert!(!flagged(&bare, "m-b-medium"));
 }
