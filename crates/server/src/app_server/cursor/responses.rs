@@ -236,9 +236,15 @@ pub(super) fn public_error(error: &str) -> Value {
     // exposed as executable calls. Discard partial output and resample within
     // the existing retry budget; execution ownership and integrity failures
     // remain terminal.
+    // Discovery drift has not been exposed as an executable call. Resample
+    // it. Ownership, history structure, and certified-text mismatches stay
+    // terminal.
     let recoverable_model_response = matches!(
         error,
-        "cursor_native_message_invalid" | super::metadata::SELECTOR_INVALID
+        "cursor_native_message_invalid"
+            | super::metadata::SELECTOR_INVALID
+            | "cursor_metadata_result_mismatch"
+            | "cursor_metadata_result_invalid"
     );
     let protocol_guard = error.starts_with("cursor_native_")
         || error.starts_with("cursor_read_intent_")

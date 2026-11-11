@@ -395,13 +395,40 @@ fn http_and_connect_capacity_errors_retain_safe_classifications() {
         credential::upstream_error(&json!({"code":14,"message":"private"})),
         "cursor_overloaded"
     );
+    let detail = |error: &str| json!({"code":"unknown","details":[{"@type":"type.googleapis.com/aiserver.v1.ErrorDetails","error":error}]});
+    for code in [
+        "ERROR_PROVIDER_ERROR",
+        "ERROR_OPENAI",
+        "ERROR_NOT_FOUND",
+        "ERROR_FILE_NOT_FOUND",
+        "ERROR_BAD_REQUEST",
+        "ERROR_PRICING_WARNING",
+        "ERROR_REPOSITORY_SERVICE_REPOSITORY_IS_NOT_INITIALIZED",
+    ] {
+        assert_eq!(
+            credential::upstream_error(&detail(code)),
+            "cursor_overloaded",
+            "{code}"
+        );
+    }
+    assert_eq!(
+        credential::upstream_error(&detail("ERROR_CUSTOM_MESSAGE")),
+        "cursor_upstream_error"
+    );
 }
 
 #[test]
 fn malformed_messages_allow_bounded_recovery_but_integrity_failures_remain_terminal() {
-    let error = responses::public_error("cursor_native_message_invalid");
-    assert_eq!(error["error"]["type"], "overloaded_error");
-    assert_eq!(error["message"], "cursor_model_response_unsupported");
+    for recoverable in [
+        "cursor_native_message_invalid",
+        "cursor_metadata_selector_invalid",
+        "cursor_metadata_result_mismatch",
+        "cursor_metadata_result_invalid",
+    ] {
+        let error = responses::public_error(recoverable);
+        assert_eq!(error["error"]["type"], "overloaded_error", "{recoverable}");
+        assert_eq!(error["message"], "cursor_model_response_unsupported");
+    }
     for guard in [
         "cursor_checkpoint_history_changed",
         "cursor_tool_not_owned",
@@ -410,6 +437,7 @@ fn malformed_messages_allow_bounded_recovery_but_integrity_failures_remain_termi
         "cursor_native_message_limit",
         "cursor_metadata_not_owned",
         "cursor_metadata_call_mismatch",
+        "cursor_metadata_history_invalid",
     ] {
         let error = responses::public_error(guard);
         assert_eq!(error["error"]["type"], "invalid_request_error", "{guard}");

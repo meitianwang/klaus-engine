@@ -29,6 +29,78 @@ fn terminal_metadata_error(error: String) -> String {
     }
 }
 
+/// Discovery answers come from the local catalog. An upstream completion may
+/// carry another body, an error, or a file path; none of those replace the
+/// catalog. A body that matches either local projection is kept in that
+/// canonical form. Anything else still continues with the server projection.
+fn accepted_discovery_value(
+    result: &Value,
+    native: &Value,
+    dynamic: &Value,
+) -> Result<Value, String> {
+    let Some(result) = result.as_object() else {
+        return Ok(native.clone());
+    };
+    if let Some(success) = result.get("success") {
+        if let Some(content) = success.get("content").and_then(Value::as_str) {
+            if content.len() > 2 * 1024 * 1024 {
+                return Err("cursor_metadata_result_too_large".into());
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(content) {
+                if super::step_history::same_metadata(&value, native) {
+                    return Ok(native.clone());
+                }
+                if super::step_history::same_metadata(&value, dynamic) {
+                    return Ok(dynamic.clone());
+                }
+            }
+        }
+    }
+    Ok(native.clone())
+}
+
+/// A signed tool result that disagrees with the local catalog is rewritten to
+/// that catalog. Structural damage (wrong tool, extra fields) is left for the
+/// history check to reject.
+fn normalize_metadata_results(native: &[Value], metadata: &BTreeMap<String, Value>) -> Vec<Value> {
+    let mut native = native.to_vec();
+    for message in &mut native {
+        if message["role"] != "tool" {
+            continue;
+        }
+        let Some(id) = message["content"][0]["toolCallId"].as_str() else {
+            continue;
+        };
+        let Some(proof) = metadata.get(id) else {
+            continue;
+        };
+        if super::metadata::history_result_matches(message, &message["content"][0], proof) {
+            continue;
+        }
+        let text = proof["value"].to_string();
+        if let Some(part) = message["content"][0].as_object_mut() {
+            part.insert("result".into(), Value::String(text.clone()));
+            if let Some(parts) = part
+                .get_mut("experimental_content")
+                .and_then(Value::as_array_mut)
+            {
+                if parts.len() == 1 && parts[0]["type"] == "text" {
+                    parts[0]["text"] = Value::String(text);
+                }
+            }
+        }
+        if let Some(high) = message.pointer_mut("/providerOptions/cursor/highLevelToolCallResult") {
+            if high.get("isError").is_some() {
+                high["isError"] = json!(false);
+            }
+            if high.get("output").is_some() {
+                high["output"] = super::metadata::mcp_result(&proof["value"]);
+            }
+        }
+    }
+    native
+}
+
 fn uint32_or_default(value: &Value, key: &str) -> Result<u32, String> {
     if !value.is_object() {
         return Err("cursor_native_scalar_invalid".into());
@@ -493,12 +565,8 @@ impl Step {
             if started["mcpToolCall"]["args"] != *args || proof != &generated {
                 return Err("cursor_metadata_call_mismatch".into());
             }
-            if mcp.as_object().is_none_or(|mcp| {
-                mcp.len() != 2 || !mcp.contains_key("args") || !mcp.contains_key("result")
-            }) || !super::metadata::mcp_result_matches(&mcp["result"], &proof["value"])
-            {
-                return Err("cursor_metadata_result_mismatch".into());
-            }
+            // The completion body is not a second catalog. The reply already
+            // generated from the local inventory is what continues.
             if !self.batch.completed.insert(id.to_string()) {
                 return Err("cursor_tool_batch_duplicate".into());
             }
@@ -521,36 +589,10 @@ impl Step {
         if started["getMcpToolsToolCall"]["args"] != *args {
             return Err("cursor_metadata_call_mismatch".into());
         }
-        let result = &call["getMcpToolsToolCall"]["result"];
-        if result.as_object().is_none_or(|result| result.len() != 1) {
-            return Err("cursor_metadata_result_invalid".into());
-        }
-        let success = result
-            .get("success")
-            .ok_or("cursor_metadata_result_invalid")?;
-        if success.get("outputFilePath").is_some()
-            || success
-                .as_object()
-                .is_none_or(|map| map.keys().any(|key| key != "content"))
-        {
-            return Err("cursor_metadata_result_invalid".into());
-        }
-        let encoded = success["content"]
-            .as_str()
-            .ok_or("cursor_metadata_result_invalid")?;
-        if encoded.len() > 2 * 1024 * 1024 {
-            return Err("cursor_metadata_result_too_large".into());
-        }
-        let value: Value =
-            serde_json::from_str(encoded).map_err(|_| "cursor_metadata_result_invalid")?;
-        if !super::step_history::same_metadata(&value, &self.catalog.metadata_result(args, false)?)
-            && !super::step_history::same_metadata(
-                &value,
-                &self.catalog.metadata_result(args, true)?,
-            )
-        {
-            return Err("cursor_metadata_result_mismatch".into());
-        }
+        let native = self.catalog.metadata_result(args, false)?;
+        let dynamic = self.catalog.metadata_result(args, true)?;
+        let value =
+            accepted_discovery_value(&call["getMcpToolsToolCall"]["result"], &native, &dynamic)?;
         let id = id.to_string();
         if self.metadata.len() >= MAX_TOOLS
             || self
@@ -607,6 +649,7 @@ impl Step {
     }
 
     fn certify(&self, native: &[Value], tools: bool) -> Result<Certified, String> {
+        let native = normalize_metadata_results(native, &self.metadata);
         if !self.metadata_replies.is_empty() {
             return Err("cursor_metadata_completion_missing".into());
         }
@@ -620,7 +663,7 @@ impl Step {
         let mut ids = HashSet::new();
         let mut metadata_calls = BTreeMap::<String, String>::new();
         let mut metadata_results = HashSet::new();
-        for message in native {
+        for message in &native {
             if message["role"] == "tool" {
                 let content = message["content"]
                     .as_array()
@@ -2128,33 +2171,49 @@ mod tests {
     }
 
     #[test]
-    fn pattern_results_reject_foreign_tools_and_reset_before_the_next_batch_in_one_chunk() {
+    fn foreign_discovery_bodies_keep_the_local_catalog_and_reset_the_batch() {
         let args = json!({"pattern":"^echo$","toolCallId":"metadata"});
-        let result = json!({"mode":"search","pattern":"^echo$","matches":[{"namespace":NAMESPACE,"tool":"echo","description":"Echo value"}]});
-        for mutation in ["none", "namespace", "tool", "schema"] {
+        for mutation in ["none", "namespace", "tool", "schema", "error", "file"] {
             let mut step = step();
+            let native = step.catalog.metadata_result(&args, false).unwrap();
+            let dynamic = step.catalog.metadata_result(&args, true).unwrap();
             step.started(
                 &json!({"modelCallId":"metadata","toolCall":{"getMcpToolsToolCall":{"args":args}}}),
             )
             .unwrap();
             step.batch.count = Some(1);
-            let mut result = result.clone();
-            match mutation {
-                "namespace" => result["matches"][0]["namespace"] = json!("foreign"),
-                "tool" => result["matches"][0]["tool"] = json!("shell"),
-                "schema" => result["matches"][0]["inputSchema"] = json!({}),
-                _ => {}
-            }
-            let complete = json!({"modelCallId":"metadata","toolCall":{"getMcpToolsToolCall":{"args":args,"result":{"success":{"content":result.to_string()}}}}});
-            let completed = step.completed(&complete);
-            if mutation == "none" {
-                completed.unwrap();
-                // No ready() call separates these two protocol batches.
-                start(&mut step);
-                assert_eq!(step.batch.model_call_id, "one");
+            let complete = match mutation {
+                "error" => {
+                    json!({"modelCallId":"metadata","toolCall":{"getMcpToolsToolCall":{"args":args,"result":{"error":"server_not_found"}}}})
+                }
+                "file" => {
+                    json!({"modelCallId":"metadata","toolCall":{"getMcpToolsToolCall":{"args":args,"result":{"success":{"content":dynamic.to_string(),"outputFilePath":"/tmp/out"}}}}})
+                }
+                other => {
+                    let mut result = dynamic.clone();
+                    match other {
+                        "namespace" => result["matches"][0]["namespace"] = json!("foreign"),
+                        "tool" => result["matches"][0]["tool"] = json!("shell"),
+                        "schema" => result["matches"][0]["inputSchema"] = json!({}),
+                        _ => {}
+                    }
+                    json!({"modelCallId":"metadata","toolCall":{"getMcpToolsToolCall":{"args":args,"result":{"success":{"content":result.to_string()}}}}})
+                }
+            };
+            step.completed(&complete).unwrap();
+            let stored = &step.metadata["metadata"]["value"];
+            if mutation == "none" || mutation == "file" {
+                assert_eq!(stored, &dynamic, "{mutation}");
             } else {
-                assert_eq!(completed.unwrap_err(), "cursor_metadata_result_mismatch");
+                assert_eq!(stored, &native, "{mutation}");
+                let encoded = stored.to_string();
+                assert!(!encoded.contains("foreign"), "{mutation}");
+                assert!(!encoded.contains("shell"), "{mutation}");
+                assert!(!encoded.contains("inputSchema"), "{mutation}");
             }
+            // No ready() call separates these two protocol batches.
+            start(&mut step);
+            assert_eq!(step.batch.model_call_id, "one");
         }
     }
 
@@ -2194,8 +2253,26 @@ mod tests {
         let mut native_messages = helpers.to_vec();
         native_messages[1] = changed;
         native_messages.push(native());
+        let certified = step.certify(&native_messages, true).unwrap();
         assert_eq!(
-            step.certify(&native_messages, true).err().unwrap(),
+            certified.context["nativeMessages"][1]["content"][0]["result"],
+            projection.to_string()
+        );
+        assert_eq!(
+            certified.context["nativeMessages"][1]["content"][0]["experimental_content"][0]["text"],
+            projection.to_string()
+        );
+        assert!(!certified.context["nativeMessages"]
+            .to_string()
+            .contains("changed"));
+        assert_eq!(certified.context["nativeMessages"][0], helpers[0]);
+        let mut renamed = helpers[1].clone();
+        renamed["content"][0]["toolName"] = json!("ExecuteTool");
+        let mut broken = helpers.to_vec();
+        broken[1] = renamed;
+        broken.push(native());
+        assert_eq!(
+            step.certify(&broken, true).err().unwrap(),
             "cursor_metadata_history_invalid"
         );
     }
@@ -2596,7 +2673,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_mcp_completion_requires_an_exact_previously_replied_projection() {
+    fn metadata_mcp_completion_keeps_the_local_reply_when_the_body_drifts() {
         for mutation in [
             "notReplied",
             "notStarted",
@@ -2621,9 +2698,8 @@ mod tests {
             } else {
                 step.batch.model_call_id = json!("one");
             }
-            let result = super::super::metadata::mcp_result(
-                &step.catalog.mcp_metadata(&args).unwrap().unwrap()["value"],
-            );
+            let proof = step.catalog.mcp_metadata(&args).unwrap().unwrap();
+            let result = super::super::metadata::mcp_result(&proof["value"]);
             if mutation != "notReplied" {
                 step.receive(&json!({"execServerMessage":{"mcpArgs":args}}))
                     .unwrap();
@@ -2646,7 +2722,18 @@ mod tests {
                 "twice" => step.completed(&complete).unwrap(),
                 _ => {}
             }
-            assert!(step.completed(&complete).is_err(), "{mutation}");
+            let completed = step.completed(&complete);
+            match mutation {
+                "notReplied" | "notStarted" | "args" | "id" | "twice" => {
+                    assert!(completed.is_err(), "{mutation}");
+                }
+                _ => {
+                    completed.unwrap();
+                    let id = args["toolCallId"].as_str().unwrap();
+                    assert_eq!(step.metadata[id]["value"], proof["value"], "{mutation}");
+                    assert!(!step.metadata[id].to_string().contains("remote"));
+                }
+            }
             assert!(step.held.is_empty());
         }
         let mut step = step();
