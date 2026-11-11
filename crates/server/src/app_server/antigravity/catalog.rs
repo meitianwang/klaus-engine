@@ -196,6 +196,9 @@ pub fn normalize_models(payload: &Value) -> Vec<Value> {
             if let Some(order) = catalog_order.iter().position(|candidate| candidate == id) {
                 entry["catalogOrder"] = json!(order);
             }
+            if in_recommended_sort(payload, id) {
+                entry["inRecommendedSort"] = json!(true);
+            }
             if let Some(budget) = signed_integer(raw.get("thinkingBudget")) {
                 entry["defaultThinkingBudget"] = json!(budget);
             }
@@ -679,6 +682,30 @@ fn model_sort_groups(payload: &Value, id: &str) -> Vec<Value> {
         }
     }
     memberships
+}
+
+/// The picker menu inventory is the service's curated recommendation: the
+/// first group of the sort section named "recommended". Membership is plain
+/// catalog data, so newly offered models join the menu without a client
+/// change; a payload without that section carries no curation at all.
+fn in_recommended_sort(payload: &Value, id: &str) -> bool {
+    payload
+        .get("agentModelSorts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|sort| {
+            let recommended = first_string(sort, &["displayName", "name"])
+                .is_some_and(|label| label.eq_ignore_ascii_case("recommended"));
+            recommended
+                && sort
+                    .get("groups")
+                    .and_then(Value::as_array)
+                    .and_then(|groups| groups.first())
+                    .and_then(|group| group.get("modelIds"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.iter().any(|candidate| candidate.as_str() == Some(id)))
+        })
 }
 
 fn usage_window(source: &str, group: Option<&Value>, bucket: &Value) -> Option<Value> {
