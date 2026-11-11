@@ -57,7 +57,7 @@ const CLAUDE_SCOPES: &[&str] = &[
 ///
 /// The ids track the vendor's own alias table, not merely "something that works":
 /// the official client resolves its `opus` alias to Opus 5.5 and its `fable` alias
-/// to Fable 5.1, and a subscription that keeps naming the previous point release
+/// to Fable 5.2, and a subscription that keeps naming the previous point release
 /// silently runs the older model for every user who never picks explicitly.
 const CLAUDE_OPUS: &str = "claude-opus-5-5";
 const CLAUDE_SONNET: &str = "claude-sonnet-5-5";
@@ -70,7 +70,7 @@ const CLAUDE_HAIKU: &str = "claude-haiku-5-5";
 /// most expensive model to the `high` slot would re-price every one of them for a
 /// gain the user never asked for. Fable is offered as a main model the user picks
 /// on purpose, and a settings tier pick can still put it on a tier.
-const CLAUDE_FABLE: &str = "claude-fable-5-1";
+const CLAUDE_FABLE: &str = "claude-fable-5-2";
 
 /// Refresh this far before expiry rather than at it, so a token cannot lapse
 /// between the check and the first request of the turn.
@@ -1087,8 +1087,8 @@ fn claude_capabilities(model: &str) -> Value {
         ),
         "claude-haiku-4-5" => base(&[], false, false, 200_000, 64_000),
         // Known current models share this measured capability set.
-        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU | "claude-opus-5"
-        | "claude-opus-4-8" => base(
+        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU | "claude-fable-5-1"
+        | "claude-opus-5" | "claude-opus-4-8" => base(
             &["low", "medium", "high", "xhigh", "max"],
             true,
             true,
@@ -1100,7 +1100,7 @@ fn claude_capabilities(model: &str) -> Value {
     };
     caps["fastMode"] = json!(matches!(
         model,
-        "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8"
+        "claude-fable-5-2" | "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8"
     ));
     caps["imageLimits"] = json!({
         "maxWidth": 2000,
@@ -1110,7 +1110,12 @@ fn claude_capabilities(model: &str) -> Value {
     // Only the source's known extended-context models advertise the larger
     // media count. An unknown id keeps a conservative request-view budget.
     caps["maxMediaBlocks"] = json!(match model {
-        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU | "claude-sonnet-5" => 600,
+        CLAUDE_FABLE
+        | CLAUDE_OPUS
+        | CLAUDE_SONNET
+        | CLAUDE_HAIKU
+        | "claude-fable-5-1"
+        | "claude-sonnet-5" => 600,
         _ => 100,
     });
     caps
@@ -1196,13 +1201,13 @@ fn claude_model(alias: &str) -> String {
 /// regardless, which lets a host tell "no ladder" apart from "no reasoning".
 ///
 /// `tier` is the slot this alias backs by default, or absent for a model that
-/// backs none (Fable 5.1 — see [`CLAUDE_FABLE`]). No credential is read: the lineup
+/// backs none (Fable 5.2 — see [`CLAUDE_FABLE`]). No credential is read: the lineup
 /// is static product knowledge, so an expired login still gets a populated picker
 /// instead of a blank one.
 pub fn claude_lineup() -> Value {
     json!({
         "models": [
-            claude_lineup_entry("fable", "Fable 5.1", CLAUDE_FABLE, None),
+            claude_lineup_entry("fable", "Fable 5.2", CLAUDE_FABLE, None),
             claude_lineup_entry("opus", "Opus 5.5", CLAUDE_OPUS, Some("high")),
             claude_lineup_entry("sonnet", "Sonnet 5.5", CLAUDE_SONNET, Some("medium")),
             claude_lineup_entry("haiku", "Haiku 5.5", CLAUDE_HAIKU, Some("low")),
@@ -2460,7 +2465,7 @@ mod tests {
     #[test]
     fn the_aliases_name_the_current_point_release() {
         assert_eq!(CLAUDE_OPUS, "claude-opus-5-5");
-        assert_eq!(CLAUDE_FABLE, "claude-fable-5-1");
+        assert_eq!(CLAUDE_FABLE, "claude-fable-5-2");
         assert_eq!(CLAUDE_SONNET, "claude-sonnet-5-5");
         assert_eq!(CLAUDE_HAIKU, "claude-haiku-5-5");
         // And every one of them resolves through the alias table above, so the
@@ -2536,6 +2541,8 @@ mod tests {
                 entry["model"]
             );
         }
+        assert_eq!(models[0]["label"], json!("Fable 5.2"));
+        assert_eq!(models[1]["label"], json!("Opus 5.5"));
         assert_eq!(models[2]["label"], json!("Sonnet 5.5"));
         assert_eq!(models[3]["label"], json!("Haiku 5.5"));
         let haiku = claude_capabilities(CLAUDE_HAIKU);
@@ -2548,6 +2555,15 @@ mod tests {
 
     #[test]
     fn previous_claude_models_keep_their_own_capabilities() {
+        let fable_51 = claude_capabilities("claude-fable-5-1");
+        assert_eq!(
+            fable_51["effort"]["levels"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(fable_51["contextWindow"], json!(1_000_000));
+        assert_eq!(fable_51["maxOutputTokens"], json!(128_000));
+        assert_eq!(fable_51["taskBudgets"], json!(true));
+        assert_eq!(fable_51["fastMode"], json!(false));
         let haiku = claude_capabilities("claude-haiku-4-5");
         assert!(haiku.get("effort").is_none());
         assert_eq!(haiku["contextWindow"], json!(200_000));
@@ -3174,10 +3190,20 @@ mod tests {
         assert_eq!(opus.capabilities["promptCacheControl"], json!(true));
         assert_eq!(opus.capabilities["taskBudgets"], json!(true));
         assert_eq!(opus.capabilities["fastMode"], json!(true));
-        for model in ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"] {
+        for model in [
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+        ] {
             assert_eq!(claude_capabilities(model)["fastMode"], json!(true));
         }
-        for model in [CLAUDE_SONNET, CLAUDE_HAIKU, "claude-opus-future"] {
+        for model in [
+            "claude-fable-5-1",
+            CLAUDE_SONNET,
+            CLAUDE_HAIKU,
+            "claude-opus-future",
+        ] {
             assert_eq!(claude_capabilities(model)["fastMode"], json!(false));
         }
         assert_eq!(opus.capabilities["contextWindow"], json!(1_000_000));

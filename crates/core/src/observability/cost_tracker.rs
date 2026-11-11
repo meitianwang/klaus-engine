@@ -84,13 +84,18 @@ const fn pricing(input: f64, output: f64, cache_read: f64, cache_write: f64) -> 
 pub static DEFAULT_PRICING: LazyLock<PricingTable> = LazyLock::new(|| {
     vec![
         // ---- Anthropic (Claude) ----
-        // Fable: $10/$50. Cache reads are 0.025x base input on 5.1, 0.1x on 5.
+        // Fable 5.2 cut Fable pricing to $8/$40 with 0.025x cache reads ($0.20);
+        // 5.1 sits at $10/$50 with $0.25 cache reads, and 5.0 at $10/$50 with $1.00.
+        (
+            "claude-fable-5-2".to_string(),
+            pricing(8.0, 40.0, 0.2, 10.0),
+        ),
         (
             "claude-fable-5-1".to_string(),
             pricing(10.0, 50.0, 0.25, 12.5),
         ),
         ("claude-fable-5".to_string(), pricing(10.0, 50.0, 1.0, 12.5)),
-        ("claude-fable".to_string(), pricing(10.0, 50.0, 0.25, 12.5)),
+        ("claude-fable".to_string(), pricing(8.0, 40.0, 0.2, 10.0)),
         // Opus 5.5 cut Opus pricing to $4/$20 and the cache-read multiplier to
         // 0.05x; 4.5 through 5.0 all sit at $5/$25, and 4/4.1 at $15/$75.
         ("claude-opus-5-5".to_string(), pricing(4.0, 20.0, 0.2, 5.0)),
@@ -772,13 +777,14 @@ mod tests {
     fn every_current_claude_model_prices_at_its_published_rate() {
         for (model, input, output, cache_read, cache_write) in [
             // The lineup the subscription actually resolves to.
-            ("claude-fable-5-1", 10.0, 50.0, 0.25, 12.5),
+            ("claude-fable-5-2", 8.0, 40.0, 0.2, 10.0),
             ("claude-opus-5-5", 4.0, 20.0, 0.2, 5.0),
             ("claude-sonnet-5-5", 2.0, 10.0, 0.1, 2.5),
             ("claude-haiku-5-5", 0.1, 0.5, 0.01, 0.125),
             // Older ids a stored session can still name. These must keep their own
             // generation's rates: a resumed thread re-prices on replay only if the
             // table moved under it.
+            ("claude-fable-5-1", 10.0, 50.0, 0.25, 12.5),
             ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
             ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
             ("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
@@ -849,7 +855,7 @@ mod tests {
     /// unknown-but-newer model billed at an old rate is a wrong number nobody sees.
     #[test]
     fn an_unknown_family_member_inherits_the_current_generation_rate() {
-        assert_eq!(price_for("claude-fable-9").input_per_m_tok, 10.0);
+        assert_eq!(price_for("claude-fable-9").input_per_m_tok, 8.0);
         assert_eq!(price_for("claude-opus-9").input_per_m_tok, 4.0);
         assert_eq!(price_for("claude-sonnet-9").input_per_m_tok, 2.0);
         assert_eq!(price_for("claude-haiku-9").input_per_m_tok, 0.1);
