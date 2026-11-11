@@ -1,11 +1,13 @@
 //! Defect 20261104: Antigravity turns died as `antigravity_stream_incomplete`
-//! after long agent streams; a clean EOF without a `finishReason` frame was
-//! classified away from the engine's bounded stream recovery.
-//! Root cause: the truncation tag carried no network signal, so the public
-//! engine never resampled a request whose tool calls had not been dispatched.
-//! Work item 20261104: `cloud::error_details` appends network wording to the
-//! exact `antigravity_stream_incomplete` / `antigravity_stream_interrupted`
-//! tags; this file pins the resulting public behaviour.
+//! after long agent streams. An unclean close stays a bounded failure and must
+//! not run a mutation. A clean HTTP EOF without `finishReason` completes on
+//! the first request and keeps the streamed answer. A continuation token opens
+//! the next leg instead of resampling the whole request.
+//! Root cause: a finished leg and a broken read were both treated as a missing
+//! terminal frame, and a checkpoint token was not used to continue.
+//! Work item 20261104: interrupted reads stay network failures; a clean EOF
+//! completes; a continuation token opens the next leg. This file pins that
+//! public behaviour.
 //! Mounted only by the server facade tests so it can reach the real
 //! Antigravity `decorate`/`CloudClient` over a local HTTP fixture.
 
@@ -84,9 +86,15 @@ impl Drop for FixtureProfile {
     }
 }
 
-/// A local SSE endpoint. `script` returns the body for the Nth model request;
-/// every connection answers once and closes, so a body without a terminal
-/// `finishReason` is the clean-EOF truncation shape under test.
+/// One scripted SSE response leg. When `clean_eof` is false, the server uses
+/// chunked transfer encoding and closes the socket without the terminal
+/// zero-length chunk so the HTTP client observes a genuine mid-stream read error.
+struct SseResponse {
+    frames: String,
+    clean_eof: bool,
+}
+
+/// A local SSE endpoint. `script` returns the response for the Nth model request.
 struct SseFixture {
     endpoint: String,
     bodies: Arc<Mutex<Vec<Value>>>,
@@ -100,7 +108,7 @@ impl Drop for SseFixture {
 }
 
 impl SseFixture {
-    async fn start(script: impl Fn(usize) -> String + Send + 'static) -> Self {
+    async fn start(script: impl Fn(usize) -> SseResponse + Send + 'static) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -118,11 +126,21 @@ impl SseFixture {
                     .lock()
                     .unwrap()
                     .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
-                let frames = script(index);
+                let reply = script(index);
                 index += 1;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{frames}"
-                );
+                let response = if reply.clean_eof {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        reply.frames.len(),
+                        reply.frames
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n",
+                        reply.frames.len(),
+                        reply.frames
+                    )
+                };
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.shutdown().await;
             }
@@ -177,7 +195,7 @@ fn sse_frame(response: Value) -> String {
 }
 
 /// Complete read-only + mutation tool calls, optionally terminated.
-fn tool_call_frames(fixture: &Path, counter: &Path, terminated: bool) -> String {
+fn tool_call_frames(fixture: &Path, counter: &Path, terminated: bool) -> SseResponse {
     let read = fixture.join("fixture.txt");
     let mut frame = json!({
         "response": {
@@ -196,10 +214,13 @@ fn tool_call_frames(fixture: &Path, counter: &Path, terminated: bool) -> String 
     if terminated {
         frame["response"]["candidates"][0]["finishReason"] = json!("STOP");
     }
-    sse_frame(frame)
+    SseResponse {
+        frames: sse_frame(frame),
+        clean_eof: terminated,
+    }
 }
 
-fn text_frames(text: &str, terminated: bool) -> String {
+fn text_frames(text: &str, terminated: bool) -> SseResponse {
     let mut frame = json!({
         "response": {
             "modelVersion": MODEL,
@@ -209,7 +230,10 @@ fn text_frames(text: &str, terminated: bool) -> String {
     if terminated {
         frame["response"]["candidates"][0]["finishReason"] = json!("STOP");
     }
-    sse_frame(frame)
+    SseResponse {
+        frames: sse_frame(frame),
+        clean_eof: terminated,
+    }
 }
 
 async fn antigravity_provider(endpoint: &str) -> Arc<dyn ModelProvider> {
@@ -401,7 +425,7 @@ async fn a_persistently_truncated_antigravity_stream_is_never_success() {
         .map(|error| error.message.clone())
         .unwrap_or_default();
     assert!(
-        message.contains("antigravity_stream_incomplete"),
+        message.contains("antigravity_stream_interrupted"),
         "truncation must stay the reported failure, got {message:?}"
     );
     assert!(
@@ -413,6 +437,152 @@ async fn a_persistently_truncated_antigravity_stream_is_never_success() {
         3,
         "the configured retry budget is bounded"
     );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+/// A stream that reaches clean HTTP EOF after emitting candidates without a
+/// `finishReason` frame must complete on the first attempt instead of throwing
+/// away the streamed answer and resampling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clean_eof_without_finish_reason_completes_without_resampling() {
+    let _profile = FixtureProfile::new();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_path_buf();
+
+    let fixture = SseFixture::start(|_| SseResponse {
+        frames: sse_frame(json!({
+            "response": {
+                "modelVersion": MODEL,
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "Complete final summary without finishReason."}]}}],
+                "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 42, "totalTokenCount": 162}
+            }
+        })),
+        clean_eof: true,
+    })
+    .await;
+    let provider = antigravity_provider(&fixture.endpoint).await;
+    let result = run_turn(root, provider).await;
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        fixture.request_count(),
+        1,
+        "clean EOF must not trigger full-request resampling"
+    );
+    let text = result.final_text.try_to_utf8().unwrap_or_default();
+    assert!(
+        text.contains("Complete final summary without finishReason."),
+        "streamed text must be retained: {text}"
+    );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+/// Multi-leg continuation (`FINISH_REASON_CONTINUATION` + `continuationToken`)
+/// and mid-stream checkpoint resume must stitch legs into a single assistant
+/// response with cumulative usage without re-running from the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_leg_continuation_and_mid_stream_checkpoint_resume_preserve_streamed_output() {
+    let _profile = FixtureProfile::new();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_path_buf();
+
+    let fixture = SseFixture::start(|index| match index {
+        0 => SseResponse {
+            frames: sse_frame(json!({
+                "response": {
+                    "modelVersion": MODEL,
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "First leg "}]},
+                        "finishReason": "FINISH_REASON_CONTINUATION",
+                        "continuationToken": "tok-leg-1"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1000,
+                        "cachedContentTokenCount": 800,
+                        "thoughtsTokenCount": 100,
+                        "candidatesTokenCount": 200,
+                        "totalTokenCount": 1300
+                    }
+                }
+            })),
+            clean_eof: true,
+        },
+        1 => SseResponse {
+            frames: sse_frame(json!({
+                "response": {
+                    "modelVersion": MODEL,
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "second leg "}]},
+                        "continuationToken": "tok-leg-2"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1200,
+                        "cachedContentTokenCount": 900,
+                        "thoughtsTokenCount": 50,
+                        "candidatesTokenCount": 150,
+                        "totalTokenCount": 1400
+                    }
+                }
+            })),
+            clean_eof: false,
+        },
+        _ => SseResponse {
+            frames: sse_frame(json!({
+                "response": {
+                    "modelVersion": MODEL,
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "third leg."}]},
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1350,
+                        "cachedContentTokenCount": 1000,
+                        "thoughtsTokenCount": 25,
+                        "candidatesTokenCount": 75,
+                        "totalTokenCount": 1450
+                    }
+                }
+            })),
+            clean_eof: true,
+        },
+    })
+    .await;
+    let provider = antigravity_provider(&fixture.endpoint).await;
+    let result = run_turn(root, provider).await;
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        fixture.request_count(),
+        3,
+        "expected initial leg + nominal continuation leg + mid-stream checkpoint resume leg"
+    );
+    {
+        let requests = fixture.bodies.lock().unwrap();
+        assert!(requests[0]["request"].get("continuationToken").is_none());
+        assert_eq!(
+            requests[1]["request"]["continuationToken"],
+            json!("tok-leg-1")
+        );
+        assert_eq!(
+            requests[2]["request"]["continuationToken"],
+            json!("tok-leg-2")
+        );
+        assert_eq!(requests[0]["userPromptId"], requests[1]["userPromptId"]);
+        assert_eq!(requests[1]["userPromptId"], requests[2]["userPromptId"]);
+        assert_ne!(requests[0]["requestId"], requests[1]["requestId"]);
+        assert_ne!(requests[1]["requestId"], requests[2]["requestId"]);
+    }
+    let text = result.final_text.try_to_utf8().unwrap_or_default();
+    assert!(
+        text.contains("First leg second leg third leg."),
+        "all three legs must be concatenated without loss: {text}"
+    );
+    let usage = result.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, 200);
+    assert_eq!(usage.cache_read_input_tokens, 800);
+    assert_eq!(usage.output_tokens, 600);
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }

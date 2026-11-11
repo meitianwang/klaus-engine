@@ -4,8 +4,8 @@ use super::auth;
 use futures::StreamExt;
 use klaus_agent_core::provider::classify::RawProviderError;
 use klaus_agent_core::provider::gemini::{
-    generate_content_request, GeminiApiError, GeminiChunkStream, GeminiClient,
-    GenerateContentParameters, GenerateContentResponse,
+    generate_content_request, Candidate, Content, GeminiApiError, GeminiChunkStream, GeminiClient,
+    GenerateContentParameters, GenerateContentResponse, UsageMetadata,
 };
 use klaus_agent_core::runtime_values::{runtime_codec, runtime_json, RuntimeJson, RuntimeString};
 use klaus_agent_core::types::abort::AbortSignal;
@@ -14,6 +14,11 @@ use serde_json::{json, Value};
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTINUATION_ATTEMPTS: usize = 32;
+const MAX_MID_STREAM_RETRIES: usize = 3;
+const MID_STREAM_RETRY_BASE_BACKOFF_MS: u64 = 100;
+const MID_STREAM_RETRY_MAX_BACKOFF_MS: u64 = 5_000;
+const MID_STREAM_RETRY_MAX_DELAY_MS: u64 = 60_000;
 
 pub(super) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     let url = url::Url::parse(endpoint).map_err(|_| "antigravity_endpoint_invalid")?;
@@ -253,8 +258,28 @@ fn service_error(
                     | "DECODE_PREEMPTED"
                     | "TPU_EXECUTE_ERROR"
                     | "MODEL_CAPACITY_EXHAUSTED"
+                    | "THROTTLED_TASK_LIMIT"
             )
-        );
+        )
+        || reasons.iter().any(|reason| {
+            matches!(
+                *reason,
+                "PREFILL_QUEUE_OVERLOADED"
+                    | "DECODE_PREEMPTED"
+                    | "TPU_EXECUTE_ERROR"
+                    | "MODEL_CAPACITY_EXHAUSTED"
+                    | "THROTTLED_TASK_LIMIT"
+            )
+        })
+        || (!explicit_quota
+            && [
+                "overloaded prefill queue",
+                "thread is cancelled before we get prefill results",
+                "preempted out of decode queue",
+                "tpu device returned error",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase)));
     let tag = if context_overflow {
         "model_context_window_exceeded"
     } else if status == Some(401) || service_code == Some("UNAUTHENTICATED") || auth_reason {
@@ -630,10 +655,66 @@ pub(super) struct CloudClient {
     pub generation: String,
 }
 
-fn decode_frame(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FinishReasonKind {
+    #[default]
+    Unspecified,
+    Continuation,
+    MaxTokens,
+    OtherTerminal,
+}
+
+struct DecodedCloudFrame {
+    response: GenerateContentResponse,
+    continuation_token: Option<RuntimeString>,
+    finish_reason_kind: FinishReasonKind,
+    prompt_feedback_blocked: bool,
+}
+
+fn classify_finish_reason_value(
+    value: Option<&RuntimeJson>,
+) -> (FinishReasonKind, Option<Option<&'static str>>) {
+    let Some(value) = value else {
+        return (FinishReasonKind::Unspecified, None);
+    };
+    if let Some(reason) = value.as_string() {
+        if reason.is_empty() || reason == "FINISH_REASON_UNSPECIFIED" {
+            (FinishReasonKind::Unspecified, None)
+        } else if reason == "FINISH_REASON_CONTINUATION" || reason == "CONTINUATION" {
+            (
+                FinishReasonKind::Continuation,
+                Some(Some("FINISH_REASON_CONTINUATION")),
+            )
+        } else if reason == "MAX_TOKENS" || reason == "FINISH_REASON_MAX_DECODED_TOKENS" {
+            (FinishReasonKind::MaxTokens, Some(Some("MAX_TOKENS")))
+        } else if reason == "STOP"
+            || reason == "FINISH_REASON_STOP"
+            || reason == "FINISH_REASON_NATURAL_STOP"
+        {
+            (FinishReasonKind::OtherTerminal, Some(Some("STOP")))
+        } else {
+            (FinishReasonKind::OtherTerminal, None)
+        }
+    } else if let Some(number) = value.as_i64() {
+        match number {
+            0 => (FinishReasonKind::Unspecified, Some(None)),
+            1 => (FinishReasonKind::OtherTerminal, Some(Some("STOP"))),
+            2 => (FinishReasonKind::MaxTokens, Some(Some("MAX_TOKENS"))),
+            18 => (
+                FinishReasonKind::Continuation,
+                Some(Some("FINISH_REASON_CONTINUATION")),
+            ),
+            _ => (FinishReasonKind::OtherTerminal, Some(Some("OTHER"))),
+        }
+    } else {
+        (FinishReasonKind::OtherTerminal, None)
+    }
+}
+
+fn decode_raw_frame(
     bytes: &[u8],
     generation: Option<&str>,
-) -> Result<GenerateContentResponse, GeminiApiError> {
+) -> Result<DecodedCloudFrame, GeminiApiError> {
     let payload = runtime_json::parse(&RuntimeString::from(
         String::from_utf8_lossy(bytes).as_ref(),
     ))
@@ -652,8 +733,665 @@ fn decode_frame(
             }
         }
     }
-    let inner = payload.get("response").unwrap_or(&payload);
-    runtime_codec::decode_value(inner).map_err(|_| api_error("antigravity_stream_invalid"))
+    let mut inner = payload.get("response").unwrap_or(&payload).clone();
+    let mut continuation_token = None;
+    let mut finish_reason_kind = FinishReasonKind::Unspecified;
+    if let Some(cand) = inner
+        .get_mut("candidates")
+        .and_then(RuntimeJson::as_array_mut)
+        .and_then(|candidates| candidates.first_mut())
+        .and_then(RuntimeJson::as_object_mut)
+    {
+        continuation_token = cand
+            .get("continuationToken")
+            .or_else(|| cand.get("continuation_token"))
+            .and_then(RuntimeJson::as_string)
+            .filter(|token| !token.is_empty())
+            .cloned();
+        let raw_reason = cand
+            .get("finishReason")
+            .or_else(|| cand.get("finish_reason"));
+        let (kind, normalized) = classify_finish_reason_value(raw_reason);
+        finish_reason_kind = kind;
+        if let Some(replacement) = normalized {
+            cand.remove("finish_reason");
+            match replacement {
+                Some(text) => {
+                    cand.insert("finishReason", RuntimeJson::String(text.into()));
+                }
+                None => {
+                    cand.remove("finishReason");
+                }
+            }
+        }
+    }
+    let prompt_feedback_blocked = inner
+        .get("promptFeedback")
+        .or_else(|| inner.get("prompt_feedback"))
+        .and_then(|feedback| {
+            feedback
+                .get("blockReason")
+                .or_else(|| feedback.get("block_reason"))
+        })
+        .is_some_and(|reason| {
+            if let Some(value) = reason.as_string() {
+                !value.is_empty() && value != "BLOCK_REASON_UNSPECIFIED"
+            } else if let Some(value) = reason.as_i64() {
+                value != 0
+            } else {
+                false
+            }
+        });
+    let response =
+        runtime_codec::decode_value(&inner).map_err(|_| api_error("antigravity_stream_invalid"))?;
+    Ok(DecodedCloudFrame {
+        response,
+        continuation_token,
+        finish_reason_kind,
+        prompt_feedback_blocked,
+    })
+}
+
+#[cfg(test)]
+fn decode_frame(
+    bytes: &[u8],
+    generation: Option<&str>,
+) -> Result<GenerateContentResponse, GeminiApiError> {
+    decode_raw_frame(bytes, generation).map(|frame| frame.response)
+}
+
+fn candidate_has_content(candidate: &Candidate) -> bool {
+    candidate.content.as_ref().is_some_and(|content| {
+        content.parts.iter().any(|part| {
+            part.text.as_ref().is_some_and(|text| !text.is_empty())
+                || part.function_call.is_some()
+                || part.inline_data.is_some()
+                || part.function_response.is_some()
+        })
+    })
+}
+
+fn is_continuation_budget_exhausted_error(error: &GeminiApiError) -> bool {
+    let invalid_arg = error.status == Some(400) || error.message.contains("[INVALID_ARGUMENT]");
+    invalid_arg
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("more than the max tokens limit allowed")
+}
+
+#[derive(Default)]
+struct LegState {
+    thinking_tokens: u64,
+    response_tokens: u64,
+    checkpoint_thinking_tokens: u64,
+    checkpoint_response_tokens: u64,
+    last_finish_reason: FinishReasonKind,
+    has_checkpoint: bool,
+    saw_candidate: bool,
+}
+
+enum LegEndAction {
+    Continue {
+        is_mid_stream_retry: bool,
+        retry_delay_ms: Option<u64>,
+    },
+    EmitSyntheticMaxTokens,
+    FinishCleanly,
+    Fail(GeminiApiError),
+}
+
+enum DialErrorAction {
+    Retry { retry_delay_ms: Option<u64> },
+    EmitSyntheticMaxTokens,
+    Fail(GeminiApiError),
+}
+
+struct StreamContinuationTracker {
+    latest_continuation_token: Option<RuntimeString>,
+    initial_input_tokens: u64,
+    initial_cache_read_tokens: u64,
+    prior_legs_thinking_tokens: u64,
+    prior_legs_response_tokens: u64,
+    leg: LegState,
+    last_usage: Option<UsageMetadata>,
+    max_continuation_attempts: usize,
+    continuation_count: usize,
+    max_mid_stream_retries: usize,
+    mid_stream_retry_count: usize,
+    mid_stream_retry_base_backoff_ms: u64,
+    initial_max_output_tokens: Option<u64>,
+    last_mid_stream_err: Option<GeminiApiError>,
+    has_prior_leg: bool,
+    has_initial_input_tokens: bool,
+    has_last_usage: bool,
+    suppressed_max_tokens_reason: bool,
+    has_uncheckpointed_chunks: bool,
+    resuming_from_mid_stream_error: bool,
+    last_model_version: Option<RuntimeString>,
+}
+
+impl StreamContinuationTracker {
+    fn new(initial_max_output_tokens: Option<u64>) -> Self {
+        Self {
+            latest_continuation_token: None,
+            initial_input_tokens: 0,
+            initial_cache_read_tokens: 0,
+            prior_legs_thinking_tokens: 0,
+            prior_legs_response_tokens: 0,
+            leg: LegState::default(),
+            last_usage: None,
+            max_continuation_attempts: MAX_CONTINUATION_ATTEMPTS,
+            continuation_count: 0,
+            max_mid_stream_retries: MAX_MID_STREAM_RETRIES,
+            mid_stream_retry_count: 0,
+            mid_stream_retry_base_backoff_ms: MID_STREAM_RETRY_BASE_BACKOFF_MS,
+            initial_max_output_tokens,
+            last_mid_stream_err: None,
+            has_prior_leg: false,
+            has_initial_input_tokens: false,
+            has_last_usage: false,
+            suppressed_max_tokens_reason: false,
+            has_uncheckpointed_chunks: false,
+            resuming_from_mid_stream_error: false,
+            last_model_version: None,
+        }
+    }
+
+    fn has_remaining_output_token_budget(&self) -> bool {
+        match self.initial_max_output_tokens {
+            None | Some(0) => true,
+            Some(max_tokens) => {
+                let total = self
+                    .prior_legs_thinking_tokens
+                    .saturating_add(self.prior_legs_response_tokens)
+                    .saturating_add(self.leg.thinking_tokens)
+                    .saturating_add(self.leg.response_tokens);
+                total < max_tokens
+            }
+        }
+    }
+
+    fn should_continue_on_leg_end(&self) -> bool {
+        self.leg.has_checkpoint
+            && !self.has_uncheckpointed_chunks
+            && self
+                .latest_continuation_token
+                .as_ref()
+                .is_some_and(|token| !token.is_empty())
+            && self.continuation_count < self.max_continuation_attempts
+            && matches!(
+                self.leg.last_finish_reason,
+                FinishReasonKind::Continuation | FinishReasonKind::MaxTokens
+            )
+            && self.has_remaining_output_token_budget()
+    }
+
+    fn record_candidate(
+        &mut self,
+        continuation_token: Option<RuntimeString>,
+        has_content: bool,
+        finish_reason_kind: FinishReasonKind,
+        usage: Option<&UsageMetadata>,
+    ) -> bool {
+        self.leg.saw_candidate = true;
+        self.resuming_from_mid_stream_error = false;
+        self.last_mid_stream_err = None;
+        if has_content && self.leg.last_finish_reason == FinishReasonKind::Unspecified {
+            self.suppressed_max_tokens_reason = false;
+        }
+        let has_token = continuation_token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty());
+        if let Some(token) = continuation_token.filter(|token| !token.is_empty()) {
+            let same = self.latest_continuation_token.as_ref() == Some(&token);
+            self.latest_continuation_token = Some(token);
+            self.has_uncheckpointed_chunks = false;
+            self.leg.has_checkpoint = true;
+            if !same {
+                self.mid_stream_retry_count = 0;
+            }
+        } else if has_content {
+            self.has_uncheckpointed_chunks = true;
+            if self.leg.last_finish_reason != FinishReasonKind::Unspecified
+                && finish_reason_kind == FinishReasonKind::Unspecified
+            {
+                self.suppressed_max_tokens_reason = false;
+            }
+        }
+        if let Some(usage) = usage {
+            let thoughts = usage.thoughts_token_count.unwrap_or(0);
+            let candidates = usage.candidates_token_count.unwrap_or(0);
+            self.leg.thinking_tokens = thoughts;
+            self.leg.response_tokens = candidates;
+            if has_token || (!self.has_uncheckpointed_chunks && self.leg.has_checkpoint) {
+                self.leg.checkpoint_thinking_tokens = thoughts;
+                self.leg.checkpoint_response_tokens = candidates;
+            }
+            let prompt = usage.prompt_token_count.unwrap_or(0);
+            let cached = usage.cached_content_token_count.unwrap_or(0).min(prompt);
+            let uncached_input = prompt.saturating_sub(cached);
+            let (pinned_input, pinned_cached) = if self.has_prior_leg {
+                if self.has_initial_input_tokens {
+                    (self.initial_input_tokens, self.initial_cache_read_tokens)
+                } else {
+                    (uncached_input, cached)
+                }
+            } else {
+                self.initial_input_tokens = uncached_input;
+                self.initial_cache_read_tokens = cached;
+                self.has_initial_input_tokens = true;
+                (uncached_input, cached)
+            };
+            let pinned_prompt = pinned_input.saturating_add(pinned_cached);
+            let total_thinking = self
+                .prior_legs_thinking_tokens
+                .saturating_add(self.leg.thinking_tokens);
+            let total_response = self
+                .prior_legs_response_tokens
+                .saturating_add(self.leg.response_tokens);
+            let total_output = total_thinking.saturating_add(total_response);
+            let total_tokens = pinned_prompt.saturating_add(total_output);
+            self.last_usage = Some(UsageMetadata {
+                prompt_token_count: Some(pinned_prompt),
+                cached_content_token_count: Some(pinned_cached),
+                candidates_token_count: Some(total_response),
+                thoughts_token_count: Some(total_thinking),
+                total_token_count: Some(total_tokens),
+            });
+            self.has_last_usage = true;
+        } else if has_token {
+            self.leg.checkpoint_thinking_tokens = self.leg.thinking_tokens;
+            self.leg.checkpoint_response_tokens = self.leg.response_tokens;
+        }
+        let mut suppress_finish_reason = false;
+        if finish_reason_kind != FinishReasonKind::Unspecified {
+            self.leg.last_finish_reason = finish_reason_kind;
+            self.suppressed_max_tokens_reason = false;
+            if self.should_continue_on_leg_end() {
+                self.suppressed_max_tokens_reason = true;
+                suppress_finish_reason = true;
+            }
+        }
+        suppress_finish_reason
+    }
+
+    fn record_frame(&mut self, mut decoded: DecodedCloudFrame) -> GenerateContentResponse {
+        if decoded
+            .response
+            .model_version
+            .as_ref()
+            .is_some_and(|version| !version.is_empty())
+        {
+            self.last_model_version = decoded.response.model_version.clone();
+        }
+        let has_candidates = decoded
+            .response
+            .candidates
+            .as_ref()
+            .is_some_and(|candidates| !candidates.is_empty());
+        if has_candidates {
+            let has_content = decoded
+                .response
+                .candidates
+                .as_ref()
+                .and_then(|candidates| candidates.first())
+                .is_some_and(candidate_has_content);
+            let suppress_finish_reason = self.record_candidate(
+                decoded.continuation_token,
+                has_content,
+                decoded.finish_reason_kind,
+                decoded.response.usage_metadata.as_ref(),
+            );
+            if decoded.response.usage_metadata.is_some() && self.has_last_usage {
+                decoded.response.usage_metadata = self.last_usage.clone();
+            }
+            if let Some(cand) = decoded
+                .response
+                .candidates
+                .as_mut()
+                .and_then(|candidates| candidates.first_mut())
+            {
+                if suppress_finish_reason {
+                    cand.finish_reason = None;
+                    if cand.content.is_none() {
+                        cand.content = Some(Content {
+                            role: "model".into(),
+                            parts: Vec::new(),
+                        });
+                    }
+                } else if matches!(
+                    decoded.finish_reason_kind,
+                    FinishReasonKind::Continuation | FinishReasonKind::MaxTokens
+                ) {
+                    cand.finish_reason = Some("MAX_TOKENS".into());
+                }
+            }
+        } else if decoded.prompt_feedback_blocked
+            || (decoded.response.usage_metadata.is_some() && self.leg.saw_candidate)
+        {
+            let has_content = decoded.prompt_feedback_blocked;
+            let kind = if decoded.prompt_feedback_blocked {
+                FinishReasonKind::OtherTerminal
+            } else {
+                FinishReasonKind::Unspecified
+            };
+            let _ = self.record_candidate(
+                None,
+                has_content,
+                kind,
+                decoded.response.usage_metadata.as_ref(),
+            );
+            if decoded.response.usage_metadata.is_some() && self.has_last_usage {
+                decoded.response.usage_metadata = self.last_usage.clone();
+            }
+        } else if decoded.response.usage_metadata.is_some() && self.has_prior_leg {
+            if self.has_last_usage {
+                decoded.response.usage_metadata = self.last_usage.clone();
+            } else {
+                decoded.response.usage_metadata = None;
+            }
+        }
+        decoded.response
+    }
+
+    fn can_resume_on_error(&self, error: &GeminiApiError) -> Option<Option<u64>> {
+        if self.has_uncheckpointed_chunks
+            || self
+                .latest_continuation_token
+                .as_ref()
+                .is_none_or(RuntimeString::is_empty)
+            || (self.leg.last_finish_reason != FinishReasonKind::Unspecified
+                && !self.suppressed_max_tokens_reason)
+            || self.max_continuation_attempts == 0
+            || self.continuation_count >= self.max_continuation_attempts
+            || self.mid_stream_retry_count >= self.max_mid_stream_retries
+        {
+            return None;
+        }
+        if error.status == Some(429)
+            || error.message.contains("[RESOURCE_EXHAUSTED]")
+            || error.message.starts_with("antigravity_quota_exhausted")
+            || error.message.starts_with("antigravity_rate_limited")
+        {
+            return None;
+        }
+        let classified =
+            klaus_agent_core::provider::classify::classify_error(&error_details(error));
+        if !klaus_agent_core::provider::retry::is_retryable(&classified)
+            || matches!(
+                classified.kind,
+                klaus_agent_core::types::errors::ProviderErrorKind::Quota
+                    | klaus_agent_core::types::errors::ProviderErrorKind::RateLimit
+            )
+        {
+            return None;
+        }
+        if classified
+            .retry_after_ms
+            .is_some_and(|delay| delay > MID_STREAM_RETRY_MAX_DELAY_MS)
+        {
+            return None;
+        }
+        Some(classified.retry_after_ms)
+    }
+
+    fn commit_leg_boundary_tokens(&mut self) {
+        self.prior_legs_thinking_tokens = self
+            .prior_legs_thinking_tokens
+            .saturating_add(self.leg.thinking_tokens);
+        self.prior_legs_response_tokens = self
+            .prior_legs_response_tokens
+            .saturating_add(self.leg.response_tokens);
+    }
+
+    fn commit_checkpoint_tokens(&mut self) {
+        self.prior_legs_thinking_tokens = self
+            .prior_legs_thinking_tokens
+            .saturating_add(self.leg.checkpoint_thinking_tokens);
+        self.prior_legs_response_tokens = self
+            .prior_legs_response_tokens
+            .saturating_add(self.leg.checkpoint_response_tokens);
+    }
+
+    fn evaluate_leg_end(&mut self, mut leg_err: Option<GeminiApiError>) -> LegEndAction {
+        if leg_err.is_none() {
+            if self.resuming_from_mid_stream_error
+                && !self.leg.saw_candidate
+                && !self.suppressed_max_tokens_reason
+            {
+                leg_err = Some(
+                    self.last_mid_stream_err
+                        .clone()
+                        .unwrap_or_else(|| api_error("antigravity_stream_interrupted")),
+                );
+            } else if self.should_continue_on_leg_end() {
+                self.commit_leg_boundary_tokens();
+                self.continuation_count += 1;
+                self.has_prior_leg = true;
+                self.resuming_from_mid_stream_error = false;
+                self.last_mid_stream_err = None;
+                self.leg = LegState::default();
+                return LegEndAction::Continue {
+                    is_mid_stream_retry: false,
+                    retry_delay_ms: None,
+                };
+            } else if self.suppressed_max_tokens_reason {
+                self.suppressed_max_tokens_reason = false;
+                self.resuming_from_mid_stream_error = false;
+                self.last_mid_stream_err = None;
+                return LegEndAction::EmitSyntheticMaxTokens;
+            } else {
+                return LegEndAction::FinishCleanly;
+            }
+        }
+        let err = leg_err.expect("checked Some above");
+        if (self.continuation_count > 0 || self.resuming_from_mid_stream_error)
+            && !self.has_uncheckpointed_chunks
+            && is_continuation_budget_exhausted_error(&err)
+        {
+            self.suppressed_max_tokens_reason = false;
+            self.resuming_from_mid_stream_error = false;
+            self.last_mid_stream_err = None;
+            return LegEndAction::EmitSyntheticMaxTokens;
+        }
+        if let Some(retry_delay_ms) = self.can_resume_on_error(&err) {
+            self.mid_stream_retry_count += 1;
+            self.commit_checkpoint_tokens();
+            self.continuation_count += 1;
+            self.has_prior_leg = true;
+            self.resuming_from_mid_stream_error = true;
+            self.last_mid_stream_err = Some(err);
+            self.leg = LegState::default();
+            return LegEndAction::Continue {
+                is_mid_stream_retry: true,
+                retry_delay_ms,
+            };
+        }
+        LegEndAction::Fail(err)
+    }
+
+    fn evaluate_dial_error(&mut self, dial_err: GeminiApiError) -> DialErrorAction {
+        if is_continuation_budget_exhausted_error(&dial_err) {
+            self.suppressed_max_tokens_reason = false;
+            self.resuming_from_mid_stream_error = false;
+            self.last_mid_stream_err = None;
+            return DialErrorAction::EmitSyntheticMaxTokens;
+        }
+        if let Some(retry_delay_ms) = self.can_resume_on_error(&dial_err) {
+            self.mid_stream_retry_count += 1;
+            if self.resuming_from_mid_stream_error {
+                self.last_mid_stream_err = Some(dial_err);
+            }
+            return DialErrorAction::Retry { retry_delay_ms };
+        }
+        DialErrorAction::Fail(dial_err)
+    }
+
+    fn mid_stream_retry_delay_ms(&self, retry_after_ms: Option<u64>) -> u64 {
+        let backoff = if self.mid_stream_retry_base_backoff_ms > 0 {
+            let shift = self.mid_stream_retry_count.saturating_sub(1).min(6) as u32;
+            let raw = self
+                .mid_stream_retry_base_backoff_ms
+                .saturating_mul(1u64 << shift)
+                .min(MID_STREAM_RETRY_MAX_BACKOFF_MS);
+            let half = raw / 2;
+            if half > 0 {
+                half.saturating_add(rand::random::<u64>() % half)
+            } else {
+                raw
+            }
+        } else {
+            0
+        };
+        retry_after_ms.unwrap_or(0).max(backoff)
+    }
+
+    fn new_synthetic_max_tokens_response(&self) -> GenerateContentResponse {
+        GenerateContentResponse {
+            model_version: self.last_model_version.clone(),
+            candidates: Some(vec![Candidate {
+                content: Some(Content {
+                    role: "model".into(),
+                    parts: Vec::new(),
+                }),
+                finish_reason: Some("MAX_TOKENS".into()),
+                grounding_metadata: None,
+            }]),
+            usage_metadata: if self.has_last_usage {
+                self.last_usage.clone()
+            } else {
+                None
+            },
+        }
+    }
+}
+
+fn build_leg_body(
+    project: &str,
+    model: &str,
+    user_prompt_id: &str,
+    base_request: &RuntimeJson,
+    continuation_token: Option<&RuntimeString>,
+) -> Result<Vec<u8>, GeminiApiError> {
+    let mut request = base_request.clone();
+    if let Some(token) = continuation_token {
+        request
+            .as_object_mut()
+            .ok_or_else(|| api_error("antigravity_request_invalid"))?
+            .insert("continuationToken", RuntimeJson::String(token.clone()));
+    }
+    let mut envelope_value = envelope(project, model, Value::Null, "agent");
+    if let Some(obj) = envelope_value.as_object_mut() {
+        obj.insert("userPromptId".into(), Value::String(user_prompt_id.into()));
+    }
+    let mut body: RuntimeJson =
+        runtime_codec::decode_text(&RuntimeString::from(envelope_value.to_string()))
+            .map_err(|_| api_error("antigravity_request_invalid"))?;
+    body.as_object_mut()
+        .ok_or_else(|| api_error("antigravity_request_invalid"))?
+        .insert("request", request);
+    let mut bytes = Vec::new();
+    runtime_json::write_to(&body, &mut bytes)
+        .map_err(|_| api_error("antigravity_request_invalid"))?;
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_stream_leg(
+    generation: &str,
+    model: &str,
+    project: &mut String,
+    user_prompt_id: &str,
+    base_request: &RuntimeJson,
+    continuation_token: Option<&RuntimeString>,
+    signal: &AbortSignal,
+    extra_headers: &[(String, String)],
+) -> Result<reqwest::Response, GeminiApiError> {
+    let body = build_leg_body(
+        project,
+        model,
+        user_prompt_id,
+        base_request,
+        continuation_token,
+    )?;
+    match send(
+        "streamGenerateContent",
+        body,
+        Some(generation),
+        signal,
+        extra_headers.to_vec(),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        // A NOT_FOUND refusal can mean the cached project no longer resolves
+        // rather than the request being wrong; resolve a fresh project and
+        // replay the request once before trusting the refusal.
+        Err(first) if is_not_found(&first) => {
+            let healed = super::heal_project(generation, signal)
+                .await
+                .map_err(api_error)?;
+            let retry_body = build_leg_body(
+                &healed,
+                model,
+                user_prompt_id,
+                base_request,
+                continuation_token,
+            )?;
+            match send(
+                "streamGenerateContent",
+                retry_body,
+                Some(generation),
+                signal,
+                extra_headers.to_vec(),
+            )
+            .await
+            {
+                Ok(response) => {
+                    *project = healed;
+                    Ok(response)
+                }
+                Err(second) if is_not_found(&second) => {
+                    Err(not_offered_or_original(generation, model, second).await)
+                }
+                Err(second) => Err(second),
+            }
+        }
+        Err(first) => Err(first),
+    }
+}
+
+async fn sleep_for_mid_stream_retry(
+    delay_ms: u64,
+    generation: &str,
+    signal: &AbortSignal,
+) -> Result<(), GeminiApiError> {
+    if !auth::is_current(generation) {
+        return Err(api_error("antigravity_credential_changed"));
+    }
+    if signal.is_cancelled() {
+        return Err(api_error("antigravity_request_cancelled"));
+    }
+    if delay_ms == 0 {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
+    loop {
+        tokio::select! {
+            _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if !auth::is_current(generation) {
+                    return Err(api_error("antigravity_credential_changed"));
+                }
+            }
+        }
+    }
+    if !auth::is_current(generation) {
+        return Err(api_error("antigravity_credential_changed"));
+    }
+    Ok(())
 }
 
 // This family completes a reasoning run with a signature-only trailer. Keep
@@ -888,134 +1626,232 @@ impl GeminiClient for CloudClient {
             .model
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
-        let build_body = |project: &str| -> Result<Vec<u8>, GeminiApiError> {
-            let mut request = generate_content_request(&params);
-            if let Some(details) = super::model_details(&self.generation, &model) {
-                adapt_model_request(&mut request, &details)?;
-            }
-            let mut body: RuntimeJson = runtime_codec::decode_text(&RuntimeString::from(
-                envelope(project, &model, Value::Null, "agent").to_string(),
-            ))
-            .map_err(|_| api_error("antigravity_request_invalid"))?;
-            body.as_object_mut()
-                .ok_or_else(|| api_error("antigravity_request_invalid"))?
-                .insert("request", request);
-            let mut bytes = Vec::new();
-            runtime_json::write_to(&body, &mut bytes)
-                .map_err(|_| api_error("antigravity_request_invalid"))?;
-            Ok(bytes)
-        };
-        let project = super::project(Some(&self.generation), &signal)
+        let mut base_request = generate_content_request(&params);
+        if let Some(details) = super::model_details(&self.generation, &model) {
+            adapt_model_request(&mut base_request, &details)?;
+        }
+        let initial_max_output_tokens = base_request
+            .get("generationConfig")
+            .and_then(|config| config.get("maxOutputTokens"))
+            .and_then(RuntimeJson::as_i64)
+            .filter(|value| *value > 0)
+            .map(|value| value as u64);
+        let user_prompt_id = uuid::Uuid::new_v4().to_string();
+        let mut project = super::project(Some(&self.generation), &signal)
             .await
             .map_err(api_error)?;
-        let response = match send(
-            "streamGenerateContent",
-            build_body(&project)?,
-            Some(&self.generation),
+        let response = send_stream_leg(
+            &self.generation,
+            &model,
+            &mut project,
+            &user_prompt_id,
+            &base_request,
+            None,
             &signal,
-            extra_headers.clone(),
+            &extra_headers,
         )
-        .await
-        {
-            Ok(response) => response,
-            // A NOT_FOUND refusal can mean the cached project no longer resolves
-            // rather than the request being wrong; resolve a fresh project and
-            // replay the request once before trusting the refusal.
-            Err(first) if is_not_found(&first) => {
-                let healed = super::heal_project(&self.generation, &signal)
-                    .await
-                    .map_err(api_error)?;
-                match send(
-                    "streamGenerateContent",
-                    build_body(&healed)?,
-                    Some(&self.generation),
-                    &signal,
-                    extra_headers,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(second) if is_not_found(&second) => {
-                        return Err(not_offered_or_original(&self.generation, &model, second).await)
-                    }
-                    Err(second) => return Err(second),
-                }
-            }
-            Err(first) => return Err(first),
-        };
+        .await?;
         let generation = self.generation.clone();
         Ok(Box::pin(async_stream::stream! {
-            let mut stream = response.bytes_stream();
-            let mut buffered = Vec::new();
-            let mut data = Vec::new();
-            let mut terminal = false;
-            let mut total_bytes=0usize;
-            loop {
-                let chunk = tokio::select! {
-                    _ = signal.cancelled() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                        if !auth::is_current(&generation) {yield Err(api_error("antigravity_credential_changed"));return;}
-                        continue;
-                    },
-                    chunk = stream.next() => chunk,
-                };
-                let Some(chunk) = chunk else { break; };
+            let mut tracker = StreamContinuationTracker::new(initial_max_output_tokens);
+            let mut response = response;
+            'leg: loop {
+                let mut stream = response.bytes_stream();
+                let mut buffered = Vec::new();
+                let mut data = Vec::new();
+                let mut total_bytes = 0usize;
+                let mut leg_err: Option<GeminiApiError> = None;
+                'read: loop {
+                    let chunk = tokio::select! {
+                        _ = signal.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                            if !auth::is_current(&generation) {
+                                yield Err(api_error("antigravity_credential_changed"));
+                                return;
+                            }
+                            continue;
+                        },
+                        chunk = stream.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break 'read; };
+                    if !auth::is_current(&generation) {
+                        yield Err(api_error("antigravity_credential_changed"));
+                        return;
+                    }
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            leg_err = Some(api_error("antigravity_stream_interrupted"));
+                            break 'read;
+                        }
+                    };
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    if total_bytes > MAX_BODY_BYTES {
+                        yield Err(api_error("antigravity_stream_response_too_large"));
+                        return;
+                    }
+                    if buffered.len().saturating_add(data.len()).saturating_add(chunk.len()) > MAX_SSE_FRAME_BYTES {
+                        yield Err(api_error("antigravity_stream_frame_too_large"));
+                        return;
+                    }
+                    buffered.extend_from_slice(&chunk);
+                    while let Some(index) = buffered.iter().position(|byte| *byte == b'\n') {
+                        let mut line: Vec<u8> = buffered.drain(..=index).collect();
+                        line.pop();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        if line.is_empty() {
+                            if !data.is_empty() {
+                                if data.as_slice() != b"[DONE]" {
+                                    if !auth::is_current(&generation) {
+                                        yield Err(api_error("antigravity_credential_changed"));
+                                        return;
+                                    }
+                                    match decode_raw_frame(&data, Some(&generation)) {
+                                        Ok(decoded) => {
+                                            yield Ok(tracker.record_frame(decoded));
+                                        }
+                                        Err(error) => {
+                                            leg_err = Some(error);
+                                            break 'read;
+                                        }
+                                    }
+                                }
+                                data.clear();
+                            }
+                        } else if let Some(payload) = line.strip_prefix(b"data:") {
+                            let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+                            if !data.is_empty() {
+                                data.push(b'\n');
+                            }
+                            data.extend_from_slice(payload);
+                        } else if data.is_empty() && line.trim_ascii().starts_with(b"{") {
+                            if let Err(error) = decode_raw_frame(line.trim_ascii(), Some(&generation)) {
+                                if error.message != "antigravity_stream_invalid" {
+                                    leg_err = Some(error);
+                                    break 'read;
+                                }
+                            }
+                        }
+                    }
+                }
+                if leg_err.is_none() {
+                    if let Some(payload) = buffered.strip_prefix(b"data:") {
+                        if !data.is_empty() {
+                            data.push(b'\n');
+                        }
+                        data.extend_from_slice(payload.strip_prefix(b" ").unwrap_or(payload));
+                    } else if data.is_empty() && buffered.trim_ascii().starts_with(b"{") {
+                        if let Err(error) = decode_raw_frame(buffered.trim_ascii(), Some(&generation)) {
+                            if error.message != "antigravity_stream_invalid" {
+                                leg_err = Some(error);
+                            }
+                        }
+                    }
+                    if leg_err.is_none() && !data.is_empty() && data.as_slice() != b"[DONE]" {
+                        if !auth::is_current(&generation) {
+                            yield Err(api_error("antigravity_credential_changed"));
+                            return;
+                        }
+                        match decode_raw_frame(&data, Some(&generation)) {
+                            Ok(decoded) => {
+                                yield Ok(tracker.record_frame(decoded));
+                            }
+                            Err(error) => {
+                                leg_err = Some(error);
+                            }
+                        }
+                    }
+                }
                 if !auth::is_current(&generation) {
                     yield Err(api_error("antigravity_credential_changed"));
                     return;
                 }
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(_) => { yield Err(api_error("antigravity_stream_interrupted")); return; }
-                };
-                total_bytes=total_bytes.saturating_add(chunk.len());
-                if total_bytes>MAX_BODY_BYTES {yield Err(api_error("antigravity_stream_response_too_large"));return;}
-                if buffered.len().saturating_add(data.len()).saturating_add(chunk.len()) > MAX_SSE_FRAME_BYTES {
-                    yield Err(api_error("antigravity_stream_frame_too_large"));
+                if signal.is_cancelled() {
                     return;
                 }
-                buffered.extend_from_slice(&chunk);
-                while let Some(index) = buffered.iter().position(|byte| *byte == b'\n') {
-                    let mut line: Vec<u8> = buffered.drain(..=index).collect();
-                    line.pop();
-                    if line.last() == Some(&b'\r') { line.pop(); }
-                    if line.is_empty() {
-                        if !data.is_empty() {
-                            if data.as_slice() != b"[DONE]" {
-                                if !auth::is_current(&generation) {yield Err(api_error("antigravity_credential_changed"));return;}
-                                match decode_frame(&data,Some(&generation)) {
-                                    Ok(chunk)=>{
-                                        terminal |= chunk.candidates.iter().flatten().any(|candidate| candidate.finish_reason.as_ref().is_some_and(|reason|!reason.is_empty() && reason!="FINISH_REASON_UNSPECIFIED"));
-                                        yield Ok(chunk);
-                                    },
-                                    Err(error)=>{yield Err(error);return;},
+                match tracker.evaluate_leg_end(leg_err) {
+                    LegEndAction::FinishCleanly => return,
+                    LegEndAction::EmitSyntheticMaxTokens => {
+                        yield Ok(tracker.new_synthetic_max_tokens_response());
+                        return;
+                    }
+                    LegEndAction::Fail(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                    LegEndAction::Continue {
+                        is_mid_stream_retry,
+                        retry_delay_ms,
+                    } => {
+                        if is_mid_stream_retry {
+                            let delay_ms = tracker.mid_stream_retry_delay_ms(retry_delay_ms);
+                            if let Err(error) =
+                                sleep_for_mid_stream_retry(delay_ms, &generation, &signal).await
+                            {
+                                if !signal.is_cancelled() {
+                                    yield Err(error);
                                 }
+                                return;
                             }
-                            data.clear();
                         }
-                    } else if let Some(payload) = line.strip_prefix(b"data:") {
-                        let payload = payload.strip_prefix(b" ").unwrap_or(payload);
-                        if !data.is_empty() { data.push(b'\n'); }
-                        data.extend_from_slice(payload);
+                        loop {
+                            if signal.is_cancelled() {
+                                return;
+                            }
+                            if !auth::is_current(&generation) {
+                                yield Err(api_error("antigravity_credential_changed"));
+                                return;
+                            }
+                            let token = tracker.latest_continuation_token.clone();
+                            match send_stream_leg(
+                                &generation,
+                                &model,
+                                &mut project,
+                                &user_prompt_id,
+                                &base_request,
+                                token.as_ref(),
+                                &signal,
+                                &extra_headers,
+                            )
+                            .await
+                            {
+                                Ok(next_response) => {
+                                    response = next_response;
+                                    continue 'leg;
+                                }
+                                Err(dial_err) => match tracker.evaluate_dial_error(dial_err) {
+                                    DialErrorAction::EmitSyntheticMaxTokens => {
+                                        yield Ok(tracker.new_synthetic_max_tokens_response());
+                                        return;
+                                    }
+                                    DialErrorAction::Fail(error) => {
+                                        yield Err(error);
+                                        return;
+                                    }
+                                    DialErrorAction::Retry { retry_delay_ms } => {
+                                        let delay_ms =
+                                            tracker.mid_stream_retry_delay_ms(retry_delay_ms);
+                                        if let Err(error) = sleep_for_mid_stream_retry(
+                                            delay_ms,
+                                            &generation,
+                                            &signal,
+                                        )
+                                        .await
+                                        {
+                                            if !signal.is_cancelled() {
+                                                yield Err(error);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                },
+                            }
+                        }
                     }
                 }
             }
-            if let Some(payload) = buffered.strip_prefix(b"data:") {
-                if !data.is_empty() { data.push(b'\n'); }
-                data.extend_from_slice(payload.strip_prefix(b" ").unwrap_or(payload));
-            }
-            if !data.is_empty() && data.as_slice() != b"[DONE]" {
-                if !auth::is_current(&generation) {yield Err(api_error("antigravity_credential_changed"));return;}
-                match decode_frame(&data,Some(&generation)) {
-                    Ok(chunk)=>{
-                        terminal |= chunk.candidates.iter().flatten().any(|candidate| candidate.finish_reason.as_ref().is_some_and(|reason|!reason.is_empty() && reason!="FINISH_REASON_UNSPECIFIED"));
-                        yield Ok(chunk);
-                    },
-                    Err(error)=>{yield Err(error);return;},
-                }
-            }
-            if !auth::is_current(&generation) {yield Err(api_error("antigravity_credential_changed"));return;}
-            if !terminal {yield Err(api_error("antigravity_stream_incomplete"));}
         }))
     }
 }
@@ -1602,5 +2438,139 @@ mod tests {
         let part = &candidates[0].content.as_ref().unwrap().parts[0];
         assert_eq!(part.thought_signature.as_ref().unwrap(), "signature");
         assert_eq!(chunk.usage_metadata.unwrap().prompt_token_count, Some(4));
+    }
+
+    #[test]
+    fn continuation_tracker_suppresses_intermediate_leg_finish_reasons_and_accumulates_usage() {
+        let mut tracker = StreamContinuationTracker::new(Some(10_000));
+        let leg1 = decode_raw_frame(
+            br#"{"response":{"modelVersion":"gemini-4-argon-medium","candidates":[{"content":{"role":"model","parts":[{"text":"part one "}]},"finishReason":"FINISH_REASON_CONTINUATION","continuationToken":"tok-leg-1"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":800,"thoughtsTokenCount":300,"candidatesTokenCount":200,"totalTokenCount":1500}}}"#,
+            None,
+        )
+        .unwrap();
+        let mapped1 = tracker.record_frame(leg1);
+        assert!(
+            mapped1.candidates.as_ref().unwrap()[0]
+                .finish_reason
+                .is_none(),
+            "intermediate continuation finishReason must be suppressed"
+        );
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::Continue {
+                is_mid_stream_retry: false,
+                ..
+            }
+        ));
+        assert_eq!(tracker.continuation_count, 1);
+        assert_eq!(
+            tracker.latest_continuation_token.as_ref().unwrap(),
+            "tok-leg-1"
+        );
+
+        let leg2 = decode_raw_frame(
+            br#"{"response":{"modelVersion":"gemini-4-argon-medium","candidates":[{"content":{"role":"model","parts":[{"text":"part two"}]},"finishReason":"STOP","continuationToken":"tok-leg-2"}],"usageMetadata":{"promptTokenCount":1500,"cachedContentTokenCount":1200,"thoughtsTokenCount":100,"candidatesTokenCount":400,"totalTokenCount":2000}}}"#,
+            None,
+        )
+        .unwrap();
+        let mapped2 = tracker.record_frame(leg2);
+        assert_eq!(
+            mapped2.candidates.as_ref().unwrap()[0]
+                .finish_reason
+                .as_ref()
+                .unwrap(),
+            "STOP"
+        );
+        let usage = mapped2.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, Some(1000));
+        assert_eq!(usage.cached_content_token_count, Some(800));
+        assert_eq!(usage.thoughts_token_count, Some(400));
+        assert_eq!(usage.candidates_token_count, Some(600));
+        assert_eq!(usage.total_token_count, Some(2000));
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::FinishCleanly
+        ));
+    }
+
+    #[test]
+    fn continuation_tracker_resumes_mid_stream_errors_only_when_checkpoint_is_current() {
+        let mut tracker = StreamContinuationTracker::new(None);
+        let checkpointed = decode_raw_frame(
+            br#"{"response":{"modelVersion":"gemini-4-argon-medium","candidates":[{"content":{"role":"model","parts":[{"text":"checkpointed"}]},"continuationToken":"tok-1"}],"usageMetadata":{"promptTokenCount":500,"cachedContentTokenCount":400,"thoughtsTokenCount":50,"candidatesTokenCount":100}}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = tracker.record_frame(checkpointed);
+        assert!(matches!(
+            tracker.evaluate_leg_end(Some(api_error("antigravity_stream_interrupted"))),
+            LegEndAction::Continue {
+                is_mid_stream_retry: true,
+                ..
+            }
+        ));
+        assert_eq!(tracker.mid_stream_retry_count, 1);
+
+        // An empty 200 EOF on a mid-stream resume leg must restore the error and retry.
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::Continue {
+                is_mid_stream_retry: true,
+                ..
+            }
+        ));
+        assert_eq!(tracker.mid_stream_retry_count, 2);
+
+        // Uncheckpointed content after a checkpoint prevents mid-stream resume so
+        // uncheckpointed text is never duplicated.
+        let uncheckpointed = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"tail without token"}]}}]}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = tracker.record_frame(uncheckpointed);
+        assert!(matches!(
+            tracker.evaluate_leg_end(Some(api_error("antigravity_stream_interrupted"))),
+            LegEndAction::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn continuation_tracker_synthesizes_max_tokens_when_continuation_budget_is_exhausted() {
+        let mut tracker = StreamContinuationTracker::new(None);
+        let leg1 = decode_raw_frame(
+            br#"{"response":{"modelVersion":"gemini-4-argon-medium","candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":18,"continuationToken":"tok-1"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":20,"thoughtsTokenCount":10,"candidatesTokenCount":30}}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = tracker.record_frame(leg1);
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::Continue {
+                is_mid_stream_retry: false,
+                ..
+            }
+        ));
+        let budget_err = service_error(
+            Some(400),
+            br#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Request contains more than the max tokens limit allowed."}}"#,
+            Default::default(),
+        );
+        assert!(matches!(
+            tracker.evaluate_dial_error(budget_err),
+            DialErrorAction::EmitSyntheticMaxTokens
+        ));
+        let synthetic = tracker.new_synthetic_max_tokens_response();
+        assert_eq!(
+            synthetic.candidates.as_ref().unwrap()[0]
+                .finish_reason
+                .as_ref()
+                .unwrap(),
+            "MAX_TOKENS"
+        );
+        assert_eq!(
+            synthetic.usage_metadata.unwrap().candidates_token_count,
+            Some(30)
+        );
     }
 }

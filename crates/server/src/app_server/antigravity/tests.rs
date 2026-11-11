@@ -701,8 +701,10 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
     })).is_err());
 }
 
+/// A credential swap aborts the live stream. A complete frame followed by a
+/// clean EOF and no finish reason completes; that close is not a truncation.
 #[tokio::test]
-async fn buffered_cloud_frames_and_premature_eof_cannot_publish_success() {
+async fn credential_change_aborts_a_live_stream_and_clean_eof_without_finish_reason_completes() {
     use klaus_agent_core::provider::gemini::GeminiClient;
     let fixture = fixture().await;
     let root = tempfile::tempdir().unwrap();
@@ -765,12 +767,8 @@ async fn buffered_cloud_frames_and_premature_eof_cannot_publish_success() {
         .unwrap()
         .collect()
         .await;
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert!(events[0].is_ok());
-    assert_eq!(
-        events[1].as_ref().unwrap_err().message,
-        "antigravity_stream_incomplete"
-    );
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
