@@ -543,6 +543,7 @@ impl Tool for EditTool {
                 size: Some(after.len()),
                 content: Some(written),
                 encoding: Some(to_state_enc(encoding)),
+                partial_view: false,
             },
         );
         (ctx.emit)(ToolDomainEvent::FileChange {
@@ -651,6 +652,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -789,6 +791,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(RuntimeString::from(contents)),
                 encoding: Some(StateEncoding::Utf8),
+                partial_view: false,
             },
         );
     }
@@ -927,6 +930,7 @@ mod tests {
                 size: None,
                 content: Some(RuntimeString::from("alpha\nbeta\ngamma\n")),
                 encoding: Some(StateEncoding::Utf8),
+                partial_view: false,
             },
         );
         std::fs::write(&file, "alpha\nbeta\nDELTA\n").unwrap();
@@ -975,6 +979,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(RuntimeString::from("before")),
                 encoding: Some(StateEncoding::Utf8),
+                partial_view: false,
             },
         );
         let ctx = make_ctx(&cwd, state, Arc::new(Mutex::new(Vec::new())));
@@ -1011,6 +1016,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(decoded.content),
                 encoding: Some(StateEncoding::Utf16Le),
+                partial_view: false,
             },
         );
         let ctx = make_ctx(&cwd, state, Arc::new(Mutex::new(Vec::new())));

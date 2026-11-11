@@ -9,6 +9,14 @@
 //! they matched byte-for-byte in the content they just read off disk, so an
 //! unread file is not at risk and is not blocked; what they guard is a baseline
 //! the model reasoned about having moved underneath it ([`check_stale_write`]).
+//!
+//! A baseline flagged `partial_view` — an auto-injected file whose raw disk bytes
+//! are tracked while the model only saw a processed view of them — counts as a
+//! faithful diff baseline but NOT as a complete read. [`check_read_before_write`]
+//! therefore still refuses it, keeping that guard fail-closed. [`check_stale_write`]
+//! compares its raw baseline against the raw text the caller just read off disk,
+//! which is the same comparison it already makes, so an injected file whose disk
+//! copy later moved is reported as stale like any other tracked baseline.
 
 use crate::runtime_values::{RuntimePath, RuntimeString};
 use crate::types::file_state::FileStateCache;
@@ -24,7 +32,8 @@ pub const STALE_MESSAGE: &str = "File has been modified since read, either by th
 /// wholesale (Write, NotebookEdit). Returns a blocking error message, or `None`
 /// to proceed.
 ///
-/// - Not fully read (no captured content) → [`NOT_READ_MESSAGE`].
+/// - Not fully read (no captured content, or a content baseline the model only
+///   saw a processed view of) → [`NOT_READ_MESSAGE`].
 /// - On-disk mtime later than the recorded baseline → [`STALE_MESSAGE`], UNLESS
 ///   `disk_content` is supplied and still matches the recorded full content
 ///   (the content fallback that prevents mtime-only false positives).
@@ -35,7 +44,9 @@ pub fn check_read_before_write(
     disk_content: Option<&RuntimeString>,
 ) -> Option<&'static str> {
     let entry = match file_state.get(abs) {
-        Some(e) if e.content.is_some() => e,
+        // A partial-view baseline holds raw disk bytes the model never saw in
+        // full, so it cannot stand in for the read this guard demands.
+        Some(e) if e.content.is_some() && !e.partial_view => e,
         _ => return Some(NOT_READ_MESSAGE),
     };
     // Floor both sides to whole ms to avoid sub-ms jitter.
@@ -59,7 +70,9 @@ pub fn check_read_before_write(
 /// full baseline, the on-disk mtime is later, and the content really differs —
 /// the model is reasoning about a version that no longer exists, so it is sent
 /// back to read again. A baseline without content (a ranged or truncated read)
-/// holds nothing to compare against and proceeds.
+/// holds nothing to compare against and proceeds. A partial-view baseline holds
+/// the raw disk bytes, so it compares against `disk_content` on the same terms
+/// as any other full baseline.
 pub fn check_stale_write(
     abs: &RuntimePath,
     st_mtime_ms: f64,
@@ -208,6 +221,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -240,7 +254,88 @@ mod tests {
             size: None,
             content: Some(RuntimeString::from(content)),
             encoding: None,
+            partial_view: false,
         }
+    }
+
+    /// A baseline holding the raw disk bytes while the model only saw a
+    /// processed view of them (an auto-injected memory file).
+    fn partial_view(disk_content: &str) -> RecordOptions {
+        RecordOptions {
+            partial_view: true,
+            ..full(disk_content)
+        }
+    }
+
+    #[test]
+    fn partial_view_content_does_not_satisfy_read_before_write() {
+        // The regression this pins: the entry HAS content, so a guard that only
+        // tested `content.is_some()` would wave a wholesale write through over
+        // bytes the model never saw.
+        let c = TestCache::default();
+        let path = RuntimePath::from("/memory/AGENTS.md");
+        c.record(&path, 100.0, partial_view("---\nk: v\n---\nbody\n"));
+        assert_eq!(
+            check_read_before_write(&path, 100.0, &c, None),
+            Some(NOT_READ_MESSAGE)
+        );
+        // A current on-disk copy does not unlock it either.
+        let disk = RuntimeString::from("---\nk: v\n---\nbody\n");
+        assert_eq!(
+            check_read_before_write(&path, 100.0, &c, Some(&disk)),
+            Some(NOT_READ_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn an_explicit_complete_read_replaces_the_partial_view_marker() {
+        let c = TestCache::default();
+        let path = RuntimePath::from("/memory/AGENTS.md");
+        c.record(&path, 100.0, partial_view("raw"));
+        assert_eq!(
+            check_read_before_write(&path, 100.0, &c, None),
+            Some(NOT_READ_MESSAGE)
+        );
+        // The read tool re-records the same path with what the model now saw.
+        c.record(&path, 100.0, full("raw"));
+        assert_eq!(check_read_before_write(&path, 100.0, &c, None), None);
+        // The re-baselined entry guards staleness normally again.
+        assert_eq!(
+            check_read_before_write(&path, 200.0, &c, None),
+            Some(STALE_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn partial_view_baseline_is_a_raw_bytes_baseline_for_stale_write() {
+        let c = TestCache::default();
+        let path = RuntimePath::from("/memory/AGENTS.md");
+        c.record(&path, 100.0, partial_view("---\nk: v\n---\nbody\n"));
+        // Untouched: the injection recorded the file's own mtime, so nothing is stale.
+        assert_eq!(
+            check_stale_write(
+                &path,
+                100.0,
+                &c,
+                &RuntimeString::from("---\nk: v\n---\nbody\n")
+            ),
+            None
+        );
+        // Touched but identical on disk → the mtime-only false positive stays suppressed.
+        assert_eq!(
+            check_stale_write(
+                &path,
+                200.0,
+                &c,
+                &RuntimeString::from("---\nk: v\n---\nbody\n")
+            ),
+            None
+        );
+        // Genuinely rewritten out-of-band → the model's injected view is gone.
+        assert_eq!(
+            check_stale_write(&path, 200.0, &c, &RuntimeString::from("body only\n")),
+            Some(STALE_MESSAGE)
+        );
     }
 
     #[test]

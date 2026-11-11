@@ -1675,6 +1675,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -1716,6 +1717,7 @@ mod tests {
                 size: None,
                 content: Some(RuntimeString::from("original")),
                 encoding: None,
+                partial_view: false,
             },
         );
         ctx.file_state = cache;
@@ -1753,6 +1755,7 @@ mod tests {
                 size: None,
                 content: Some(RuntimeString::from("original")),
                 encoding: None,
+                partial_view: false,
             },
         );
         ctx.file_state = cache;

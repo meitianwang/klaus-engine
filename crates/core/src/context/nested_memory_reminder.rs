@@ -15,21 +15,28 @@
 //! engine wraps the whole provider output in one, so the per-file blocks are joined with a blank
 //! line inside that single reminder (content-identical, one wrapper).
 //!
-//! `file_state` marking (honest note): a fuller scheme records the RAW disk bytes with a partial-view
-//! marker when the injected (frontmatter-stripped) body differs from disk. The engine's
-//! `FileStateEntry` has no such marker, so recording stripped content would make the edited-files
-//! reminder diff it as an out-of-band change. We instead record mtime-ONLY (no content): the
-//! edited-files reminder skips content-less entries, so there's no spurious diff, while
-//! read-before-write is still satisfied (the path is in `file_state`) and stale-write detection
-//! still fires (a later external edit bumps the mtime). The only missing effect is
-//! mid-session content-diffing of an injected memory file — which the engine's edited-files
-//! reminder can't do for content-less entries anyway.
+//! `file_state` marking: on inject the entry records the file's REAL mtime plus the RAW disk bytes,
+//! flagged `partial_view` because the injected body is a processed view of them (frontmatter is
+//! stripped before it reaches the context). The two halves of that entry do different jobs, and the
+//! marker is what keeps them from being confused:
+//!
+//!   - The raw bytes are a faithful external-edit baseline, so the edited-files reminder can diff an
+//!     injected memory file against disk like any other tracked file. The baseline is written at the
+//!     file's own mtime, so the injection itself is never reported as an out-of-band change.
+//!   - `partial_view` keeps the entry from counting as a complete read. The write guards still send
+//!     the model to Read the file before putting content down wholesale, because what it saw was not
+//!     the bytes it would be replacing. An explicit complete read re-records the path and clears the
+//!     marker.
+//!
+//! Stale-write detection is unchanged in kind: an external edit bumps the mtime, and the raw baseline
+//! now also lets the reminder show WHAT changed rather than only that something did.
 
 use crate::context::memory_files::MemoryGates;
 use crate::context::nested_memory::{get_nested_memory_for_file, NestedMemoryOptions};
 use crate::fs::node_path::{project_runtime_path, runtime_path_from_native};
+use crate::fs::text_file::{decode_text_buffer, Encoding as FsEncoding};
 use crate::runtime_values::{RuntimePath, RuntimeString};
-use crate::types::file_state::{FileStateCache, RecordOptions};
+use crate::types::file_state::{Encoding as StateEncoding, FileStateCache, RecordOptions};
 use crate::types::reminder::{ReminderContext, ReminderProvider};
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -79,6 +86,14 @@ fn join_runtime_strings(values: &[RuntimeString], separator: &str) -> RuntimeStr
         output = output.concat(&separator).concat(value);
     }
     output
+}
+
+/// The state-cache encoding for a decoded text file.
+fn to_state_encoding(encoding: FsEncoding) -> StateEncoding {
+    match encoding {
+        FsEncoding::Utf8 => StateEncoding::Utf8,
+        FsEncoding::Utf16Le => StateEncoding::Utf16Le,
+    }
 }
 
 #[async_trait]
@@ -140,28 +155,45 @@ impl ReminderProvider for NestedMemoryReminderProvider {
                     .lock()
                     .unwrap()
                     .insert(memory_path.clone());
-                // Mark as seen (read-before-write baseline) at the file's REAL mtime so a later
-                // external edit is detected as stale. mtime-only (see module docs). A stat
-                // failure just skips the mark — loaded_paths still dedups the injection; the file
-                // is unreadable now, so it's left out of file_state.
+                // Mark as seen at the file's REAL mtime so a later external edit is detected as
+                // stale, and record the RAW disk bytes as the external-edit baseline. The injected
+                // body is a processed view of those bytes, hence `partial_view` (see module docs).
+                // A stat or read failure just skips the content — loaded_paths still dedups the
+                // injection, and an entry with no content still fails the write guards closed.
                 let Ok(native_path) =
                     project_runtime_path(&memory_path, "nested-memory loaded path")
                 else {
                     continue;
                 };
-                if let Ok(meta) = tokio::fs::metadata(&native_path).await {
-                    if let Ok(modified) = meta.modified() {
-                        let mtime_ms = match modified.duration_since(UNIX_EPOCH) {
-                            Ok(d) => d.as_secs_f64() * 1000.0,
-                            Err(e) => -(e.duration().as_secs_f64() * 1000.0),
-                        };
-                        self.deps.file_state.record(
-                            &memory_path,
-                            mtime_ms,
-                            RecordOptions::default(),
-                        );
+                let Ok(meta) = tokio::fs::metadata(&native_path).await else {
+                    continue;
+                };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                let mtime_ms = match modified.duration_since(UNIX_EPOCH) {
+                    Ok(d) => d.as_secs_f64() * 1000.0,
+                    Err(e) => -(e.duration().as_secs_f64() * 1000.0),
+                };
+                // Decode and CRLF-normalize exactly as the read/edit baselines do, so the
+                // edited-files reminder doesn't report a whole-file change from the newline or
+                // encoding form alone.
+                let opts = match tokio::fs::read(&native_path).await {
+                    Ok(buf) => {
+                        let text = decode_text_buffer(&buf);
+                        RecordOptions {
+                            size: Some(meta.len()),
+                            content: Some(text.content),
+                            encoding: Some(to_state_encoding(text.encoding)),
+                            partial_view: true,
+                        }
                     }
-                }
+                    Err(_) => RecordOptions {
+                        size: Some(meta.len()),
+                        ..Default::default()
+                    },
+                };
+                self.deps.file_state.record(&memory_path, mtime_ms, opts);
             }
         }
 
@@ -282,6 +314,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -362,20 +395,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn marks_file_state_with_mtime_but_no_content() {
-        // The edited-files reminder skips content-less entries.
+    async fn marks_file_state_with_raw_disk_content_flagged_as_a_partial_view() {
+        // The injected body is the frontmatter-stripped text, so the entry records
+        // the RAW disk bytes and flags them: the edited-files reminder can diff
+        // them, while the write guards still treat the path as unread.
         let dir = temp_dir();
-        write(&dir, "proj/sub/AGENTS.md", "SUB-MEM");
+        write(
+            &dir,
+            "proj/sub/AGENTS.md",
+            "---\ndescription: nested rule\n---\n\nSUB-MEM\n",
+        );
         let file = runtime_path_from_native(&at(&dir, "proj/sub/file.ts"));
         let mem_path = runtime_path_from_native(&at(&dir, "proj/sub/AGENTS.md"));
         let st = setup(&dir, &[file], Arc::new(TestFileStateCache::default()));
 
-        st.provider.reminder(&ctx(&dir, "proj")).await;
-        let entry = st.file_state.get(&mem_path);
-        assert!(entry.is_some());
-        let entry = entry.unwrap();
+        let out = st
+            .provider
+            .reminder(&ctx(&dir, "proj"))
+            .await
+            .unwrap_or_default();
+        // The model sees the body without the frontmatter.
+        assert!(out.contains("SUB-MEM"));
+        assert!(!out.contains("description: nested rule"));
+
+        let entry = st
+            .file_state
+            .get(&mem_path)
+            .expect("injected path is tracked");
         assert!(entry.mtime_ms > 0.0);
-        assert!(entry.content.is_none()); // mtime-only: no spurious out-of-band diff later
+        assert!(entry.partial_view);
+        // The baseline is the disk bytes, not the injected view — frontmatter included.
+        let recorded = entry.content.expect("raw disk baseline");
+        assert!(recorded.contains("description: nested rule"));
+        assert!(recorded.contains("SUB-MEM"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

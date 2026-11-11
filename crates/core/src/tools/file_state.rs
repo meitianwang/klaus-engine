@@ -122,6 +122,9 @@ impl FileStateCache for InMemoryFileStateCache {
             size: None,
             content: None,
             encoding: None,
+            // Re-recording a path replaces the whole baseline, so an explicit
+            // complete read clears a marker an earlier injection left behind.
+            partial_view: opts.partial_view,
         };
         if let Some(size) = opts.size {
             entry.size = Some(size);
@@ -223,6 +226,7 @@ mod tests {
             size,
             content: content.map(RuntimeString::from),
             encoding: None,
+            partial_view: false,
         }
     }
 
@@ -232,6 +236,7 @@ mod tests {
             size,
             content: content.map(RuntimeString::from),
             encoding: None,
+            partial_view: false,
         }
     }
 

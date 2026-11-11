@@ -410,6 +410,7 @@ impl Tool for MultiEditTool {
                 size: Some(after.len()),
                 content: Some(written),
                 encoding: Some(to_state_enc(encoding)),
+                partial_view: false,
             },
         );
         // Against what this TURN first found in the file, so a file this turn has
@@ -530,6 +531,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -667,6 +669,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(RuntimeString::from(contents)),
                 encoding: Some(StateEncoding::Utf8),
+                partial_view: false,
             },
         );
     }
@@ -768,6 +771,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(RuntimeString::from("one two")),
                 encoding: Some(StateEncoding::Utf8),
+                partial_view: false,
             },
         );
         let ctx = make_ctx(&cwd, state, Arc::new(Mutex::new(Vec::new())));
@@ -807,6 +811,7 @@ mod tests {
                 size: Some(md.len()),
                 content: Some(decoded.content),
                 encoding: Some(StateEncoding::Utf16Le),
+                partial_view: false,
             },
         );
         let ctx = make_ctx(&cwd, state, Arc::new(Mutex::new(Vec::new())));

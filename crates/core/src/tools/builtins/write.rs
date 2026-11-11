@@ -584,6 +584,7 @@ impl Tool for WriteTool {
                 size: Some(st_after.len()),
                 content: Some(written),
                 encoding: Some(enc),
+                partial_view: false,
             },
         );
         let kind = if existed { "modify" } else { "create" };
@@ -728,6 +729,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }

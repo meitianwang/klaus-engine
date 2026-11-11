@@ -545,6 +545,7 @@ impl Tool for ReadTool {
                         size: Some(0),
                         content: Some(RuntimeString::default()),
                         encoding: None,
+                        partial_view: false,
                     },
                 );
             }
@@ -678,6 +679,7 @@ impl Tool for ReadTool {
                     size: Some(size),
                     content: Some(text.clone()),
                     encoding: Some(to_state_encoding(encoding)),
+                    partial_view: false,
                 },
             );
         }

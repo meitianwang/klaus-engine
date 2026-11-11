@@ -394,6 +394,7 @@ impl Tool for NotebookEditTool {
                 size: Some(st_after.len()),
                 content: Some(written),
                 encoding: None,
+                partial_view: false,
             },
         );
         // Against what this TURN first found in the notebook, so editing several
@@ -482,6 +483,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -530,6 +532,7 @@ mod tests {
                 size: None,
                 content: Some(RuntimeString::from(NOTEBOOK)),
                 encoding: None,
+                partial_view: false,
             },
         );
         let mut ctx = make_ctx(cwd);

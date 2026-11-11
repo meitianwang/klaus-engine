@@ -105,8 +105,10 @@ impl EditedFilesReminderProvider {
         let file_state = (self.get_file_state)();
         let mut blocks: Vec<RuntimeString> = Vec::new();
         for (path, entry) in file_state.entries() {
-            // Only files with a full text baseline can be diffed (partial/truncated/
-            // binary reads stored no content).
+            // Only files with a text baseline can be diffed (partial/truncated/binary
+            // reads stored no content). A baseline flagged `partial_view` still holds
+            // the raw disk bytes, so it diffs normally: the marker says the model saw
+            // a processed view, not that the baseline is approximate.
             let Some(baseline) = entry.content.as_ref() else {
                 continue;
             };
@@ -209,6 +211,7 @@ mod tests {
                     size: opts.size,
                     content: opts.content,
                     encoding: opts.encoding,
+                    partial_view: opts.partial_view,
                 },
             );
         }
@@ -272,6 +275,7 @@ mod tests {
             size: None,
             content: Some(RuntimeString::from(content)),
             encoding: None,
+            partial_view: false,
         }
     }
 

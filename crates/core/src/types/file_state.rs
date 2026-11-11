@@ -21,14 +21,30 @@ pub struct FileStateEntry {
     pub mtime_ms: f64,
     /// Byte size last seen (a cheap pre-filter for external-edit detection).
     pub size: Option<u64>,
-    /// The raw on-disk text the agent last saw — present ONLY for a complete
-    /// text read / edit / write (absent for partial, truncated, or binary
-    /// reads). It backs external-edit diffing.
+    /// The raw on-disk text the agent last saw — present for a complete text
+    /// read / edit / write (absent for partial, truncated, or binary reads), and
+    /// also for an auto-injected file recorded with [`FileStateEntry::partial_view`]
+    /// set. It backs external-edit diffing.
     pub content: Option<RuntimeString>,
     /// The encoding the file was last read/written as (utf8 default, utf16le for
     /// a BOM'd file). A full Write reuses this to preserve a utf16le file's
     /// encoding on overwrite.
     pub encoding: Option<Encoding>,
+    /// `content` holds the raw on-disk bytes, but the model was only shown a
+    /// processed view of them (an auto-injected memory file, whose frontmatter is
+    /// stripped before it reaches the context).
+    ///
+    /// The two halves of the entry therefore answer different questions, and
+    /// consumers must keep them apart:
+    ///
+    /// - `content` is a faithful external-edit baseline, so out-of-band change
+    ///   diffing works normally against the raw bytes.
+    /// - The entry does NOT count as a complete read. The write guards treat it
+    ///   as unread, so a tool that puts content down wholesale still has to Read
+    ///   the file first and see the bytes it is about to replace.
+    ///
+    /// An explicit complete read re-records the path and clears the marker.
+    pub partial_view: bool,
 }
 
 /// Optional metadata passed to [`FileStateCache::record`].
@@ -37,6 +53,10 @@ pub struct RecordOptions {
     pub size: Option<u64>,
     pub content: Option<RuntimeString>,
     pub encoding: Option<Encoding>,
+    /// Marks the recorded content as raw disk bytes the model only saw a
+    /// processed view of. See [`FileStateEntry::partial_view`]. Defaults to
+    /// false: a recorded read/edit/write baseline is a complete view.
+    pub partial_view: bool,
 }
 
 /// Tracks files the agent has read/written, so (a) writes/edits can detect a
