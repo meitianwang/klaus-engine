@@ -244,23 +244,9 @@ pub(super) async fn compact(
     let mut candidate =
         restore_compaction_protected(replacement, protected, turn_user_uuid.as_ref());
     invalidate_context_usage(&mut candidate);
-    candidate = inject_running_agent_reminder(
-        candidate,
-        shared.background_tasks.as_ref(),
-        &|| (shared.deps.uuid)(),
-        &prepared.profile,
-    );
-    {
-        let surfaced = shared.surfaced.lock_recover();
-        let tools = shared.tools.lock_recover().clone();
-        candidate = inject_surfaced_tools_reminder(
-            candidate,
-            &tools,
-            &surfaced,
-            &|| (shared.deps.uuid)(),
-            &prepared.profile,
-        );
-    }
+    // Detect which retained reminder fragments the migration rewrite dropped
+    // and re-inject only those; surviving copies contribute zero bytes.
+    reinject_query_retained_fragments(shared, &mut candidate, &prepared.profile);
     let has_task_tool = shared.params.tools.iter().any(|tool| tool.name() == "task");
     tokio::select! {
         biased;

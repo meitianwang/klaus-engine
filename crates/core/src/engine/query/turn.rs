@@ -21,9 +21,8 @@ mod preflight_compaction;
 use super::backoff_ms;
 use super::base_hook_input;
 use super::compaction::compaction_summary_of;
-use super::compaction::inject_running_agent_reminder;
-use super::compaction::inject_surfaced_tools_reminder;
 use super::compaction::persist_history_repair;
+use super::compaction::reinject_query_retained_fragments;
 use super::concat_runtime_strings;
 use super::count_mcp_tools;
 use super::is_retryable;
@@ -3470,23 +3469,9 @@ async fn finish_turn_compact(
     let mut candidate =
         restore_compaction_protected(replacement, protected, turn_user_uuid.as_ref());
     invalidate_context_usage(&mut candidate);
-    candidate = inject_running_agent_reminder(
-        candidate,
-        shared.background_tasks.as_ref(),
-        &|| (shared.deps.uuid)(),
-        profile,
-    );
-    {
-        let surfaced = shared.surfaced.lock_recover();
-        let tools = shared.tools.lock_recover().clone();
-        candidate = inject_surfaced_tools_reminder(
-            candidate,
-            &tools,
-            &surfaced,
-            &|| (shared.deps.uuid)(),
-            profile,
-        );
-    }
+    // Detect which retained reminder fragments the rewrite dropped and
+    // re-inject only those; surviving copies contribute zero bytes.
+    reinject_query_retained_fragments(shared, &mut candidate, profile);
     let has_task_tool = shared.params.tools.iter().any(|tool| tool.name() == "task");
     tokio::select! {
         biased;

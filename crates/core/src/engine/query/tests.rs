@@ -131,8 +131,6 @@ async fn raw_query_fixture_keeps_inference_absent() {
 }
 
 use super::build_tool_catalog;
-use super::compaction::inject_running_agent_reminder;
-use super::compaction::inject_surfaced_tools_reminder;
 use super::is_valid_runtime_json;
 use super::join_runtime_strings;
 use super::permission_denial_message;
@@ -252,8 +250,6 @@ use crate::types::provider::ToolChoice;
 use crate::types::provider::ToolInputFormat;
 use crate::types::provider::{ModelStopReason, ModelStream};
 use crate::types::sandbox::{ExecRequest, SandboxBackend, SandboxKind, SandboxPolicy, SpawnSpec};
-use crate::types::tool::BackgroundTaskRegistry;
-use crate::types::tool::BackgroundTaskStatus;
 use crate::types::tool::ElicitHandler;
 use crate::types::tool::ElicitRequest;
 use crate::types::tool::ElicitResponse;
@@ -3036,30 +3032,6 @@ fn user_msg(text: &str) -> Message {
     })
 }
 
-struct StaticBackgroundTasks {
-    tasks: Vec<crate::types::tool::BackgroundTaskHandle>,
-}
-
-#[async_trait]
-impl BackgroundTaskRegistry for StaticBackgroundTasks {
-    fn get(&self, agent_id: &RuntimeString) -> Option<crate::types::tool::BackgroundTaskHandle> {
-        self.tasks
-            .iter()
-            .find(|task| &task.agent_id == agent_id)
-            .cloned()
-    }
-
-    fn list(&self) -> Vec<crate::types::tool::BackgroundTaskHandle> {
-        self.tasks.clone()
-    }
-
-    fn stop(&self, _agent_id: &RuntimeString) -> bool {
-        false
-    }
-
-    async fn wait_for_idle(&self) {}
-}
-
 fn compact_boundary() -> Message {
     Message::CompactBoundary(crate::schemas::message::CompactBoundaryMessage {
         native_compaction: None,
@@ -3156,66 +3128,6 @@ fn compaction_excludes_protected_messages_and_restores_them_before_the_turn_user
             RuntimeString::from("current"),
         ]
     );
-}
-
-#[test]
-fn running_agent_reminder_uses_context_manager_reinsertion() {
-    let registry: Arc<dyn BackgroundTaskRegistry> = Arc::new(StaticBackgroundTasks {
-        tasks: vec![crate::types::tool::BackgroundTaskHandle {
-            agent_id: "bg-1".into(),
-            output_file: "/tmp/bg-1.txt".into(),
-            status: BackgroundTaskStatus::Running,
-            description: Some("inspect logs".into()),
-            partial: None,
-        }],
-    });
-
-    let rendered = inject_running_agent_reminder(
-        vec![compact_boundary()],
-        Some(&registry),
-        &|| "ctx-1".to_string(),
-        &test_provider_profile("claude-sonnet-4-6"),
-    );
-
-    assert_eq!(rendered.len(), 2);
-    let Message::User(user) = &rendered[1] else {
-        panic!("expected inserted user message");
-    };
-    assert_eq!(user.uuid, "ctx-1");
-    assert_eq!(user.is_meta, Some(true));
-    let text = text_block_text(&user.content[0]);
-    assert!(text.starts_with("<system-reminder>\nThese background tasks"));
-    assert!(text.contains("bg-1"));
-    assert!(text.contains("task_output"));
-}
-
-#[test]
-fn surfaced_tools_reminder_uses_context_manager_reinsertion() {
-    let tool = Arc::new(SourceTool {
-        name: "extra_tool",
-        schema: JsonSchema::new(),
-        mcp_server: None,
-        exposure: ToolExposure::Deferred,
-    }) as Arc<dyn Tool>;
-    let mut surfaced = HashSet::new();
-    surfaced.insert(RuntimeString::from("extra_tool"));
-
-    let rendered = inject_surfaced_tools_reminder(
-        vec![user_msg("question")],
-        &[tool],
-        &surfaced,
-        &|| "unused".to_string(),
-        &test_provider_profile("claude-sonnet-4-6"),
-    );
-
-    let Message::User(user) = &rendered[0] else {
-        panic!("expected trailing user message");
-    };
-    assert_eq!(user.is_meta, None);
-    assert_eq!(user.content.len(), 2);
-    let text = text_block_text(&user.content[1]);
-    assert!(text.starts_with("<system-reminder>\nThese tools"));
-    assert!(text.contains("extra_tool"));
 }
 
 fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {

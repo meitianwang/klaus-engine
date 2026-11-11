@@ -1,21 +1,17 @@
-//! Compaction persistence wiring and protected-message reinsertion, including
-//! the running-agent / surfaced-tools reminder fragments.
+//! Compaction persistence wiring, protected-message reinsertion, and
+//! liveness-based re-injection of the retained reminder fragments.
 
-use super::join_runtime_strings;
 /// The latest checkpoint summary text, or an empty string for opaque checkpoints.
 use super::CompactionRecord;
 use super::QueryParams;
-use crate::context::manager::ContextFragment;
-use crate::context::manager::ContextManager;
+use crate::context::retained_fragments::reinject_retained_fragments;
+use crate::context::retained_fragments::RunningTasksSection;
+use crate::context::retained_fragments::SurfacedToolsSection;
 use crate::provider::behavior::ProviderBehaviorProfile;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::message::Message;
-use crate::types::tool::BackgroundTaskRegistry;
-use crate::types::tool::BackgroundTaskStatus;
-use crate::types::tool::Tool;
-use crate::types::tool::ToolExposure;
+use crate::sync_ext::MutexExt;
 use std::collections::HashSet;
-use std::sync::Arc;
 pub fn compaction_summary_of(messages: &[Message]) -> RuntimeString {
     for m in messages.iter().rev() {
         if let Message::CompactBoundary(c) = m {
@@ -145,97 +141,25 @@ pub(super) fn restore_compaction_protected(
     compacted
 }
 
-fn render_reinsertion_fragment(
-    messages: Vec<Message>,
-    id: &str,
-    order: i32,
-    text: RuntimeString,
-    uuid: &dyn Fn() -> String,
+/// Detect which retained reminder fragments a history rewrite dropped and
+/// re-inject only those, in registration order. A fragment that is still
+/// visible to the model contributes zero bytes; an unverifiable surviving
+/// copy is replaced instead of duplicated.
+pub(super) fn reinject_query_retained_fragments(
+    shared: &super::Shared,
+    messages: &mut Vec<Message>,
     profile: &ProviderBehaviorProfile,
-) -> Vec<Message> {
-    let mut manager = ContextManager::new();
-    manager.upsert(ContextFragment::user_reinsertion(id, order, text));
-    manager.render_messages(messages, uuid, profile)
-}
-
-/// Re-surface running background agents as an ephemeral reminder after a
-/// compaction dropped the tool_use that spawned them.
-pub fn inject_running_agent_reminder(
-    messages: Vec<Message>,
-    background_tasks: Option<&Arc<dyn BackgroundTaskRegistry>>,
-    uuid: &dyn Fn() -> String,
-    profile: &ProviderBehaviorProfile,
-) -> Vec<Message> {
-    let running: Vec<_> = background_tasks
-        .map(|b| b.list())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|t| t.status == BackgroundTaskStatus::Running)
-        .collect();
-    if running.is_empty() {
-        return messages;
-    }
-    let lines: Vec<RuntimeString> = running
-        .iter()
-        .map(|t| {
-            let description = t
-                .description
-                .as_ref()
-                .map(|description| RuntimeString::from(" — ").concat(description))
-                .unwrap_or_default();
-            RuntimeString::from("- ")
-                .concat(&t.agent_id)
-                .concat(&description)
-                .concat(&RuntimeString::from(" (output: "))
-                .concat(t.output_file.as_runtime_string())
-                .concat(&RuntimeString::from(")"))
-        })
-        .collect();
-    let text = RuntimeString::from(
-        "These background tasks are still running after the context was compacted. Do NOT re-spawn them; read their results with task_output:\n",
-    )
-    .concat(&join_runtime_strings(&lines, "\n"));
-    render_reinsertion_fragment(
+) {
+    let running = RunningTasksSection::new(shared.background_tasks.as_ref());
+    let surfaced = {
+        let surfaced_tools = shared.surfaced.lock_recover();
+        let tools = shared.tools.lock_recover().clone();
+        SurfacedToolsSection::new(&tools, &surfaced_tools)
+    };
+    reinject_retained_fragments(
         messages,
-        "running-background-tasks",
-        10,
-        text,
-        uuid,
+        &[&running, &surfaced],
+        &|| (shared.deps.uuid)(),
         profile,
-    )
-}
-
-/// Re-announce the deferred tools surfaced via `tool_search` after a compaction
-/// dropped the search call that revealed them.
-pub fn inject_surfaced_tools_reminder(
-    messages: Vec<Message>,
-    tools: &[Arc<dyn Tool>],
-    surfaced: &HashSet<RuntimeString>,
-    uuid: &dyn Fn() -> String,
-    profile: &ProviderBehaviorProfile,
-) -> Vec<Message> {
-    if surfaced.is_empty() {
-        return messages;
-    }
-    let available: Vec<&Arc<dyn Tool>> = tools
-        .iter()
-        .filter(|t| t.exposure() == ToolExposure::Deferred && surfaced.contains(&t.name()))
-        .collect();
-    if available.is_empty() {
-        return messages;
-    }
-    let lines: Vec<RuntimeString> = available
-        .iter()
-        .map(|t| {
-            RuntimeString::from("- ")
-                .concat(&t.name())
-                .concat(&RuntimeString::from(": "))
-                .concat(&t.description())
-        })
-        .collect();
-    let text = RuntimeString::from(
-        "These tools you previously found via tool_search remain available — call them directly without searching again:\n",
-    )
-    .concat(&join_runtime_strings(&lines, "\n"));
-    render_reinsertion_fragment(messages, "surfaced-tools", 20, text, uuid, profile)
+    );
 }

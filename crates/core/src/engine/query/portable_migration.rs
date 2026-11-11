@@ -125,6 +125,15 @@ pub(super) async fn recover(
     if shared.params.signal.is_cancelled() {
         return Err(CompactionFailure::Aborted);
     }
+    // Re-inject only the retained reminder fragments this rewrite dropped;
+    // fragments still visible to the model contribute zero bytes.
+    {
+        let profile = crate::provider::behavior::resolve_provider_behavior_profile(
+            shared.params.provider_info.as_ref(),
+            &turn_override.model,
+        );
+        reinject_query_retained_fragments(shared, &mut candidate, &profile);
+    }
     // Refresh current instructions before the atomic context replacement.
     let has_task_tool = shared.params.tools.iter().any(|tool| tool.name() == "task");
     super::super::turn::refresh_retained_context_inner(

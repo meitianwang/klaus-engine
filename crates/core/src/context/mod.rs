@@ -18,6 +18,7 @@ pub(crate) mod multi_agent;
 pub mod nested_memory;
 pub mod nested_memory_reminder;
 pub mod request_media_budget;
+pub(crate) mod retained_fragments;
 pub mod system_prompt;
 pub mod tokens;
 pub mod tool_result_budget;
