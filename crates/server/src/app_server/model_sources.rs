@@ -1110,11 +1110,7 @@ fn claude_capabilities(model: &str) -> Value {
     // Only the source's known extended-context models advertise the larger
     // media count. An unknown id keeps a conservative request-view budget.
     caps["maxMediaBlocks"] = json!(match model {
-        CLAUDE_FABLE
-        | CLAUDE_OPUS
-        | CLAUDE_SONNET
-        | CLAUDE_HAIKU
-        | "claude-fable-5-1"
+        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU | "claude-fable-5-1"
         | "claude-sonnet-5" => 600,
         _ => 100,
     });
