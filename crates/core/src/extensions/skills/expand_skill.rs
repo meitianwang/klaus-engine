@@ -269,6 +269,7 @@ mod tests {
         Skill {
             name: RuntimeString::from("s"),
             description: RuntimeString::from("d"),
+            short_description: None,
             when_to_use: None,
             argument_hint: None,
             allowed_tools,

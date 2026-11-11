@@ -87,6 +87,11 @@ impl RuntimeDecode for SkillContext {
 pub struct Skill {
     pub name: RuntimeString,
     pub description: RuntimeString,
+    /// Compact catalog blurb. When present the skill listing shows THIS instead of
+    /// `description`, so a long description does not have to compete with every
+    /// other skill's location for the listing's budget. Absent means the listing
+    /// falls back to `description` (plus `when_to_use`) as before.
+    pub short_description: Option<RuntimeString>,
     pub when_to_use: Option<RuntimeString>,
     pub argument_hint: Option<RuntimeString>,
     pub allowed_tools: Option<Vec<RuntimeString>>,
@@ -123,6 +128,9 @@ impl RuntimeEncode for Skill {
         let mut object = RuntimeObjectEncoder::new();
         object.field("name", &self.name)?;
         object.field("description", &self.description)?;
+        if let Some(value) = &self.short_description {
+            object.field("shortDescription", value)?;
+        }
         if let Some(value) = &self.when_to_use {
             object.field("whenToUse", value)?;
         }
@@ -177,6 +185,7 @@ impl RuntimeDecode for Skill {
             Ok(Self {
                 name: object.required("name", &[])?,
                 description: object.required("description", &[])?,
+                short_description: object.optional("shortDescription", &[])?,
                 when_to_use: object.optional("whenToUse", &[])?,
                 argument_hint: object.optional("argumentHint", &[])?,
                 allowed_tools: object.optional("allowedTools", &[])?,
@@ -240,6 +249,8 @@ enum StrOrBool {
 struct SkillFm {
     description: Option<Value>,
     name: Option<Value>,
+    short_description: Option<String>,
+    short_description_hyphen: Option<String>,
     when_to_use: Option<String>,
     when_to_use_hyphen: Option<String>,
     argument_hint: Option<Value>,
@@ -300,6 +311,8 @@ fn get_str_or_bool_field(data: &JsonObject, key: &str) -> Result<Option<StrOrBoo
 /// leniently typed fields (`description`, `name`, `argument-hint`, `effort`) are
 /// carried as raw values and coerced/degraded separately.
 fn validate_skill_frontmatter(data: &JsonObject) -> Result<SkillFm, String> {
+    let short_description = get_string_field(data, "short_description")?;
+    let short_description_hyphen = get_string_field(data, "short-description")?;
     let when_to_use = get_string_field(data, "when_to_use")?;
     let when_to_use_hyphen = get_string_field(data, "when-to-use")?;
     let model = get_string_field(data, "model")?;
@@ -322,6 +335,8 @@ fn validate_skill_frontmatter(data: &JsonObject) -> Result<SkillFm, String> {
     Ok(SkillFm {
         description: data.get("description").cloned(),
         name: data.get("name").cloned(),
+        short_description,
+        short_description_hyphen,
         when_to_use,
         when_to_use_hyphen,
         argument_hint: data.get("argument-hint").cloned(),
@@ -585,6 +600,7 @@ async fn load_one_skill_with_default(
     let mut skill = Skill {
         name,
         description: RuntimeString::from(description),
+        short_description: None,
         when_to_use: None,
         argument_hint: None,
         allowed_tools: None,
@@ -609,6 +625,17 @@ async fn load_one_skill_with_default(
         .or_else(|| fm.when_to_use_hyphen.clone());
     if let Some(w) = when_to_use {
         skill.when_to_use = Some(RuntimeString::from(w));
+    }
+    // Same two-spelling tolerance as `when_to_use`. An EMPTY short description is
+    // treated as absent so the listing falls back to the full description rather
+    // than rendering a blank entry.
+    let short_description = fm
+        .short_description
+        .clone()
+        .or_else(|| fm.short_description_hyphen.clone())
+        .filter(|value| !value.trim().is_empty());
+    if let Some(value) = short_description {
+        skill.short_description = Some(RuntimeString::from(value));
     }
     if let Some(v) = &fm.argument_hint {
         if !v.is_null() {
@@ -919,12 +946,47 @@ mod tests {
         }
     }
 
+    /// The compact catalog blurb is optional and accepts the same two spellings as
+    /// `when_to_use`; a blank one is absent so the listing falls back to the full
+    /// description instead of rendering an empty entry.
+    #[tokio::test]
+    async fn short_description_loads_from_either_spelling() {
+        for key in ["short_description", "short-description"] {
+            let content = [
+                "---",
+                "description: Does things",
+                &format!("{key}: Does things briefly"),
+                "---",
+                "Body line",
+            ]
+            .join("\n");
+            let s = load_content(&content, "x").await.unwrap();
+            assert_eq!(
+                s.short_description.as_ref(),
+                Some(&RuntimeString::from("Does things briefly")),
+                "{key}"
+            );
+        }
+
+        let content = [
+            "---",
+            "description: Does things",
+            "short_description: '   '",
+            "---",
+            "Body line",
+        ]
+        .join("\n");
+        let s = load_content(&content, "x").await.unwrap();
+        assert_eq!(s.short_description, None);
+    }
+
     #[tokio::test]
     async fn loads_a_full_skill() {
         let content = [
             "---",
             "name: my-skill",
             "description: Does things",
+            "short_description: Does things briefly",
             "when_to_use: when needed",
             "argument-hint: <file>",
             "allowed-tools: Read, Write",
@@ -947,6 +1009,10 @@ mod tests {
         let s = load_one_skill(path_str(&path), "my-skill").await.unwrap();
         assert_eq!(s.name, "my-skill");
         assert_eq!(s.description, "Does things");
+        assert_eq!(
+            s.short_description.as_ref(),
+            Some(&RuntimeString::from("Does things briefly"))
+        );
         assert_eq!(
             s.when_to_use.as_ref(),
             Some(&RuntimeString::from("when needed"))
@@ -1144,6 +1210,7 @@ mod tests {
         let skill = Skill {
             name: exact.clone(),
             description: exact.clone(),
+            short_description: Some(exact.clone()),
             when_to_use: Some(exact.clone()),
             argument_hint: Some(exact.clone()),
             allowed_tools: Some(vec![exact.clone()]),
@@ -1167,6 +1234,7 @@ mod tests {
             [
                 "name",
                 "description",
+                "shortDescription",
                 "whenToUse",
                 "argumentHint",
                 "allowedTools",
@@ -1189,6 +1257,7 @@ mod tests {
         for field in [
             "name",
             "description",
+            "shortDescription",
             "whenToUse",
             "argumentHint",
             "model",

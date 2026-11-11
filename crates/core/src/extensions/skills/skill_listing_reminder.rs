@@ -24,8 +24,10 @@ use sha2::{Digest, Sha256};
 /// The usual ~4 chars/token approximation used to size the listing budget
 /// against a token-denominated context window.
 const CHARS_PER_TOKEN: f64 = 4.0;
-/// The listing gets about 1% of the context window.
-const SKILL_BUDGET_FRACTION: f64 = 0.01;
+/// The listing gets about 2% of the context window. At 1% a large catalog's
+/// locations and its descriptions compete for the same characters and one of them
+/// has to go; 2% is what lets a big catalog keep both.
+const SKILL_BUDGET_FRACTION: f64 = 0.02;
 /// Window assumed when the caller supplies none — derived from the engine's own
 /// default window so it tracks the config default.
 const FALLBACK_CONTEXT_WINDOW: f64 = 200_000.0;
@@ -60,8 +62,21 @@ fn u16_slice(s: &RuntimeString, end: usize) -> RuntimeString {
     s.slice_utf16(..end)
 }
 
-/// The description shown for a skill: `when_to_use` folded onto the description.
+/// The description shown for a skill: its compact `short_description` when it
+/// declares one, otherwise the full description with `when_to_use` folded on. A
+/// declared short description stands alone — folding `when_to_use` back onto it
+/// would undo the reason for writing one.
 fn describe(s: &Skill) -> RuntimeString {
+    if let Some(short) = &s.short_description {
+        // A blank short description counts as absent, so the listing still says
+        // something about the skill instead of rendering an empty entry. A value
+        // that is not valid UTF-8 (lone surrogates) is kept byte-exact.
+        let blank =
+            short.is_empty() || short.try_to_utf8().is_ok_and(|text| text.trim().is_empty());
+        if !blank {
+            return short.clone();
+        }
+    }
     match &s.when_to_use {
         Some(w) if !w.is_empty() => s.description.concat(&RuntimeString::from(" - ")).concat(w),
         _ => s.description.clone(),
@@ -234,35 +249,7 @@ fn render_line(s: &Skill, desc_max: usize, location: Option<&RuntimeString>) -> 
 
 /// The rendered width of a listing: the lines plus the newlines joining them.
 fn listing_width(lines: &[RuntimeString]) -> usize {
-    combined_width(lines, &[])
-}
-
-/// The width of two line groups joined into one listing by newlines.
-fn combined_width(first: &[RuntimeString], second: &[RuntimeString]) -> usize {
-    first
-        .iter()
-        .chain(second.iter())
-        .map(RuntimeString::len_utf16)
-        .sum::<usize>()
-        + (first.len() + second.len()).saturating_sub(1)
-}
-
-/// Per-line fixed cost at one location spelling: "- " + name + ": " + the
-/// " (" + location + ")" suffix when there is one + the joining newline.
-fn line_overhead(name: &RuntimeString, location: Option<&RuntimeString>) -> usize {
-    name_overhead(name) + location.map_or(0, |location| location.len_utf16() + 3)
-}
-
-/// Description characters the budget cut across `skills` at a `desc_max` cap: what
-/// a shortened line lost, and — at a zero cap — every description of every line.
-fn truncated_desc_chars(skills: &[&Skill], desc_max: usize) -> usize {
-    skills
-        .iter()
-        .map(|s| {
-            let described = describe(s);
-            u16_len(&described).saturating_sub(u16_len(&truncate(&described, desc_max)))
-        })
-        .sum()
+    lines.iter().map(RuntimeString::len_utf16).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
 /// The listing's location spelling plus the alias table that spelling needs.
@@ -317,100 +304,90 @@ fn first_step(skills: &[Skill], budget: usize, plan: Option<&AliasPlan>) -> Firs
     }
 }
 
-/// One rendered listing: the alias table (empty when locations are absolute or
-/// absent), the skill lines, and what the render cost the budget.
-struct Listing<'a> {
-    root_lines: Vec<RuntimeString>,
-    lines: Vec<RuntimeString>,
-    named: Vec<&'a Skill>,
-    truncated_desc_chars: usize,
-}
-
-impl Listing<'_> {
-    fn text(&self) -> RuntimeString {
-        let mut all = self.root_lines.clone();
-        all.extend(self.lines.iter().cloned());
-        join_runtime_strings(&all, "\n")
+/// Render `- name: description (location)` lines within `budget` chars, degrading
+/// in four steps: full descriptions with locations → the same descriptions without
+/// locations → descriptions shrunk to an even share of the budget → names only when
+/// even that share is below the floor. Locations give way first because a
+/// description is what lets the model pick the right skill, so a location must
+/// never cost one a single character; dropping one is also free on the invocation
+/// path, since the engine sends the skill's base directory again with its body.
+/// What makes locations affordable rather than expendable is the alias table: each
+/// root is named once and a location spells only its suffix, so step one covers far
+/// more of a real catalog than spelling every path out would. Returns the rendered
+/// text AND the skills actually NAMED in it — so the caller can mark only those as
+/// "sent" (a skill collapsed into the `… (+N more)` marker stays unsent and gets
+/// another chance to be named on a later, roomier turn).
+///
+/// `plan` is numbered against the WHOLE catalog, not just `skills`: a listing too
+/// large for one budget is emitted as several pages, and `r0` has to name the same
+/// root on every one of them.
+fn render_listing<'a>(
+    skills: &'a [Skill],
+    budget: usize,
+    plan: &AliasPlan,
+) -> (RuntimeString, Vec<&'a Skill>) {
+    // Step 1: full descriptions with locations. The aliased and absolute spellings
+    // compete and the narrower one that fits wins, so a table that costs more than
+    // it saves is simply not used.
+    let mut best: Option<(RuntimeString, usize)> = None;
+    for aliased in [true, false] {
+        let first = first_step(skills, budget, aliased.then_some(plan));
+        let lines: Vec<RuntimeString> = skills
+            .iter()
+            .zip(&first.locations)
+            .map(|(s, location)| render_line(s, MAX_DESC_CHARS, location.as_ref()))
+            .collect();
+        if listing_width(&lines) > budget.saturating_sub(first.cost) {
+            continue;
+        }
+        let mut all = first.root_lines;
+        all.extend(lines);
+        let width = listing_width(&all);
+        let narrower = match &best {
+            None => true,
+            Some((_, best_width)) => width < *best_width,
+        };
+        if narrower {
+            best = Some((join_runtime_strings(&all, "\n"), width));
+        }
+    }
+    if let Some((text, _)) = best {
+        return (text, skills.iter().collect());
     }
 
-    fn width(&self) -> usize {
-        combined_width(&self.root_lines, &self.lines)
-    }
-}
-
-/// Whether `candidate` earns its place over `current`: more skills named first,
-/// then fewer description characters cut, then less width spent. Aliasing is only
-/// a means to those ends, so it never wins on its own.
-fn listing_is_better(candidate: &Listing<'_>, current: &Listing<'_>) -> bool {
-    if candidate.named.len() != current.named.len() {
-        return candidate.named.len() > current.named.len();
-    }
-    if candidate.truncated_desc_chars != current.truncated_desc_chars {
-        return candidate.truncated_desc_chars < current.truncated_desc_chars;
-    }
-    candidate.width() < current.width()
-}
-
-/// The ladder for one location spelling: `plan` aliases the locations, `None`
-/// spells them out.
-fn render_ladder<'a>(skills: &'a [Skill], budget: usize, plan: Option<&AliasPlan>) -> Listing<'a> {
-    let first = first_step(skills, budget, plan);
-    let line_budget = budget.saturating_sub(first.cost);
-    let all: Vec<&Skill> = skills.iter().collect();
-
-    // Step 1: full descriptions with locations.
+    // Step 2: full descriptions, no locations.
     let lines: Vec<RuntimeString> = skills
         .iter()
-        .zip(&first.locations)
-        .map(|(s, location)| render_line(s, MAX_DESC_CHARS, location.as_ref()))
+        .map(|s| render_line(s, MAX_DESC_CHARS, None))
         .collect();
-    if listing_width(&lines) <= line_budget {
-        let truncated = truncated_desc_chars(&all, MAX_DESC_CHARS);
-        return Listing {
-            root_lines: first.root_lines,
-            lines,
-            named: all,
-            truncated_desc_chars: truncated,
-        };
+    if listing_width(&lines) <= budget {
+        return (join_runtime_strings(&lines, "\n"), skills.iter().collect());
     }
 
-    // Step 2: locations stay and the descriptions absorb the pressure. A location
-    // is what lets the model open the skill's own supporting files, and the alias
-    // table has already bought it for a fraction of its absolute cost.
-    let overhead: usize = skills
-        .iter()
-        .zip(&first.locations)
-        .map(|(s, location)| line_overhead(&s.name, location.as_ref()))
-        .sum();
-    // Signed division: `line_budget - overhead` may be negative; only a per_desc at
-    // or above the floor (necessarily positive) is used as a truncate width, where
+    // Step 3: descriptions shrunk to an even share of what is left after names.
+    let overhead: usize = skills.iter().map(|s| name_overhead(&s.name)).sum();
+    // Signed division: `budget - overhead` may be negative; only a per_desc at or
+    // above the floor (necessarily positive) is used as a truncate width, where
     // truncation toward zero and floor agree.
-    let per_desc = (line_budget as i64 - overhead as i64) / (skills.len() as i64);
+    let per_desc = (budget as i64 - overhead as i64) / (skills.len() as i64);
     if per_desc >= MIN_DESC_CHARS as i64 {
         let lines = skills
             .iter()
-            .zip(&first.locations)
-            .map(|(s, location)| render_line(s, per_desc as usize, location.as_ref()))
+            .map(|s| render_line(s, per_desc as usize, None))
             .collect::<Vec<_>>();
-        let truncated = truncated_desc_chars(&all, per_desc as usize);
-        return Listing {
-            root_lines: first.root_lines,
-            lines,
-            named: all,
-            truncated_desc_chars: truncated,
-        };
+        return (join_runtime_strings(&lines, "\n"), skills.iter().collect());
     }
 
-    // Step 3: descriptions are gone. Emit as many `- name: (location)` lines as fit
-    // the budget (always at least one), then a "+N more" marker — so the listing
-    // still respects the budget instead of dumping every name unbounded.
+    // Step 4: names only. Emit as many `- name` lines as fit the budget (always at
+    // least one), then a "+N more" marker — so the listing still respects the
+    // budget instead of dumping every name unbounded.
     let mut lines: Vec<RuntimeString> = Vec::new();
     let mut named: Vec<&Skill> = Vec::new();
     let mut width: usize = 0;
-    for (i, (s, location)) in skills.iter().zip(&first.locations).enumerate() {
-        let line = render_line(s, 0, location.as_ref());
+    for (i, s) in skills.iter().enumerate() {
+        let line = RuntimeString::from("- ").concat(&s.name);
         let cost = line.len_utf16() + usize::from(!lines.is_empty());
-        if !lines.is_empty() && width + cost > line_budget {
+        if !lines.is_empty() && width + cost > budget {
             lines.push(RuntimeString::from(format!(
                 "… (+{} more)",
                 skills.len() - i
@@ -421,46 +398,7 @@ fn render_ladder<'a>(skills: &'a [Skill], budget: usize, plan: Option<&AliasPlan
         named.push(s);
         width += cost;
     }
-    Listing {
-        root_lines: first.root_lines,
-        lines,
-        named,
-        // Nothing behind the marker was described either, so every description in
-        // the catalog counts as cut.
-        truncated_desc_chars: truncated_desc_chars(&all, 0),
-    }
-}
-
-/// Render `- name: description (location)` lines within `budget` chars, degrading
-/// in three steps: full descriptions with locations → the same locations with
-/// descriptions shrunk to an even share of the budget → locations without
-/// descriptions when even that share is below the floor. A location outlives the
-/// prose at every step, because the model needs it to open the skill's own
-/// supporting files; what gives way is the description that helps it choose, and a
-/// location too expensive to spell out is aliased against a root table instead of
-/// dropped. Both spellings are rendered and the better one wins, so aliasing is
-/// kept only when it actually names more skills, cuts less description, or costs
-/// less width. Returns the rendered text AND the skills actually NAMED in it — so
-/// the caller can mark only those as "sent" (a skill collapsed into the
-/// `… (+N more)` marker stays unsent and gets another chance to be named on a
-/// later, roomier turn).
-///
-/// `plan` is numbered against the WHOLE catalog, not just `skills`: a listing too
-/// large for one budget is emitted as several pages, and `r0` has to name the same
-/// root on every one of them.
-fn render_listing<'a>(
-    skills: &'a [Skill],
-    budget: usize,
-    plan: &AliasPlan,
-) -> (RuntimeString, Vec<&'a Skill>) {
-    let absolute = render_ladder(skills, budget, None);
-    let aliased = render_ladder(skills, budget, Some(plan));
-    let best = if listing_is_better(&aliased, &absolute) {
-        aliased
-    } else {
-        absolute
-    };
-    (best.text(), best.named)
+    (join_runtime_strings(&lines, "\n"), named)
 }
 
 fn join_runtime_strings(values: &[RuntimeString], separator: &str) -> RuntimeString {
@@ -832,6 +770,50 @@ mod tests {
         assert!(text.contains("- chart: Render charts - when asked for a graph"));
     }
 
+    /// The catalog is the model's picking surface, so a skill that declares a
+    /// compact blurb shows that instead of its full description: a short one leaves
+    /// the budget for every other skill's location instead of competing with it.
+    #[test]
+    fn a_short_description_replaces_the_full_one_in_the_listing() {
+        let p = provider(vec![Skill {
+            short_description: Some(RuntimeString::from("Deploy the portal")),
+            ..skill(
+                "deploy-portal",
+                "a much longer description covering the whole release flow",
+            )
+        }]);
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(
+            text.contains("- deploy-portal: Deploy the portal"),
+            "{text}"
+        );
+        assert!(!text.contains("much longer"), "{text}");
+    }
+
+    /// A declared short description stands alone: folding `when_to_use` back onto it
+    /// would spend the budget the field exists to save. A blank one is absent, so
+    /// the full description — folding included — returns.
+    #[test]
+    fn a_blank_short_description_falls_back_to_the_full_description() {
+        let p = provider(vec![Skill {
+            short_description: Some(RuntimeString::from("   ")),
+            ..skill_when("chart", "Render charts", "when asked for a graph")
+        }]);
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(
+            text.contains("- chart: Render charts - when asked for a graph"),
+            "{text}"
+        );
+
+        let p = provider(vec![Skill {
+            short_description: Some(RuntimeString::from("Draw charts")),
+            ..skill_when("chart", "Render charts", "when asked for a graph")
+        }]);
+        let text = p.tick().unwrap().try_to_utf8().unwrap();
+        assert!(text.contains("- chart: Draw charts"), "{text}");
+        assert!(!text.contains("when asked"), "{text}");
+    }
+
     #[test]
     fn returns_null_when_there_are_no_skills() {
         let p = provider(vec![]);
@@ -1081,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn shortens_descriptions_before_giving_up_locations() {
+    fn drops_locations_before_shortening_descriptions() {
         let p = create_skill_listing_reminder_provider(
             || {
                 vec![
@@ -1089,21 +1071,18 @@ mod tests {
                     skill("beta", "another fairly wordy description here"),
                 ]
             },
-            // 120-char budget: both full descriptions plus both locations need 135,
-            // while both locations plus an even description share need 120.
-            Some(3000),
+            // 100-char budget: the two lines fit at 86 chars without their
+            // locations but need 135 with them.
+            Some(1250),
         );
-        let text = p.tick().unwrap().try_to_utf8().unwrap();
-        // The location is what lets the model open the skill's own supporting files,
-        // so the description gives way first.
-        assert!(text.contains("(/skills/alpha/SKILL.md)"), "{text}");
-        assert!(text.contains("(/skills/beta/SKILL.md)"), "{text}");
-        assert!(!text.contains("description here"), "{text}");
-        assert!(text.contains("- alpha: a fairly wordy"), "{text}");
+        let text = p.tick().unwrap_or_default();
+        assert!(text.contains("- alpha: a fairly wordy description here\n"));
+        assert!(text.ends_with("- beta: another fairly wordy description here"));
+        assert!(!text.contains("SKILL.md"));
     }
 
     #[test]
-    fn degrades_to_locations_without_descriptions_under_a_tiny_budget() {
+    fn degrades_to_names_only_under_a_tiny_budget() {
         let p = create_skill_listing_reminder_provider(
             || {
                 vec![
@@ -1112,13 +1091,12 @@ mod tests {
                     skill("gamma", "yet another wordy description here"),
                 ]
             },
-            Some(1000), // 40-char budget → no description survives
+            Some(1000), // 80-char budget → no even description share clears the floor
         );
-        let text = p.tick().unwrap().try_to_utf8().unwrap();
-        assert!(text.contains("- alpha:"), "{text}");
-        assert!(!text.contains("wordy"), "{text}");
-        // The location is the last thing the listing gives up.
-        assert!(text.contains("SKILL.md"), "{text}");
+        let text = p.tick().unwrap_or_default();
+        assert!(text.contains("- alpha"));
+        assert!(!text.contains("- alpha:")); // no description
+        assert!(!text.contains("wordy"));
     }
 
     #[test]
@@ -1128,12 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_the_description_less_listing_to_the_budget_with_a_plus_n_more_marker() {
+    fn caps_the_names_only_listing_to_the_budget_with_a_plus_n_more_marker() {
         let many: Vec<Skill> = (0..100)
             .map(|i| skill(&format!("skill{i}"), "a wordy description here"))
             .collect();
-        // budget = 1000 * 4 * 0.01 = 40 chars → no description fits, and the
-        // listing must not dump all 100 lines either.
+        // budget = 1000 * 4 * 0.02 = 80 chars → names only, must not dump all 100.
         let p = create_skill_listing_reminder_provider(move || many.clone(), Some(1000));
         let text = p.tick().unwrap_or_default();
         let listing = text.slice_utf16(LISTING_PREAMBLE.encode_utf16().count() + 1..);
@@ -1301,11 +1278,11 @@ mod tests {
         assert_eq!(plan.roots[0].value, "/agent/skills");
     }
 
-    /// A listing too large for one budget is emitted as several pages, and every
-    /// page has to agree on what an alias names — numbering is taken from the whole
-    /// catalog, not from the slice a page happens to render.
+    /// The pages of one listing have to agree on what an alias names: the plan is
+    /// numbered against the whole catalog, so a page rendering only the second
+    /// root's skills still calls it `r1` instead of renumbering it as `r0`.
     #[test]
-    fn pages_of_one_listing_agree_on_alias_numbers() {
+    fn a_page_keeps_the_whole_catalog_alias_numbers() {
         let first_root = "/Users/someone/projects/first-root";
         let second_root = "/Users/someone/projects/second-root";
         let description = "a fairly wordy description here";
@@ -1313,33 +1290,20 @@ mod tests {
             .map(|i| skill_at(&format!("a{i}"), description, first_root))
             .chain((1..=6).map(|i| skill_at(&format!("b{i}"), description, second_root)))
             .collect::<Vec<_>>();
-        // 250-char budget (window 6250 × 4 chars/token × 1%): the aliased spelling
-        // names all six skills of the first root where the absolute one names four,
-        // so page one covers exactly the first root and the rest is paged.
-        let p = create_skill_listing_reminder_provider(move || skills.clone(), Some(6250));
-        let mut ctx = context(vec![user("first")]);
-        let first = p.retained_listing(&ctx, Some(6250)).unwrap();
-        let first = first.try_to_utf8().unwrap();
+        // A later page hands the renderer only the skills earlier pages left
+        // unsent, but the plan it renders with was numbered over the whole catalog.
+        let plan = AliasPlan::build(&skills);
+        let (body, named) = render_listing(&skills[6..], 4000, &plan);
+        let body = body.try_to_utf8().unwrap();
+        assert_eq!(named.len(), 6);
         assert!(
-            first.contains(&format!("- `r0` = `{first_root}`")),
-            "{first}"
-        );
-        assert!(first.contains("(r0/a1/SKILL.md)"), "{first}");
-        assert!(first.contains("… (+"), "{first}");
-
-        ctx.messages
-            .push(catalog_message(RuntimeString::from(first.as_str())));
-        ctx.messages.push(user("second"));
-        let second = p.retained_listing(&ctx, Some(6250)).unwrap();
-        let second = second.try_to_utf8().unwrap();
-        assert!(
-            second.contains(&format!("- `r1` = `{second_root}`")),
-            "{second}"
+            body.contains(&format!("- `r1` = `{second_root}`")),
+            "{body}"
         );
         assert!(
-            !second.contains("`r0`"),
-            "the second page must not renumber the second root as r0: {second}"
+            !body.contains("`r0`"),
+            "the page must not renumber the second root as r0: {body}"
         );
-        assert!(second.contains("(r1/b1/SKILL.md)"), "{second}");
+        assert!(body.contains("(r1/b1/SKILL.md)"), "{body}");
     }
 }

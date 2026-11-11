@@ -351,6 +351,7 @@ mod tests {
         Skill {
             name: name.into(),
             description: description.into(),
+            short_description: None,
             when_to_use: None,
             argument_hint: None,
             allowed_tools: None,
