@@ -165,6 +165,7 @@ fn query_params(
         tool_result_budget_state: None,
         on_tool_result_budget_records: None,
         thinking_context_cold: false,
+        context_edit_state: None,
         padded_countdown_spend: Default::default(),
         task_countdown_anchor: None,
         live_model_override: None,

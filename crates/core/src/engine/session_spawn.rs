@@ -2533,6 +2533,7 @@ impl Session {
                 // Sub-agents consult the main thread's cache-cold decision but never
                 // advance it.
                 thinking_context_cold: this.turn.thinking_context_cold(),
+                context_edit_state: None,
                 padded_countdown_spend: this.turn.padded_countdown_spend(),
                 task_countdown_anchor: None,
                 live_model_override: None,

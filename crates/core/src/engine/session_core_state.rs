@@ -1598,6 +1598,9 @@ impl Session {
             turn_index: Mutex::new(TurnIndex::default()),
             tool_result_budget_state,
             context_hint_state: Arc::new(crate::context::context_hints::ContextHintState::new()),
+            context_edit_state: Arc::new(
+                crate::context::context_editing::ContextEditState::default(),
+            ),
             file_changes: Mutex::new(SessionFileChanges::default()),
             subagents: SessionSubagentState {
                 model_target_resolver: Mutex::new(None),

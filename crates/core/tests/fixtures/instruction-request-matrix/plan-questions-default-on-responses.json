@@ -190,6 +190,7 @@
         "type": "adaptive"
       },
       "cacheKey": "plan-questions-default-on-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

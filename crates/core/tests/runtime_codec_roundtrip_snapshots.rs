@@ -202,6 +202,7 @@ fn context_management_config_roundtrip_snapshots() {
     let empty = ContextManagementConfig::default();
     let populated = ContextManagementConfig {
         trigger_input_tokens: Some(120_000),
+        trigger_tool_uses: Some(24),
         keep_tool_uses: Some(3),
         clear_at_least_input_tokens: None,
         clear_tool_inputs: Some(ClearToolInputs::All(false)),

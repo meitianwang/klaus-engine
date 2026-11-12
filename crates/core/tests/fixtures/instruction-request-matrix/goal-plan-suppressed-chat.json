@@ -212,6 +212,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-plan-suppressed-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

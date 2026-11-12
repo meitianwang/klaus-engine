@@ -1050,6 +1050,14 @@ pub enum ModelStreamEvent {
     UsageSnapshot {
         usage: Usage,
     },
+    /// The server applied context editing to this request (its
+    /// `context_management.applied_edits` report). Counts cover this response
+    /// only; consumers accumulate them into session-scoped accounting.
+    ContextEditsApplied {
+        cleared_tool_uses: u64,
+        cleared_input_tokens: u64,
+        cleared_thinking_turns: u64,
+    },
     MessageStop {
         stop_reason: ModelStopReason,
         usage: Usage,
@@ -1196,6 +1204,17 @@ impl RuntimeEncode for ModelStreamEvent {
                 fields.field("usage", usage)?;
                 ("usage_snapshot", fields)
             }
+            Self::ContextEditsApplied {
+                cleared_tool_uses,
+                cleared_input_tokens,
+                cleared_thinking_turns,
+            } => {
+                let mut fields = RuntimeObjectEncoder::new();
+                fields.field("clearedToolUses", cleared_tool_uses)?;
+                fields.field("clearedInputTokens", cleared_input_tokens)?;
+                fields.field("clearedThinkingTurns", cleared_thinking_turns)?;
+                ("context_edits_applied", fields)
+            }
             Self::MessageStop { stop_reason, usage } => {
                 let mut fields = RuntimeObjectEncoder::new();
                 fields.field("stopReason", stop_reason)?;
@@ -1252,6 +1271,7 @@ impl RuntimeDecode for ModelStreamEvent {
                 RuntimeEnumVariant::new("text_message", &[]),
                 RuntimeEnumVariant::new("usage_snapshot", &[]),
                 RuntimeEnumVariant::new("text_message_completed", &[]),
+                RuntimeEnumVariant::new("context_edits_applied", &[]),
             ],
             |variant, object| match variant {
                 0 => Ok(Self::MessageStart {
@@ -1324,6 +1344,11 @@ impl RuntimeDecode for ModelStreamEvent {
                     id: object.required("id", &[])?,
                     phase: object.optional("phase", &[])?,
                     text: object.required("text", &[])?,
+                }),
+                17 => Ok(Self::ContextEditsApplied {
+                    cleared_tool_uses: object.required("clearedToolUses", &[])?,
+                    cleared_input_tokens: object.required("clearedInputTokens", &[])?,
+                    cleared_thinking_turns: object.required("clearedThinkingTurns", &[])?,
                 }),
                 _ => Err(RuntimeCodecError::new(
                     RuntimeCodecErrorKind::UnknownEnumVariant,

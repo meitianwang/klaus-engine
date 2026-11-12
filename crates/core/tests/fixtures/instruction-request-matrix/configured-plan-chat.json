@@ -190,6 +190,7 @@
         "type": "adaptive"
       },
       "cacheKey": "configured-plan-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

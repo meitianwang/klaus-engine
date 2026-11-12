@@ -483,6 +483,12 @@ pub struct QueryParams {
     /// cached prefix is gone and aged prior-turn thinking blocks are no longer
     /// worth retransmitting. Sticky once set: the decision is cache-key material.
     pub thinking_context_cold: bool,
+    /// Session-scoped accounting of server-side context-edit reports (see
+    /// [`crate::context::context_editing::ContextEditState`]). Present on turn
+    /// loops whose count-based clearing trigger adapts to what the server has
+    /// already cleared; absent on auxiliary and view-only queries.
+    pub context_edit_state:
+        Option<std::sync::Arc<crate::context::context_editing::ContextEditState>>,
     /// Long-horizon token spend carried across compactions, for the padded
     /// remaining-context countdown. Zero for every other reminder mode.
     pub padded_countdown_spend: PaddedCountdownSpend,

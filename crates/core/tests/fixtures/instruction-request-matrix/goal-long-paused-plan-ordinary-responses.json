@@ -212,6 +212,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-plan-ordinary-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -466,6 +467,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-plan-ordinary-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -686,6 +688,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-plan-ordinary-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

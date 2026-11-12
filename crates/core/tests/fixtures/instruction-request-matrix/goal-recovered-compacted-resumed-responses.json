@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-recovered-compacted-resumed-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -355,6 +356,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-recovered-compacted-resumed-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

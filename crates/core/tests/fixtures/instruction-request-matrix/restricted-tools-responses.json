@@ -66,6 +66,7 @@
         "type": "adaptive"
       },
       "cacheKey": "restricted-tools-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

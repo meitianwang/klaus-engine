@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-objective-edited-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -384,6 +385,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-objective-edited-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

@@ -2000,6 +2000,7 @@ impl Session {
             thinking_context_cold: this
                 .turn
                 .latch_thinking_context_cold((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS),
+            context_edit_state: Some(this.context_edit_state.clone()),
             live_model_override,
         };
         this.turn

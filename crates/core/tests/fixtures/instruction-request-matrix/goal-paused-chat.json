@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-paused-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

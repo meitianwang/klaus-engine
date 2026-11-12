@@ -240,6 +240,7 @@ fn event_kind(event: &ModelStreamEvent) -> &'static str {
         ModelStreamEvent::WebSearchResult { .. } => "web_search_result",
         ModelStreamEvent::Citation { .. } => "citation",
         ModelStreamEvent::UsageSnapshot { .. } => "usage_snapshot",
+        ModelStreamEvent::ContextEditsApplied { .. } => "context_edits_applied",
         ModelStreamEvent::MessageStop { .. } => "message_stop",
         ModelStreamEvent::Error { .. } => "error",
         ModelStreamEvent::RetryScheduled { .. } => "retry_scheduled",

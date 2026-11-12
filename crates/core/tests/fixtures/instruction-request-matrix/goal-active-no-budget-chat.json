@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-active-no-budget-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -373,6 +374,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-active-no-budget-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

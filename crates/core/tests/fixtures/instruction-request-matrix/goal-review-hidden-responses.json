@@ -241,8 +241,14 @@
                 "description": "Working directory (relative to session cwd)",
                 "type": "string"
               },
+              "yieldMs": {
+                "description": "Initial observation window for a resumable command. Defaults to 10000 ms; effective range is 250-30000 ms, with a 10000 ms minimum on Windows.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
               "runInBackground": {
-                "description": "Run the command in the background and return immediately with a shellId. Poll its output with bash_output and stop it with kill_shell.",
+                "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
                 "type": "boolean"
               },
               "sandboxPermissions": {
@@ -293,6 +299,7 @@
       },
       "skipCacheWrite": true,
       "cacheKey": "goal-review-hidden-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -530,8 +537,14 @@
                   "description": "Working directory (relative to session cwd)",
                   "type": "string"
                 },
+                "yieldMs": {
+                  "description": "Initial observation window for a resumable command. Defaults to 10000 ms; effective range is 250-30000 ms, with a 10000 ms minimum on Windows.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
                 "runInBackground": {
-                  "description": "Run the command in the background and return immediately with a shellId. Poll its output with bash_output and stop it with kill_shell.",
+                  "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
                   "type": "boolean"
                 },
                 "sandboxPermissions": {

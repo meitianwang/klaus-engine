@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-completed-tool-result-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -426,6 +427,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-completed-tool-result-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

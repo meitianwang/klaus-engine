@@ -3206,6 +3206,7 @@ fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {
         tool_result_budget_state: None,
         on_tool_result_budget_records: None,
         thinking_context_cold: false,
+        context_edit_state: None,
         padded_countdown_spend: Default::default(),
         task_countdown_anchor: None,
         live_model_override: None,
@@ -3359,7 +3360,10 @@ fn captured_request_planning_uses_captured_provider_config_and_explicit_effort()
     assert_eq!(prepared.request.task_budget, Some(777));
     assert_eq!(
         prepared.request.thinking_context,
-        Some(crate::types::provider::ThinkingContextPolicy::KeepAll),
+        // This test pins `thinking_context_cold = true`: past the longest cache
+        // lifetime the prefix is rewritten anyway, so aged thinking is trimmed
+        // to the most recent turn.
+        Some(crate::types::provider::ThinkingContextPolicy::KeepMostRecentTurn),
     );
     assert_eq!(prepared.request.cache_key, params.cache_key);
     assert_eq!(
@@ -11176,13 +11180,16 @@ async fn thinking_context_pins_every_turn_while_the_cache_is_warm() {
 }
 
 #[tokio::test]
-async fn thinking_context_pins_every_turn_after_an_idle_gap() {
+async fn thinking_context_drops_aged_reasoning_after_an_idle_gap() {
+    // Past the longest prompt-cache lifetime the prefix has to be rewritten at
+    // full price anyway, so aged thinking turns become pure weight on that
+    // rewrite and only the most recent one is kept.
     let mut params = mk_params(vec![user_msg("hi")], Vec::new());
     params.thinking = Some(ThinkingConfig::Adaptive);
     params.thinking_context_cold = true;
     assert_eq!(
         resolved_thinking_context(&params),
-        Some(crate::types::provider::ThinkingContextPolicy::KeepAll),
+        Some(crate::types::provider::ThinkingContextPolicy::KeepMostRecentTurn),
     );
 }
 

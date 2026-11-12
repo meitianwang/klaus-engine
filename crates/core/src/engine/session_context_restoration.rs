@@ -323,8 +323,15 @@ impl Session {
             cache_key: Some(self.id.clone()),
             context_management: config.context_management.clone(),
             context_hints: None,
-            thinking_context: (config.thinking && config.manage_thinking_context)
-                .then_some(ThinkingContextPolicy::KeepAll),
+            // Read (never advance) the cold latch so this request declares the
+            // same thinking policy the main thread is caching against.
+            thinking_context: (config.thinking && config.manage_thinking_context).then_some(
+                if self.turn.thinking_context_cold() {
+                    ThinkingContextPolicy::KeepMostRecentTurn
+                } else {
+                    ThinkingContextPolicy::KeepAll
+                },
+            ),
         }
     }
 

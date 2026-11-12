@@ -1147,6 +1147,25 @@ async fn stream_and_dispatch_inner(
                 goal_usage.observe(&sample);
                 usage = Some(sample);
             }
+            ModelStreamEvent::ContextEditsApplied {
+                cleared_tool_uses,
+                cleared_input_tokens,
+                cleared_thinking_turns,
+            } => {
+                if let Some(state) = &shared.params.context_edit_state {
+                    state.record(
+                        cleared_tool_uses,
+                        cleared_input_tokens,
+                        cleared_thinking_turns,
+                    );
+                }
+                tracing::debug!(
+                    cleared_tool_uses,
+                    cleared_input_tokens,
+                    cleared_thinking_turns,
+                    "server-side context editing applied"
+                );
+            }
             ModelStreamEvent::MessageStop {
                 stop_reason: sr,
                 usage: u,

@@ -3,6 +3,7 @@
 pub mod agents_md;
 pub mod at_mention;
 pub mod compact;
+pub mod context_editing;
 pub mod context_hints;
 pub mod date_change_reminder;
 pub mod edited_files_diff;

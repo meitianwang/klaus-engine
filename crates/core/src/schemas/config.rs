@@ -1084,7 +1084,7 @@ impl RuntimeDecode for ClearToolInputs {
 
 /// API-level context editing (Anthropic `context-management` beta). When set,
 /// the provider clears aged `tool_use`/`tool_result` blocks server-side once the
-/// prompt crosses `trigger_input_tokens`, preserving the most recent
+/// prompt crosses the configured trigger, preserving the most recent
 /// `keep_tool_uses` calls. This is a wire-level complement to the client-side
 /// micro-compaction: cleared blocks stop counting against the context window
 /// AND stop being retransmitted. Neutral across providers — only the Anthropic
@@ -1096,6 +1096,12 @@ pub struct ContextManagementConfig {
     /// Omitted lets the server apply its own default threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_input_tokens: Option<u64>,
+    /// Clear once the request carries this many tool calls (API `trigger` of
+    /// type `tool_uses`). Takes precedence over `trigger_input_tokens` when both
+    /// are set, and enables the batched re-trigger anchored at what the server
+    /// has already cleared (see `context::context_editing`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_tool_uses: Option<u64>,
     /// Most-recent tool uses to preserve when clearing (API `keep`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_tool_uses: Option<u64>,
@@ -1118,6 +1124,9 @@ impl RuntimeEncode for ContextManagementConfig {
         if let Some(trigger_input_tokens) = &self.trigger_input_tokens {
             object.field("triggerInputTokens", trigger_input_tokens)?;
         }
+        if let Some(trigger_tool_uses) = &self.trigger_tool_uses {
+            object.field("triggerToolUses", trigger_tool_uses)?;
+        }
         if let Some(keep_tool_uses) = &self.keep_tool_uses {
             object.field("keepToolUses", keep_tool_uses)?;
         }
@@ -1139,6 +1148,7 @@ impl RuntimeDecode for ContextManagementConfig {
         runtime_codec::decode_object(value, false, |object| {
             Ok(Self {
                 trigger_input_tokens: object.optional("triggerInputTokens", &[])?,
+                trigger_tool_uses: object.optional("triggerToolUses", &[])?,
                 keep_tool_uses: object.optional("keepToolUses", &[])?,
                 clear_at_least_input_tokens: object.optional("clearAtLeastInputTokens", &[])?,
                 clear_tool_inputs: object.optional("clearToolInputs", &[])?,
@@ -1367,8 +1377,11 @@ pub struct EngineConfig {
     /// + supported-model only, clamped to the 20k API minimum.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_budget_tokens: Option<u64>,
-    /// API-level context editing (Anthropic `context-management` beta). Optional;
-    /// first-party Anthropic only. Complements client-side micro-compaction.
+    /// API-level context editing (Anthropic `context-management` beta),
+    /// first-party Anthropic only. Enabled by default with every threshold
+    /// unset, so the server applies its own tuned defaults; set
+    /// `contextManagement: null` to opt out. Complements client-side
+    /// micro-compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagementConfig>,
     /// Manage prior-turn thinking blocks server-side: normally pin every thinking
@@ -1713,7 +1726,7 @@ impl Default for EngineConfig {
             thinking: true,
             fast_mode: false,
             task_budget_tokens: None,
-            context_management: None,
+            context_management: Some(ContextManagementConfig::default()),
             allow: Vec::new(),
             deny: Vec::new(),
             ask: Vec::new(),
@@ -2074,6 +2087,9 @@ const OPTIONAL_KEY_SHAPES: &[(&str, ConfigValueKind)] = &[
     ("approvalReviewPolicyTemplate", ConfigValueKind::String),
     ("approvalReviewTranscriptMode", ConfigValueKind::String),
     ("maximumGoalTokenBudget", ConfigValueKind::Integer),
+    // Enabled by default as an object; an explicit null is the config-level
+    // opt-out, so the key must accept both shapes.
+    ("contextManagement", ConfigValueKind::Any),
 ];
 
 pub fn engine_config_governance_schema() -> ConfigGovernanceSchema {
@@ -2194,13 +2210,21 @@ mod tests {
     }
 
     #[test]
-    fn context_management_parses_camel_case_and_defaults_to_absent() {
+    fn context_management_parses_camel_case_and_defaults_to_enabled() {
         let cfg: EngineConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            cfg.context_management,
+            Some(ContextManagementConfig::default())
+        );
+
+        // An explicit null is the opt-out.
+        let cfg: EngineConfig = serde_json::from_value(json!({"contextManagement": null})).unwrap();
         assert!(cfg.context_management.is_none());
 
         let cfg: EngineConfig = serde_json::from_value(json!({
             "contextManagement": {
                 "triggerInputTokens": 30000,
+                "triggerToolUses": 24,
                 "keepToolUses": 3,
                 "clearAtLeastInputTokens": 5000,
                 "clearToolInputs": true,
@@ -2210,6 +2234,7 @@ mod tests {
         .unwrap();
         let cm = cfg.context_management.expect("contextManagement parsed");
         assert_eq!(cm.trigger_input_tokens, Some(30_000));
+        assert_eq!(cm.trigger_tool_uses, Some(24));
         assert_eq!(cm.keep_tool_uses, Some(3));
         assert_eq!(cm.clear_at_least_input_tokens, Some(5_000));
         assert_eq!(cm.clear_tool_inputs, Some(ClearToolInputs::All(true)));
@@ -2233,7 +2258,6 @@ mod tests {
         // from the defaults document would have dropped.
         for key in [
             "modelTiers",
-            "contextManagement",
             "codeModeHost",
             "codeModeHostRequired",
             "effort",

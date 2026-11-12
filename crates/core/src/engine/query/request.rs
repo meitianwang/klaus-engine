@@ -462,7 +462,10 @@ pub(super) fn prepare_with_inference(
         cache_ttl: params.cache_ttl,
         cache_key: params.cache_key.clone(),
         cache_domain: params.cache_domain.clone(),
-        context_management: config.context_management.clone(),
+        context_management: adaptive_context_management(
+            config.context_management.as_ref(),
+            params.context_edit_state.as_deref(),
+        ),
         context_hints,
         thinking_context: resolve_thinking_context(
             config.manage_thinking_context,
@@ -473,17 +476,49 @@ pub(super) fn prepare_with_inference(
     PreparedModelRequest { request, profile }
 }
 
-/// Preserve prior-turn reasoning whenever thinking is active. Idle time does
-/// not change the retained reasoning policy or invalidate the cached prefix.
+/// Preserve prior-turn reasoning whenever thinking is active. While the prompt
+/// cache can still be warm every thinking turn is pinned: shedding one would
+/// rewrite a prefix that is otherwise served from cache. Once the session has
+/// been idle past the longest cache lifetime (`cold`), the prefix has to be
+/// rewritten at full price anyway, so aged thinking turns are dropped down to
+/// the most recent one — pure weight saved on a rewrite that cannot be avoided.
 fn resolve_thinking_context(
     manage: bool,
     thinking: Option<ThinkingConfig>,
-    _cold: bool,
+    cold: bool,
 ) -> Option<ThinkingContextPolicy> {
     if !manage || thinking.is_none() {
         return None;
     }
-    Some(ThinkingContextPolicy::KeepAll)
+    Some(if cold {
+        ThinkingContextPolicy::KeepMostRecentTurn
+    } else {
+        ThinkingContextPolicy::KeepAll
+    })
+}
+
+/// Raise a count-based clearing trigger by the tool uses the server has already
+/// cleared for this session. The client resends its full unrewritten history on
+/// every request, so a fixed count trigger would re-clear on every request once
+/// crossed; anchoring at the cleared total makes the next clear wait for a fresh
+/// batch of roughly `trigger_tool_uses` tool calls, amortizing the cache rewrite
+/// each clear costs. Token-based triggers are passed through as configured.
+fn adaptive_context_management(
+    config: Option<&crate::schemas::config::ContextManagementConfig>,
+    state: Option<&crate::context::context_editing::ContextEditState>,
+) -> Option<crate::schemas::config::ContextManagementConfig> {
+    let config = config?.clone();
+    let (Some(base), Some(state)) = (config.trigger_tool_uses, state) else {
+        return Some(config);
+    };
+    let cleared = state.cleared_tool_uses();
+    if cleared == 0 {
+        return Some(config);
+    }
+    Some(crate::schemas::config::ContextManagementConfig {
+        trigger_tool_uses: Some(base + cleared),
+        ..config
+    })
 }
 
 impl Shared {
@@ -1008,5 +1043,80 @@ pub(super) async fn resolve_system_prompt(s: &SystemPromptResolvable) -> Vec<Sys
     match s {
         SystemPromptResolvable::Parts(parts) => parts.clone(),
         SystemPromptResolvable::Fn(thunk) => thunk().await,
+    }
+}
+
+#[cfg(test)]
+mod context_policy_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_policy_pins_every_turn_while_the_cache_can_be_warm() {
+        assert_eq!(
+            resolve_thinking_context(true, Some(ThinkingConfig::Adaptive), false),
+            Some(ThinkingContextPolicy::KeepAll)
+        );
+    }
+
+    #[test]
+    fn thinking_policy_keeps_one_turn_once_the_cache_is_cold() {
+        assert_eq!(
+            resolve_thinking_context(true, Some(ThinkingConfig::Adaptive), true),
+            Some(ThinkingContextPolicy::KeepMostRecentTurn)
+        );
+    }
+
+    #[test]
+    fn thinking_policy_needs_both_the_switch_and_wire_thinking() {
+        assert_eq!(
+            resolve_thinking_context(false, Some(ThinkingConfig::Adaptive), true),
+            None
+        );
+        assert_eq!(resolve_thinking_context(true, None, true), None);
+    }
+
+    #[test]
+    fn count_trigger_rises_by_what_the_server_already_cleared() {
+        use crate::context::context_editing::ContextEditState;
+        use crate::schemas::config::ContextManagementConfig;
+        let config = ContextManagementConfig {
+            trigger_tool_uses: Some(10),
+            ..Default::default()
+        };
+        // No state or nothing cleared yet: the configured base is sent as-is.
+        assert_eq!(
+            adaptive_context_management(Some(&config), None),
+            Some(config.clone())
+        );
+        let state = ContextEditState::default();
+        assert_eq!(
+            adaptive_context_management(Some(&config), Some(&state)),
+            Some(config.clone())
+        );
+        // After a server report, the next trigger waits for a fresh batch.
+        state.record(8, 40_000, 0);
+        assert_eq!(
+            adaptive_context_management(Some(&config), Some(&state)),
+            Some(ContextManagementConfig {
+                trigger_tool_uses: Some(18),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn token_trigger_is_never_adapted() {
+        use crate::context::context_editing::ContextEditState;
+        use crate::schemas::config::ContextManagementConfig;
+        let config = ContextManagementConfig {
+            trigger_input_tokens: Some(120_000),
+            ..Default::default()
+        };
+        let state = ContextEditState::default();
+        state.record(8, 40_000, 0);
+        assert_eq!(
+            adaptive_context_management(Some(&config), Some(&state)),
+            Some(config)
+        );
     }
 }

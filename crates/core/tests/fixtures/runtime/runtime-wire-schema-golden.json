@@ -6909,6 +6909,71 @@
       }
     ]
   },
+  "crates/core/src/memory/usage.rs::Ledger": {
+    "kind": "struct",
+    "shape": "named",
+    "canEncode": true,
+    "canDecode": true,
+    "denyUnknownFields": false,
+    "transparent": false,
+    "containerDefault": false,
+    "taggingKind": "external",
+    "fields": [
+      {
+        "rustName": "version",
+        "rustType": "u32",
+        "wireSerialize": "version",
+        "wireDeserialize": "version",
+        "default": true,
+        "defaultFunction": "ledger_version",
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "entries",
+        "rustType": "BTreeMap < String , UsageEntry >",
+        "wireSerialize": "entries",
+        "wireDeserialize": "entries",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      }
+    ]
+  },
+  "crates/core/src/memory/usage.rs::UsageEntry": {
+    "kind": "struct",
+    "shape": "named",
+    "canEncode": true,
+    "canDecode": true,
+    "denyUnknownFields": false,
+    "transparent": false,
+    "containerDefault": false,
+    "taggingKind": "external",
+    "fields": [
+      {
+        "rustName": "usage_count",
+        "rustType": "u64",
+        "wireSerialize": "usageCount",
+        "wireDeserialize": "usageCount",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "last_used_at",
+        "rustType": "i64",
+        "wireSerialize": "lastUsedAt",
+        "wireDeserialize": "lastUsedAt",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      }
+    ]
+  },
   "crates/core/src/network_proxy.rs::CredentialBrokerConfig": {
     "kind": "struct",
     "shape": "named",
@@ -7846,6 +7911,17 @@
         "flatten": false
       },
       {
+        "rustName": "trigger_tool_uses",
+        "rustType": "Option < u64 >",
+        "wireSerialize": "triggerToolUses",
+        "wireDeserialize": "triggerToolUses",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "skipSerializeIf": "Option::is_none",
+        "flatten": false
+      },
+      {
         "rustName": "keep_tool_uses",
         "rustType": "Option < u64 >",
         "wireSerialize": "keepToolUses",
@@ -8606,6 +8682,16 @@
         "flatten": false
       },
       {
+        "rustName": "precompute_compaction",
+        "rustType": "bool",
+        "wireSerialize": "precomputeCompaction",
+        "wireDeserialize": "precomputeCompaction",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
         "rustName": "provider_trace",
         "rustType": "bool",
         "wireSerialize": "providerTrace",
@@ -8864,6 +8950,16 @@
         "skipSerialize": false,
         "skipDeserialize": false,
         "skipSerializeIf": "Option::is_none",
+        "flatten": false
+      },
+      {
+        "rustName": "session_unload_delay_secs",
+        "rustType": "u64",
+        "wireSerialize": "sessionUnloadDelaySecs",
+        "wireDeserialize": "sessionUnloadDelaySecs",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
         "flatten": false
       },
       {

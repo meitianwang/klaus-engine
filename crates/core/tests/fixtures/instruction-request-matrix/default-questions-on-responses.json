@@ -235,6 +235,7 @@
         "type": "adaptive"
       },
       "cacheKey": "default-questions-on-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

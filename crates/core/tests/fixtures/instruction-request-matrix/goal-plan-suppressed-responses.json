@@ -212,6 +212,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-plan-suppressed-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

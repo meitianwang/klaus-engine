@@ -131,6 +131,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-progress-disabled-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -283,6 +284,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-progress-disabled-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

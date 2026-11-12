@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-active-ordinary-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -394,6 +395,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-active-ordinary-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -578,6 +580,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-active-ordinary-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

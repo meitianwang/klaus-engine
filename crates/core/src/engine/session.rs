@@ -1370,6 +1370,11 @@ pub struct Session {
     pub(crate) tool_result_budget_state:
         Arc<Mutex<crate::context::tool_result_budget::ReplacementState>>,
     pub(crate) context_hint_state: Arc<crate::context::context_hints::ContextHintState>,
+    /// What API-level context editing has cleared for this session so far (see
+    /// [`crate::context::context_editing::ContextEditState`]). Fed from the
+    /// provider's applied-edits reports; the running tool-use total anchors the
+    /// next count-based clearing trigger so clears arrive in batches.
+    pub(crate) context_edit_state: Arc<crate::context::context_editing::ContextEditState>,
     /// What this session changed on disk, served with `get_file_changes` (see
     /// [`SessionFileChanges`]). Folded live during runs and rebuilt from the
     /// rollout on resume, so reopening a thread still reports what it produced.

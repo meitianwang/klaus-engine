@@ -5,6 +5,7 @@ expression: "format!(\"{}\\n{}\", roundtrip(&empty), roundtrip(&populated))"
 {}
 {
   "triggerInputTokens": 120000,
+  "triggerToolUses": 24,
   "keepToolUses": 3,
   "clearToolInputs": false,
   "excludeTools": [

@@ -235,6 +235,7 @@
         "type": "adaptive"
       },
       "cacheKey": "configured-default-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

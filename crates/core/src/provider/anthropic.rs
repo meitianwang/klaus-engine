@@ -1420,6 +1420,15 @@ impl ModelProvider for AnthropicProvider {
                 if update_stream_usage(&data, &mut usage) {
                     yield ModelStreamEvent::UsageSnapshot { usage: usage.clone() };
                 }
+                if let Some((cleared_tool_uses, cleared_input_tokens, cleared_thinking_turns)) =
+                    parse_applied_context_edits(&data)
+                {
+                    yield ModelStreamEvent::ContextEditsApplied {
+                        cleared_tool_uses,
+                        cleared_input_tokens,
+                        cleared_thinking_turns,
+                    };
+                }
                 for e in out.events {
                     if buffer_result_text {
                         if let ModelStreamEvent::TextDelta { text } = &e {
@@ -1482,6 +1491,15 @@ impl ModelProvider for AnthropicProvider {
                     saw_wire_stop |= data.get("type").and_then(Value::as_str).is_some_and(|tag| tag == "message_stop");
                     if update_stream_usage(&data, &mut usage) {
                         yield ModelStreamEvent::UsageSnapshot { usage: usage.clone() };
+                    }
+                    if let Some((cleared_tool_uses, cleared_input_tokens, cleared_thinking_turns)) =
+                        parse_applied_context_edits(&data)
+                    {
+                        yield ModelStreamEvent::ContextEditsApplied {
+                            cleared_tool_uses,
+                            cleared_input_tokens,
+                            cleared_thinking_turns,
+                        };
                     }
                     for e in out.events {
                         if buffer_result_text {
@@ -2366,6 +2384,46 @@ struct BlockInfo {
     data: Option<RuntimeString>,
     /// Accumulated input JSON for a server-search block (the `{query}`).
     json: Option<RuntimeString>,
+}
+
+/// Extract the server's applied context-edit report from a stream event, when
+/// one is present. Streaming responses carry `context_management` on the final
+/// `message_delta`; `message_start`'s message is checked as well so a shape
+/// change cannot silently drop the accounting. Returns
+/// `(cleared_tool_uses, cleared_input_tokens, cleared_thinking_turns)`.
+fn parse_applied_context_edits(event: &Value) -> Option<(u64, u64, u64)> {
+    let management = event.get("context_management").or_else(|| {
+        event
+            .get("message")
+            .and_then(|m| m.get("context_management"))
+    })?;
+    let edits = management.get("applied_edits")?.as_array()?;
+    let (mut uses, mut tokens, mut turns) = (0u64, 0u64, 0u64);
+    let mut any = false;
+    let empty = RuntimeString::default();
+    for edit in edits {
+        let kind = edit.get("type").and_then(Value::as_str).unwrap_or(&empty);
+        let cleared_tokens = edit
+            .get("cleared_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if kind == CLEAR_TOOL_USES_EDIT {
+            uses += edit
+                .get("cleared_tool_uses")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tokens += cleared_tokens;
+            any = true;
+        } else if kind == CLEAR_THINKING_EDIT {
+            turns += edit
+                .get("cleared_thinking_turns")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            tokens += cleared_tokens;
+            any = true;
+        }
+    }
+    any.then_some((uses, tokens, turns))
 }
 
 /// Merge only fields the provider actually reported; later events can extend
@@ -3895,12 +3953,14 @@ fn resolve_context_editing(
 /// Build the Anthropic `context_management` request object from the neutral
 /// per-request declarations.
 ///
-/// Emits up to two edits. The tool-use edit is driven by config: every
-/// threshold/limit is optional and only serialized when set, so an unset field
-/// lets the server apply its own default, and tool-name exclusions are forwarded
-/// verbatim. The thinking edit is resolved per request: `KeepAll` pins every
-/// prior-turn thinking block so no server-side default sheds reasoning the model
-/// may still need, while `KeepMostRecentTurn` keeps exactly one — the wire schema
+/// Emits up to two edits, the thinking edit first: the API requires
+/// `clear_thinking_20251015` to lead the `edits` array whenever strategies
+/// combine. The tool-use edit is driven by config: every threshold/limit is
+/// optional and only serialized when set, so an unset field lets the server
+/// apply its own default, and tool-name exclusions are forwarded verbatim. The
+/// thinking edit is resolved per request: `KeepAll` pins every prior-turn
+/// thinking block so no server-side default sheds reasoning the model may still
+/// need, while `KeepMostRecentTurn` keeps exactly one — the wire schema
 /// requires a positive count, and omitting the edit entirely would fall back to
 /// the server default (usually keep-everything) and clear nothing.
 ///
@@ -3911,9 +3971,6 @@ fn build_context_management(
     thinking: Option<ThinkingContextPolicy>,
 ) -> Option<Value> {
     let mut edits: Vec<Value> = Vec::new();
-    if let Some(config) = tool_uses {
-        edits.push(build_clear_tool_uses_edit(config));
-    }
     if let Some(policy) = thinking {
         let keep = match policy {
             ThinkingContextPolicy::KeepAll => vs("all"),
@@ -3927,6 +3984,9 @@ fn build_context_management(
             ("keep", keep),
         ]));
     }
+    if let Some(config) = tool_uses {
+        edits.push(build_clear_tool_uses_edit(config));
+    }
     if edits.is_empty() {
         return None;
     }
@@ -3936,7 +3996,17 @@ fn build_context_management(
 /// The `clear_tool_uses_20250919` edit built from neutral config.
 fn build_clear_tool_uses_edit(config: &ContextManagementConfig) -> Value {
     let mut edit = vec![("type", vs(CLEAR_TOOL_USES_EDIT))];
-    if let Some(trigger) = config.trigger_input_tokens {
+    // The count-based trigger wins when both forms are configured: it batches
+    // clears against the tool-call count the client can observe exactly.
+    if let Some(trigger) = config.trigger_tool_uses {
+        edit.push((
+            "trigger",
+            vobj(vec![
+                ("type", vs("tool_uses")),
+                ("value", Value::from(trigger)),
+            ]),
+        ));
+    } else if let Some(trigger) = config.trigger_input_tokens {
         edit.push((
             "trigger",
             vobj(vec![
@@ -4181,6 +4251,7 @@ mod tests {
     fn build_context_management_emits_faithful_clear_tool_uses_edit() {
         let config = ContextManagementConfig {
             trigger_input_tokens: Some(30_000),
+            trigger_tool_uses: None,
             keep_tool_uses: Some(3),
             clear_at_least_input_tokens: Some(5_000),
             clear_tool_inputs: Some(ClearToolInputs::All(false)),
@@ -4232,6 +4303,83 @@ mod tests {
     }
 
     #[test]
+    fn build_context_management_lists_the_thinking_edit_first_when_combined() {
+        // The API requires `clear_thinking_20251015` to lead the edits array
+        // whenever strategies combine.
+        let config = ContextManagementConfig {
+            trigger_input_tokens: Some(30_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_context_management(Some(&config), Some(ThinkingContextPolicy::KeepAll)),
+            Some(exact_json!({
+                "edits": [
+                    { "type": "clear_thinking_20251015", "keep": "all" },
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "trigger": { "type": "input_tokens", "value": 30000 }
+                    }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn build_clear_tool_uses_edit_prefers_the_count_based_trigger() {
+        // `tool_uses` is the newer trigger form and wins when both are set; it
+        // counts tool calls instead of estimated tokens.
+        let config = ContextManagementConfig {
+            trigger_tool_uses: Some(24),
+            trigger_input_tokens: Some(30_000),
+            keep_tool_uses: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_context_management(Some(&config), None),
+            Some(exact_json!({
+                "edits": [{
+                    "type": "clear_tool_uses_20250919",
+                    "trigger": { "type": "tool_uses", "value": 24 },
+                    "keep": { "type": "tool_uses", "value": 5 }
+                }]
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_applied_context_edits_reads_the_message_delta_report() {
+        let event = exact_json!({
+            "type": "message_delta",
+            "context_management": {
+                "applied_edits": [
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "cleared_tool_uses": 8,
+                        "cleared_input_tokens": 50000
+                    },
+                    {
+                        "type": "clear_thinking_20251015",
+                        "cleared_thinking_turns": 2,
+                        "cleared_input_tokens": 1500
+                    }
+                ]
+            }
+        });
+        assert_eq!(parse_applied_context_edits(&event), Some((8, 51_500, 2)));
+    }
+
+    #[test]
+    fn parse_applied_context_edits_ignores_events_without_reports() {
+        let plain = exact_json!({ "type": "message_delta", "usage": { "output_tokens": 3 } });
+        assert_eq!(parse_applied_context_edits(&plain), None);
+        let empty = exact_json!({
+            "type": "message_delta",
+            "context_management": { "applied_edits": [] }
+        });
+        assert_eq!(parse_applied_context_edits(&empty), None);
+    }
+
+    #[test]
     fn build_context_management_pins_every_thinking_turn_while_the_cache_is_warm() {
         assert_eq!(
             build_context_management(None, Some(ThinkingContextPolicy::KeepAll)),
@@ -4263,15 +4411,17 @@ mod tests {
             keep_tool_uses: Some(2),
             ..Default::default()
         };
+        // The API requires the thinking edit to lead the array when strategies
+        // combine, so it comes first even though the tool config is passed first.
         assert_eq!(
             build_context_management(Some(&config), Some(ThinkingContextPolicy::KeepAll)),
             Some(exact_json!({
                 "edits": [
+                    { "type": "clear_thinking_20251015", "keep": "all" },
                     {
                         "type": "clear_tool_uses_20250919",
                         "keep": { "type": "tool_uses", "value": 2 }
-                    },
-                    { "type": "clear_thinking_20251015", "keep": "all" }
+                    }
                 ]
             }))
         );

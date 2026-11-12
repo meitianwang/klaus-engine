@@ -176,6 +176,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-paused-responses",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],

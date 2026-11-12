@@ -4036,6 +4036,7 @@ impl Session {
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),
+            context_edit_state: Some(self.context_edit_state.clone()),
             padded_countdown_spend: self.turn.padded_countdown_spend(),
             task_countdown_anchor: None,
             live_model_override: None,

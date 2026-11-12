@@ -154,6 +154,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -382,6 +383,7 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-chat",
+      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
