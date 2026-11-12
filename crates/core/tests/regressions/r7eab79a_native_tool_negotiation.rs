@@ -1,6 +1,6 @@
 //! Defect: unsupported native tool fields terminated gateway sessions.
 //! Root cause: native search declarations had no scoped downgrade boundary.
-//! Work item 20261112: negotiate once without changing active tool state.
+//! Fixing commit 7eab79a: negotiate once without changing active tool state.
 
 use futures::StreamExt;
 use klaus_agent_core::provider::anthropic::{AnthropicProvider, AnthropicProviderOptions};
