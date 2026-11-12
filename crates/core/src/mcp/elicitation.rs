@@ -6,10 +6,11 @@ use crate::runtime_values::{
     RuntimeEncoder, RuntimeJson, RuntimeMap, RuntimeObjectEncoder, RuntimeString,
 };
 use crate::types::abort::AbortSignal;
+use crate::types::permission::{ApprovalPolicy, SandboxMode};
 use crate::types::tool::UuidFn;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, watch};
@@ -960,9 +961,23 @@ struct RouterOwner {
     id: u64,
     next_generation: AtomicU64,
     turn: Mutex<Option<ElicitationTurn>>,
-    approval_policy_provider:
-        Mutex<Option<Arc<dyn Fn() -> crate::types::permission::ApprovalPolicy + Send + Sync>>>,
+    permission_policy_provider: Mutex<Option<Arc<dyn Fn() -> McpElicitationPolicy + Send + Sync>>>,
+    form_input_generations: Mutex<HashSet<u64>>,
     pause_state: ElicitationPauseState,
+}
+
+/// One live snapshot determines both interactive and unattended confirmation authority.
+#[derive(Clone, Copy)]
+pub struct McpElicitationPolicy {
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox_mode: SandboxMode,
+}
+
+impl McpElicitationPolicy {
+    fn auto_approves_confirmation(self) -> bool {
+        self.approval_policy == ApprovalPolicy::Never
+            && self.sandbox_mode == SandboxMode::DangerFullAccess
+    }
 }
 
 /// Connections share public reply ids, while each runtime owns its query
@@ -1019,22 +1034,35 @@ impl McpElicitationRouter {
                 id: 0,
                 next_generation: AtomicU64::new(0),
                 turn: Mutex::new(None),
-                approval_policy_provider: Mutex::new(None),
+                permission_policy_provider: Mutex::new(None),
+                form_input_generations: Mutex::new(HashSet::new()),
                 pause_state: ElicitationPauseState::new(),
             }),
         }
     }
 
     pub(crate) fn fork_owner(&self) -> Self {
+        let parent_policy = self
+            .owner
+            .permission_policy_provider
+            .lock()
+            .unwrap()
+            .clone();
         Self {
             inner: self.inner.clone(),
             owner: Arc::new(RouterOwner {
                 id: self.inner.next_owner.fetch_add(1, Ordering::Relaxed),
                 next_generation: AtomicU64::new(0),
                 turn: Mutex::new(None),
-                approval_policy_provider: Mutex::new(
-                    self.owner.approval_policy_provider.lock().unwrap().clone(),
-                ),
+                // A child connection has not been bound to its own sandbox authority.
+                // Inherit prompt policy, never the parent's unattended confirmation grant.
+                permission_policy_provider: Mutex::new(parent_policy.map(|provider| {
+                    Arc::new(move || McpElicitationPolicy {
+                        approval_policy: provider().approval_policy,
+                        sandbox_mode: SandboxMode::ReadOnly,
+                    }) as Arc<dyn Fn() -> McpElicitationPolicy + Send + Sync>
+                })),
+                form_input_generations: Mutex::new(HashSet::new()),
                 pause_state: ElicitationPauseState::new(),
             }),
         }
@@ -1054,16 +1082,38 @@ impl McpElicitationRouter {
         &self,
         provider: Arc<dyn Fn() -> crate::types::permission::ApprovalPolicy + Send + Sync>,
     ) {
-        *self.owner.approval_policy_provider.lock().unwrap() = Some(provider);
+        self.set_permission_policy_provider(Arc::new(move || McpElicitationPolicy {
+            approval_policy: provider(),
+            sandbox_mode: SandboxMode::ReadOnly,
+        }));
+    }
+
+    pub fn set_permission_policy_provider(
+        &self,
+        provider: Arc<dyn Fn() -> McpElicitationPolicy + Send + Sync>,
+    ) {
+        *self.owner.permission_policy_provider.lock().unwrap() = Some(provider);
+    }
+
+    fn permission_policy(&self) -> McpElicitationPolicy {
+        let provider = self
+            .owner
+            .permission_policy_provider
+            .lock()
+            .unwrap()
+            .clone();
+        provider.map_or(
+            McpElicitationPolicy {
+                approval_policy: ApprovalPolicy::OnRequest,
+                sandbox_mode: SandboxMode::ReadOnly,
+            },
+            |provider| provider(),
+        )
     }
 
     pub(crate) fn policy_allows_elicitation(&self) -> bool {
-        let provider = self.owner.approval_policy_provider.lock().unwrap().clone();
-        provider
-            .map_or(
-                crate::types::permission::ApprovalPolicy::OnRequest,
-                |provider| provider(),
-            )
+        self.permission_policy()
+            .approval_policy
             .allows_prompt(crate::types::permission::ApprovalPromptKind::McpElicitation)
     }
 
@@ -1086,7 +1136,10 @@ impl McpElicitationRouter {
                 let generation = self.owner.next_generation.fetch_add(1, Ordering::Relaxed);
                 self.set_turn_scope(generation, signal);
             }
-            None => *self.owner.turn.lock().unwrap() = None,
+            None => {
+                *self.owner.turn.lock().unwrap() = None;
+                self.owner.form_input_generations.lock().unwrap().clear();
+            }
         }
     }
 
@@ -1094,8 +1147,63 @@ impl McpElicitationRouter {
         *self.owner.turn.lock().unwrap() = Some(ElicitationTurn { generation, signal });
     }
 
+    /// Enable ordinary input only after a running root turn has initialized its MCP runtime.
+    pub(crate) fn enable_form_input_for_turn(&self, generation: u64) {
+        if self.owner.id != 0 || !self.has_presenter() {
+            return;
+        }
+        let turn = self.owner.turn.lock().unwrap();
+        if turn
+            .as_ref()
+            .is_some_and(|turn| turn.generation == generation && !turn.signal.is_cancelled())
+        {
+            self.owner
+                .form_input_generations
+                .lock()
+                .unwrap()
+                .insert(generation);
+        }
+    }
+
+    fn full_access_input_allowed(&self, generation: Option<u64>) -> bool {
+        if self.owner.id != 0
+            || !self.has_presenter()
+            || !self.permission_policy().auto_approves_confirmation()
+        {
+            return false;
+        }
+        let turn = self.owner.turn.lock().unwrap();
+        turn.as_ref().is_some_and(|turn| {
+            Some(turn.generation) == generation
+                && !turn.signal.is_cancelled()
+                && self
+                    .owner
+                    .form_input_generations
+                    .lock()
+                    .unwrap()
+                    .contains(&turn.generation)
+        })
+    }
+
+    fn is_ordinary_input_form(request: &McpElicitationRequest) -> bool {
+        matches!(request, McpElicitationRequest::Form { requested_schema, .. }
+            if !requested_schema.properties.is_empty())
+            && !request.meta().is_some_and(|meta| {
+                meta.get("persist").is_some()
+                    || meta
+                        .get("klaus")
+                        .and_then(|meta| meta.get("computerUseApp"))
+                        .is_some()
+            })
+    }
+
     pub(crate) fn clear_turn_scope(&self, generation: u64) {
         let mut turn = self.owner.turn.lock().unwrap();
+        self.owner
+            .form_input_generations
+            .lock()
+            .unwrap()
+            .remove(&generation);
         if turn
             .as_ref()
             .is_some_and(|turn| turn.generation == generation)
@@ -1200,7 +1308,40 @@ impl McpElicitationRouter {
         connection_signal: AbortSignal,
         cancel_signal: AbortSignal,
     ) -> McpElicitationResponse {
-        if !self.policy_allows_elicitation() {
+        if self.permission_policy().auto_approves_confirmation()
+            && matches!(
+                &request,
+                McpElicitationRequest::Form { requested_schema, .. }
+                    if requested_schema.properties.is_empty()
+            )
+        {
+            let turn = self.owner.turn.lock().unwrap().clone();
+            if connection_signal.is_cancelled()
+                || cancel_signal.is_cancelled()
+                || turn.as_ref().is_some_and(|turn| turn.signal.is_cancelled())
+            {
+                return McpElicitationResponse::cancel();
+            }
+            if turn.is_none() {
+                return McpElicitationResponse::decline();
+            }
+            return McpElicitationResponse {
+                action: McpElicitationAction::Accept,
+                content: Some(RuntimeJson::Object(Default::default())),
+                meta: None,
+            };
+        }
+        let input_form = Self::is_ordinary_input_form(&request);
+        let input_generation = self
+            .owner
+            .turn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|turn| turn.generation);
+        if !(self.policy_allows_elicitation()
+            || input_form && self.full_access_input_allowed(input_generation))
+        {
             return McpElicitationResponse::decline();
         }
         let Some(presenter) = self.inner.presenter.clone() else {
@@ -1229,6 +1370,12 @@ impl McpElicitationRouter {
             router: self.clone(),
             request_id: request_id.clone(),
         };
+        let query_generation = query.as_ref().map(|query| query.generation);
+        if !(self.policy_allows_elicitation()
+            || input_form && self.full_access_input_allowed(query_generation))
+        {
+            return McpElicitationResponse::decline();
+        }
         let event = McpElicitationEvent {
             request_id,
             server_name,
@@ -1259,7 +1406,12 @@ impl McpElicitationRouter {
                 _ = cancel_signal.cancelled() => McpElicitationResponse::cancel(),
             },
         };
-        if !self.policy_allows_elicitation() {
+        if input_form && response.action == McpElicitationAction::Cancel {
+            return response.normalized();
+        }
+        if !(self.policy_allows_elicitation()
+            || input_form && self.full_access_input_allowed(query_generation))
+        {
             return McpElicitationResponse::decline();
         }
         response.normalized()
@@ -1702,6 +1854,321 @@ mod approval_policy_tests {
             message: "Authorize account".into(),
             url: "https://example.invalid/auth".into(),
             elicitation_id: "fixture".into(),
+        }
+    }
+
+    fn confirmation() -> McpElicitationRequest {
+        parse_mcp_elicitation_request(
+            "elicitation/create",
+            crate::runtime_values::runtime_json::parse(&RuntimeString::from(
+                r#"{"message":"Allow application access?","requestedSchema":{"type":"object","properties":{}}}"#,
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn full_access_router() -> McpElicitationRouter {
+        let router = McpElicitationRouter::disabled();
+        router.set_permission_policy_provider(Arc::new(|| McpElicitationPolicy {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox_mode: SandboxMode::DangerFullAccess,
+        }));
+        router
+    }
+
+    fn input_request() -> McpElicitationRequest {
+        parse_mcp_elicitation_request(
+            "elicitation/create",
+            crate::runtime_values::runtime_json::parse(&RuntimeString::from(
+                r#"{"message":"Which label?","requestedSchema":{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}}"#,
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_access_input_preserves_the_user_answer_and_rechecks_live_policy() {
+        for narrow_policy in [false, true] {
+            let (events, mut receive) = tokio::sync::mpsc::channel(1);
+            let router = McpElicitationRouter::new(
+                Some(Arc::new(Presenter(events))),
+                Arc::new(|| "input".to_owned()),
+            );
+            let full = Arc::new(AtomicBool::new(true));
+            let current = full.clone();
+            router.set_permission_policy_provider(Arc::new(move || McpElicitationPolicy {
+                approval_policy: ApprovalPolicy::Never,
+                sandbox_mode: if current.load(Ordering::Acquire) {
+                    SandboxMode::DangerFullAccess
+                } else {
+                    SandboxMode::WorkspaceWrite
+                },
+            }));
+            let query = router.begin_query(AbortSignal::new());
+            router.enable_form_input_for_turn(query.generation);
+            let routed = router.clone();
+            let waiting = tokio::spawn(async move {
+                routed
+                    .route(
+                        "input-server".into(),
+                        input_request(),
+                        AbortSignal::new(),
+                        AbortSignal::new(),
+                    )
+                    .await
+            });
+            let event = receive.recv().await.unwrap();
+            assert!(*router.pause_state().subscribe().borrow());
+            if narrow_policy {
+                full.store(false, Ordering::Release);
+            }
+            let answer = crate::runtime_values::runtime_json::parse(&RuntimeString::from(
+                r#"{"label":"user supplied value"}"#,
+            ))
+            .unwrap();
+            router
+                .resolve(
+                    &event.request_id,
+                    McpElicitationResponse {
+                        action: McpElicitationAction::Accept,
+                        content: Some(answer.clone()),
+                        meta: None,
+                    },
+                )
+                .unwrap();
+            let response = waiting.await.unwrap();
+            assert_eq!(
+                response.action,
+                if narrow_policy {
+                    McpElicitationAction::Decline
+                } else {
+                    McpElicitationAction::Accept
+                }
+            );
+            assert_eq!(
+                response.content,
+                if narrow_policy { None } else { Some(answer) }
+            );
+            assert_eq!(router.pending_count(), 0);
+            assert!(!*router.pause_state().subscribe().borrow());
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_input_excludes_initialization_children_and_approval_forms() {
+        let (events, mut receive) = tokio::sync::mpsc::channel(1);
+        let router = McpElicitationRouter::new(
+            Some(Arc::new(Presenter(events))),
+            Arc::new(|| "input".to_owned()),
+        );
+        router.set_permission_policy_provider(Arc::new(|| McpElicitationPolicy {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox_mode: SandboxMode::DangerFullAccess,
+        }));
+        let query = router.begin_query(AbortSignal::new());
+        // Initialization has a query lease, but not an enabled input generation.
+        assert_eq!(
+            router
+                .route(
+                    "input-server".into(),
+                    input_request(),
+                    AbortSignal::new(),
+                    AbortSignal::new()
+                )
+                .await
+                .action,
+            McpElicitationAction::Decline
+        );
+        router.enable_form_input_for_turn(query.generation);
+        for metadata in [
+            r#"{"persist":["session"]}"#,
+            r#"{"klaus":{"computerUseApp":"Fixture App"}}"#,
+        ] {
+            let mut request = input_request();
+            if let McpElicitationRequest::Form { meta, .. } = &mut request {
+                *meta = Some(
+                    crate::runtime_values::runtime_json::parse(&RuntimeString::from(metadata))
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                router
+                    .route(
+                        "input-server".into(),
+                        request,
+                        AbortSignal::new(),
+                        AbortSignal::new()
+                    )
+                    .await
+                    .action,
+                McpElicitationAction::Decline
+            );
+        }
+        let child = router.fork_owner();
+        let child_query = child.begin_query(AbortSignal::new());
+        child.enable_form_input_for_turn(child_query.generation);
+        assert_eq!(
+            child
+                .route(
+                    "input-server".into(),
+                    input_request(),
+                    AbortSignal::new(),
+                    AbortSignal::new()
+                )
+                .await
+                .action,
+            McpElicitationAction::Decline
+        );
+        router.clear_turn_scope(query.generation);
+        assert_eq!(
+            router
+                .route(
+                    "input-server".into(),
+                    input_request(),
+                    AbortSignal::new(),
+                    AbortSignal::new()
+                )
+                .await
+                .action,
+            McpElicitationAction::Decline
+        );
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_access_confirmation_needs_no_presenter_or_pending_card() {
+        let router = full_access_router();
+        let _query = router.begin_query(AbortSignal::new());
+        let response = router
+            .route(
+                "registered-server".into(),
+                confirmation(),
+                AbortSignal::new(),
+                AbortSignal::new(),
+            )
+            .await;
+        assert_eq!(response.action, McpElicitationAction::Accept);
+        assert_eq!(
+            response.content,
+            Some(RuntimeJson::Object(Default::default()))
+        );
+        assert_eq!(router.pending_count(), 0);
+        assert!(!*router.pause_state().subscribe().borrow());
+    }
+
+    #[tokio::test]
+    async fn full_access_does_not_invent_answers_or_authorize_url_flows() {
+        let router = full_access_router();
+        let _query = router.begin_query(AbortSignal::new());
+        let mut form = confirmation();
+        if let McpElicitationRequest::Form {
+            requested_schema, ..
+        } = &mut form
+        {
+            requested_schema.properties.insert(
+                "answer".into(),
+                McpElicitationPrimitiveSchema::Boolean(McpElicitationBooleanSchema {
+                    type_: McpElicitationBooleanType::Boolean,
+                    title: None,
+                    description: None,
+                    default: None,
+                }),
+            );
+        }
+        let extended = McpElicitationRequest::OpenAiForm {
+            meta: None,
+            message: "Confirm extended request".into(),
+            requested_schema: RuntimeJson::Object(Default::default()),
+        };
+        for request in [form, request(), extended] {
+            assert_eq!(
+                router
+                    .route(
+                        "registered-server".into(),
+                        request,
+                        AbortSignal::new(),
+                        AbortSignal::new()
+                    )
+                    .await
+                    .action,
+                McpElicitationAction::Decline
+            );
+        }
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_access_confirmation_preserves_cancellation_and_query_ownership() {
+        let router = full_access_router();
+        assert_eq!(
+            router
+                .route(
+                    "registered-server".into(),
+                    confirmation(),
+                    AbortSignal::new(),
+                    AbortSignal::new()
+                )
+                .await
+                .action,
+            McpElicitationAction::Decline
+        );
+        for source in 0..3 {
+            let turn = AbortSignal::new();
+            let connection = AbortSignal::new();
+            let call = AbortSignal::new();
+            let _query = router.begin_query(turn.clone());
+            [&turn, &connection, &call][source].cancel();
+            assert_eq!(
+                router
+                    .route("registered-server".into(), confirmation(), connection, call)
+                    .await
+                    .action,
+                McpElicitationAction::Cancel
+            );
+        }
+        let child = router.fork_owner();
+        let _child_query = child.begin_query(AbortSignal::new());
+        assert_eq!(
+            child
+                .route(
+                    "registered-server".into(),
+                    confirmation(),
+                    AbortSignal::new(),
+                    AbortSignal::new()
+                )
+                .await
+                .action,
+            McpElicitationAction::Decline
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_reads_live_sandbox_authority_instead_of_a_cached_preset() {
+        let router = full_access_router();
+        let full = Arc::new(AtomicBool::new(true));
+        let current = full.clone();
+        router.set_permission_policy_provider(Arc::new(move || McpElicitationPolicy {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox_mode: if current.load(Ordering::Acquire) {
+                SandboxMode::DangerFullAccess
+            } else {
+                SandboxMode::WorkspaceWrite
+            },
+        }));
+        let _query = router.begin_query(AbortSignal::new());
+        for expected in [McpElicitationAction::Accept, McpElicitationAction::Decline] {
+            let response = router
+                .route(
+                    "registered-server".into(),
+                    confirmation(),
+                    AbortSignal::new(),
+                    AbortSignal::new(),
+                )
+                .await;
+            assert_eq!(response.action, expected);
+            full.store(false, Ordering::Release);
         }
     }
 

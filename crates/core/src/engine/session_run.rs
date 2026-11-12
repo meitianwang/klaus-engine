@@ -829,6 +829,11 @@ impl Session {
         let automatic = this
             .goal_runtime()
             .is_some_and(|goal| goal.is_automatic_turn());
+        let allow_mcp_form_input = !opts.meta_input
+            && !automatic
+            && this.meta.parent_thread_id.is_none()
+            && (this.meta.role.is_none() || this.meta.role == Some(SessionRole::Main))
+            && this.config.task_resource_scope.is_none();
         let turn_goal_metadata = super::TurnGoalMetadata {
             goal_continuation: automatic,
             input_origin: if automatic {
@@ -2174,6 +2179,11 @@ impl Session {
             #[cfg(any(test, feature = "testing"))]
             if let Some(goal) = this2.goal_observation_runtime() { goal.testing_note_phase("mcp.clients"); }
             let plugin_mcp_clients = this2.plugin_mcp_clients().await;
+            if allow_mcp_form_input {
+                this2
+                    .mcp_elicitation_router
+                    .enable_form_input_for_turn(question_generation);
+            }
             if initial_bundle.provider.capabilities(&turn_model).tools && !plugin_mcp_clients.is_empty() {
                 let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
                 let selected = select_web_search(

@@ -1659,16 +1659,22 @@ impl Session {
         let review_policy_owner = Arc::downgrade(&session);
         session
             .mcp_elicitation_router
-            .set_approval_policy_provider(Arc::new(move || {
+            .set_permission_policy_provider(Arc::new(move || {
+                use crate::mcp::elicitation::McpElicitationPolicy;
+                use crate::types::permission::{ApprovalPolicy, SandboxMode};
                 review_policy_owner
                     .upgrade()
                     .map(|session| {
-                        session
-                            .runtime_policy_state()
-                            .approval_policy
-                            .unwrap_or_default()
+                        let state = session.runtime_policy_state();
+                        McpElicitationPolicy {
+                            approval_policy: state.approval_policy.unwrap_or_default(),
+                            sandbox_mode: state.sandbox_mode.unwrap_or(SandboxMode::ReadOnly),
+                        }
                     })
-                    .unwrap_or(crate::types::permission::ApprovalPolicy::Never)
+                    .unwrap_or(McpElicitationPolicy {
+                        approval_policy: ApprovalPolicy::Never,
+                        sandbox_mode: SandboxMode::ReadOnly,
+                    })
             }));
         if let Some(owner) = startup_owner {
             owner
