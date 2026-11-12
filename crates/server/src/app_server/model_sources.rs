@@ -512,11 +512,18 @@ pub fn delete_claude_login(config_root: &Path) -> Result<bool, String> {
 
 /// Remove the login keys from one credential file, deleting the file when
 /// nothing else lives in it. Returns whether anything was removed.
+///
+/// The login is the current account queue as well as the historical token
+/// keys: a prune that only knew the old keys found nothing to remove in an
+/// accounts-only record, reported the logout as failed, and left the queue
+/// keeping the source signed in.
 fn prune_login_from_file(path: &Path) -> Result<bool, String> {
     let Some(mut record) = read_record_file(path)? else {
         return Ok(false);
     };
-    let had = record.remove("claudeAiOauth").is_some() || record.remove("tokens").is_some();
+    let had = record.remove("claudeAiOauth").is_some()
+        || record.remove("tokens").is_some()
+        || record.remove("accounts").is_some();
     if !had {
         return Ok(false);
     }
@@ -2882,6 +2889,43 @@ mod tests {
         // The legacy file loses its login key too — a login left in it would
         // resurrect after the logout — and an emptied file is removed.
         assert!(!root.path().join(".credentials.json").exists());
+    }
+
+    /// A logout clears the current account queue, not just the historical
+    /// token keys: a copy holding only the queue is removed outright, and one
+    /// with unrelated keys beside the queue keeps them.
+    #[test]
+    fn logout_removes_an_accounts_queue() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = claude_subscription_path(root.path());
+        std::fs::write(
+            &path,
+            json!({ "accounts": [ { "id": "a1", "tokens": { "accessToken": "at" } } ] })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(delete_claude_login(root.path()).expect("delete succeeds"));
+        assert!(!path.exists(), "an emptied copy leaves no file behind");
+        assert!(!delete_claude_login(root.path()).expect("second delete succeeds"));
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = claude_subscription_path(root.path());
+        std::fs::write(
+            &path,
+            json!({
+                "account": { "email_address": "kept@example.test" },
+                "accounts": [ { "id": "a1", "tokens": { "accessToken": "at" } } ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(delete_claude_login(root.path()).expect("delete succeeds"));
+        let record = credential_record(root.path()).expect("the copy survives");
+        assert_eq!(
+            record["account"]["email_address"],
+            json!("kept@example.test")
+        );
+        assert!(record.get("accounts").is_none());
     }
 
     #[tokio::test]
