@@ -1181,6 +1181,7 @@ impl ReviewerRequest for ReviewAttempt {
                 system: system.clone(),
                 messages: history.clone(),
                 tools: session.state.tool_specs(&self.setup.target.capabilities),
+                native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 tool_choice: None,
                 max_output_tokens: self.setup.target.capabilities.max_output_tokens,

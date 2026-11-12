@@ -443,6 +443,7 @@ pub(super) fn prepare_with_inference(
         tools,
         // Native deferred-loading lists are bound per-request inside
         // `Shared::prepare`, which owns the exposure/surfaced state.
+        native_deferred_tools: None,
         deferred_tools: Vec::new(),
         tool_choice,
         max_output_tokens,

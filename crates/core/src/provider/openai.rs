@@ -51,6 +51,7 @@ use crate::types::provider::{
 };
 
 mod approval_classifier;
+mod native_tool_loading;
 mod remote_compaction;
 
 /// Fallback per-model input context window when nothing more specific matches.
@@ -1536,14 +1537,28 @@ fn build_responses_params_with_tool_mode(
     function_tools: bool,
 ) -> Result<Value, ProviderError> {
     let structured = req.output_schema.is_some();
+    let native_search = !function_tools
+        && req
+            .native_deferred_tools
+            .or(caps.native_deferred_tools)
+            .unwrap_or_else(|| {
+                super::model_catalog::native_deferred_tools_default("openai", &req.model)
+            });
+    let mut effective_tools = req.tools.clone();
+    if !native_search {
+        for tool in &mut effective_tools {
+            if tool.kind == ToolSpecKind::ToolSearch {
+                tool.kind = ToolSpecKind::Function;
+            }
+        }
+    }
     // Leave stable instructions and history unchanged when guidance changes.
     // Responses supports developer input messages, so the trailing update keeps
     // its instruction authority without pretending to be human input.
     let (stable_parts, volatile_parts) = split_system_for_cache(&req.system);
     let instructions = join_system_parts(stable_parts);
     let profile = openai_behavior_profile(&req.model);
-    let mut tools: Vec<Value> = req
-        .tools
+    let mut tools: Vec<Value> = effective_tools
         .iter()
         .map(|tool| {
             if function_tools {
@@ -1696,7 +1711,7 @@ fn build_responses_params_with_tool_mode(
     if let Some(tc) = &req.tool_choice {
         obj.insert(
             "tool_choice",
-            to_responses_tool_choice(tc, &req.tools, function_tools)?,
+            to_responses_tool_choice(tc, &effective_tools, function_tools)?,
         );
     }
     let mut text = Map::new();
@@ -1722,7 +1737,9 @@ fn build_responses_params_with_tool_mode(
     if let Some(ck) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
         obj.insert("prompt_cache_key", vs(ck.clone()));
     }
-    Ok(Value::Object(obj))
+    let mut body = Value::Object(obj);
+    native_tool_loading::apply_policy(&mut body, req, native_search);
+    Ok(body)
 }
 
 /// Engine-owned adapter replay context is scoped independently of a model id.
@@ -5190,6 +5207,7 @@ async fn establish_stream_with_instruction_role(
 pub struct OpenAIProvider {
     remote_compaction: crate::types::provider::RemoteCompactionSupport,
     instruction_roles: InstructionRoleCache,
+    native_tool_support: super::native_tools::NativeToolSupport,
     info: ProviderInfo,
     client: reqwest::Client,
     classifier_http_client_factory:
@@ -5243,6 +5261,7 @@ impl OpenAIProvider {
         OpenAIProvider {
             remote_compaction: opts.remote_compaction,
             instruction_roles: Arc::new(Mutex::new(HashMap::new())),
+            native_tool_support: Default::default(),
             info,
             client,
             classifier_http_client_factory: opts.classifier_http_client_factory,
@@ -5268,7 +5287,7 @@ impl OpenAIProvider {
     /// the host declared one, else the legacy session-level set. Media limits
     /// belong only to the model the declaration named.
     fn capabilities_for(&self, model: &RuntimeString) -> ModelCapabilities {
-        model
+        let mut capabilities = model
             .try_to_utf8()
             .ok()
             .and_then(|id| self.capabilities_by_model.get(&id))
@@ -5280,9 +5299,17 @@ impl OpenAIProvider {
                     capabilities.supports_image_detail_original = false;
                     capabilities.max_media_blocks = None;
                     capabilities.output_verbosity = None;
+                    capabilities.native_deferred_tools = None;
                 }
                 capabilities
-            })
+            });
+        capabilities.native_deferred_tools =
+            Some(capabilities.native_deferred_tools.unwrap_or_else(|| {
+                self.api == OpenAiApi::Responses
+                    && (self.uses_official_api_catalog() || self.is_codex_subscription_backend())
+                    && super::model_catalog::native_deferred_tools_default("openai", model)
+            }));
+        capabilities
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -5539,6 +5566,7 @@ impl OpenAIProvider {
 
     /// Responses API path (`api: Responses`).
     fn stream_responses(&self, req: ModelRequest, signal: AbortSignal) -> ModelStream {
+        let native_tool_support = self.native_tool_support.clone();
         let instruction_roles = self.instruction_roles.clone();
         let client = self.client.clone();
         let url = self.endpoint("/responses");
@@ -5551,7 +5579,13 @@ impl OpenAIProvider {
         let provider_id = diagnostic_string(&self.info.name);
         let codex_backend = self.uses_responses_backend_format();
         let fast_mode = self.fast_mode;
-        let capabilities = self.capabilities_for(&req.model);
+        let mut capabilities = self.capabilities_for(&req.model);
+        capabilities.native_deferred_tools = req
+            .native_deferred_tools
+            .or(capabilities.native_deferred_tools);
+        if native_tool_support.disabled(&url, &req.model) {
+            capabilities.native_deferred_tools = Some(false);
+        }
         let reasoning_dialect = self.reasoning_dialect;
         let review_effort = self.review_effort.clone();
         let review_stream = self.retry.retry_class_policy
@@ -5559,6 +5593,13 @@ impl OpenAIProvider {
         let reviewer_header_model = self.reviewer_header_model.clone();
         let mut req = req;
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
+        if capabilities.native_deferred_tools != Some(true) {
+            for tool in &mut req.tools {
+                if tool.kind == ToolSpecKind::ToolSearch {
+                    tool.kind = ToolSpecKind::Function;
+                }
+            }
+        }
         let s = async_stream::stream! {
             let auth = match remote_compaction::scope_auth(auth, native_scope, api_key.as_deref(), &signal).await {
                 Ok(auth) => auth,
@@ -5622,7 +5663,11 @@ impl OpenAIProvider {
             }
             // Surface every establishment retry while its backoff sleeps.
             let (retry, retry_rx) = observe_retries(retry);
-            let establish = establish_stream_with_instruction_role(client, url, body, auth, api_key, extra_headers, retry, signal.clone(), (interceptor, provider_id, diagnostic_string(&req.model)), (instruction_roles, req.model.clone(), compatibility.as_ref().and_then(OpenAICompatibilityOptions::instruction_role)));
+            let establish = native_tool_loading::establish(native_tool_loading::Transport {
+                client, url, auth, api_key, extra_headers, retry, signal: signal.clone(),
+                interception: (interceptor, provider_id, diagnostic_string(&req.model)),
+                role_state: (instruction_roles, req.model.clone(), compatibility.as_ref().and_then(OpenAICompatibilityOptions::instruction_role)),
+            }, body, &req, native_tool_support);
             let mut establish = std::pin::pin!(establishment_steps(establish, retry_rx));
             let mut established = None;
             while let Some(step) = establish.next().await {
@@ -5864,6 +5909,8 @@ impl ModelProvider for OpenAIProvider {
         signal: AbortSignal,
     ) -> ModelStream {
         let mut selected = self.clone();
+        let mut req = req;
+        req.native_deferred_tools = metadata.native_deferred_tools;
         selected.reviewer_header_model = self.reviewer_attribution_model();
 
         let model = match req.model.try_to_utf8() {
@@ -6846,7 +6893,10 @@ mod tests {
     fn responses_params_default(req: &ModelRequest) -> Result<Value, ProviderError> {
         build_responses_params(
             req,
-            &ModelCapabilities::default(),
+            &ModelCapabilities {
+                native_deferred_tools: Some(true),
+                ..Default::default()
+            },
             OpenAiReasoningDialect::OpenAi,
         )
     }
@@ -6862,6 +6912,7 @@ mod tests {
             system: vec![],
             messages: vec![],
             tools: vec![],
+            native_deferred_tools: None,
             deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1000,
@@ -7397,6 +7448,11 @@ mod tests {
         let responses = OpenAIProvider::new(OpenAIProviderOptions {
             api: Some(OpenAiApi::Responses),
             auth_source: Some(responses_auth.clone()),
+            default_model: Some("gpt-4o".into()),
+            capabilities: Some(ModelCapabilities {
+                native_deferred_tools: Some(true),
+                ..Default::default()
+            }),
             retry: Some(RetryOptions {
                 max_attempts: Some(1),
                 ..Default::default()
@@ -9187,6 +9243,222 @@ mod tests {
           {"type":"custom","kind":"custom","name":"ignored","description":"Ignored","inputSchema":{"type":"object"}},
           {"type":"namespace","name":"empty","tools":[{"type":"custom","name":"ignored"}]}
         ]})
+    }
+
+    #[test]
+    fn native_search_definitions_are_not_redeclared_eagerly() {
+        let mut request = base_req();
+        request.tools = vec![function_spec("read", "Read", schema_obj())];
+        request.messages = vec![
+            assistant_tool_search("s1", json!({"query":"read"})),
+            tool_search_result(
+                "s1",
+                json!({"tools":[
+                    {"name":"read","description":"Read","inputSchema":{"type":"object"}}
+                ]}),
+            ),
+        ];
+        let body = build_responses_params(
+            &request,
+            &ModelCapabilities {
+                native_deferred_tools: Some(true),
+                ..Default::default()
+            },
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        eprintln!(
+            "native search request: {:?}",
+            runtime_json::stringify(&body)
+        );
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.get("type") == Some(&json!("tool_search_output"))));
+        assert!(!body["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| tool.get("name") == Some(&json!("read")))));
+    }
+
+    #[test]
+    fn native_search_downgrade_preserves_other_native_features_and_avoids_schema_echo() {
+        let mut request = base_req();
+        request.tools = vec![
+            tool_search_spec("tool_search", "Find tools", schema_obj()),
+            function_spec("read", "Read", schema_obj()),
+            text_spec("apply_patch", "Apply changes"),
+        ];
+        request.messages = vec![
+            assistant_tool_search("s1", json!({"query":"read"})),
+            tool_search_result("s1", native_search_output_fixture()),
+        ];
+        request.web_search = Some(Default::default());
+        request.output_schema = Some(schema_obj());
+        let mut body = build_responses_params(
+            &request,
+            &ModelCapabilities {
+                native_deferred_tools: Some(true),
+                ..Default::default()
+            },
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        body["reasoning"] = json!({"effort":"high","summary":"auto"});
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        let before = body.clone();
+        native_tool_loading::apply_policy(&mut body, &request, false);
+        for key in [
+            "text",
+            "reasoning",
+            "include",
+            "model",
+            "store",
+            "max_output_tokens",
+        ] {
+            assert_eq!(body[key], before[key], "{key}");
+        }
+        for kind in ["custom", "web_search"] {
+            let select = |value: &Value| {
+                value["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["type"].as_str().is_some_and(|value| value == kind))
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(select(&body), select(&before));
+        }
+        assert_eq!(body["input"][1]["type"], json!("function_call_output"));
+        assert_eq!(body["input"][1]["output"], json!("search complete"));
+        assert_eq!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool.get("name") == Some(&json!("read")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_channel_projection_matrix_keeps_active_definitions_across_history_and_compaction() {
+        let rows: Vec<(String, String, bool)> = match std::env::var("KLAUS_NATIVE_TOOL_MATRIX") {
+            Ok(path) => {
+                let document: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                document["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["source"].as_str().unwrap().to_owned(),
+                            row["model"].as_str().unwrap().to_owned(),
+                            row["expectedNative"].as_bool().unwrap(),
+                        )
+                    })
+                    .collect()
+            }
+            Err(_) => vec![
+                ("subscription".into(), "claude-opus-5-5".into(), true),
+                ("subscription".into(), "claude-haiku-5-5".into(), false),
+                ("codex".into(), "gpt-6.1-sol".into(), true),
+                ("api/openai/responses".into(), "gpt-4o".into(), false),
+                ("cursor".into(), "gpt-6.1-sol".into(), false),
+            ],
+        };
+        let anthropic = crate::provider::anthropic::AnthropicProvider::new(
+            crate::provider::anthropic::AnthropicProviderOptions::default(),
+        );
+        let official = OpenAIProvider::new(OpenAIProviderOptions {
+            api: Some(OpenAiApi::Responses),
+            api_key: Some("fixture".into()),
+            ..Default::default()
+        });
+        let gateway = OpenAIProvider::new(OpenAIProviderOptions {
+            api: Some(OpenAiApi::Responses),
+            api_key: Some("fixture".into()),
+            base_url: Some("https://gateway.example/v1".into()),
+            ..Default::default()
+        });
+        let mut results = Vec::new();
+        for (source, model, expected) in rows {
+            let selected: RuntimeString = model.clone().into();
+            let caps = if source == "subscription" {
+                anthropic.model_metadata(&selected)
+            } else if source == "codex" || source == "api/openai/responses" {
+                official.model_metadata(&selected)
+            } else {
+                gateway.model_metadata(&selected)
+            };
+            assert_eq!(
+                caps.native_deferred_tools,
+                Some(expected),
+                "{source}/{model}"
+            );
+            let mut request = base_req();
+            request.model = selected;
+            request.tools = vec![
+                tool_search_spec("tool_search", "Find tools", schema_obj()),
+                function_spec("read", "Read", schema_obj()),
+            ];
+            let searched = vec![
+                assistant_tool_search("s1", json!({"query":"read"})),
+                tool_search_result(
+                    "s1",
+                    json!({"tools":[{"name":"read","description":"Read","inputSchema":{"type":"object"}}]}),
+                ),
+            ];
+            for stage in ["searched", "later-turn", "compacted"] {
+                request.messages = if stage == "compacted" {
+                    vec![Message::CompactBoundary(CompactBoundaryMessage {
+                        uuid: "compact".into(),
+                        summary: "Retain the active tool state".into(),
+                        native_compaction: None,
+                    })]
+                } else {
+                    searched.clone()
+                };
+                if stage == "later-turn" {
+                    request
+                        .messages
+                        .push(user_msg("Use the already loaded tool"));
+                }
+                let body = build_responses_params(&request, &caps, OpenAiReasoningDialect::OpenAi)
+                    .unwrap();
+                let input = body["input"].as_array().unwrap();
+                let has_native = input
+                    .iter()
+                    .any(|item| item.get("type") == Some(&json!("tool_search_output")));
+                assert_eq!(
+                    has_native,
+                    expected && stage != "compacted",
+                    "{source}/{model}/{stage}"
+                );
+                let eager = body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|tool| tool.get("name") == Some(&json!("read")))
+                    .count();
+                assert_eq!(
+                    eager,
+                    usize::from(!expected || stage == "compacted"),
+                    "{source}/{model}/{stage}"
+                );
+            }
+            results.push(serde_json::json!({"source":source,"model":model,"native":expected,"projection":"passed","stages":["searched","later-turn","compacted"],"live":"not_run"}));
+        }
+        eprintln!(
+            "native channel projection matrix: {} rows passed",
+            results.len()
+        );
+        if let Ok(path) = std::env::var("KLAUS_NATIVE_TOOL_MATRIX_RESULT") {
+            std::fs::write(path, serde_json::to_string_pretty(&results).unwrap()).unwrap();
+        }
     }
 
     #[test]

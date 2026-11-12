@@ -306,6 +306,7 @@ impl Session {
             system,
             messages,
             tools,
+            native_deferred_tools: None,
             deferred_tools: Vec::new(),
             tool_choice: None,
             max_output_tokens: config.max_output_tokens.unwrap_or(20_000),

@@ -733,6 +733,9 @@ pub struct ModelRequest {
     /// `defer_loading`) send these alongside `tools`; other providers ignore
     /// them. Native-only binding like `supports_image_detail_original`: never
     /// serialized, and decoded requests start with an empty list.
+    /// Frozen source/model policy bound at the provider send boundary. Internal
+    /// only: ordinary decoded requests leave it unset.
+    pub native_deferred_tools: Option<bool>,
     pub deferred_tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
@@ -899,6 +902,7 @@ impl RuntimeDecode for ModelRequest {
                 system: object.required("system", &[])?,
                 messages: object.required("messages", &[])?,
                 tools: object.required("tools", &[])?,
+                native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 tool_choice: object.optional("toolChoice", &[])?,
                 max_output_tokens: object.required("maxOutputTokens", &[])?,
@@ -1700,13 +1704,15 @@ impl RuntimeDecode for ReasoningSummary {
     }
 }
 
-/// The per-model capability set the CLIENT declares at session init. The engine
-/// never infers these from the model id: a provider reads exactly what was
-/// declared, and every absent/false field means "not supported". This is what
-/// lets each model source own its own model system without the engine keeping a
-/// model-id table.
+/// Per-model declarations supplied at session init or by a source catalog.
+/// Explicit declarations are authoritative. Fields with compatibility defaults
+/// document their absent-field behavior individually; no provider infers a new
+/// model's support from a version number.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelCapabilities {
+    /// Native deferred-tool protocol support for this exact model and source.
+    /// An explicit false overrides the offline compatibility baseline.
+    pub native_deferred_tools: Option<bool>,
     /// Tool/function calling. None keeps the provider's backward-compatible
     /// default; false explicitly keeps a plain-chat model tool-free.
     pub tools: Option<bool>,
@@ -1843,6 +1849,9 @@ impl RuntimeDecode for ThinkingCapability {
 impl RuntimeEncode for ModelCapabilities {
     fn encode_runtime(&self, out: &mut RuntimeEncoder) -> Result<(), RuntimeCodecError> {
         let mut object = RuntimeObjectEncoder::new();
+        if let Some(value) = self.native_deferred_tools {
+            object.field("nativeDeferredTools", &value)?;
+        }
         if let Some(value) = &self.tools {
             object.field("tools", value)?;
         }
@@ -1950,6 +1959,7 @@ impl RuntimeDecode for ModelCapabilities {
     fn decode_runtime(value: &RuntimeJson) -> Result<Self, RuntimeCodecError> {
         runtime_codec::decode_object(value, false, |object| {
             Ok(Self {
+                native_deferred_tools: object.optional("nativeDeferredTools", &[])?,
                 tools: object.optional("tools", &[])?,
                 forced_tool_choice_with_thinking: object
                     .optional("forcedToolChoiceWithThinking", &[])?,
@@ -2198,6 +2208,7 @@ pub trait ModelProvider: Send + Sync {
     ) -> ModelStream {
         let mut req = req;
         req.max_output_tokens = metadata.clamp_output_tokens(req.max_output_tokens);
+        req.native_deferred_tools = metadata.native_deferred_tools;
         if let Err(error) =
             crate::provider::review_target::apply_typed_review_effort(&mut req, raw_effort.as_ref())
         {

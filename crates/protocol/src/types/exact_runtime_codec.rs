@@ -951,6 +951,7 @@ impl_runtime_struct!(ProtocolModelCapabilitiesEntry, deny_unknown: true, {
 });
 
 impl_runtime_struct!(ModelCapabilitiesInit, deny_unknown: true, {
+    native_deferred_tools => "nativeDeferredTools": optional,
     tools => "tools": optional,
     forced_tool_choice_with_thinking => "forcedToolChoiceWithThinking": optional,
     effort => "effort": optional,

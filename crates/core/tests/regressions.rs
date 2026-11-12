@@ -13,6 +13,9 @@
 #[path = "regressions/r20261112_full_access_mcp_confirmation.rs"]
 mod r20261112_full_access_mcp_confirmation;
 
+#[path = "regressions/r20261112_native_tool_negotiation.rs"]
+mod r20261112_native_tool_negotiation;
+
 #[path = "regressions/r20261104_native_compaction_retry.rs"]
 mod r20261104_native_compaction_retry;
 

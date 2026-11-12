@@ -454,6 +454,7 @@ pub struct AnthropicProvider {
     capabilities: ModelCapabilities,
     /// Per-model overrides consulted before `capabilities` (see the options).
     capabilities_by_model: HashMap<String, ModelCapabilities>,
+    native_tool_support: super::native_tools::NativeToolSupport,
 }
 
 impl AnthropicProvider {
@@ -532,26 +533,38 @@ impl AnthropicProvider {
             interceptor: opts.interceptor,
             capabilities: opts.capabilities.unwrap_or_default(),
             capabilities_by_model: opts.capabilities_by_model.unwrap_or_default(),
+            native_tool_support: Default::default(),
         }
     }
 
     /// The capability set for ONE request's model: the per-model override when
     /// the host declared one, else the session-level set.
     fn capabilities_for(&self, model: &RuntimeString) -> ModelCapabilities {
-        if let Some(caps) = model
+        let declared = model
             .try_to_utf8()
             .ok()
-            .and_then(|id| self.capabilities_by_model.get(&id))
-        {
-            return caps.clone();
-        }
-        let mut caps = self.capabilities.clone();
-        if model != &self.info.default_model {
+            .and_then(|id| self.capabilities_by_model.get(&id));
+        let mut caps = declared
+            .cloned()
+            .unwrap_or_else(|| self.capabilities.clone());
+        if declared.is_none() && model != &self.info.default_model {
             caps.fast_mode = false;
             caps.image_limits = None;
             caps.max_media_blocks = None;
+            caps.native_deferred_tools = None;
         }
+        caps.native_deferred_tools = Some(caps.native_deferred_tools.unwrap_or_else(|| {
+            self.is_first_party
+                && super::model_catalog::native_deferred_tools_default("anthropic", model)
+        }));
         caps
+    }
+
+    fn native_deferred_tools_enabled(&self, model: &RuntimeString, bound: Option<bool>) -> bool {
+        self.vertex.is_none()
+            && self.bedrock.is_none()
+            && bound.or(self.capabilities_for(model).native_deferred_tools) == Some(true)
+            && !self.native_tool_support.disabled(&self.messages_url, model)
     }
 
     /// The resolved model/source limits used by admission and final validation.
@@ -712,7 +725,7 @@ impl AnthropicProvider {
             req,
             req.output_schema.is_some(),
             false,
-            self.is_first_party && model_supports_deferred_tool_loading(&req.model),
+            self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools),
             self.structured_output_mode(req),
             self.requires_claude_code_identity(),
             image_limits,
@@ -797,6 +810,7 @@ impl ModelProvider for AnthropicProvider {
         signal: AbortSignal,
     ) -> ModelStream {
         let mut req = req;
+        req.native_deferred_tools = metadata.native_deferred_tools;
         if let Err(error) =
             crate::provider::review_target::apply_typed_review_effort(&mut req, raw_effort.as_ref())
         {
@@ -861,7 +875,7 @@ impl ModelProvider for AnthropicProvider {
             &request,
             request.output_schema.is_some(),
             cache_scope_enabled,
-            self.is_first_party && model_supports_deferred_tool_loading(&request.model),
+            self.native_deferred_tools_enabled(&request.model, request.native_deferred_tools),
             output_mode,
             self.requires_claude_code_identity(),
             image_limits,
@@ -1055,7 +1069,8 @@ impl ModelProvider for AnthropicProvider {
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
         let output_mode = self.structured_output_mode(&req);
         let defer_loading_supported =
-            is_first_party && model_supports_deferred_tool_loading(&req.model);
+            self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
+        let native_tool_support = self.native_tool_support.clone();
 
         let s = async_stream::stream! {
             let structured = req.output_schema.is_some();
@@ -1248,6 +1263,7 @@ impl ModelProvider for AnthropicProvider {
                 context_hints: Mutex::new(context_hints),
                 hint_messages: req.messages.clone(),
                 hint_model: req.model.clone(),
+                native_tool_support,
                 emits_global: emits_global_scope,
                 use_native,
                 vertex: uses_vertex,
@@ -1573,6 +1589,7 @@ struct AttemptCtx {
     context_hints: Mutex<ContextHintController>,
     hint_messages: Vec<Message>,
     hint_model: RuntimeString,
+    native_tool_support: super::native_tools::NativeToolSupport,
     emits_global: bool,
     use_native: bool,
     /// Vertex routing: the API version travels in the body, so suppress the
@@ -1745,6 +1762,27 @@ async fn attempt_with_media_remediation(
             ),
         }
         if let Err(raw) = &result {
+            if !signal.is_cancelled()
+                && super::native_tools::unsupported_native_tools(raw.status, &raw.message)
+            {
+                let downgraded = {
+                    let mut body = ctx.body.lock_recover();
+                    let mut changed = false;
+                    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+                        tools.retain(|tool| {
+                            let deferred =
+                                tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
+                            changed |= deferred;
+                            !deferred
+                        });
+                    }
+                    changed
+                };
+                if downgraded {
+                    ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
+                    continue;
+                }
+            }
             if !signal.is_cancelled() {
                 let adjusted = reduce_output_reservation(&mut ctx.body.lock_recover(), raw);
                 if let Some(output_tokens) = adjusted {
@@ -2423,60 +2461,9 @@ fn model_returns_thinking_summaries(model: &RuntimeString) -> bool {
     })
 }
 
-/// First-party Anthropic models that implement native deferred tool loading
-/// (`defer_loading` on tool definitions). Mirrors the model-id parsing of
-/// [`model_returns_thinking_summaries`]; the haiku family is excluded and the
-/// version floor is 4.5.
+#[cfg(test)]
 fn model_supports_deferred_tool_loading(model: &RuntimeString) -> bool {
-    if model.len_utf16() > 128 {
-        return false;
-    }
-    let Ok(model) = model.try_to_utf8() else {
-        return false;
-    };
-    let normalized = model.strip_suffix("[1m]").unwrap_or(&model);
-    let Some(rest) = normalized.strip_prefix("claude-") else {
-        return false;
-    };
-    let fields = rest.split('-').collect::<Vec<_>>();
-    if !(2..=6).contains(&fields.len()) {
-        return false;
-    }
-    let family = |name: &str| matches!(name, "opus" | "sonnet" | "haiku");
-    let (family_name, major, suffix) = if family(fields[0]) {
-        (fields[0], fields[1], &fields[2..])
-    } else if family(fields[1]) {
-        (fields[1], fields[0], &fields[2..])
-    } else {
-        return false;
-    };
-    // The haiku family does not implement deferred tool loading.
-    if family_name == "haiku" {
-        return false;
-    }
-    if major.len() > 2 || major.starts_with('0') || !major.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    if !suffix.iter().enumerate().all(|(index, field)| {
-        (*field == "latest" && index + 1 == suffix.len())
-            || (!field.is_empty()
-                && field.len() <= 8
-                && field.bytes().all(|byte| byte.is_ascii_digit()))
-    }) {
-        return false;
-    }
-    let Some(major) = major.parse::<u8>().ok() else {
-        return false;
-    };
-    // A date suffix ("20250929") is not a minor version; only a short numeric
-    // field directly after the major version counts.
-    let minor = suffix
-        .first()
-        .filter(|field| field.len() <= 2)
-        .and_then(|field| field.parse::<u8>().ok())
-        .unwrap_or(0);
-    major > 4 || (major == 4 && minor >= 5)
+    super::model_catalog::native_deferred_tools_default("anthropic", model)
 }
 
 struct ThinkingSummaryState {
@@ -4171,6 +4158,7 @@ mod tests {
             system: vec![sys("You are helpful.")],
             messages: vec![user_msg("hi")],
             tools: vec![],
+            native_deferred_tools: None,
             deferred_tools: vec![],
             tool_choice: None,
             max_output_tokens: 1024,

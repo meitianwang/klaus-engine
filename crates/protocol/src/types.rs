@@ -1316,6 +1316,8 @@ pub struct ProtocolModelCapabilitiesEntry {
 /// the engine's providers read instead of a model-id table).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelCapabilitiesInit {
+    /// Exact model/source support for native deferred-tool wire items.
+    pub native_deferred_tools: Option<bool>,
     /// Tool/function calling. Absent keeps the provider's backward-compatible
     /// default; false explicitly keeps a plain-chat model tool-free.
     pub tools: Option<bool>,

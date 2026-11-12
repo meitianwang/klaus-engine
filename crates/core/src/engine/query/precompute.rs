@@ -105,6 +105,7 @@ struct NativeCandidate {
     prefix_hash: [u8; 32],
     system: Vec<crate::types::provider::SystemPromptPart>,
     tools: Vec<crate::types::provider::ToolSpec>,
+    native_deferred_tools: Option<bool>,
     deferred_tools: Vec<crate::types::provider::ToolSpec>,
 }
 
@@ -212,6 +213,7 @@ impl PrecomputeRegistry {
                 source: arm.config.model_source.clone(),
                 system: arm.request.system.clone(),
                 tools: arm.request.tools.clone(),
+                native_deferred_tools: arm.request.native_deferred_tools,
                 deferred_tools: arm.request.deferred_tools.clone(),
             })
         } else {
@@ -386,6 +388,7 @@ impl PrecomputeRegistry {
                         && request.system == native.system
                         && request.tools == native.tools
                         && request.deferred_tools == native.deferred_tools
+                        && request.native_deferred_tools == native.native_deferred_tools
                         && messages_now.len() >= native.prefix_len
                         && history_hash(&messages_now[..native.prefix_len])
                             == Some(native.prefix_hash)
@@ -762,6 +765,7 @@ mod tests {
                 system: Vec::new(),
                 messages: Vec::new(),
                 tools: Vec::new(),
+                native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 tool_choice: None,
                 max_output_tokens: 100,

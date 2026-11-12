@@ -17,6 +17,7 @@ pub mod model_catalog;
 pub mod model_fallback;
 pub mod native_compaction;
 pub mod native_media;
+pub(crate) mod native_tools;
 pub mod oauth;
 pub mod observability;
 pub mod openai;

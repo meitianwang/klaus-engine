@@ -465,6 +465,7 @@ pub(crate) async fn ids(config_root: &Path) -> Option<Vec<String>> {
 /// than a number invented here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelLimits {
+    pub native_deferred_tools: Option<bool>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
     pub output_verbosity: Option<klaus_agent_core::types::provider::OutputVerbosity>,
@@ -548,6 +549,7 @@ pub(crate) fn limits_from_entry(entry: &Value) -> ModelLimits {
         })
         .map(|levels| spellable_effort_levels(&levels));
     ModelLimits {
+        native_deferred_tools: entry.get("nativeDeferredTools").and_then(Value::as_bool),
         context_window: entry
             .get("contextWindow")
             .or_else(|| entry.get("maxContextWindow"))
@@ -787,6 +789,14 @@ pub(crate) fn parse(body: &Value) -> Vec<Value> {
             model.insert("visibility".into(), json!(visibility));
         }
         for (target, keys) in [
+            (
+                "nativeDeferredTools",
+                &[
+                    "native_deferred_tools",
+                    "nativeDeferredTools",
+                    "supports_tool_search",
+                ][..],
+            ),
             (
                 "autoReviewModelOverride",
                 &["auto_review_model_override", "autoReviewModelOverride"][..],

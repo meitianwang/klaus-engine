@@ -12544,6 +12544,7 @@ fn model_capabilities_from_init(init: Option<&ModelCapabilitiesInit>) -> ModelCa
         return ModelCapabilities::default();
     };
     ModelCapabilities {
+        native_deferred_tools: init.native_deferred_tools,
         tools: init.tools,
         forced_tool_choice_with_thinking: init.forced_tool_choice_with_thinking,
         output_verbosity: init.output_verbosity,
@@ -12658,6 +12659,44 @@ mod output_verbosity_mapping_tests {
         assert!(
             runtime_codec::decode_text::<ModelCapabilitiesInit>(&RuntimeString::from(
                 r#"{"forcedToolChoiceWithThinking":"false"}"#,
+            ))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_init_preserves_exact_native_tool_capabilities_and_explicit_false() {
+        let init: ProtocolSessionInit = runtime_codec::decode_text(&RuntimeString::from(
+            r#"{"provider":{"type":"openai","model":"main","api":"responses"},"auth":{"type":"api_key","key":"fixture-only"},"capabilities":{"nativeDeferredTools":false},"capabilitiesByModel":[{"model":"future-model","capabilities":{"nativeDeferredTools":true}}]}"#,
+        )).unwrap();
+        let encoded = runtime_codec::encode_value(&init).unwrap();
+        let restored: ProtocolSessionInit = runtime_codec::decode_value(&encoded).unwrap();
+        let provider = provider_from_init(&restored, None).await.unwrap().unwrap();
+        assert_eq!(
+            provider
+                .model_metadata(&"main".into())
+                .native_deferred_tools,
+            Some(false)
+        );
+        assert_eq!(
+            provider
+                .model_metadata(&"future-model".into())
+                .native_deferred_tools,
+            Some(true)
+        );
+        assert_eq!(
+            provider
+                .model_metadata(&"unlisted-model".into())
+                .native_deferred_tools,
+            Some(false)
+        );
+        assert_eq!(
+            model_capabilities_from_init(None).native_deferred_tools,
+            None
+        );
+        assert!(
+            runtime_codec::decode_text::<ModelCapabilitiesInit>(&RuntimeString::from(
+                r#"{"nativeDeferredTools":"false"}"#
             ))
             .is_err()
         );

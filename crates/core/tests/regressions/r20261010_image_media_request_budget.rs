@@ -88,6 +88,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         system: vec![],
         messages,
         tools: vec![],
+        native_deferred_tools: None,
         deferred_tools: Vec::new(),
         tool_choice: None,
         max_output_tokens: 64,

@@ -215,6 +215,9 @@ fn merge_review_catalog_metadata(
     catalog.used_fallback_model_metadata |= declared.used_fallback_model_metadata;
     catalog.model_specialty = declared.model_specialty.or(catalog.model_specialty);
     catalog.supports_image_detail_original |= declared.supports_image_detail_original;
+    catalog.native_deferred_tools = declared
+        .native_deferred_tools
+        .or(catalog.native_deferred_tools);
     catalog.tools = declared.tools.or(catalog.tools);
     catalog.forced_tool_choice_with_thinking = declared
         .forced_tool_choice_with_thinking
@@ -1567,6 +1570,9 @@ pub(crate) fn codex_capabilities(limits: super::codex_catalog::ModelLimits) -> V
         "vision": true,
         "reasoningDialect": "openai",
     });
+    if let Some(native) = limits.native_deferred_tools {
+        capabilities["nativeDeferredTools"] = json!(native);
+    }
     // An empty ladder declares NO effort knob, which is a different statement
     // from "the full ladder" — omit the key entirely so the provider reads it as
     // absent capability rather than an empty list.

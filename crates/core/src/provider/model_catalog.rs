@@ -29,6 +29,58 @@ use crate::types::provider::{
     ModelStreamEvent, ProviderCapabilities, ProviderInfo, DEFAULT_MAX_MEDIA_BLOCKS,
 };
 
+/// Offline native-tool facts. Exact declarations override these compatibility
+/// defaults; unlisted models remain on the ordinary function-tool protocol.
+/// This lookup deliberately does not infer capabilities from version numbers.
+pub(crate) fn native_deferred_tools_default(provider: &str, model: &RuntimeString) -> bool {
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    let models: &[&str] = match provider {
+        "anthropic" => &[
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5-latest",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-7",
+            "claude-sonnet-4-8",
+            "claude-sonnet-4-9",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-5-latest",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-4-9",
+            "claude-opus-5",
+            "claude-opus-5-5",
+        ],
+        "openai" => &[
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ],
+        _ => &[],
+    };
+    let exact = if provider == "anthropic" {
+        model.strip_suffix("[1m]").unwrap_or(&model)
+    } else {
+        &model
+    };
+    models.contains(&exact)
+}
+
 /// Environment variable naming the remote catalog document URL. Unset means
 /// the engine never fetches — the disk cache and built-ins still apply.
 pub const MODEL_CATALOG_URL_ENV: &str = "KLAUS_MODEL_CATALOG_URL";
@@ -42,6 +94,7 @@ pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 /// Field-level capability overrides. Absent fields keep the built-in value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityOverrides {
+    pub native_deferred_tools: Option<bool>,
     pub streaming: Option<bool>,
     pub tools: Option<bool>,
     pub thinking: Option<bool>,
@@ -101,6 +154,9 @@ impl CapabilityOverrides {
 impl RuntimeEncode for CapabilityOverrides {
     fn encode_runtime(&self, out: &mut RuntimeEncoder) -> Result<(), RuntimeCodecError> {
         let mut object = RuntimeObjectEncoder::new();
+        if let Some(value) = self.native_deferred_tools {
+            object.field("nativeDeferredTools", &value)?;
+        }
         if let Some(value) = &self.streaming {
             object.field("streaming", value)?;
         }
@@ -146,6 +202,7 @@ impl RuntimeDecode for CapabilityOverrides {
         // Permissive: a newer document may carry fields this engine ignores.
         runtime_codec::decode_object(value, false, |object| {
             Ok(Self {
+                native_deferred_tools: object.optional("nativeDeferredTools", &[])?,
                 streaming: object.optional("streaming", &[])?,
                 tools: object.optional("tools", &[])?,
                 thinking: object.optional("thinking", &[])?,
@@ -377,6 +434,18 @@ impl ModelCatalog {
             entry.overrides.apply(&mut resolved);
         }
         resolved
+    }
+
+    fn native_deferred_tools(&self, provider: &str, model: &str) -> Option<bool> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .document
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.match_kind == CatalogMatch::Exact && entry.matches(provider, model))
+            .and_then(|entry| entry.overrides.native_deferred_tools)
     }
 
     /// The configured remote source, when any.
@@ -849,6 +918,7 @@ impl ModelProvider for CapturedModelProvider {
             return crate::provider::native_media::rejected_stream(error);
         }
         req.bind_media_capabilities(capabilities);
+        req.native_deferred_tools = metadata.native_deferred_tools;
         self.inner.stream(req, signal)
     }
 
@@ -1000,6 +1070,14 @@ impl ModelProvider for CatalogModelProvider {
             self.inner.effective_context_window_percent(model),
         ));
         metadata.auto_compact_token_limit = self.inner.model_auto_compact_token_limit(model);
+        if let (Ok(provider), Ok(model)) =
+            (self.inner.info().name.try_to_utf8(), model.try_to_utf8())
+        {
+            metadata.native_deferred_tools = self
+                .catalog
+                .native_deferred_tools(&provider, &model)
+                .or(metadata.native_deferred_tools);
+        }
         metadata
     }
     fn offline_model_catalog(&self) -> Vec<(RuntimeString, ModelCapabilities)> {
@@ -1082,6 +1160,9 @@ impl ModelProvider for CatalogModelProvider {
                     .max_media_blocks
                     .unwrap_or(DEFAULT_MAX_MEDIA_BLOCKS),
             );
+        }
+        if req.native_deferred_tools.is_none() {
+            req.native_deferred_tools = self.model_metadata(&req.model).native_deferred_tools;
         }
         self.inner.stream(req, signal)
     }
@@ -1371,6 +1452,88 @@ mod tests {
         assert_eq!(sent[0].max_media_blocks.unwrap().get(), 42);
         assert_eq!(sent[1].image_limits, Some(ImageLimits::default()));
         assert_eq!(sent[1].max_media_blocks.unwrap().get(), 42);
+    }
+
+    #[tokio::test]
+    async fn native_tool_policy_is_exact_scoped_and_frozen_at_capture() {
+        use futures::StreamExt;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = Arc::new(RecordingMediaProvider {
+            info: ProviderInfo {
+                name: "fixture".into(),
+                default_model: "main".into(),
+                base_url: None,
+                env_key: None,
+            },
+            requests: requests.clone(),
+        });
+        let catalog = catalog_with(vec![
+            entry(
+                "fixture",
+                "main",
+                CatalogMatch::Exact,
+                CapabilityOverrides {
+                    native_deferred_tools: Some(true),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "fixture",
+                "unlisted-",
+                CatalogMatch::Prefix,
+                CapabilityOverrides {
+                    native_deferred_tools: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let live = with_model_catalog(inner, catalog.clone());
+        let frozen = capture_model_provider(live.clone(), &["main".into()]);
+        catalog.state.write().unwrap().document.entries[0]
+            .overrides
+            .native_deferred_tools = Some(false);
+        assert_eq!(
+            frozen.model_metadata(&"main".into()).native_deferred_tools,
+            Some(true)
+        );
+        assert_eq!(
+            live.model_metadata(&"main".into()).native_deferred_tools,
+            Some(false)
+        );
+        assert_eq!(
+            live.model_metadata(&"unlisted-model".into())
+                .native_deferred_tools,
+            None
+        );
+        let request: ModelRequest = runtime_codec::decode_text(&RuntimeString::from(
+            r#"{"model":"main","system":[],"messages":[],"tools":[],"maxOutputTokens":100}"#,
+        ))
+        .unwrap();
+        frozen
+            .stream(request.clone(), AbortSignal::new())
+            .collect::<Vec<_>>()
+            .await;
+        live.stream(request, AbortSignal::new())
+            .collect::<Vec<_>>()
+            .await;
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent[0].native_deferred_tools, Some(true));
+        assert_eq!(sent[1].native_deferred_tools, Some(false));
+        let metadata = ModelCapabilities {
+            native_deferred_tools: Some(false),
+            ..Default::default()
+        };
+        let encoded = runtime_codec::encode_value(&metadata).unwrap();
+        assert_eq!(
+            encoded.get("nativeDeferredTools"),
+            Some(&crate::runtime_values::RuntimeJson::Bool(false))
+        );
+        assert_eq!(
+            runtime_codec::decode_value::<ModelCapabilities>(&encoded)
+                .unwrap()
+                .native_deferred_tools,
+            Some(false)
+        );
     }
 
     #[tokio::test]
