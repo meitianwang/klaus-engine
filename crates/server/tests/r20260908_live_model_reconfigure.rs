@@ -1237,15 +1237,15 @@ async fn live_model_reconfigure_keeps_ephemeral_state_and_routes_turns_and_compa
     let history_before_title = source.history();
     source.generate_title(None, None, false).await.unwrap();
     let title = provider.requests.lock().unwrap().last().unwrap().clone();
-    assert_eq!(title["model"], "fixture-low");
-    assert_eq!(title["max_tokens"], 256);
+    assert_eq!(title["model"], "fixture-next");
+    assert_eq!(title["max_tokens"], 2048);
     assert_eq!(
-        title["thinking"]["type"], "disabled",
-        "compatible structured output explicitly disables thinking"
+        title["thinking"]["type"], "adaptive",
+        "the selected model requires adaptive thinking"
     );
-    assert!(
-        title["output_config"].get("effort").is_none(),
-        "the low model has its own effort capability table"
+    assert_eq!(
+        title["output_config"]["effort"], "low",
+        "title generation uses the selected model's lowest declared effort"
     );
     assert_eq!(source.history(), history_before_title);
     fixture.close().await;

@@ -5573,8 +5573,14 @@ mod tests {
             Some(recording_call_model(requests.clone())),
             None,
         );
+        let parent = agent.start_session(StartSessionOptions {
+            id: Some("sess-1".into()),
+            initial_history: Some(store.resume("sess-1").await.unwrap().messages),
+            ..Default::default()
+        });
+        let snapshot = parent.side_task_snapshot().unwrap();
         let side = agent
-            .create_side_task(store.clone(), "sess-1", StartSessionOptions::default())
+            .create_side_task_from_live(&snapshot, StartSessionOptions::default(), None)
             .await
             .unwrap();
         let side_id = side.id.try_to_utf8().unwrap();
@@ -5634,6 +5640,7 @@ mod tests {
             }));
         }
         side.dispose().await;
+        parent.dispose().await;
 
         // Ephemeral: no rollout was created, so the side task left nothing behind
         // and cannot be resumed by id.

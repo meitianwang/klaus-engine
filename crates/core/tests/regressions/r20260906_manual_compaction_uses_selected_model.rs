@@ -273,7 +273,7 @@ async fn global_model_tiers_null_low_and_medium_follow_the_selected_legacy_main_
     assert!(!title_requests.is_empty());
     assert!(title_requests
         .iter()
-        .all(|request| request.model == "switched-large" && request.max_output_tokens <= 256));
+        .all(|request| request.model == "switched-large" && request.max_output_tokens == 2048));
     provider.requests.lock().unwrap().clear();
     let outcome = session.compact(None).await.unwrap();
     let requests = provider.requests.lock().unwrap().clone();
