@@ -12025,7 +12025,9 @@ async fn empty_closing_after_visible_work_blocks_on_the_user_and_honours_the_ans
         }));
         let mut params = mk_params(
             vec![user_msg("answer")],
-            vec![Arc::new(EchoTool { schema: JsonSchema::new() })],
+            vec![Arc::new(EchoTool {
+                schema: JsonSchema::new(),
+            })],
         );
         params.model = "gpt-5".into();
         params.config.loop_detection = false;
@@ -12038,8 +12040,8 @@ async fn empty_closing_after_visible_work_blocks_on_the_user_and_honours_the_ans
             1,
             "{answer}: the user is asked exactly once, after the step-4.8 retry is spent"
         );
-        let asked = String::from_utf8_lossy(&elicits.lock().unwrap()[0].prompt.to_node_utf8())
-            .into_owned();
+        let asked =
+            String::from_utf8_lossy(&elicits.lock().unwrap()[0].prompt.to_node_utf8()).into_owned();
         assert!(
             asked.contains("closing answer"),
             "{answer}: the question names the empty closing: {asked}"
@@ -12068,7 +12070,9 @@ async fn empty_closing_after_visible_work_blocks_on_the_user_and_honours_the_ans
                 _ => None,
             });
             assert!(
-                failure.as_deref().is_some_and(|message| message.contains("you chose to stop")),
+                failure
+                    .as_deref()
+                    .is_some_and(|message| message.contains("you chose to stop")),
                 "{answer}: stopping by choice says so: {failure:?}"
             );
         }
@@ -12112,7 +12116,9 @@ async fn a_declined_empty_closing_prompt_fails_the_turn() {
     }));
     let mut params = mk_params(
         vec![user_msg("answer")],
-        vec![Arc::new(EchoTool { schema: JsonSchema::new() })],
+        vec![Arc::new(EchoTool {
+            schema: JsonSchema::new(),
+        })],
     );
     params.model = "gpt-5".into();
     params.config.loop_detection = false;
@@ -12132,7 +12138,9 @@ async fn a_declined_empty_closing_prompt_fails_the_turn() {
         _ => None,
     });
     assert!(
-        failure.as_deref().is_some_and(|message| message.contains("you chose to stop")),
+        failure
+            .as_deref()
+            .is_some_and(|message| message.contains("you chose to stop")),
         "a declined card fails the turn rather than looping: {failure:?}"
     );
 }
