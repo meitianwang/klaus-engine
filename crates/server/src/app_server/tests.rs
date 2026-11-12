@@ -193,6 +193,9 @@ mod r20260905_pin_during_active_turn;
 #[path = "../../tests/thread_read_facade.rs"]
 mod thread_read_facade;
 
+#[path = "../../tests/thread_read_input_identity.rs"]
+mod thread_read_input_identity;
+
 #[path = "../../tests/thread_history_facade.rs"]
 mod thread_history_facade;
 
