@@ -73,6 +73,7 @@ pub fn create_codex_subscription_provider(
         auth_source: Some(auth_source),
         api: Some(OpenAiApi::Responses),
         remote_compaction: crate::types::provider::RemoteCompactionSupport::ResponsesV2,
+        prefer_local_compaction: true,
         default_model: opts.default_model,
         ..Default::default()
     });
@@ -116,6 +117,11 @@ mod tests {
             identity: None,
         });
         assert!(!provider.info().default_model.is_empty());
+        assert!(provider.prefers_local_compaction(&"selected".into()));
+        assert_eq!(
+            provider.remote_compaction_support(&"selected".into()),
+            crate::types::provider::RemoteCompactionSupport::ResponsesV2
+        );
     }
 
     #[tokio::test]

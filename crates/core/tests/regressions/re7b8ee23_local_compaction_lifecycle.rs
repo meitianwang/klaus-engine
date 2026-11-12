@@ -681,6 +681,76 @@ async fn idle_wait_after_partial_text_cancels_only_the_summary_request() {
     assert!(!parent.is_cancelled());
 }
 
+#[tokio::test]
+async fn subscription_summaries_and_isolated_forks_use_the_portable_path() {
+    use klaus_agent_core::provider::codex_subscription::{
+        codex_oauth_defaults, create_codex_subscription_provider, CodexSubscriptionOptions,
+    };
+    use klaus_agent_core::provider::oauth::OAuthTokens;
+
+    let (provider, _) = create_codex_subscription_provider(CodexSubscriptionOptions {
+        oauth: codex_oauth_defaults("fixture-client", None),
+        store: None,
+        tokens: Some(OAuthTokens {
+            access_token: "fixture-token".into(),
+            ..Default::default()
+        }),
+        base_url: Some("http://127.0.0.1:1".into()),
+        default_model: Some(MODEL.into()),
+        access_policy: None,
+        identity: None,
+    });
+    assert_eq!(
+        provider.remote_compaction_support(&MODEL.into()),
+        RemoteCompactionSupport::ResponsesV2,
+        "existing native checkpoints must remain readable"
+    );
+    assert!(provider.prefers_local_compaction(&MODEL.into()));
+    let requests = Requests::default();
+    let compactor = create_compactor(CompactorOptions {
+        call_model: recording(&requests, |_, _| success()),
+        model: MODEL.into(),
+        max_output_tokens: Some(8_000),
+        uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
+    });
+    let provider = Arc::new(provider);
+    compactor.bind_native_provider(provider.clone());
+    assert!(
+        !compactor.native_summary_active(),
+        "the background precompute gate must accept this provider"
+    );
+    let original = vec![user("task", "Keep the task constraints.")];
+    for result in [
+        compactor
+            .manual_compact(original.clone(), &config(), None)
+            .await,
+        compactor
+            .threshold_compact(original.clone(), &config(), None)
+            .await,
+        compactor
+            .reactive_compact(original.clone(), &config(), None)
+            .await,
+    ] {
+        assert!(result.compacted, "{result:?}");
+        summary_is_last(&result.messages);
+        assert!(result.messages.iter().all(|message| !matches!(
+            message,
+            Message::CompactBoundary(boundary) if boundary.native_compaction.is_some()
+        )));
+    }
+    let fork = compactor
+        .fork_isolated(recording(&requests, |_, _| success()), &config())
+        .unwrap();
+    fork.bind_native_provider(provider);
+    assert!(!fork.native_summary_active());
+    let result = fork.threshold_compact(original, &config(), None).await;
+    assert!(result.compacted, "{result:?}");
+    summary_is_last(&result.messages);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|(_, request)| request.tools.is_empty()));
+}
+
 #[tokio::test(start_paused = true)]
 async fn regular_stream_events_can_finish_after_the_normal_request_total_timeout() {
     let compactor = full(Box::new(move |_, _| {

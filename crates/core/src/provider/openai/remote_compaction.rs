@@ -1274,6 +1274,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_summary_preference_replays_and_replaces_an_existing_checkpoint() {
+        use crate::context::compact::engine::Compactor;
+        use crate::context::compact::{create_compactor, CompactorOptions};
+        use crate::provider::codex_subscription::{
+            codex_oauth_defaults, create_codex_subscription_provider, CodexSubscriptionOptions,
+        };
+        use crate::provider::oauth::OAuthTokens;
+        use crate::schemas::config::EngineConfig;
+
+        let reply = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Portable task summary.\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"summary\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n\n";
+        let (base, server) = fixture(vec![("text/event-stream", reply.into())]).await;
+        let (provider, _) = create_codex_subscription_provider(CodexSubscriptionOptions {
+            oauth: codex_oauth_defaults("fixture-client", None),
+            store: None,
+            tokens: Some(OAuthTokens {
+                access_token: "fixture-token".into(),
+                expires_at: Some(4_000_000_000_000),
+                ..Default::default()
+            }),
+            base_url: Some(base.clone()),
+            default_model: Some("selected".into()),
+            access_policy: None,
+            identity: None,
+        });
+        let saved = checkpoint(&base, "fixture-key");
+        assert!(provider
+            .native_checkpoint_compatibility(&saved, &"selected".into(), &AbortSignal::new())
+            .await
+            .unwrap());
+        let original = vec![Message::CompactBoundary(CompactBoundaryMessage {
+            uuid: "old-checkpoint".into(),
+            summary: RuntimeString::default(),
+            native_compaction: Some(saved),
+        })];
+        let provider = Arc::new(provider);
+        let transport = provider.clone();
+        let compactor = create_compactor(CompactorOptions {
+            call_model: Box::new(move |request, signal| transport.stream(request, signal)),
+            model: "selected".into(),
+            max_output_tokens: Some(8_000),
+            uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
+        });
+        compactor.bind_native_provider(provider);
+        assert!(!compactor.native_summary_active());
+        compactor.prepare_request(&request(), &AbortSignal::new());
+        let result = compactor
+            .threshold_compact(original, &EngineConfig::default(), None)
+            .await;
+        assert!(result.compacted, "{result:?}");
+        let Message::CompactBoundary(boundary) = result.messages.last().unwrap() else {
+            panic!("expected a completed text checkpoint");
+        };
+        assert!(boundary.native_compaction.is_none());
+        assert!(boundary.summary.contains("Portable task summary."));
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].0.starts_with("POST /responses HTTP/1.1"));
+        let input = captured[0].1["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], vs("compaction"));
+        assert_eq!(input[0]["encrypted_content"], vs("opaque"));
+        assert!(input
+            .iter()
+            .all(|item| item.get("type") != Some(&vs("compaction_trigger"))));
+        assert!(runtime_json::stringify(input.last().unwrap()).contains("context checkpoint"));
+    }
+
+    #[tokio::test]
     async fn subscription_factory_records_checkpoint_account_without_restricting_replay() {
         use crate::provider::codex_subscription::{
             codex_oauth_defaults, create_codex_subscription_provider, CodexSubscriptionOptions,

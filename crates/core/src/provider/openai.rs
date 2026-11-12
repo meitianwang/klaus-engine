@@ -418,6 +418,8 @@ pub fn local_bridge_fast_mode(
 pub struct OpenAIProviderOptions {
     /// Explicit native compaction protocol advertised by this endpoint.
     pub remote_compaction: crate::types::provider::RemoteCompactionSupport,
+    /// Select portable summaries while retaining native checkpoint transport support.
+    pub prefer_local_compaction: bool,
     /// Static API key. When an `auth_source` is supplied it takes precedence.
     pub api_key: Option<String>,
     /// Override the API root.
@@ -5183,6 +5185,7 @@ async fn establish_stream_with_instruction_role(
 #[derive(Clone)]
 pub struct OpenAIProvider {
     remote_compaction: crate::types::provider::RemoteCompactionSupport,
+    prefer_local_compaction: bool,
     instruction_roles: InstructionRoleCache,
     info: ProviderInfo,
     client: reqwest::Client,
@@ -5236,6 +5239,7 @@ impl OpenAIProvider {
         };
         OpenAIProvider {
             remote_compaction: opts.remote_compaction,
+            prefer_local_compaction: opts.prefer_local_compaction,
             instruction_roles: Arc::new(Mutex::new(HashMap::new())),
             info,
             client,
@@ -5733,6 +5737,10 @@ impl OpenAIProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for OpenAIProvider {
+    fn prefers_local_compaction(&self, _model: &RuntimeString) -> bool {
+        self.prefer_local_compaction || self.is_codex_subscription_backend()
+    }
+
     fn remote_compaction_support(
         &self,
         _model: &RuntimeString,
@@ -6127,6 +6135,28 @@ mod tests {
         fn base_url(&self) -> Option<&str> {
             Some("http://127.0.0.1:9")
         }
+    }
+
+    #[test]
+    fn subscription_auto_detection_selects_text_without_disabling_native_replay() {
+        let mut subscription = OpenAIProvider::new(OpenAIProviderOptions {
+            auth_source: Some(Arc::new(CountingAuth::default())),
+            api: Some(OpenAiApi::Responses),
+            ..Default::default()
+        });
+        subscription.request_base_url = "https://chatgpt.com/backend-api/codex".into();
+        assert!(subscription.prefers_local_compaction(&"selected".into()));
+        assert_eq!(
+            subscription.remote_compaction_support(&"selected".into()),
+            crate::types::provider::RemoteCompactionSupport::ResponsesV2
+        );
+        let api = OpenAIProvider::new(OpenAIProviderOptions {
+            api_key: Some("fixture".into()),
+            api: Some(OpenAiApi::Responses),
+            remote_compaction: crate::types::provider::RemoteCompactionSupport::ResponsesV2,
+            ..Default::default()
+        });
+        assert!(!api.prefers_local_compaction(&"selected".into()));
     }
 
     #[test]

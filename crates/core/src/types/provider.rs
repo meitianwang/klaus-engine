@@ -2051,6 +2051,10 @@ pub trait ModelProvider: Send + Sync {
     fn remote_compaction_support(&self, _model: &RuntimeString) -> RemoteCompactionSupport {
         RemoteCompactionSupport::Unsupported
     }
+    /// Prefer portable model summaries without disabling replay of existing native checkpoints.
+    fn prefers_local_compaction(&self, _model: &RuntimeString) -> bool {
+        false
+    }
     fn effective_context_window_percent(&self, model: &RuntimeString) -> u8 {
         self.model_metadata(model)
             .effective_context_window_percent

@@ -658,6 +658,9 @@ impl ModelProvider for CapturedModelProvider {
         }
         self.inner.remote_compaction_support(model)
     }
+    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
+        self.inner.prefers_local_compaction(model)
+    }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
         self.inner.compaction_stream_max_retries()
     }
@@ -862,6 +865,9 @@ impl ModelProvider for CatalogModelProvider {
             return crate::types::provider::RemoteCompactionSupport::Unsupported;
         }
         self.inner.remote_compaction_support(model)
+    }
+    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
+        self.inner.prefers_local_compaction(model)
     }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
         self.inner.compaction_stream_max_retries()

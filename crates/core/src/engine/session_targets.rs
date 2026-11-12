@@ -754,6 +754,9 @@ impl ModelProvider for SummaryProvider {
     ) -> crate::types::provider::RemoteCompactionSupport {
         self.inner.remote_compaction_support(model)
     }
+    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
+        self.inner.prefers_local_compaction(model)
+    }
     fn compaction_compatibility_hash(&self, model: &RuntimeString) -> Option<RuntimeString> {
         self.inner.compaction_compatibility_hash(model)
     }

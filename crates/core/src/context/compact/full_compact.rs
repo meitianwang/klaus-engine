@@ -177,18 +177,17 @@ impl FullCompactor {
         *self.provider.lock().unwrap() = Some(provider);
     }
 
-    /// True when a summary would run through the provider's native remote
-    /// compaction channel instead of a model request. Native checkpoints are
-    /// stateful on the provider side, so background precomputation stays off
-    /// for them and the synchronous path keeps owning that channel.
+    /// True when new summaries use the native remote channel. Replay support
+    /// alone does not select that channel or disable background text summaries.
     pub(super) fn native_summary_active(&self) -> bool {
         self.provider
             .lock()
             .unwrap()
             .as_ref()
             .is_some_and(|provider| {
-                provider.remote_compaction_support(&self.model)
-                    != RemoteCompactionSupport::Unsupported
+                !provider.prefers_local_compaction(&self.model)
+                    && provider.remote_compaction_support(&self.model)
+                        != RemoteCompactionSupport::Unsupported
             })
     }
 
@@ -349,8 +348,9 @@ impl FullCompactor {
             .unwrap_or(config.compaction_stream_max_retries);
         if allow_native {
             if let Some(provider) = provider.as_ref().filter(|provider| {
-                provider.remote_compaction_support(&self.model)
-                    != RemoteCompactionSupport::Unsupported
+                !provider.prefers_local_compaction(&self.model)
+                    && provider.remote_compaction_support(&self.model)
+                        != RemoteCompactionSupport::Unsupported
             }) {
                 let mut request = self.summary_request(&messages, config, instructions);
                 let snapshot = self.request_snapshot();
