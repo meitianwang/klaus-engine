@@ -105,13 +105,16 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 10] = [
+const ERROR_TAGS: [&str; 13] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
     "antigravity_model_unlisted",
     "antigravity_quota_exhausted",
     "antigravity_request_rejected",
     "antigravity_region_unsupported",
+    "antigravity_account_disabled",
+    "antigravity_account_restricted",
+    "antigravity_permission_denied",
     "antigravity_auth_required",
     "antigravity_rate_limited",
     "antigravity_service_unavailable",
@@ -198,8 +201,7 @@ fn service_error(
     let auth_reason = reasons.iter().any(|reason| {
         matches!(
             *reason,
-            "IAM_PERMISSION_DENIED"
-                | "ACCESS_TOKEN_EXPIRED"
+            "ACCESS_TOKEN_EXPIRED"
                 | "ACCESS_TOKEN_INVALID"
                 | "CREDENTIALS_MISSING"
                 | "UNAUTHENTICATED"
@@ -247,6 +249,36 @@ fn service_error(
             service_code,
             Some("FAILED_PRECONDITION" | "PERMISSION_DENIED")
         );
+    // An account-level ban is not a stale token. Re-login with the same Google
+    // account cannot clear it, so it must not be reported as an auth refresh.
+    let account_disabled = reasons.iter().any(|reason| {
+        matches!(
+            *reason,
+            "ACCOUNT_DISABLED" | "ACCOUNT_SUSPENDED" | "USER_DISABLED" | "CONSUMER_SUSPENDED"
+        )
+    }) || [
+        "account has been disabled",
+        "account is disabled",
+        "account has been suspended",
+        "account is suspended",
+        "banned from antigravity",
+        "this service has been disabled in this account",
+        "this service has been disabled for this account",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    // Eligibility restrictions do not establish that an account was banned.
+    let account_restricted = reasons.iter().any(|reason| {
+        matches!(
+            *reason,
+            "ACCOUNT_RESTRICTED" | "ACCOUNT_INELIGIBLE" | "USER_NOT_ELIGIBLE"
+        )
+    }) || [
+        "not eligible to use antigravity",
+        "antigravity is not available for this account",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
     // Upstream capacity verdicts arrive shaped like ordinary refusals but clear
     // on their own, so the retry schedule can wait them out instead of failing
     // the turn fast. HTTP 408 is the service's own request-timeout verdict.
@@ -282,14 +314,20 @@ fn service_error(
             .any(|phrase| lower.contains(phrase)));
     let tag = if context_overflow {
         "model_context_window_exceeded"
+    } else if account_disabled {
+        "antigravity_account_disabled"
+    } else if region_unsupported {
+        "antigravity_region_unsupported"
     } else if status == Some(401) || service_code == Some("UNAUTHENTICATED") || auth_reason {
         "antigravity_auth_required"
     } else if explicit_quota {
         "antigravity_quota_exhausted"
     } else if (status == Some(403) || service_code == Some("PERMISSION_DENIED")) && model_access {
         "antigravity_model_access_denied"
+    } else if account_restricted {
+        "antigravity_account_restricted"
     } else if status == Some(403) || service_code == Some("PERMISSION_DENIED") {
-        "antigravity_auth_required"
+        "antigravity_permission_denied"
     } else if status.is_some_and(|status| status >= 500)
         || transient_overload
         || matches!(
@@ -300,8 +338,6 @@ fn service_error(
         "antigravity_service_unavailable"
     } else if explicit_rate || status == Some(429) || service_code == Some("RESOURCE_EXHAUSTED") {
         "antigravity_rate_limited"
-    } else if region_unsupported {
-        "antigravity_region_unsupported"
     } else {
         "antigravity_request_rejected"
     };
@@ -1949,6 +1985,73 @@ mod tests {
     }
 
     #[test]
+    fn account_verdicts_do_not_guess_suspension_from_eligibility_or_permission() {
+        use klaus_agent_core::provider::classify::classify_error;
+        use klaus_agent_core::types::errors::ProviderErrorKind;
+        for (message, reason, expected) in [
+            (
+                "This service has been disabled in this account for violation of Terms of Service.",
+                None,
+                "antigravity_account_disabled",
+            ),
+            (
+                "Account access denied.",
+                Some("ACCOUNT_SUSPENDED"),
+                "antigravity_account_disabled",
+            ),
+            (
+                "Account access denied.",
+                Some("ACCOUNT_RESTRICTED"),
+                "antigravity_account_restricted",
+            ),
+            (
+                "You are not eligible to use Antigravity.",
+                None,
+                "antigravity_account_restricted",
+            ),
+            (
+                "Access has been disabled.",
+                None,
+                "antigravity_permission_denied",
+            ),
+            (
+                "This model is not available for this account.",
+                None,
+                "antigravity_model_access_denied",
+            ),
+            (
+                "Credentials expired.",
+                Some("ACCESS_TOKEN_EXPIRED"),
+                "antigravity_auth_required",
+            ),
+        ] {
+            let details: Vec<Value> = reason
+                .into_iter()
+                .map(|reason| json!({"reason": reason}))
+                .collect();
+            let body = serde_json::to_vec(&json!({"error": {
+                "code": 403, "status": "PERMISSION_DENIED", "message": message, "details": details
+            }}))
+            .unwrap();
+            for error in [
+                service_error(Some(403), &body, Default::default()),
+                decode_frame(&body, None).unwrap_err(),
+            ] {
+                let classified = classify_error(&error_details(&error));
+                assert_eq!(classified.code.as_ref().unwrap(), expected, "{message}");
+                assert_eq!(
+                    classified.kind,
+                    if expected == "antigravity_auth_required" {
+                        ProviderErrorKind::Auth
+                    } else {
+                        ProviderErrorKind::InvalidRequest
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn service_failures_preserve_bounded_details_and_context_classification() {
         use klaus_agent_core::provider::classify::classify_error;
         use klaus_agent_core::types::errors::ProviderErrorKind;
@@ -1968,8 +2071,8 @@ mod tests {
                 403,
                 "PERMISSION_DENIED",
                 "The caller does not have permission.",
-                "antigravity_auth_required",
-                ProviderErrorKind::Auth,
+                "antigravity_permission_denied",
+                ProviderErrorKind::InvalidRequest,
             ),
             (
                 403,
@@ -1998,6 +2101,13 @@ mod tests {
                 "Model capacity is unavailable.",
                 "antigravity_service_unavailable",
                 ProviderErrorKind::Overloaded,
+            ),
+            (
+                403,
+                "PERMISSION_DENIED",
+                "User location is not supported for the API use.",
+                "antigravity_region_unsupported",
+                ProviderErrorKind::InvalidRequest,
             ),
             (
                 400,
@@ -2034,10 +2144,31 @@ mod tests {
             iam.as_bytes(),
             Default::default(),
         )));
-        assert_eq!(classified.kind, ProviderErrorKind::Auth);
+        assert_eq!(classified.kind, ProviderErrorKind::InvalidRequest);
         assert_eq!(
             classified.code.as_ref().unwrap(),
-            "antigravity_auth_required"
+            "antigravity_permission_denied"
+        );
+        let banned=json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"Your account has been disabled.","details":[{"reason":"ACCOUNT_DISABLED"}]}}).to_string();
+        let classified = classify_error(&error_details(&service_error(
+            Some(403),
+            banned.as_bytes(),
+            Default::default(),
+        )));
+        assert_eq!(classified.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(
+            classified.code.as_ref().unwrap(),
+            "antigravity_account_disabled"
+        );
+        let ineligible=br#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Antigravity is not available for this account."}}"#;
+        let classified = classify_error(&error_details(&service_error(
+            Some(403),
+            ineligible,
+            Default::default(),
+        )));
+        assert_eq!(
+            classified.code.as_ref().unwrap(),
+            "antigravity_account_restricted"
         );
         for details in [
             json!([]),

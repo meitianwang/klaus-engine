@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261112_antigravity_account_refusal.rs"]
+mod r20261112_antigravity_account_refusal;
+
 #[path = "regressions/r20261112_full_access_mcp_confirmation.rs"]
 mod r20261112_full_access_mcp_confirmation;
 

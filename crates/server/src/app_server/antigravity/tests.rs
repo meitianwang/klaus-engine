@@ -89,6 +89,10 @@ async fn fixture() -> Fixture {
                             "fixture-plain":{"displayName":"Plain Model","supportsTools":false,"maxTokens":50000,"maxOutputTokens":4096},
                             "fixture-locked":{"displayName":"Locked Model","disabled":true,"supportsThinking":true,"thinkingBudget":4000,"minThinkingBudget":32,"maxTokens":200000,"maxOutputTokens":8192},
                             "fixture-stream-locked":{"displayName":"Stream Locked Model","disabled":true},
+                            "fixture-http-disabled":{"displayName":"Disabled Account Model"},
+                            "fixture-stream-disabled":{"displayName":"Disabled Stream Model"},
+                            "fixture-http-restricted":{"displayName":"Restricted Account Model"},
+                            "fixture-stream-restricted":{"displayName":"Restricted Stream Model"},
                             "fixture-stream-quota":{"displayName":"Stream Quota Model"},
                             "fixture-http-quota":{"displayName":"HTTP Quota Model"},
                             "fixture-notfound-listed":{"displayName":"Listed NotFound Model"},
@@ -127,7 +131,11 @@ async fn fixture() -> Fixture {
                 };
                 let model = body["model"].as_str().unwrap_or("");
                 let not_found = json!({"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found."}});
-                let refusal = if model.contains("quota") {
+                let refusal = if model.ends_with("-disabled") {
+                    json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"This service has been disabled in this account for violation of Terms of Service."}})
+                } else if model.ends_with("-restricted") {
+                    json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"Antigravity is not available for this account."}})
+                } else if model.contains("quota") {
                     json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Your model quota is exhausted.","requestId":"fixture-request-123","details":[{"reason":"QUOTA_EXHAUSTED"},{"retryDelay":"2s"}]},"privatePrompt":"not-public"})
                 } else {
                     json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"Your subscription does not permit access to this model.","details":[{"reason":"MODEL_ACCESS_DENIED"}]},"privatePrompt":"not-public"})
@@ -148,6 +156,8 @@ async fn fixture() -> Fixture {
                         | "claude-sonnet-5-5-max"
                         | "gemini-4-argon-high"
                         | "fixture-http-quota"
+                        | "fixture-http-disabled"
+                        | "fixture-http-restricted"
                 ) {
                     (
                         if model.contains("quota") { 429 } else { 403 },
@@ -570,6 +580,30 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
             ProviderErrorKind::Quota,
             429,
         ),
+        (
+            "fixture-http-disabled",
+            "antigravity_account_disabled",
+            ProviderErrorKind::InvalidRequest,
+            403,
+        ),
+        (
+            "fixture-stream-disabled",
+            "antigravity_account_disabled",
+            ProviderErrorKind::InvalidRequest,
+            403,
+        ),
+        (
+            "fixture-http-restricted",
+            "antigravity_account_restricted",
+            ProviderErrorKind::InvalidRequest,
+            403,
+        ),
+        (
+            "fixture-stream-restricted",
+            "antigravity_account_restricted",
+            ProviderErrorKind::InvalidRequest,
+            403,
+        ),
     ] {
         let tiers = serde_json::from_value(json!({"high":"claude-sonnet-5-5-max"})).unwrap();
         let resolved = resolve(model, &tiers).await.unwrap();
@@ -613,11 +647,17 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
                 "RESOURCE_EXHAUSTED"
             }
         );
-        assert!(error.message.contains(if status == 403 {
-            "subscription does not permit access"
-        } else {
-            "quota is exhausted"
-        }));
+        assert!(error
+            .message
+            .contains(if code == "antigravity_account_disabled" {
+                "service has been disabled"
+            } else if code == "antigravity_account_restricted" {
+                "not available for this account"
+            } else if status == 403 {
+                "subscription does not permit access"
+            } else {
+                "quota is exhausted"
+            }));
         assert!(!error.message.contains("not-public"));
         if status == 429 {
             assert_eq!(error.retry_after_ms, Some(2000));
@@ -659,7 +699,7 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
             .collect();
         assert_eq!(
             streams.len(),
-            6,
+            10,
             "no local fallback, retry, or structural-invalid request"
         );
         assert_eq!(streams[0]["body"]["model"], "fixture-locked");
@@ -702,7 +742,7 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
 }
 
 #[tokio::test]
-async fn buffered_cloud_frames_and_premature_eof_cannot_publish_success() {
+async fn buffered_cloud_frames_respect_credentials_and_clean_eof_preserves_output() {
     use klaus_agent_core::provider::gemini::GeminiClient;
     let fixture = fixture().await;
     let root = tempfile::tempdir().unwrap();
@@ -765,12 +805,10 @@ async fn buffered_cloud_frames_and_premature_eof_cannot_publish_success() {
         .unwrap()
         .collect()
         .await;
-    assert_eq!(events.len(), 2);
+    // A clean HTTP EOF preserves emitted candidates even without finishReason.
+    // Abrupt transport truncation is covered by the stream recovery regressions.
+    assert_eq!(events.len(), 1);
     assert!(events[0].is_ok());
-    assert_eq!(
-        events[1].as_ref().unwrap_err().message,
-        "antigravity_stream_incomplete"
-    );
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
