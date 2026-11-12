@@ -649,6 +649,28 @@ impl ModelProvider for CapturedModelProvider {
             .await
     }
 
+    fn native_compaction_context(
+        &self,
+        model: &RuntimeString,
+    ) -> Option<crate::types::provider::NativeCompactionContext> {
+        if self.remote_compaction_support(model)
+            == crate::types::provider::RemoteCompactionSupport::Unsupported
+        {
+            return None;
+        }
+        self.inner
+            .native_compaction_context(model)
+            .map(|mut context| {
+                context.identity = format!(
+                    "{:?}:{:?}",
+                    context.identity,
+                    self.compaction_compatibility_hash(model)
+                )
+                .into();
+                context
+            })
+    }
+
     fn remote_compaction_support(
         &self,
         model: &RuntimeString,
@@ -657,9 +679,6 @@ impl ModelProvider for CapturedModelProvider {
             return crate::types::provider::RemoteCompactionSupport::Unsupported;
         }
         self.inner.remote_compaction_support(model)
-    }
-    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
-        self.inner.prefers_local_compaction(model)
     }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
         self.inner.compaction_stream_max_retries()
@@ -677,6 +696,27 @@ impl ModelProvider for CapturedModelProvider {
         }
         let mut result = self.inner.compact_remote(request.clone(), signal).await?;
         result.checkpoint.comp_hash = self.compaction_compatibility_hash(&request.model);
+        Ok(result)
+    }
+
+    async fn compact_remote_with_usage(
+        &self,
+        request: crate::types::provider::ModelRequest,
+        signal: crate::types::abort::AbortSignal,
+        idle_ms: u64,
+        observer: crate::types::provider::NativeCompactionUsageObserver,
+        expected_scope: Option<RuntimeString>,
+    ) -> Result<crate::types::provider::RemoteCompactionResult, crate::types::errors::ProviderError>
+    {
+        if !self.has_model_capabilities(&request.model) {
+            return Err(crate::provider::native_compaction::unsupported_checkpoint());
+        }
+        let model = request.model.clone();
+        let mut result = self
+            .inner
+            .compact_remote_with_usage(request, signal, idle_ms, observer, expected_scope)
+            .await?;
+        result.checkpoint.comp_hash = self.compaction_compatibility_hash(&model);
         Ok(result)
     }
 
@@ -857,6 +897,28 @@ impl ModelProvider for CatalogModelProvider {
             .await
     }
 
+    fn native_compaction_context(
+        &self,
+        model: &RuntimeString,
+    ) -> Option<crate::types::provider::NativeCompactionContext> {
+        if self.remote_compaction_support(model)
+            == crate::types::provider::RemoteCompactionSupport::Unsupported
+        {
+            return None;
+        }
+        self.inner
+            .native_compaction_context(model)
+            .map(|mut context| {
+                context.identity = format!(
+                    "{:?}:{:?}",
+                    context.identity,
+                    self.compaction_compatibility_hash(model)
+                )
+                .into();
+                context
+            })
+    }
+
     fn remote_compaction_support(
         &self,
         model: &RuntimeString,
@@ -865,9 +927,6 @@ impl ModelProvider for CatalogModelProvider {
             return crate::types::provider::RemoteCompactionSupport::Unsupported;
         }
         self.inner.remote_compaction_support(model)
-    }
-    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
-        self.inner.prefers_local_compaction(model)
     }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
         self.inner.compaction_stream_max_retries()
@@ -885,6 +944,27 @@ impl ModelProvider for CatalogModelProvider {
         }
         let mut result = self.inner.compact_remote(request.clone(), signal).await?;
         result.checkpoint.comp_hash = self.compaction_compatibility_hash(&request.model);
+        Ok(result)
+    }
+
+    async fn compact_remote_with_usage(
+        &self,
+        request: crate::types::provider::ModelRequest,
+        signal: crate::types::abort::AbortSignal,
+        idle_ms: u64,
+        observer: crate::types::provider::NativeCompactionUsageObserver,
+        expected_scope: Option<RuntimeString>,
+    ) -> Result<crate::types::provider::RemoteCompactionResult, crate::types::errors::ProviderError>
+    {
+        if !self.has_model_capabilities(&request.model) {
+            return Err(crate::provider::native_compaction::unsupported_checkpoint());
+        }
+        let model = request.model.clone();
+        let mut result = self
+            .inner
+            .compact_remote_with_usage(request, signal, idle_ms, observer, expected_scope)
+            .await?;
+        result.checkpoint.comp_hash = self.compaction_compatibility_hash(&model);
         Ok(result)
     }
 

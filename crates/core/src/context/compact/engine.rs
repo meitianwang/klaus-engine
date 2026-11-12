@@ -50,6 +50,16 @@ pub trait Compactor: Send + Sync {
     fn native_summary_active(&self) -> bool {
         false
     }
+    fn native_precompute_context(&self) -> Option<RuntimeString> {
+        None
+    }
+    fn fork_precompute(
+        &self,
+        call_model: CallModel,
+        config: &ResolvedConfig,
+    ) -> Result<Arc<dyn Compactor>, String> {
+        self.fork_isolated(call_model, config)
+    }
 
     async fn local_compact(
         &self,
@@ -206,6 +216,20 @@ pub fn create_compactor(options: CompactorOptions) -> RealCompactor {
 
 #[async_trait]
 impl Compactor for RealCompactor {
+    fn native_precompute_context(&self) -> Option<RuntimeString> {
+        self.full.native_precompute_context()
+    }
+    fn fork_precompute(
+        &self,
+        call_model: CallModel,
+        config: &ResolvedConfig,
+    ) -> Result<Arc<dyn Compactor>, String> {
+        let full = self.full.rebind_model(call_model, config);
+        full.retain_native_provider_from(&self.full)?;
+        Ok(Arc::new(Self {
+            full: Arc::new(full),
+        }))
+    }
     fn bind_native_provider(&self, provider: Arc<dyn ModelProvider>) {
         self.full.bind_native_provider(provider);
     }

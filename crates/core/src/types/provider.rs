@@ -2045,15 +2045,25 @@ pub struct RemoteCompactionResult {
     pub usage: Option<crate::schemas::message::Usage>,
 }
 
+/// One receipt per physical native compaction attempt, including rejected output.
+pub type NativeCompactionUsageObserver = Arc<dyn Fn(Usage) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct NativeCompactionContext {
+    pub identity: RuntimeString,
+    pub auth_scope: RuntimeString,
+}
+
 #[async_trait::async_trait]
 pub trait ModelProvider: Send + Sync {
     fn info(&self) -> &ProviderInfo;
     fn remote_compaction_support(&self, _model: &RuntimeString) -> RemoteCompactionSupport {
         RemoteCompactionSupport::Unsupported
     }
-    /// Prefer portable model summaries without disabling replay of existing native checkpoints.
-    fn prefers_local_compaction(&self, _model: &RuntimeString) -> bool {
-        false
+    /// Stable, non-secret execution identity for speculative native checkpoints.
+    /// Providers without a locally known account identity keep synchronous compaction.
+    fn native_compaction_context(&self, _model: &RuntimeString) -> Option<NativeCompactionContext> {
+        None
     }
     fn effective_context_window_percent(&self, model: &RuntimeString) -> u8 {
         self.model_metadata(model)
@@ -2108,6 +2118,25 @@ pub trait ModelProvider: Send + Sync {
         _idle_ms: u64,
     ) -> Result<RemoteCompactionResult, ProviderError> {
         self.compact_remote(request, signal).await
+    }
+    async fn compact_remote_with_usage(
+        &self,
+        request: ModelRequest,
+        signal: AbortSignal,
+        idle_ms: u64,
+        observer: NativeCompactionUsageObserver,
+        expected_scope: Option<RuntimeString>,
+    ) -> Result<RemoteCompactionResult, ProviderError> {
+        if expected_scope.is_some() {
+            return Err(crate::provider::native_compaction::unsupported_checkpoint());
+        }
+        let result = self
+            .compact_remote_with_idle_timeout(request, signal, idle_ms)
+            .await?;
+        if let Some(usage) = &result.usage {
+            observer(usage.clone());
+        }
+        Ok(result)
     }
     /// Observe account ownership independently from token refresh revisions.
     fn classifier_auth_changes(

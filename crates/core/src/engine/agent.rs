@@ -413,6 +413,16 @@ struct RealCompactorBridge(Arc<dyn crate::context::compact::engine::Compactor>);
 
 #[async_trait::async_trait]
 impl Compactor for RealCompactorBridge {
+    fn fork_precompute(
+        &self,
+        call_model: CallModel,
+        config: &ResolvedConfig,
+    ) -> Result<Arc<dyn Compactor>, String> {
+        Ok(Arc::new(Self(self.0.fork_precompute(call_model, config)?)))
+    }
+    fn native_precompute_context(&self) -> Option<RuntimeString> {
+        self.0.native_precompute_context()
+    }
     fn fork_isolated(
         &self,
         call_model: CallModel,

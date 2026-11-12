@@ -175,12 +175,8 @@ pub(super) async fn compact(
     if !result.compacted
         && !native_to_local
         && source_support == RemoteCompactionSupport::ResponsesV2
-        && !source
-            .provider
-            .prefers_local_compaction(&source.config.model)
         && distinct_target
         && target_support == RemoteCompactionSupport::ResponsesV2
-        && !target.provider.prefers_local_compaction(&config.model)
         && target.provider.supports_compaction_model_fallback()
         && !quota_or_budget
         && !shared.params.signal.is_cancelled()

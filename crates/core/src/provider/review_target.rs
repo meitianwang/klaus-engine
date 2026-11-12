@@ -40,14 +40,33 @@ impl ModelProvider for ReviewCatalogProvider {
             .await
     }
 
+    fn native_compaction_context(
+        &self,
+        model: &RuntimeString,
+    ) -> Option<crate::types::provider::NativeCompactionContext> {
+        if self.remote_compaction_support(model)
+            == crate::types::provider::RemoteCompactionSupport::Unsupported
+        {
+            return None;
+        }
+        self.inner
+            .native_compaction_context(model)
+            .map(|mut context| {
+                context.identity = format!(
+                    "{:?}:{:?}",
+                    context.identity,
+                    self.compaction_compatibility_hash(model)
+                )
+                .into();
+                context
+            })
+    }
+
     fn remote_compaction_support(
         &self,
         model: &RuntimeString,
     ) -> crate::types::provider::RemoteCompactionSupport {
         self.inner.remote_compaction_support(model)
-    }
-    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
-        self.inner.prefers_local_compaction(model)
     }
     fn compaction_stream_max_retries(&self) -> Option<u32> {
         self.inner.compaction_stream_max_retries()
@@ -62,6 +81,24 @@ impl ModelProvider for ReviewCatalogProvider {
     ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
         let model = request.model.clone();
         let mut result = self.inner.compact_remote(request, signal).await?;
+        result.checkpoint.comp_hash = self.compaction_compatibility_hash(&model);
+        Ok(result)
+    }
+
+    async fn compact_remote_with_usage(
+        &self,
+        request: crate::types::provider::ModelRequest,
+        signal: crate::types::abort::AbortSignal,
+        idle_ms: u64,
+        observer: crate::types::provider::NativeCompactionUsageObserver,
+        expected_scope: Option<RuntimeString>,
+    ) -> Result<crate::types::provider::RemoteCompactionResult, crate::types::errors::ProviderError>
+    {
+        let model = request.model.clone();
+        let mut result = self
+            .inner
+            .compact_remote_with_usage(request, signal, idle_ms, observer, expected_scope)
+            .await?;
         result.checkpoint.comp_hash = self.compaction_compatibility_hash(&model);
         Ok(result)
     }

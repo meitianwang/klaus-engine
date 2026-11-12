@@ -22,6 +22,7 @@ use crate::schemas::config::ResolvedConfig;
 use crate::schemas::message::Message;
 use crate::types::abort::AbortSignal;
 use crate::types::provider::ModelRequest;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -88,12 +89,60 @@ pub struct PrecomputeEntry {
     precomputed_at_uuid: RuntimeString,
     pre_compact_tokens: u64,
     model: RuntimeString,
+    native: Option<NativeCandidate>,
     started_at_ms: i64,
     /// Independent cancellation: a turn abort never kills the background task,
     /// but session teardown (registry drop) does.
     signal: AbortSignal,
     state: Mutex<EntryState>,
     settled: tokio::sync::watch::Sender<bool>,
+}
+
+struct NativeCandidate {
+    context: RuntimeString,
+    source: Option<crate::types::events::InferenceSource>,
+    prefix_len: usize,
+    prefix_hash: [u8; 32],
+    system: Vec<crate::types::provider::SystemPromptPart>,
+    tools: Vec<crate::types::provider::ToolSpec>,
+    deferred_tools: Vec<crate::types::provider::ToolSpec>,
+}
+
+fn history_hash(messages: &[Message]) -> Option<[u8; 32]> {
+    let encoded = crate::runtime_values::runtime_codec::encode_text(&messages.to_vec()).ok()?;
+    let mut hash = Sha256::new();
+    for unit in encoded.as_utf16() {
+        hash.update(unit.to_le_bytes());
+    }
+    Some(hash.finalize().into())
+}
+
+fn closed_tool_exchanges(messages: &[Message]) -> bool {
+    use crate::schemas::content::ContentBlock;
+    let mut pending = HashSet::new();
+    for message in messages {
+        match message {
+            Message::Assistant(assistant) => {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolUse(call) = block {
+                        pending.insert(call.id.clone());
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                pending.remove(&result.tool_use_id);
+            }
+            Message::User(user) => {
+                for block in &user.content {
+                    if let ContentBlock::ToolResult(result) = block {
+                        pending.remove(&result.tool_use_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pending.is_empty()
 }
 
 /// The checkpoint plus everything needed to apply it on the synchronous path.
@@ -146,6 +195,28 @@ impl PrecomputeRegistry {
     /// Arm one background checkpoint unless an entry is already in flight, the
     /// agent hit its failure cap, or the snapshot has no boundary uuid.
     pub fn arm(self: &Arc<Self>, arm: PrecomputeArm) -> bool {
+        let native = if arm.compactor.native_summary_active() {
+            let Some(context) = arm.compactor.native_precompute_context() else {
+                return false;
+            };
+            let Some(prefix_hash) = history_hash(&arm.snapshot) else {
+                return false;
+            };
+            if !closed_tool_exchanges(&arm.snapshot) {
+                return false;
+            }
+            Some(NativeCandidate {
+                context,
+                prefix_hash,
+                prefix_len: arm.snapshot.len(),
+                source: arm.config.model_source.clone(),
+                system: arm.request.system.clone(),
+                tools: arm.request.tools.clone(),
+                deferred_tools: arm.request.deferred_tools.clone(),
+            })
+        } else {
+            None
+        };
         if self
             .failures
             .lock()
@@ -188,6 +259,7 @@ impl PrecomputeRegistry {
             precomputed_at_uuid: boundary_uuid,
             pre_compact_tokens: arm.pre_compact_tokens,
             model: arm.model.clone(),
+            native,
             started_at_ms: (arm.now)(),
             signal: AbortSignal::new(),
             state: Mutex::new(EntryState::Pending),
@@ -208,6 +280,7 @@ impl PrecomputeRegistry {
     /// Try to apply the armed checkpoint for this agent or, failing that, a
     /// borrowable one from another agent in the same session. A borrow only
     /// succeeds when the other entry's boundary uuid exists in this history.
+    #[cfg(test)]
     pub async fn consume(
         &self,
         agent_key: &RuntimeString,
@@ -215,6 +288,42 @@ impl PrecomputeRegistry {
         config: &ResolvedConfig,
         turn_signal: &AbortSignal,
         now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> PrecomputeConsume {
+        self.consume_checked(agent_key, messages_now, config, turn_signal, now, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consume_native(
+        &self,
+        agent_key: &RuntimeString,
+        messages_now: &[Message],
+        config: &ResolvedConfig,
+        turn_signal: &AbortSignal,
+        now: &(dyn Fn() -> i64 + Send + Sync),
+        compactor: &dyn Compactor,
+        request: &ModelRequest,
+    ) -> PrecomputeConsume {
+        self.consume_checked(
+            agent_key,
+            messages_now,
+            config,
+            turn_signal,
+            now,
+            Some((compactor, request)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn consume_checked(
+        &self,
+        agent_key: &RuntimeString,
+        messages_now: &[Message],
+        config: &ResolvedConfig,
+        turn_signal: &AbortSignal,
+        now: &(dyn Fn() -> i64 + Send + Sync),
+        current: Option<(&dyn Compactor, &ModelRequest)>,
     ) -> PrecomputeConsume {
         let candidates: Vec<(Arc<PrecomputeEntry>, bool)> = {
             let entries = self.entries.lock().unwrap();
@@ -230,8 +339,19 @@ impl PrecomputeRegistry {
             list
         };
         for (entry, borrowed) in candidates {
+            if borrowed && entry.native.is_some() {
+                continue;
+            }
             match self
-                .consume_entry(&entry, borrowed, messages_now, config, turn_signal, now)
+                .consume_entry(
+                    &entry,
+                    borrowed,
+                    messages_now,
+                    config,
+                    turn_signal,
+                    now,
+                    current,
+                )
                 .await
             {
                 PrecomputeConsume::Miss => continue,
@@ -241,6 +361,7 @@ impl PrecomputeRegistry {
         PrecomputeConsume::Miss
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn consume_entry(
         &self,
         entry: &Arc<PrecomputeEntry>,
@@ -249,11 +370,30 @@ impl PrecomputeRegistry {
         config: &ResolvedConfig,
         turn_signal: &AbortSignal,
         now: &(dyn Fn() -> i64 + Send + Sync),
+        current: Option<(&dyn Compactor, &ModelRequest)>,
     ) -> PrecomputeConsume {
         // Staleness bounds, checked before any wait: a checkpoint whose
         // boundary no longer exists can never be applied.
         if entry.model != config.model {
             self.invalidate(entry, "model_changed");
+            return PrecomputeConsume::Miss;
+        }
+        let native_is_current = || {
+            entry.native.as_ref().is_none_or(|native| {
+                current.is_some_and(|(compactor, request)| {
+                    compactor.native_precompute_context().as_ref() == Some(&native.context)
+                        && config.model_source == native.source
+                        && request.system == native.system
+                        && request.tools == native.tools
+                        && request.deferred_tools == native.deferred_tools
+                        && messages_now.len() >= native.prefix_len
+                        && history_hash(&messages_now[..native.prefix_len])
+                            == Some(native.prefix_hash)
+                })
+            })
+        };
+        if !native_is_current() {
+            self.invalidate(entry, "native_context_changed");
             return PrecomputeConsume::Miss;
         }
         let Some(boundary_index) = messages_now
@@ -290,6 +430,10 @@ impl PrecomputeRegistry {
                 }
             }
         }
+        if !native_is_current() {
+            self.invalidate(entry, "native_context_changed_while_waiting");
+            return PrecomputeConsume::Miss;
+        }
         let payload = {
             let mut state = entry.state.lock().unwrap();
             match std::mem::replace(&mut *state, EntryState::Retired) {
@@ -302,6 +446,14 @@ impl PrecomputeRegistry {
                 }
             }
         };
+        if entry.native.is_some() && !payload.result.messages.iter().any(|message| {
+            matches!(
+                message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some()
+            )
+        }) {
+            self.invalidate(entry, "native_checkpoint_missing");
+            return PrecomputeConsume::Miss;
+        }
         // The retained tail must survive verbatim: a rewind that removed any
         // of its messages invalidates the checkpoint.
         let live_uuids: HashSet<RuntimeString> = messages_now
@@ -341,6 +493,20 @@ impl PrecomputeRegistry {
         }
         let mut spliced = payload.result.messages;
         spliced.splice(boundary_pos + 1..boundary_pos + 1, after.iter().cloned());
+        if entry.native.is_some() {
+            let fixed = current.map_or(0, |(_, request)| {
+                super::request::fixed_prefix_tokens(request)
+            });
+            let status = crate::context::compact::policy::context_window_status(
+                config,
+                estimate_context_tokens(&spliced).saturating_add(fixed),
+                None,
+            );
+            if status.token_limit_reached {
+                self.invalidate(entry, "native_checkpoint_still_over_budget");
+                return PrecomputeConsume::Miss;
+            }
+        }
         let freed = est_now.saturating_sub(estimate_context_tokens(&spliced));
         let lead_ms = payload.ready_at_ms.saturating_sub(entry.started_at_ms);
         let total_ms = now().saturating_sub(entry.started_at_ms);
@@ -350,7 +516,7 @@ impl PrecomputeRegistry {
             freed_tokens: freed,
             compacted: true,
             reason: None,
-            diagnostics: Vec::new(),
+            diagnostics: payload.result.diagnostics,
         };
         self.remove_listed(entry);
         PrecomputeConsume::Hit(Box::new(PrecomputedSwap {
@@ -630,6 +796,386 @@ mod tests {
                 &|| 0,
             )
             .await
+    }
+
+    struct NativeScript {
+        owner: std::sync::atomic::AtomicUsize,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Compactor for NativeScript {
+        fn native_summary_active(&self) -> bool {
+            true
+        }
+        fn native_precompute_context(&self) -> Option<RuntimeString> {
+            Some(
+                format!(
+                    "source-account-model-{}",
+                    self.owner.load(std::sync::atomic::Ordering::SeqCst)
+                )
+                .into(),
+            )
+        }
+        async fn maybe_compact(
+            &self,
+            messages: &[Message],
+            _: u64,
+            config: &ResolvedConfig,
+            instructions: Option<&RuntimeString>,
+        ) -> CompactionResult {
+            self.threshold_compact(messages, config, instructions).await
+        }
+        async fn reactive_compact(
+            &self,
+            messages: &[Message],
+            config: &ResolvedConfig,
+            instructions: Option<&RuntimeString>,
+        ) -> CompactionResult {
+            self.threshold_compact(messages, config, instructions).await
+        }
+        async fn threshold_compact(
+            &self,
+            messages: &[Message],
+            _: &ResolvedConfig,
+            _: Option<&RuntimeString>,
+        ) -> CompactionResult {
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            CompactionResult {
+                messages: if self.fail {
+                    messages.to_vec()
+                } else {
+                    vec![Message::CompactBoundary(CompactBoundaryMessage {
+                        uuid: "native-background".into(),
+                        summary: RuntimeString::default(),
+                        native_compaction: Some(
+                            crate::schemas::message::NativeCompactionCheckpoint {
+                                source: "fixture-source".into(),
+                                auth_scope: "fixture-account".into(),
+                                model: default_config().model,
+                                comp_hash: None,
+                                response_id: "fixture-response".into(),
+                                encrypted_content: "opaque-context".into(),
+                                retained_input: Vec::new(),
+                                retained_input_metadata: Vec::new(),
+                            },
+                        ),
+                    })]
+                },
+                freed_tokens: 0,
+                compacted: !self.fail,
+                reason: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    fn native_script() -> Arc<NativeScript> {
+        Arc::new(NativeScript {
+            owner: std::sync::atomic::AtomicUsize::new(0),
+            gate: None,
+            fail: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn native_precompute_waits_for_a_complete_tool_exchange() {
+        use crate::schemas::content::ToolUseBlock;
+        use crate::schemas::message::{AssistantMessage, ToolResultMessage};
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let mut messages = vec![Message::Assistant(AssistantMessage {
+            uuid: "call-message".into(),
+            model: default_config().model,
+            usage: None,
+            content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                id: "call".into(),
+                name: "read".into(),
+                input: crate::runtime_values::RuntimeJson::Object(
+                    crate::runtime_values::RuntimeObject::new(),
+                ),
+                tool_kind: None,
+                thought_signature: None,
+            })],
+        })];
+        assert!(!registry.arm(arm_request(native_script(), messages.clone())));
+        messages.push(Message::ToolResult(ToolResultMessage {
+            uuid: "result-message".into(),
+            tool_use_id: "call".into(),
+            content: Vec::new(),
+            is_error: false,
+            tool_kind: None,
+            native_tool_output: None,
+            output: None,
+            extra_user_blocks: None,
+        }));
+        assert!(registry.arm(arm_request(native_script(), messages)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_leaves_native_candidate_for_the_next_turn() {
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let compactor = Arc::new(NativeScript {
+            owner: std::sync::atomic::AtomicUsize::new(0),
+            gate: Some(gate.clone()),
+            fail: false,
+        });
+        let snapshot = vec![user("old")];
+        let arm = arm_request(compactor.clone(), snapshot.clone());
+        let request = arm.request.clone();
+        assert!(registry.arm(arm));
+        let cancelled = AbortSignal::new();
+        cancelled.cancel();
+        assert!(matches!(
+            registry
+                .consume_native(
+                    &"main".into(),
+                    &snapshot,
+                    &default_config(),
+                    &cancelled,
+                    &|| 0,
+                    compactor.as_ref(),
+                    &request
+                )
+                .await,
+            PrecomputeConsume::Aborted
+        ));
+        gate.notify_one();
+        assert!(matches!(
+            registry
+                .consume_native(
+                    &"main".into(),
+                    &snapshot,
+                    &default_config(),
+                    &AbortSignal::new(),
+                    &|| 0,
+                    compactor.as_ref(),
+                    &request
+                )
+                .await,
+            PrecomputeConsume::Hit(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_candidate_preserves_live_suffix_and_opaque_checkpoint() {
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let compactor = native_script();
+        let snapshot = vec![user("old")];
+        let arm = arm_request(compactor.clone(), snapshot.clone());
+        let request = arm.request.clone();
+        assert!(registry.arm(arm));
+        let mut live = snapshot;
+        live.push(user("steer"));
+        let PrecomputeConsume::Hit(swap) = registry
+            .consume_native(
+                &"main".into(),
+                &live,
+                &default_config(),
+                &AbortSignal::new(),
+                &|| 0,
+                compactor.as_ref(),
+                &request,
+            )
+            .await
+        else {
+            panic!("expected native checkpoint adoption");
+        };
+        assert_eq!(swap.result.messages[1..], live[1..]);
+        let Message::CompactBoundary(boundary) = &swap.result.messages[0] else {
+            panic!("expected native boundary");
+        };
+        assert_eq!(
+            boundary
+                .native_compaction
+                .as_ref()
+                .unwrap()
+                .encrypted_content,
+            RuntimeString::from("opaque-context")
+        );
+        let encoded =
+            crate::runtime_values::runtime_codec::encode_text(&swap.result.messages).unwrap();
+        let restored: Vec<Message> =
+            crate::runtime_values::runtime_codec::decode_text(&encoded).unwrap();
+        assert_eq!(restored, swap.result.messages);
+    }
+
+    #[tokio::test]
+    async fn native_candidate_rejects_same_id_rewrites_and_changed_request_context() {
+        for mutation in 0..4 {
+            let registry = Arc::new(PrecomputeRegistry::default());
+            let compactor = native_script();
+            let snapshot = vec![user("old")];
+            let arm = arm_request(compactor.clone(), snapshot.clone());
+            let mut request = arm.request.clone();
+            assert!(registry.arm(arm));
+            let mut live = snapshot;
+            let mut config = default_config();
+            match mutation {
+                0 => {
+                    let Message::User(user) = &mut live[0] else {
+                        unreachable!()
+                    };
+                    user.content.clear();
+                }
+                1 => {
+                    compactor
+                        .owner
+                        .store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                2 => {
+                    request
+                        .system
+                        .push(crate::types::provider::SystemPromptPart {
+                            name: "mode".into(),
+                            text: "new-mode".into(),
+                            cacheable: None,
+                            cache_scope: None,
+                        });
+                }
+                _ => {
+                    config.model = "changed-model".into();
+                }
+            }
+            assert!(
+                matches!(
+                    registry
+                        .consume_native(
+                            &"main".into(),
+                            &live,
+                            &config,
+                            &AbortSignal::new(),
+                            &|| 0,
+                            compactor.as_ref(),
+                            &request
+                        )
+                        .await,
+                    PrecomputeConsume::Miss
+                ),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_candidate_rechecks_owner_after_wait_without_blocking_other_work() {
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let compactor = Arc::new(NativeScript {
+            owner: std::sync::atomic::AtomicUsize::new(0),
+            gate: Some(gate.clone()),
+            fail: false,
+        });
+        let snapshot = vec![user("old")];
+        let arm = arm_request(compactor.clone(), snapshot.clone());
+        let request = arm.request.clone();
+        assert!(registry.arm(arm));
+        let waiting = tokio::spawn({
+            let registry = registry.clone();
+            let compactor = compactor.clone();
+            async move {
+                registry
+                    .consume_native(
+                        &"main".into(),
+                        &snapshot,
+                        &default_config(),
+                        &AbortSignal::new(),
+                        &|| 0,
+                        compactor.as_ref(),
+                        &request,
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        compactor
+            .owner
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        gate.notify_one();
+        assert!(matches!(waiting.await.unwrap(), PrecomputeConsume::Miss));
+    }
+
+    #[tokio::test]
+    async fn native_candidates_are_not_borrowed_and_over_budget_results_fall_back() {
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let compactor = native_script();
+        let snapshot = vec![user("old")];
+        let arm = arm_request(compactor.clone(), snapshot.clone());
+        let request = arm.request.clone();
+        assert!(registry.arm(arm));
+        assert!(matches!(
+            registry
+                .consume_native(
+                    &"child".into(),
+                    &snapshot,
+                    &default_config(),
+                    &AbortSignal::new(),
+                    &|| 0,
+                    compactor.as_ref(),
+                    &request
+                )
+                .await,
+            PrecomputeConsume::Miss
+        ));
+        let mut live = snapshot;
+        let mut huge = user("new");
+        let Message::User(user) = &mut huge else {
+            unreachable!()
+        };
+        let ContentBlock::Text(text) = &mut user.content[0] else {
+            unreachable!()
+        };
+        text.text = "x".repeat(10_000).into();
+        live.push(huge);
+        let mut config = default_config();
+        config.context_window = 1_000;
+        assert!(matches!(
+            registry
+                .consume_native(
+                    &"main".into(),
+                    &live,
+                    &config,
+                    &AbortSignal::new(),
+                    &|| 0,
+                    compactor.as_ref(),
+                    &request
+                )
+                .await,
+            PrecomputeConsume::Miss
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_precompute_keeps_failed_work_out_of_history() {
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let compactor = Arc::new(NativeScript {
+            owner: std::sync::atomic::AtomicUsize::new(0),
+            gate: None,
+            fail: true,
+        });
+        let snapshot = vec![user("old")];
+        let arm = arm_request(compactor.clone(), snapshot.clone());
+        let request = arm.request.clone();
+        assert!(registry.arm(arm));
+        assert!(matches!(
+            registry
+                .consume_native(
+                    &"main".into(),
+                    &snapshot,
+                    &default_config(),
+                    &AbortSignal::new(),
+                    &|| 0,
+                    compactor.as_ref(),
+                    &request
+                )
+                .await,
+            PrecomputeConsume::Miss
+        ));
+        assert_eq!(snapshot, vec![user("old")]);
     }
 
     #[tokio::test]

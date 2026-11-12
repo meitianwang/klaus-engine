@@ -39,7 +39,6 @@ struct Provider {
     window: u64,
     hash: Option<&'static str>,
     remote: bool,
-    prefer_local: bool,
     eligible_fallback: bool,
     reply: NativeReply,
     native_network_failures: AtomicUsize,
@@ -91,9 +90,6 @@ impl ModelProvider for Provider {
     }
     fn compaction_compatibility_hash(&self, _: &RuntimeString) -> Option<RuntimeString> {
         self.hash.map(Into::into)
-    }
-    fn prefers_local_compaction(&self, _: &RuntimeString) -> bool {
-        self.prefer_local
     }
     fn supports_compaction_model_fallback(&self) -> bool {
         self.eligible_fallback
@@ -194,7 +190,6 @@ pub(super) struct Spec {
     pub(super) window: u64,
     pub(super) hash: Option<&'static str>,
     pub(super) remote: bool,
-    pub(super) prefer_local: bool,
     pub(super) eligible: bool,
     pub(super) reply: NativeReply,
     pub(super) native_network_failures: usize,
@@ -214,7 +209,6 @@ impl Spec {
             window: self.window,
             hash: self.hash,
             remote: self.remote,
-            prefer_local: self.prefer_local,
             eligible_fallback: self.eligible,
             reply: self.reply,
             native_network_failures: AtomicUsize::new(self.native_network_failures),
@@ -231,7 +225,6 @@ pub(super) fn spec(name: &'static str, model: &'static str, hash: Option<&'stati
         window: 100_000,
         hash,
         remote: false,
-        prefer_local: false,
         eligible: false,
         reply: NativeReply::Success,
         native_network_failures: 0,
@@ -390,61 +383,6 @@ async fn native_checkpoint_is_localized_by_its_owner_before_a_wider_unsupported_
         assert!(trace[0].2.messages.iter().any(|message| matches!(message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some())));
         assert!(!trace[1].2.messages.iter().any(|message| matches!(message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some())));
     }
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn compatible_native_history_uses_text_when_the_source_prefers_local_summaries() {
-    let fixture = Fixture::new(
-        Spec {
-            remote: true,
-            prefer_local: true,
-            ..spec("old", "same-model", Some("v1"))
-        },
-        true,
-    );
-    fixture.select(Spec {
-        remote: true,
-        prefer_local: true,
-        ..spec("old", "same-model", Some("v2"))
-    });
-    let events = fixture.run().await;
-    assert!(succeeded(&events), "{events:?}");
-    assert_eq!(
-        fixture.routes(),
-        [("old".into(), "local"), ("old".into(), "normal")]
-    );
-    {
-        let trace = fixture.trace.lock().unwrap();
-        assert!(trace[0].2.messages.iter().any(|message| matches!(
-            message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some()
-        )));
-        assert!(trace[1].2.messages.iter().all(|message| !matches!(
-            message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some()
-        )));
-    }
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn local_summary_target_is_not_used_as_a_native_migration_fallback() {
-    let fixture = Fixture::new(
-        Spec {
-            remote: true,
-            reply: NativeReply::Unavailable,
-            ..spec("old", "old-model", Some("v1"))
-        },
-        false,
-    );
-    fixture.select(Spec {
-        remote: true,
-        prefer_local: true,
-        eligible: true,
-        ..spec("new", "new-model", Some("v2"))
-    });
-    let events = fixture.run().await;
-    assert!(!succeeded(&events));
-    assert_eq!(fixture.routes(), [("old".into(), "native")]);
     fixture.close().await;
 }
 

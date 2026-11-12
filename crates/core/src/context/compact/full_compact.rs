@@ -119,6 +119,7 @@ pub struct FullCompactor {
     request: Mutex<Option<ModelRequest>>,
     signal: Mutex<AbortSignal>,
     provider: Mutex<Option<Arc<dyn ModelProvider>>>,
+    precompute_context: Mutex<Option<crate::types::provider::NativeCompactionContext>>,
     output: Mutex<Option<CompactionOutputSink>>,
     session_memory: Mutex<Option<Arc<dyn SessionMemoryCompactProvider>>>,
 }
@@ -140,6 +141,7 @@ pub fn create_full_compactor(options: FullCompactorOptions) -> FullCompactor {
         request: Mutex::new(None),
         signal: Mutex::new(AbortSignal::new()),
         provider: Mutex::new(None),
+        precompute_context: Mutex::new(None),
         output: Mutex::new(None),
         session_memory: Mutex::new(None),
     }
@@ -160,6 +162,7 @@ impl FullCompactor {
             request: Mutex::new(None),
             signal: Mutex::new(AbortSignal::new()),
             provider: Mutex::new(None),
+            precompute_context: Mutex::new(None),
             output: Mutex::new(None),
             session_memory: Mutex::new(None),
         }
@@ -167,6 +170,36 @@ impl FullCompactor {
 
     pub(super) fn retain_session_memory_from(&self, other: &Self) {
         *self.session_memory.lock().unwrap() = other.session_memory.lock().unwrap().clone();
+    }
+
+    pub(super) fn retain_native_provider_from(&self, other: &Self) -> Result<(), String> {
+        let provider = other.provider.lock().unwrap().clone();
+        let context = provider
+            .as_ref()
+            .and_then(|provider| provider.native_compaction_context(&self.model));
+        if context.is_none()
+            && provider.as_ref().is_some_and(|provider| {
+                provider.remote_compaction_support(&self.model)
+                    != RemoteCompactionSupport::Unsupported
+            })
+        {
+            return Err("Native precompute requires a captured execution identity.".into());
+        }
+        *self.precompute_context.lock().unwrap() = context;
+        *self.provider.lock().unwrap() = provider;
+        Ok(())
+    }
+
+    pub(super) fn native_precompute_context(&self) -> Option<RuntimeString> {
+        if let Some(context) = self.precompute_context.lock().unwrap().as_ref() {
+            return Some(context.identity.clone());
+        }
+        self.provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|provider| provider.native_compaction_context(&self.model))
+            .map(|context| context.identity)
     }
 
     pub fn bind_session_memory(&self, provider: Option<Arc<dyn SessionMemoryCompactProvider>>) {
@@ -177,17 +210,16 @@ impl FullCompactor {
         *self.provider.lock().unwrap() = Some(provider);
     }
 
-    /// True when new summaries use the native remote channel. Replay support
-    /// alone does not select that channel or disable background text summaries.
+    /// True when a summary would run through the provider's native remote
+    /// compaction channel instead of a model request.
     pub(super) fn native_summary_active(&self) -> bool {
         self.provider
             .lock()
             .unwrap()
             .as_ref()
             .is_some_and(|provider| {
-                !provider.prefers_local_compaction(&self.model)
-                    && provider.remote_compaction_support(&self.model)
-                        != RemoteCompactionSupport::Unsupported
+                provider.remote_compaction_support(&self.model)
+                    != RemoteCompactionSupport::Unsupported
             })
     }
 
@@ -348,9 +380,8 @@ impl FullCompactor {
             .unwrap_or(config.compaction_stream_max_retries);
         if allow_native {
             if let Some(provider) = provider.as_ref().filter(|provider| {
-                !provider.prefers_local_compaction(&self.model)
-                    && provider.remote_compaction_support(&self.model)
-                        != RemoteCompactionSupport::Unsupported
+                provider.remote_compaction_support(&self.model)
+                    != RemoteCompactionSupport::Unsupported
             }) {
                 let mut request = self.summary_request(&messages, config, instructions);
                 let snapshot = self.request_snapshot();
@@ -363,13 +394,20 @@ impl FullCompactor {
                     .unwrap_or_default();
                 // Native compaction has its own trigger item, supplied by the transport.
                 request.messages.pop();
+                let expected_scope = self
+                    .precompute_context
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|context| context.auth_scope.clone());
                 return super::retry::run(&messages, &signal, max_retries, || {
                     let request = request.clone();
+                    let expected_scope = expected_scope.clone();
                     async {
                         let result = tokio::select! {
                             biased;
                             _ = signal.cancelled() => return failed(messages.to_vec(), "Context compaction was interrupted.", None),
-                            result = provider.compact_remote_with_idle_timeout(request, signal.clone(), config.stream_idle_timeout_ms) => result,
+                            result = provider.compact_remote_with_usage(request, signal.clone(), config.stream_idle_timeout_ms, Arc::new(|_| {}), expected_scope) => result,
                         };
                         match result {
                             Ok(result) => {

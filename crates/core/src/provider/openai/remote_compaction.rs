@@ -149,6 +149,39 @@ pub(super) async fn scope_auth(
 }
 
 impl OpenAIProvider {
+    pub(super) fn native_execution_context(
+        &self,
+        model: &RuntimeString,
+    ) -> Option<crate::types::provider::NativeCompactionContext> {
+        if self.remote_compaction_support(model) == RemoteCompactionSupport::Unsupported {
+            return None;
+        }
+        let (owner, generation) = if let Some(auth) = &self.auth_source {
+            (
+                digest_scope(&format!("account:{}", auth.credential_account_id()?)),
+                auth.credential_changes()
+                    .map(|state| state.borrow().owner_generation)
+                    .unwrap_or(0),
+            )
+        } else {
+            (
+                digest_scope(&format!("api-key:{}", self.api_key.as_ref()?)),
+                0,
+            )
+        };
+        Some(crate::types::provider::NativeCompactionContext {
+            identity: digest_scope(&format!(
+                "native-compaction-v1\n{}\n{:?}\n{:?}\n{:?}\n{:?}\n{}",
+                self.request_base_url.trim_end_matches('/'),
+                self.remote_compaction_support(model),
+                model,
+                self.compaction_compatibility_hash(model),
+                owner,
+                generation,
+            )),
+            auth_scope: owner,
+        })
+    }
     pub(super) async fn native_checkpoint_matches(
         &self,
         checkpoint: &NativeCompactionCheckpoint,
@@ -218,9 +251,21 @@ impl OpenAIProvider {
 
     pub(super) async fn native_compact(
         &self,
+        request: ModelRequest,
+        signal: AbortSignal,
+        idle_ms: Option<u64>,
+    ) -> Result<RemoteCompactionResult, ProviderError> {
+        self.native_compact_observed(request, signal, idle_ms, None, None)
+            .await
+    }
+
+    pub(super) async fn native_compact_observed(
+        &self,
         mut request: ModelRequest,
         signal: AbortSignal,
         idle_ms: Option<u64>,
+        observer: Option<crate::types::provider::NativeCompactionUsageObserver>,
+        expected_scope: Option<RuntimeString>,
     ) -> Result<RemoteCompactionResult, ProviderError> {
         let support = self.remote_compaction_support(&request.model);
         if support == RemoteCompactionSupport::Unsupported {
@@ -232,6 +277,12 @@ impl OpenAIProvider {
         };
         let auth_scope =
             account_scope(&headers, self.auth_source.as_ref(), self.api_key.as_deref())?;
+        if expected_scope
+            .as_ref()
+            .is_some_and(|expected| expected != &auth_scope)
+        {
+            return Err(crate::provider::native_compaction::unsupported_checkpoint());
+        }
         let auth = scope_auth(
             self.auth_source.clone(),
             Ok(Some(auth_scope.clone())),
@@ -338,10 +389,11 @@ impl OpenAIProvider {
             let outcome = match response {
                 Ok(response) => match support {
                     RemoteCompactionSupport::ResponsesV2 => {
-                        collect_v2(response, &signal, idle_ms).await
+                        collect_v2_observed(response, &signal, idle_ms, observer.clone()).await
                     }
                     RemoteCompactionSupport::ResponsesV1 => {
-                        collect_v1(response, &signal, &original, idle_ms).await
+                        collect_v1_observed(response, &signal, &original, idle_ms, observer.clone())
+                            .await
                     }
                     RemoteCompactionSupport::Unsupported => unreachable!(),
                 },
@@ -443,6 +495,19 @@ struct Collected {
     retained: Option<Vec<Value>>,
 }
 
+struct AttemptUsage {
+    observer: Option<crate::types::provider::NativeCompactionUsageObserver>,
+    actual: Option<Usage>,
+}
+
+impl Drop for AttemptUsage {
+    fn drop(&mut self) {
+        if let (Some(observer), Some(actual)) = (&self.observer, self.actual.take()) {
+            observer(actual);
+        }
+    }
+}
+
 fn is_compaction_item(item: &Value) -> bool {
     item.get("type")
         .and_then(Value::as_str)
@@ -459,11 +524,16 @@ fn encrypted_item(item: &Value) -> Option<RuntimeString> {
         .cloned()
 }
 
-async fn collect_v2(
+async fn collect_v2_observed(
     response: reqwest::Response,
     signal: &AbortSignal,
     idle_ms: Option<u64>,
+    observer: Option<crate::types::provider::NativeCompactionUsageObserver>,
 ) -> Result<Collected, ProviderError> {
+    let mut receipt = AttemptUsage {
+        observer,
+        actual: None,
+    };
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut outputs = Vec::new();
@@ -475,6 +545,9 @@ async fn collect_v2(
             }
             let value = runtime_json::parse(&event.data)
                 .map_err(|_| invalid("Native compaction returned malformed stream data."))?;
+            if update_responses_usage(&value, &mut state) {
+                receipt.actual = Some(state.usage());
+            }
             let kind = value.get("type").and_then(Value::as_str);
             let incomplete = kind.is_some_and(|kind| kind == "response.incomplete");
             let incomplete_reason = value
@@ -527,7 +600,7 @@ async fn collect_v2(
                     .ok_or_else(|| {
                         invalid("Native compaction completed without a response identity.")
                     })?;
-                let usage = update_responses_usage(&value, &mut state).then(|| state.usage());
+                let usage = receipt.actual.clone();
                 return Ok(Collected {
                     encrypted_content: native[0].clone(),
                     response_id,
@@ -605,12 +678,17 @@ async fn collect_v2(
     }
 }
 
-async fn collect_v1(
+async fn collect_v1_observed(
     response: reqwest::Response,
     signal: &AbortSignal,
     original: &[Value],
     idle_ms: Option<u64>,
+    observer: Option<crate::types::provider::NativeCompactionUsageObserver>,
 ) -> Result<Collected, ProviderError> {
+    let mut receipt = AttemptUsage {
+        observer,
+        actual: None,
+    };
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     loop {
@@ -640,6 +718,8 @@ async fn collect_v1(
     let source = decoder.feed(&bytes);
     let value = runtime_json::parse(&source)
         .map_err(|_| invalid("Native compaction returned invalid JSON."))?;
+    let mut state = ResponsesState::default();
+    receipt.actual = update_responses_usage(&value, &mut state).then(|| state.usage());
     let output = value
         .get("output")
         .and_then(Value::as_array)
@@ -675,8 +755,7 @@ async fn collect_v1(
         .filter(|id| !id.is_empty())
         .cloned()
         .ok_or_else(|| invalid("Native compaction returned no response identity."))?;
-    let mut state = ResponsesState::default();
-    let usage = update_responses_usage(&value, &mut state).then(|| state.usage());
+    let usage = receipt.actual.clone();
     Ok(Collected {
         encrypted_content: native[0].clone(),
         response_id,
@@ -1274,7 +1353,381 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_summary_preference_replays_and_replaces_an_existing_checkpoint() {
+    async fn native_precompute_fork_keeps_transport_but_not_foreground_request_state() {
+        use crate::context::compact::engine::Compactor;
+        use crate::context::compact::{create_compactor, CompactorOptions};
+        use crate::schemas::config::EngineConfig;
+        let (base, server) =
+            fixture(vec![("text/event-stream", complete("background-native"))]).await;
+        let provider = Arc::new(provider(base, RemoteCompactionSupport::ResponsesV2));
+        let parent = create_compactor(CompactorOptions {
+            call_model: Box::new(|_, _| {
+                panic!("native compaction must not request a text summary")
+            }),
+            model: "selected".into(),
+            max_output_tokens: Some(8_000),
+            uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
+        });
+        parent.bind_native_provider(provider);
+        let config = EngineConfig {
+            model: "selected".into(),
+            ..Default::default()
+        };
+        let isolated = parent
+            .fork_isolated(Box::new(|_, _| panic!("unused")), &config)
+            .unwrap();
+        assert!(
+            !isolated.native_summary_active(),
+            "internal isolated queries remain text-only"
+        );
+        let fork = parent
+            .fork_precompute(
+                Box::new(|_, _| panic!("must use native transport")),
+                &config,
+            )
+            .unwrap();
+        assert!(fork.native_summary_active());
+        assert_eq!(
+            fork.native_precompute_context(),
+            parent.native_precompute_context()
+        );
+        assert!(fork.native_precompute_context().is_some());
+        fork.prepare_request(&request(), &AbortSignal::new());
+        let result = fork
+            .threshold_compact(request().messages, &config, None)
+            .await;
+        assert!(result.compacted, "{result:?}");
+        assert!(
+            matches!(result.messages.last(), Some(Message::CompactBoundary(boundary))
+            if boundary.native_compaction.as_ref().is_some_and(|checkpoint| checkpoint.encrypted_content == "background-native"))
+        );
+        let captured = server.await.unwrap();
+        assert_eq!(
+            captured[0].1["input"].as_array().unwrap().last().unwrap()["type"],
+            vs("compaction_trigger")
+        );
+    }
+
+    struct ChangingAuth {
+        owner: std::sync::Mutex<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        switch_on_call: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthSource for ChangingAuth {
+        async fn get_headers(&self, _: &AbortSignal) -> Result<AuthHeaders, ProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let mut owner = self.owner.lock().unwrap();
+            if call == self.switch_on_call {
+                *owner = "account-b".into();
+            }
+            Ok(HashMap::from([
+                ("chatgpt-account-id".into(), owner.clone()),
+                ("authorization".into(), format!("Bearer refreshed-{call}")),
+            ]))
+        }
+        fn credential_account_id(&self) -> Option<String> {
+            Some(self.owner.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_precompute_rejects_owner_changes_before_sending_history() {
+        use crate::context::compact::engine::Compactor;
+        use crate::context::compact::{create_compactor, CompactorOptions};
+        use crate::schemas::config::EngineConfig;
+        // Cover a queued task, the initial header read, scope binding, and the
+        // actual send. All must reject before the listening endpoint sees data.
+        for switch_on_call in 0..=3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let auth = Arc::new(ChangingAuth {
+                owner: std::sync::Mutex::new("account-a".into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                switch_on_call,
+            });
+            let provider = Arc::new(OpenAIProvider::new(OpenAIProviderOptions {
+                base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+                api: Some(OpenAiApi::Responses),
+                remote_compaction: RemoteCompactionSupport::ResponsesV2,
+                auth_source: Some(auth.clone()),
+                ..Default::default()
+            }));
+            let parent = create_compactor(CompactorOptions {
+                call_model: Box::new(|_, _| panic!("native transport required")),
+                model: "selected".into(),
+                max_output_tokens: Some(1024),
+                uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
+            });
+            parent.bind_native_provider(provider);
+            let config = EngineConfig {
+                model: "selected".into(),
+                ..Default::default()
+            };
+            let fork = parent
+                .fork_precompute(
+                    Box::new(|_, _| panic!("native transport required")),
+                    &config,
+                )
+                .unwrap();
+            if switch_on_call == 0 {
+                *auth.owner.lock().unwrap() = "account-b".into();
+            }
+            fork.prepare_request(&request(), &AbortSignal::new());
+            assert!(
+                !fork
+                    .threshold_compact(request().messages, &config, None)
+                    .await
+                    .compacted
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err(),
+                "an invalidated account must receive no speculative history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_precompute_allows_same_account_token_refresh() {
+        let (base, server) = fixture(vec![("text/event-stream", complete("refreshed"))]).await;
+        let provider = OpenAIProvider::new(OpenAIProviderOptions {
+            base_url: Some(base),
+            api: Some(OpenAiApi::Responses),
+            remote_compaction: RemoteCompactionSupport::ResponsesV2,
+            auth_source: Some(Arc::new(ChangingAuth {
+                owner: std::sync::Mutex::new("account-a".into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                switch_on_call: usize::MAX,
+            })),
+            ..Default::default()
+        });
+        let context = provider
+            .native_compaction_context(&"selected".into())
+            .unwrap();
+        let result = provider
+            .compact_remote_with_usage(
+                request(),
+                AbortSignal::new(),
+                5_000,
+                Arc::new(|_| {}),
+                Some(context.auth_scope),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.checkpoint.encrypted_content, "refreshed");
+        assert_eq!(
+            provider
+                .native_compaction_context(&"selected".into())
+                .unwrap()
+                .identity,
+            context.identity
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metered_native_compaction_cannot_bypass_a_captured_model_allowlist() {
+        let (base, server) = fixture(vec![("text/event-stream", complete("must-not-send"))]).await;
+        let captured = crate::provider::model_catalog::capture_model_provider(
+            Arc::new(provider(base, RemoteCompactionSupport::ResponsesV2)),
+            &["selected".into()],
+        );
+        let mut denied = request();
+        denied.model = "not-captured".into();
+        let result = captured
+            .compact_remote_with_usage(denied, AbortSignal::new(), 5_000, Arc::new(|_| {}), None)
+            .await;
+        server.abort();
+        assert_eq!(
+            result.unwrap_err().code.as_ref(),
+            Some(&RuntimeString::from("native_compaction_incompatible"))
+        );
+    }
+
+    #[tokio::test]
+    async fn native_usage_is_reported_once_per_attempt_even_when_output_is_rejected() {
+        let incomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"first\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":30,\"output_tokens\":7}}}\n\n";
+        let invalid = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"bad\",\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":9},\"output\":[]}}\n\n";
+        let (base, server) = fixture(vec![
+            ("text/event-stream", incomplete.into()),
+            ("text/event-stream", complete("retried")),
+            ("text/event-stream", invalid.into()),
+        ])
+        .await;
+        let provider = provider(base, RemoteCompactionSupport::ResponsesV2);
+        let receipts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = receipts.clone();
+        let observer: crate::types::provider::NativeCompactionUsageObserver =
+            Arc::new(move |usage| captured.lock().unwrap().push(usage));
+        let result = provider
+            .compact_remote_with_usage(request(), AbortSignal::new(), 5_000, observer.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.usage.unwrap().output_tokens, 12);
+        assert!(provider
+            .compact_remote_with_usage(request(), AbortSignal::new(), 5_000, observer, None)
+            .await
+            .is_err());
+        assert_eq!(server.await.unwrap().len(), 3);
+        let usages = receipts.lock().unwrap();
+        assert_eq!(
+            usages
+                .iter()
+                .map(|usage| (usage.input_tokens, usage.output_tokens))
+                .collect::<Vec<_>>(),
+            vec![(30, 7), (100, 12), (50, 9)]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires an explicitly supplied isolated subscription credential file and model"]
+    async fn live_native_precompute_runs_beside_foreground_and_replays() {
+        use crate::context::compact::engine::Compactor;
+        use crate::context::compact::{create_compactor, CompactorOptions};
+        use crate::provider::codex_subscription::{
+            codex_oauth_defaults, create_codex_subscription_provider, CodexSubscriptionOptions,
+        };
+        use crate::provider::oauth::OAuthTokens;
+        use crate::schemas::config::EngineConfig;
+        let user = |id: &str, body: &str| {
+            Message::User(crate::schemas::message::UserMessage {
+                uuid: id.into(),
+                is_meta: None,
+                question_answer: None,
+                content: vec![crate::schemas::content::ContentBlock::Text(
+                    crate::schemas::content::TextBlock {
+                        text: body.into(),
+                        citations: None,
+                        harness_envelope: None,
+                        message_id: None,
+                        phase: None,
+                    },
+                )],
+            })
+        };
+        let path =
+            std::env::var("KLAUS_NATIVE_LIVE_AUTH").expect("isolated credential path is required");
+        let model = std::env::var("KLAUS_NATIVE_LIVE_MODEL")
+            .expect("an explicitly selected model is required");
+        let bytes = std::fs::read(path).expect("cannot read isolated credentials");
+        let tokens: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("invalid isolated credential JSON");
+        let (provider, _) = create_codex_subscription_provider(CodexSubscriptionOptions {
+            oauth: codex_oauth_defaults("live-probe", None),
+            store: None,
+            tokens: Some(OAuthTokens {
+                access_token: tokens["accessToken"]
+                    .as_str()
+                    .expect("missing access token")
+                    .into(),
+                id_token: tokens["idToken"].as_str().map(Into::into),
+                expires_at: tokens["expiresAt"].as_i64(),
+                refresh_token: None,
+            }),
+            base_url: Some("https://chatgpt.com/backend-api/codex".into()),
+            default_model: Some(model.clone()),
+            access_policy: None,
+            identity: None,
+        });
+        let provider = Arc::new(provider);
+        let mut request = request();
+        request.model = model.clone().into();
+        request.max_output_tokens = 256;
+        request.system = vec![crate::types::provider::SystemPromptPart {
+            name: "probe".into(),
+            text: "Answer briefly. Preserve the exact probe marker when asked.".into(),
+            cacheable: None,
+            cache_scope: None,
+        }];
+        request.messages = vec![user("probe-user", "Remember the exact marker native_probe_lighthouse_7481 and that the pending task is to verify replay.")];
+        let compactor = create_compactor(CompactorOptions {
+            call_model: Box::new(|_, _| panic!("native path required")),
+            model: model.clone().into(),
+            max_output_tokens: Some(256),
+            uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
+        });
+        compactor.bind_native_provider(provider.clone());
+        let config = EngineConfig {
+            model: model.into(),
+            stream_idle_timeout_ms: 120_000,
+            ..Default::default()
+        };
+        let fork = compactor
+            .fork_precompute(Box::new(|_, _| panic!("native path required")), &config)
+            .unwrap();
+        assert!(fork.native_summary_active());
+        assert!(fork.native_precompute_context().is_some());
+        fork.prepare_request(&request, &AbortSignal::new());
+        let started = std::time::Instant::now();
+        let background = {
+            let messages = request.messages.clone();
+            tokio::spawn(async move { fork.threshold_compact(messages, &config, None).await })
+        };
+        let mut foreground = request.clone();
+        foreground.messages = vec![user("foreground", "Reply exactly: foreground_ready")];
+        let foreground_events: Vec<_> = provider
+            .stream(foreground, AbortSignal::new())
+            .collect()
+            .await;
+        assert!(
+            foreground_events
+                .iter()
+                .all(|event| !matches!(event, ModelStreamEvent::Error { .. })),
+            "foreground request failed"
+        );
+        let foreground_text: String = foreground_events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .collect();
+        assert!(foreground_text.contains("foreground_ready"));
+        println!(
+            "foreground completed after {} ms",
+            started.elapsed().as_millis()
+        );
+        let compacted = background.await.unwrap();
+        println!(
+            "native result available after {} ms; compacted={}",
+            started.elapsed().as_millis(),
+            compacted.compacted
+        );
+        assert!(compacted.compacted, "native background compaction failed");
+        assert!(
+            matches!(compacted.messages.last(), Some(Message::CompactBoundary(boundary)) if boundary.native_compaction.is_some())
+        );
+        let mut replay = request;
+        replay.messages = compacted.messages;
+        replay.messages.push(user(
+            "verify",
+            "Return the exact probe marker from the earlier context.",
+        ));
+        let events: Vec<_> = provider.stream(replay, AbortSignal::new()).collect().await;
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, ModelStreamEvent::Error { .. })),
+            "native replay failed"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("native_probe_lighthouse_7481"),
+            "replayed marker was not recovered"
+        );
+        println!("native background, parallel foreground and checkpoint replay passed");
+    }
+
+    #[tokio::test]
+    async fn explicit_text_summary_replays_and_replaces_an_existing_checkpoint() {
         use crate::context::compact::engine::Compactor;
         use crate::context::compact::{create_compactor, CompactorOptions};
         use crate::provider::codex_subscription::{
@@ -1317,10 +1770,10 @@ mod tests {
             uuid: Box::new(|| uuid::Uuid::new_v4().to_string()),
         });
         compactor.bind_native_provider(provider);
-        assert!(!compactor.native_summary_active());
+        assert!(compactor.native_summary_active());
         compactor.prepare_request(&request(), &AbortSignal::new());
         let result = compactor
-            .threshold_compact(original, &EngineConfig::default(), None)
+            .local_compact(original, &EngineConfig::default(), None)
             .await;
         assert!(result.compacted, "{result:?}");
         let Message::CompactBoundary(boundary) = result.messages.last().unwrap() else {

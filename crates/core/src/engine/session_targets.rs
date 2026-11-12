@@ -728,6 +728,21 @@ struct SummaryProvider {
     broker: Option<Arc<ReceiptBroker>>,
 }
 
+struct NativeSummaryReceipt {
+    model: RuntimeString,
+    actual: Arc<std::sync::Mutex<Option<crate::schemas::message::Usage>>>,
+    sink: SummaryUsageSink,
+    slot: Option<ReceiptSlot>,
+}
+
+impl Drop for NativeSummaryReceipt {
+    fn drop(&mut self) {
+        if let Some(usage) = self.actual.lock_recover().take() {
+            (self.sink)(&self.model, &usage, self.slot.take());
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelProvider for SummaryProvider {
     async fn native_checkpoint_compatibility(
@@ -748,14 +763,33 @@ impl ModelProvider for SummaryProvider {
         self.inner.model_auto_compact_token_limit(model)
     }
 
+    fn native_compaction_context(
+        &self,
+        model: &RuntimeString,
+    ) -> Option<crate::types::provider::NativeCompactionContext> {
+        if self.remote_compaction_support(model)
+            == crate::types::provider::RemoteCompactionSupport::Unsupported
+        {
+            return None;
+        }
+        self.inner
+            .native_compaction_context(model)
+            .map(|mut context| {
+                context.identity = format!(
+                    "{:?}:{:?}",
+                    context.identity,
+                    self.compaction_compatibility_hash(model)
+                )
+                .into();
+                context
+            })
+    }
+
     fn remote_compaction_support(
         &self,
         model: &RuntimeString,
     ) -> crate::types::provider::RemoteCompactionSupport {
         self.inner.remote_compaction_support(model)
-    }
-    fn prefers_local_compaction(&self, model: &RuntimeString) -> bool {
-        self.inner.prefers_local_compaction(model)
     }
     fn compaction_compatibility_hash(&self, model: &RuntimeString) -> Option<RuntimeString> {
         self.inner.compaction_compatibility_hash(model)
@@ -790,18 +824,63 @@ impl ModelProvider for SummaryProvider {
         idle_ms: u64,
     ) -> Result<crate::types::provider::RemoteCompactionResult, crate::types::errors::ProviderError>
     {
-        let model = request.model.clone();
+        self.compact_remote_with_usage(request, signal, idle_ms, Arc::new(|_| {}), None)
+            .await
+    }
+
+    async fn compact_remote_with_usage(
+        &self,
+        request: crate::types::provider::ModelRequest,
+        signal: crate::types::abort::AbortSignal,
+        idle_ms: u64,
+        observer: crate::types::provider::NativeCompactionUsageObserver,
+        expected_scope: Option<RuntimeString>,
+    ) -> Result<crate::types::provider::RemoteCompactionResult, crate::types::errors::ProviderError>
+    {
         let slot = reserve_receipt(self.broker.as_ref(), &signal)
             .await
             .map_err(usage_admission_error)?;
+        let actual = Arc::new(std::sync::Mutex::new(
+            None::<crate::schemas::message::Usage>,
+        ));
+        let receipt = NativeSummaryReceipt {
+            model: request.model.clone(),
+            actual: actual.clone(),
+            sink: self.sink.clone(),
+            slot,
+        };
         let result = self
             .inner
-            .compact_remote_with_idle_timeout(request, signal, idle_ms)
-            .await?;
-        if let Some(usage) = &result.usage {
-            (self.sink)(&model, usage, slot);
-        }
-        Ok(result)
+            .compact_remote_with_usage(
+                request,
+                signal,
+                idle_ms,
+                Arc::new(move |usage| {
+                    observer(usage.clone());
+                    let mut recorded = actual.lock_recover();
+                    if let Some(total) = recorded.as_mut() {
+                        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+                        total.output_tokens =
+                            total.output_tokens.saturating_add(usage.output_tokens);
+                        total.cache_read_input_tokens = total
+                            .cache_read_input_tokens
+                            .saturating_add(usage.cache_read_input_tokens);
+                        total.cache_creation_input_tokens = total
+                            .cache_creation_input_tokens
+                            .saturating_add(usage.cache_creation_input_tokens);
+                        total.total_tokens = match (total.total_tokens, usage.total_tokens) {
+                            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                            _ => None,
+                        };
+                    } else {
+                        *recorded = Some(usage);
+                    }
+                }),
+                expected_scope,
+            )
+            .await;
+        drop(receipt);
+        result
     }
     fn info(&self) -> &crate::types::provider::ProviderInfo {
         self.inner.info()
@@ -857,5 +936,133 @@ impl ModelProvider for SummaryProvider {
                 yield event;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod native_summary_usage_tests {
+    use super::*;
+    use crate::runtime_values::{runtime_codec, runtime_json};
+    use crate::schemas::message::{NativeCompactionCheckpoint, Usage};
+    use crate::types::abort::AbortSignal;
+    use crate::types::errors::ProviderError;
+    use crate::types::provider::{
+        ModelRequest, ModelStream, NativeCompactionUsageObserver, ProviderCapabilities,
+        ProviderInfo, RemoteCompactionResult,
+    };
+
+    struct MeteredNativeProvider {
+        info: ProviderInfo,
+        pending: Option<Arc<tokio::sync::Notify>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for MeteredNativeProvider {
+        fn info(&self) -> &ProviderInfo {
+            &self.info
+        }
+        fn capabilities(&self, _: &RuntimeString) -> ProviderCapabilities {
+            panic!("native compaction must not request text capabilities")
+        }
+        fn stream(&self, _: ModelRequest, _: AbortSignal) -> ModelStream {
+            panic!("native compaction must not request a text summary")
+        }
+        async fn compact_remote_with_usage(
+            &self,
+            _: ModelRequest,
+            _: AbortSignal,
+            _: u64,
+            observer: NativeCompactionUsageObserver,
+            _: Option<RuntimeString>,
+        ) -> Result<RemoteCompactionResult, ProviderError> {
+            for (input, output) in [(30, 7), (100, 12)] {
+                observer(Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_input_tokens: 4,
+                    cache_creation_input_tokens: 2,
+                    total_tokens: Some(input + output + 6),
+                });
+            }
+            if let Some(ready) = &self.pending {
+                ready.notify_one();
+                futures::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(usage_admission_error(std::io::Error::other("fixture")));
+            }
+            Ok(RemoteCompactionResult {
+                checkpoint: NativeCompactionCheckpoint {
+                    source: "fixture".into(),
+                    auth_scope: "fixture".into(),
+                    model: "selected".into(),
+                    comp_hash: None,
+                    response_id: "fixture".into(),
+                    encrypted_content: "opaque".into(),
+                    retained_input: Vec::new(),
+                    retained_input_metadata: Vec::new(),
+                },
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_summary_receipts_include_retries_on_success_failure_and_future_drop() {
+        for mode in 0..3 {
+            let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink_records = recorded.clone();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let provider = SummaryProvider {
+                inner: Arc::new(MeteredNativeProvider {
+                    info: ProviderInfo {
+                        name: "fixture".into(),
+                        base_url: None,
+                        env_key: None,
+                        default_model: "selected".into(),
+                    },
+                    pending: (mode == 2).then(|| ready.clone()),
+                    fail: mode == 1,
+                }),
+                call_model: Arc::new(|_, _| panic!("text transport must not be called")),
+                sink: Arc::new(move |model, usage, slot| {
+                    assert_eq!(model, &RuntimeString::from("selected"));
+                    assert!(slot.is_none());
+                    sink_records.lock_recover().push(usage.clone());
+                }),
+                broker: None,
+            };
+            let request: ModelRequest = runtime_codec::decode_value(
+                &runtime_json::parse(&RuntimeString::from(
+                    r#"{"model":"selected","system":[],"messages":[],"tools":[],"maxOutputTokens":1024}"#,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            let task = tokio::spawn(async move {
+                provider
+                    .compact_remote_with_idle_timeout(request, AbortSignal::new(), 100)
+                    .await
+            });
+            if mode == 2 {
+                ready.notified().await;
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(task.await.unwrap().is_err(), mode == 1);
+            }
+            assert_eq!(
+                *recorded.lock_recover(),
+                vec![Usage {
+                    input_tokens: 130,
+                    output_tokens: 19,
+                    cache_read_input_tokens: 8,
+                    cache_creation_input_tokens: 4,
+                    total_tokens: Some(161),
+                }],
+                "each logical compaction must persist all attempt usage exactly once"
+            );
+        }
     }
 }

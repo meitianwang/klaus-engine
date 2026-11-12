@@ -2544,6 +2544,7 @@ async fn run_turn_compaction_check(
                 messages,
                 prefix_tokens,
                 &config,
+                &prepared.request,
             )
             .await
             {
@@ -3645,6 +3646,7 @@ async fn consume_precomputed_compaction(
     messages: &mut Vec<Message>,
     prefix_tokens: u64,
     config: &crate::schemas::config::ResolvedConfig,
+    request: &crate::types::provider::ModelRequest,
 ) -> Option<Result<(), CompactionFailure>> {
     // The gate is checked on both ends so a session that disables precompute
     // mid-flight never applies an entry armed while it was enabled; the
@@ -3660,14 +3662,17 @@ async fn consume_precomputed_compaction(
         .unwrap_or_else(|| RuntimeString::from("main"));
     let (compactable, _protected) =
         split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
-    let now = shared.deps().now.clone();
+    let deps = shared.deps();
+    let now = deps.now.clone();
     match registry
-        .consume(
+        .consume_native(
             &agent_key,
             &compactable,
             config,
             &shared.params.signal,
             now.as_ref(),
+            deps.compactor.as_ref(),
+            request,
         )
         .await
     {
@@ -3733,13 +3738,8 @@ fn maybe_arm_compaction_precompute(
         return;
     }
     let deps = shared.deps();
-    // Native remote checkpoints are stateful on the provider side; sessions
-    // bound to them keep the synchronous compaction path.
-    if deps.compactor.native_summary_active() {
-        return;
-    }
     let now = deps.now.clone();
-    let Ok(compactor) = deps.compactor.fork_isolated(deps.call_model, config) else {
+    let Ok(compactor) = deps.compactor.fork_precompute(deps.call_model, config) else {
         return;
     };
     let (compactable, _protected) =
