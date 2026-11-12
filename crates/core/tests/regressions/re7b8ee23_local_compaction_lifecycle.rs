@@ -480,23 +480,36 @@ async fn five_configured_retries_follow_server_waits_before_a_complete_summary()
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_or_incomplete_text_never_replaces_original_history() {
+async fn failed_or_unterminated_text_never_replaces_original_history() {
     let original = vec![
         user("task", "Original constraints."),
         old_boundary(),
         pair("read")[0].clone(),
         pair("read")[1].clone(),
     ];
-    for failure in 0..3 {
+    for failure in [
+        "network",
+        "unterminated",
+        "refusal",
+        "empty-limit",
+        "empty-tool",
+    ] {
         let requests = Requests::default();
         let compactor = full(recording(&requests, move |_, _| {
-            let mut events = vec![ModelStreamEvent::TextDelta {
-                text: "UNCOMMITTED_PARTIAL_TEXT".into(),
-            }];
+            let mut events = if failure.starts_with("empty-") {
+                Vec::new()
+            } else {
+                vec![ModelStreamEvent::TextDelta {
+                    text: "UNCOMMITTED_PARTIAL_TEXT".into(),
+                }]
+            };
             match failure {
-                0 => events.push(error(ProviderErrorKind::Network, Some(0))),
-                1 => {}
-                _ => events.push(stop(ModelStopReason::MaxTokens)),
+                "network" => events.push(error(ProviderErrorKind::Network, Some(0))),
+                "unterminated" => {}
+                "refusal" => events.push(stop(ModelStopReason::Refusal)),
+                "empty-limit" => events.push(stop(ModelStopReason::MaxTokens)),
+                "empty-tool" => events.push(stop(ModelStopReason::ToolUse)),
+                _ => unreachable!(),
             }
             events
         }));
@@ -505,12 +518,45 @@ async fn failed_or_incomplete_text_never_replaces_original_history() {
         let result = compactor
             .full_compact(original.clone(), &config, None, false)
             .await;
-        assert!(!result.compacted);
-        assert_eq!(result.messages, original);
-        assert_eq!(result.freed_tokens, 0);
-        assert!(!result.diagnostics.is_empty());
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(!result.compacted, "{failure}: {result:?}");
+        assert_eq!(result.messages, original, "{failure}");
+        assert_eq!(result.freed_tokens, 0, "{failure}");
+        assert!(!result.diagnostics.is_empty(), "{failure}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{failure}");
     }
+}
+
+#[tokio::test]
+async fn output_limited_text_replaces_history_with_an_explicit_degradation() {
+    use klaus_agent_core::context::compact::outcome::CompactionDiagnosticKind;
+
+    let requests = Requests::default();
+    let compactor = full(recording(&requests, |_, _| {
+        vec![
+            ModelStreamEvent::TextDelta {
+                text: SUMMARY.into(),
+            },
+            stop(ModelStopReason::MaxTokens),
+        ]
+    }));
+    let original = vec![
+        user("task", "Original constraints."),
+        old_boundary(),
+        pair("read")[0].clone(),
+        pair("read")[1].clone(),
+    ];
+    let result = compactor
+        .full_compact(original, &config(), None, false)
+        .await;
+    assert!(result.compacted, "{result:?}");
+    summary_is_last(&result.messages);
+    assert_eq!(body(&result.messages[0]), "Original constraints.");
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(
+        result.diagnostics[0].kind,
+        CompactionDiagnosticKind::OutputTruncated
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
