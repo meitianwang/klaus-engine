@@ -648,7 +648,13 @@ async fn stream_and_dispatch_inner(
         (deps.call_model)(wire_req, attempt.clone())
     }));
     let mut stream = match provider_stream {
-        Ok(stream) => stream,
+        // Scope the stream so the transport-level records a provider writes
+        // while it is polled can name the session, and therefore the sub-agent
+        // scope, that issued the request.
+        Ok(stream) => crate::observability::provider_diagnostics::scoped_trace_stream(
+            shared.params.thread_id.clone(),
+            stream,
+        ),
         Err(payload) => {
             attempt.cancel();
             return Outcome::ProviderAdmissionError {

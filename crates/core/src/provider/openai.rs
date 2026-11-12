@@ -4601,6 +4601,12 @@ fn record_provider_trace(enabled: bool, record: &ProviderTraceRecord<'_>) {
     if let Some(request_id) = record.request_id {
         object.insert("requestId".to_string(), json!(request_id));
     }
+    // Attribution comes from the scope the engine sets around the stream this
+    // record settles, so a success line can be joined with the failure line of
+    // the same session and scope.
+    if let Some(session_id) = crate::observability::provider_diagnostics::trace_session_id() {
+        object.insert("sessionId".to_string(), json!(session_id));
+    }
     crate::observability::provider_diagnostics::record_named(
         crate::observability::provider_diagnostics::TRACE_LOG_FILE_NAME,
         "provider_request_settled",
@@ -6622,6 +6628,77 @@ mod tests {
         // No wire marker arrived, so the record must not claim one.
         assert!(!line.contains("rawFinishReason"), "{line}");
         assert!(!log.contains("trace-disabled-fixture"), "{log}");
+    }
+
+    #[test]
+    fn provider_trace_names_the_scoped_session_and_invents_no_attribution() {
+        let path = crate::observability::provider_diagnostics::log_path_named(
+            crate::observability::provider_diagnostics::TRACE_LOG_FILE_NAME,
+        );
+        let scoped_marker = format!("trace-scoped-fixture-{}", std::process::id());
+        let bare_marker = format!("trace-bare-fixture-{}", std::process::id());
+        crate::observability::provider_diagnostics::with_trace_session(
+            RuntimeString::from("session-7:sub:child-1"),
+            || {
+                record_provider_trace(
+                    true,
+                    &ProviderTraceRecord {
+                        api: "chat",
+                        model: &scoped_marker,
+                        request_id: None,
+                        raw_finish_reason: None,
+                        saw_done: true,
+                        mapped_any: true,
+                        buffered: false,
+                        stop_reason: "end_turn",
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        total_tokens: 2,
+                        visible_chars: 1,
+                        elapsed_ms: 1,
+                    },
+                )
+            },
+        );
+        record_provider_trace(
+            true,
+            &ProviderTraceRecord {
+                api: "chat",
+                model: &bare_marker,
+                request_id: None,
+                raw_finish_reason: None,
+                saw_done: true,
+                mapped_any: true,
+                buffered: false,
+                stop_reason: "end_turn",
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                total_tokens: 2,
+                visible_chars: 1,
+                elapsed_ms: 1,
+            },
+        );
+
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        let scoped_line = log
+            .lines()
+            .rfind(|line| line.contains(&scoped_marker))
+            .unwrap_or_else(|| panic!("the scoped record landed: {log}"))
+            .to_string();
+        assert!(
+            scoped_line.contains("\"sessionId\":\"session-7:sub:child-1\""),
+            "{scoped_line}"
+        );
+        // A record written outside a scope keeps saying nothing about ownership,
+        // rather than borrowing whatever ran on this thread before it.
+        let bare_line = log
+            .lines()
+            .rfind(|line| line.contains(&bare_marker))
+            .unwrap_or_else(|| panic!("the unscoped record landed: {log}"))
+            .to_string();
+        assert!(!bare_line.contains("sessionId"), "{bare_line}");
     }
 
     fn collect_text(events: &[ModelStreamEvent]) -> RuntimeString {

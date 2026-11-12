@@ -23,11 +23,18 @@
 //! Writing is best-effort by design: a diagnostic that fails (read-only config
 //! home, a full disk) must never turn a recoverable turn into a failed one.
 
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use futures::stream::Stream;
 use serde_json::{json, Map, Value};
+
+use crate::runtime_values::RuntimeString;
+use crate::types::provider::{ModelStream, ModelStreamEvent};
 
 /// Cap on a single sanitized field. The failure bodies worth keeping are short
 /// (a JSON envelope, an HTML title); a megabyte-long body is a different problem
@@ -49,6 +56,88 @@ pub const TRACE_LOG_FILE_NAME: &str = "provider-trace.log";
 
 /// Content-free request lifecycle records, independent of the opt-in trace.
 pub const TIMING_LOG_FILE_NAME: &str = "provider-timing.log";
+
+thread_local! {
+    /// The session that owns the model stream currently being polled.
+    ///
+    /// Transport-level records are written from inside a provider's stream
+    /// body, a layer that receives the request and never a session. The failure
+    /// path can still name its session because the engine records it, but a
+    /// success record could not, so the two logs could not be joined and a
+    /// per-scope success rate was unknowable. The engine scopes every stream it
+    /// polls; records read the scope back.
+    ///
+    /// A thread local is the right carrier here, not a task local: a record is
+    /// written synchronously inside one `poll_next` call, so holding the scope
+    /// for the duration of that poll attributes it exactly, on whichever task
+    /// or thread the consumer happens to poll from.
+    static TRACE_SESSION: RefCell<Option<RuntimeString>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous scope on drop, so nested polls keep their own session.
+struct TraceSessionGuard {
+    previous: Option<RuntimeString>,
+}
+
+impl Drop for TraceSessionGuard {
+    fn drop(&mut self) {
+        TRACE_SESSION.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+fn enter_trace_session(session_id: RuntimeString) -> TraceSessionGuard {
+    let previous = TRACE_SESSION.with(|slot| slot.borrow_mut().replace(session_id));
+    TraceSessionGuard { previous }
+}
+
+/// A model stream whose every poll carries the owning session into
+/// [`TRACE_SESSION`].
+///
+/// Scoping the stream instead of the code around it keeps attribution correct
+/// wherever the stream is polled, including a retry loop or a consumer on
+/// another task. A stream polled without this wrapper records no session, which
+/// is exactly the behavior from before attribution existed.
+struct SessionScopedStream {
+    session_id: RuntimeString,
+    inner: ModelStream,
+}
+
+impl Stream for SessionScopedStream {
+    type Item = ModelStreamEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let _guard = enter_trace_session(this.session_id.clone());
+        this.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Attribute every transport-level record written while `stream` is polled to
+/// `session_id`.
+pub fn scoped_trace_stream(session_id: RuntimeString, stream: ModelStream) -> ModelStream {
+    Box::pin(SessionScopedStream {
+        session_id,
+        inner: stream,
+    })
+}
+
+/// Run `f` with `session_id` scoped, for a caller that already holds the
+/// session and writes a record outside a stream poll.
+pub fn with_trace_session<R>(session_id: RuntimeString, f: impl FnOnce() -> R) -> R {
+    let _guard = enter_trace_session(session_id);
+    f()
+}
+
+/// The scoped session id, or `None` outside a scope.
+pub fn trace_session_id() -> Option<String> {
+    TRACE_SESSION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|session_id| session_id.try_to_utf8().ok())
+    })
+}
 
 /// Where the log lives: `<config home>/logs/<file name>`, the
 /// directory the host and the engine already share for user-visible logs.
@@ -646,5 +735,50 @@ mod tests {
             !path.starts_with(crate::fs::paths::config_home()),
             "{path:?} must not resolve into the real config home under test"
         );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_stream_attributes_its_polls_to_the_owning_session() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&observed);
+        let inner: ModelStream = Box::pin(futures::stream::poll_fn(move |_| {
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(trace_session_id());
+            Poll::Ready(None)
+        }));
+        let mut stream = scoped_trace_stream(RuntimeString::from("session-9:sub:child"), inner);
+        use futures::StreamExt;
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![Some("session-9:sub:child".to_string())],
+            "the poll that wrote the record must see the owning session"
+        );
+        assert_eq!(
+            trace_session_id(),
+            None,
+            "the scope must not outlive the poll that set it"
+        );
+    }
+
+    #[test]
+    fn the_session_scope_restores_what_it_displaced() {
+        with_trace_session(RuntimeString::from("outer"), || {
+            assert_eq!(trace_session_id().as_deref(), Some("outer"));
+            with_trace_session(RuntimeString::from("inner"), || {
+                assert_eq!(trace_session_id().as_deref(), Some("inner"));
+            });
+            assert_eq!(
+                trace_session_id().as_deref(),
+                Some("outer"),
+                "an inner scope must hand the outer one back"
+            );
+        });
+        assert_eq!(trace_session_id(), None);
     }
 }
