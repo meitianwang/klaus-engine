@@ -11970,6 +11970,173 @@ async fn reasoning_over_limit_settles_when_prompts_are_avoided() {
     );
 }
 
+/// A normal-stop empty closing after visible work parks on the user once the
+/// step-4.8 retry is spent, on the same elicitation channel as the
+/// reasoning-over-limit ladder: "keep retrying" resets the ladder and gives the
+/// model another chance to close, while "stop" — or anything unrecognised —
+/// fails the turn with the chose-to-stop wording.
+#[tokio::test]
+async fn empty_closing_after_visible_work_blocks_on_the_user_and_honours_the_answer() {
+    for (answer, expect_retry, expect_completed) in [
+        ("Keep retrying", true, true),
+        ("Stop", false, false),
+        ("something unrelated", false, false),
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::<ModelRequest>::new()));
+        let elicits = Arc::new(Mutex::new(Vec::<ElicitRequest>::new()));
+        let answer_text = RuntimeString::from(answer);
+        let tool_context_base = {
+            let elicits = Arc::clone(&elicits);
+            Arc::new(move || {
+                let mut ctx = make_test_ctx("/tmp");
+                ctx.elicit = Some(Arc::new(ScriptedReasoningElicit {
+                    elicits: Arc::clone(&elicits),
+                    answer: answer_text.clone(),
+                }));
+                ctx
+            })
+        };
+        let deps = deps_with(Box::new({
+            let requests = Arc::clone(&requests);
+            let elicits = Arc::clone(&elicits);
+            move |request: ModelRequest, _signal: AbortSignal| -> ModelStream {
+                let index = requests.lock().unwrap().len();
+                requests.lock().unwrap().push(request);
+                let asked = elicits.lock().unwrap().len();
+                let mut events = vec![ev::message_start(Some("gpt-5"))];
+                if index == 0 {
+                    // Visible work first, so the turn has output the closing
+                    // response can then fail to close.
+                    events.extend(exact_tool_use_events("t1", "echo", &runtime_json!({})));
+                    events.push(ev::stop(Some(ModelStopReason::ToolUse), None));
+                } else if asked > 0 && index >= 3 {
+                    // The user chose retry and the fresh step-4.8 retry was
+                    // spent: close with visible text at last.
+                    events.push(ev::text("finally the closing answer"));
+                    events.push(ev::stop(None, None));
+                } else {
+                    // Thinking only with a normal stop: the empty-closing shape
+                    // the step-4.8 ladder and then the confirmation handle.
+                    events.push(ev::thinking("reasoning that never surfaces"));
+                    events.push(ev::stop(None, None));
+                }
+                Box::pin(futures::stream::iter(events))
+            }
+        }));
+        let mut params = mk_params(
+            vec![user_msg("answer")],
+            vec![Arc::new(EchoTool { schema: JsonSchema::new() })],
+        );
+        params.model = "gpt-5".into();
+        params.config.loop_detection = false;
+        params.tool_context_base = tool_context_base;
+
+        let events = query(params, deps).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            elicits.lock().unwrap().len(),
+            1,
+            "{answer}: the user is asked exactly once, after the step-4.8 retry is spent"
+        );
+        let asked = String::from_utf8_lossy(&elicits.lock().unwrap()[0].prompt.to_node_utf8())
+            .into_owned();
+        assert!(
+            asked.contains("closing answer"),
+            "{answer}: the question names the empty closing: {asked}"
+        );
+        let request_count = requests.lock().unwrap().len();
+        assert_eq!(
+            request_count > 3,
+            expect_retry,
+            "{answer}: requests={request_count}"
+        );
+        let completed = events.iter().any(|event| {
+            matches!(
+                event,
+                EngineEvent::TurnCompleted {
+                    stop_reason: TerminalReason::Completed,
+                    ..
+                }
+            )
+        });
+        assert_eq!(completed, expect_completed, "{answer}");
+        if !expect_retry {
+            let failure = events.iter().find_map(|event| match event {
+                EngineEvent::TurnFailed { error, .. } => {
+                    Some(error.message.try_to_utf8().unwrap_or_default())
+                }
+                _ => None,
+            });
+            assert!(
+                failure.as_deref().is_some_and(|message| message.contains("you chose to stop")),
+                "{answer}: stopping by choice says so: {failure:?}"
+            );
+        }
+    }
+}
+
+/// A declined empty-closing prompt reads as "stop", not as "keep going": the
+/// work stays on screen and the turn fails with the chose-to-stop wording.
+#[tokio::test]
+async fn a_declined_empty_closing_prompt_fails_the_turn() {
+    let elicits = Arc::new(Mutex::new(Vec::<ElicitRequest>::new()));
+    let tool_context_base = {
+        let elicits = Arc::clone(&elicits);
+        Arc::new(move || {
+            let mut ctx = make_test_ctx("/tmp");
+            ctx.elicit = Some(Arc::new(DecliningReasoningElicit {
+                elicits: Arc::clone(&elicits),
+            }));
+            ctx
+        })
+    };
+    let deps = deps_with(Box::new({
+        let served = Arc::new(Mutex::new(0usize));
+        move |_request: ModelRequest, _signal: AbortSignal| -> ModelStream {
+            let index = {
+                let mut count = served.lock().unwrap();
+                let index = *count;
+                *count += 1;
+                index
+            };
+            let mut events = vec![ev::message_start(Some("gpt-5"))];
+            if index == 0 {
+                events.extend(exact_tool_use_events("t1", "echo", &runtime_json!({})));
+                events.push(ev::stop(Some(ModelStopReason::ToolUse), None));
+            } else {
+                events.push(ev::thinking("reasoning that never surfaces"));
+                events.push(ev::stop(None, None));
+            }
+            Box::pin(futures::stream::iter(events))
+        }
+    }));
+    let mut params = mk_params(
+        vec![user_msg("answer")],
+        vec![Arc::new(EchoTool { schema: JsonSchema::new() })],
+    );
+    params.model = "gpt-5".into();
+    params.config.loop_detection = false;
+    params.tool_context_base = tool_context_base;
+
+    let events = query(params, deps).collect::<Vec<_>>().await;
+
+    assert_eq!(
+        elicits.lock().unwrap().len(),
+        1,
+        "the card is shown once before the decline ends the turn"
+    );
+    let failure = events.iter().find_map(|event| match event {
+        EngineEvent::TurnFailed { error, .. } => {
+            Some(error.message.try_to_utf8().unwrap_or_default())
+        }
+        _ => None,
+    });
+    assert!(
+        failure.as_deref().is_some_and(|message| message.contains("you chose to stop")),
+        "a declined card fails the turn rather than looping: {failure:?}"
+    );
+}
+
 /// Returns one structured answer for the reasoning-over-limit question.
 struct ScriptedReasoningElicit {
     elicits: Arc<Mutex<Vec<ElicitRequest>>>,

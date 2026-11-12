@@ -1691,7 +1691,7 @@ async fn run_turn(
                 // user. Three outcomes, because "nobody to ask" must not read as
                 // "keep going" — that would loop forever with no visible output.
                 match reasoning_over_limit_confirmation(&shared).await {
-                    ReasoningOverLimitDecision::Retry => {
+                    EmptyClosingDecision::Retry => {
                         empty_content_retries = 0;
                         inject_reasoning_over_limit_reminder(
                             &shared,
@@ -1703,7 +1703,7 @@ async fn run_turn(
                         .await;
                         continue;
                     }
-                    ReasoningOverLimitDecision::Stop => {
+                    EmptyClosingDecision::Stop => {
                         shared.q.push(EngineEvent::TurnFailed { inference: None,
                             error: EngineError {
                                 code: EngineErrorCode::ProviderError,
@@ -1719,7 +1719,7 @@ async fn run_turn(
                     // No way to ask (headless, sub-agent): fall through to the
                     // settlement below, which fails the turn with the truncation
                     // wording rather than looping or settling as a completion.
-                    ReasoningOverLimitDecision::Settle => {}
+                    EmptyClosingDecision::Settle => {}
                 }
             }
         }
@@ -1931,6 +1931,46 @@ async fn run_turn(
             let closing_response_empty = !response_produced_output;
             let turn_produced_nothing = !produced_output;
             if closing_response_empty || turn_produced_nothing {
+                if !turn_produced_nothing && !truncated {
+                    // (c) A normal-stop empty closing after visible work: the
+                    // step-4.8 ladder spent its single retry. Park on the user
+                    // the way the truncation ladder does once its retries are
+                    // spent, instead of failing the turn outright — the work is
+                    // on screen and the model may still be able to close.
+                    match empty_closing_confirmation(&shared).await {
+                        EmptyClosingDecision::Retry => {
+                            empty_closing_retries = 0;
+                            let nudge = provider_meta_nudge(
+                                &shared,
+                                render_empty_closing_retry(&prepared.profile, true),
+                            );
+                            messages.push(nudge.clone());
+                            if let Some(cb) = &shared.params.on_message {
+                                if cb(nudge).await.is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                        EmptyClosingDecision::Stop => {
+                            shared.q.push(EngineEvent::TurnFailed {
+                                inference: None,
+                                error: EngineError {
+                                    code: EngineErrorCode::ProviderError,
+                                    message: "the model returned an empty closing response after doing visible work, and the retry did not produce one either; you chose to stop".into(),
+                                    cause: None,
+                                    request_id: None,
+                                    provider_kind: None,
+                                    retry_after_ms: None,
+                                },
+                            });
+                            return;
+                        }
+                        // Nobody to ask (headless, sub-agent): fall through to
+                        // the failure below, which keeps the pre-card wording.
+                        EmptyClosingDecision::Settle => {}
+                    }
+                }
                 let message = if turn_produced_nothing {
                     if truncated {
                         "the model returned no content: the output token limit was reached before any text"
@@ -4389,14 +4429,16 @@ fn climb_budget_for_tool_over_limit(
     climbed
 }
 
-/// The user's answer once the reasoning-over-limit ladder is spent.
-enum ReasoningOverLimitDecision {
+/// The user's answer once an empty-closing ladder is spent: the truncation
+/// ladder (zero visible text at the output ceiling) and the normal-stop ladder
+/// (empty closing after visible work) both park here.
+enum EmptyClosingDecision {
     /// Ask again with the ladder reset.
     Retry,
     /// Fail the turn.
     Stop,
     /// Nobody to ask. Fall through to settlement, which fails the turn with the
-    /// truncation wording — deliberately NOT `Retry`, since retrying with nobody
+    /// ladder's wording — deliberately NOT `Retry`, since retrying with nobody
     /// able to stop it is an infinite loop producing nothing visible.
     Settle,
 }
@@ -4408,38 +4450,57 @@ enum ReasoningOverLimitDecision {
 /// retrying without a ceiling would loop forever. Qoder parks such a turn in a
 /// manual-confirm node; this is the same stop, on the elicitation channel the
 /// `ask_user` tool already uses.
-async fn reasoning_over_limit_confirmation(shared: &Arc<Shared>) -> ReasoningOverLimitDecision {
+async fn reasoning_over_limit_confirmation(shared: &Arc<Shared>) -> EmptyClosingDecision {
+    let question = reasoning_over_limit_question_text();
+    let request = reasoning_over_limit_request(&question);
+    confirm_empty_closing(shared, question, request).await
+}
+
+/// Block on the user when a normal-stop closing response came back empty after
+/// visible work and the step-4.8 retry did not change that. Same stop as the
+/// reasoning-over-limit confirmation, on the same elicitation channel.
+async fn empty_closing_confirmation(shared: &Arc<Shared>) -> EmptyClosingDecision {
+    let question = empty_closing_question_text();
+    let request = empty_closing_request(&question);
+    confirm_empty_closing(shared, question, request).await
+}
+
+/// The shared block-on-the-user step for both empty-closing ladders.
+///
+/// Settling here would report success for a turn that produced no answer, and
+/// retrying without a ceiling would loop forever. Qoder parks such a turn in a
+/// manual-confirm node; this is the same stop, on the elicitation channel the
+/// `ask_user` tool already uses.
+async fn confirm_empty_closing(
+    shared: &Arc<Shared>,
+    question: RuntimeString,
+    request: ElicitRequest,
+) -> EmptyClosingDecision {
     // The base tool context is the only place the loop can reach an elicitation
     // handler: it is a per-session factory, and `QueryParams` carries none.
     let base = (shared.params.tool_context_base)();
     let Some(elicit) = base.elicit.clone() else {
-        return ReasoningOverLimitDecision::Settle;
+        return EmptyClosingDecision::Settle;
     };
     // A headless or non-interactive session has no user to answer, and waiting
     // would hang the turn.
     if base.permission.should_avoid_prompts || shared.params.signal.is_cancelled() {
-        return ReasoningOverLimitDecision::Settle;
+        return EmptyClosingDecision::Settle;
     }
-    let question = reasoning_over_limit_question_text();
-    let response = elicit
-        .elicit(
-            reasoning_over_limit_request(&question),
-            shared.params.signal.clone(),
-        )
-        .await;
+    let response = elicit.elicit(request, shared.params.signal.clone()).await;
     match &response {
         ElicitResponse::Answers { answers, .. } => {
             let choice = answers.get(&question).cloned().unwrap_or_default();
-            normalize_reasoning_over_limit_choice(&choice)
+            normalize_empty_closing_choice(&choice)
         }
         ElicitResponse::Accept { values } => {
             let choice = values.first().cloned().unwrap_or_default();
-            normalize_reasoning_over_limit_choice(&choice)
+            normalize_empty_closing_choice(&choice)
         }
         // A declined or cancelled prompt means "do not keep going", which is the
         // safe reading: failing the turn is recoverable, looping is not.
         ElicitResponse::Decline { .. } | ElicitResponse::UserInput { .. } => {
-            ReasoningOverLimitDecision::Stop
+            EmptyClosingDecision::Stop
         }
     }
 }
@@ -4500,16 +4561,73 @@ fn reasoning_over_limit_request(question: &RuntimeString) -> ElicitRequest {
     }
 }
 
+/// The consultation question text for a normal-stop empty closing; also the key
+/// in a structured answer map.
+fn empty_closing_question_text() -> RuntimeString {
+    RuntimeString::from(
+        "The model did visible work but never wrote a closing answer, and stayed empty after a retry. Keep retrying, or stop?",
+    )
+}
+
+/// Two choices, structured so the host renders its question card.
+fn empty_closing_request(question: &RuntimeString) -> ElicitRequest {
+    let mut entry = RuntimeObject::new();
+    entry.insert("question", RuntimeJson::String(question.clone()));
+    entry.insert(
+        "header",
+        RuntimeJson::String(RuntimeString::from("No closing answer")),
+    );
+    let mut options: Vec<RuntimeJson> = Vec::new();
+    let mut retry = RuntimeObject::new();
+    retry.insert(
+        "label",
+        RuntimeJson::String(RuntimeString::from("Keep retrying")),
+    );
+    retry.insert(
+        "description",
+        RuntimeJson::String(RuntimeString::from(
+            "Ask the model again to write the closing answer or continue with tool calls.",
+        )),
+    );
+    options.push(RuntimeJson::Object(retry));
+    let mut stop = RuntimeObject::new();
+    stop.insert("label", RuntimeJson::String(RuntimeString::from("Stop")));
+    stop.insert(
+        "description",
+        RuntimeJson::String(RuntimeString::from(
+            "End this turn as failed. The work done so far stays visible.",
+        )),
+    );
+    options.push(RuntimeJson::Object(stop));
+    entry.insert("options", RuntimeJson::Array(options));
+    entry.insert("multiSelect", RuntimeJson::Bool(false));
+    // Caller attribution the client uses to localize this engine-authored card;
+    // metadata is never read back as an answer.
+    let mut metadata = RuntimeObject::new();
+    metadata.insert(
+        "kind",
+        RuntimeJson::String(RuntimeString::from("empty_closing")),
+    );
+    ElicitRequest {
+        prompt: question.clone(),
+        questions: Some(vec![entry]),
+        attachments_supported: None,
+        metadata: Some(metadata),
+        options: None,
+        multi_select: None,
+    }
+}
+
 /// Map a free-form or label-shaped answer onto the two decisions. Anything
 /// unrecognised reads as Stop: ending the turn is recoverable, retrying forever
 /// is not.
-fn normalize_reasoning_over_limit_choice(value: &RuntimeString) -> ReasoningOverLimitDecision {
+fn normalize_empty_closing_choice(value: &RuntimeString) -> EmptyClosingDecision {
     let Ok(text) = value.try_to_utf8() else {
-        return ReasoningOverLimitDecision::Stop;
+        return EmptyClosingDecision::Stop;
     };
     let lowered = text.trim().to_lowercase();
     if lowered.contains("retry") || lowered.contains("keep going") || lowered.contains("continue") {
-        return ReasoningOverLimitDecision::Retry;
+        return EmptyClosingDecision::Retry;
     }
-    ReasoningOverLimitDecision::Stop
+    EmptyClosingDecision::Stop
 }
