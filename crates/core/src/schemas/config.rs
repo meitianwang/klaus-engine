@@ -1532,6 +1532,14 @@ pub struct EngineConfig {
     pub max_tool_results_per_message_chars: u64,
     /// Enable frozen aggregate replacement of otherwise eligible tool results.
     pub aggregate_tool_results: bool,
+    /// Re-decide kept tool results once per idle period when the provider's
+    /// prompt cache is certain to have expired: the prefix re-sends in full
+    /// anyway, so aged results spill to disk and leave their recoverable
+    /// previews in the transcript. Requires `aggregate_tool_results`.
+    pub reclaim_tool_results_when_cache_cold: bool,
+    /// Most recent tool results the cold reclaim never touches — the model's
+    /// active working set.
+    pub reclaim_tool_results_keep_recent: u64,
     /// SESSION-CUMULATIVE spend ceiling in USD. Omit for no cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
@@ -1782,6 +1790,8 @@ impl Default for EngineConfig {
             max_aggregated_output_bytes: 256 * 1024,
             max_tool_results_per_message_chars: 200_000,
             aggregate_tool_results: false,
+            reclaim_tool_results_when_cache_cold: true,
+            reclaim_tool_results_keep_recent: 5,
             max_budget_usd: None,
             max_retries: 5,
             unbounded_network_retries: true,

@@ -203,7 +203,14 @@ fn resumed_replacements_keep_retained_markers_and_nested_results_but_drop_retire
         vec![("kept".into(), retained.clone()), ("nested".into(), nested)],
     );
     let raw_retained = vec![result("kept", "freshly reconstructed full output")];
-    let decision = decide(&raw_retained, &state, 1, &HashSet::new(), &HashMap::new());
+    let decision = decide(
+        &raw_retained,
+        &state,
+        1,
+        &HashSet::new(),
+        &HashMap::new(),
+        None,
+    );
     assert_eq!(decision.reapply, vec![("kept".into(), retained)]);
     assert!(decision.to_persist.is_empty());
 

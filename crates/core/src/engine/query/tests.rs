@@ -12555,6 +12555,129 @@ async fn request_view_budget_persists_an_over_budget_historical_result() {
     );
 }
 
+#[tokio::test]
+async fn cold_window_reclaim_persists_aged_keeps_the_budget_once_held() {
+    let recorded: Arc<Mutex<Vec<(RuntimeString, RuntimeString)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    // Three historical results, each comfortably inside the per-message
+    // limit: a warm pass keeps all three in full and freezes them.
+    let assistant_with_tool = |uuid: &str, id: &str| {
+        Message::Assistant(AssistantMessage {
+            uuid: uuid.into(),
+            content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                id: id.into(),
+                name: "bash".into(),
+                input: crate::runtime_values::RuntimeJson::Null,
+                tool_kind: None,
+                thought_signature: None,
+            })],
+            model: "fake-model".into(),
+            usage: None,
+        })
+    };
+    let big_result = |id: &str, marker: &str| {
+        Message::ToolResult(ToolResultMessage {
+            uuid: format!("tr-{id}").into(),
+            tool_use_id: id.into(),
+            content: vec![OutputBlock::Text(TextBlock {
+                text: format!("{}{marker}", "A".repeat(60_000)).into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_error: false,
+            tool_kind: None,
+            native_tool_output: None,
+            output: None,
+            extra_user_blocks: None,
+        })
+    };
+    let history = vec![
+        user_msg("work"),
+        assistant_with_tool("a1", "tu-1"),
+        big_result("tu-1", "MARK1"),
+        assistant_with_tool("a2", "tu-2"),
+        big_result("tu-2", "MARK2"),
+        assistant_with_tool("a3", "tu-3"),
+        big_result("tu-3", "MARK3"),
+    ];
+    let mut deps = deps_with(scripted_call_model(vec![vec![
+        ev::message_start(None),
+        ev::text("done"),
+        ev::stop(None, None),
+    ]]));
+    let requests: Arc<Mutex<Vec<ModelRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    deps.call_model = {
+        let requests = Arc::clone(&requests);
+        Box::new(
+            move |request: ModelRequest, _signal: AbortSignal| -> ModelStream {
+                requests.lock().unwrap().push(request);
+                Box::pin(futures::stream::iter(vec![
+                    ev::message_start(None),
+                    ev::text("done"),
+                    ev::stop(None, None),
+                ]))
+            },
+        )
+    };
+    // Resume-style state: the whole history freezes, then the session arms
+    // the one-shot cold window (the turn-start gap check that decides arming
+    // is unit-tested on its own).
+    let mut cold_state =
+        crate::context::tool_result_budget::ReplacementState::reconstruct(&history, Vec::new());
+    cold_state.arm_cold_reclaim();
+    let state = Arc::new(Mutex::new(cold_state));
+    let mut params = mk_params(history, Vec::new());
+    params.config.aggregate_tool_results = true;
+    params.config.max_tool_results_per_message_chars = 200_000;
+    params.config.reclaim_tool_results_keep_recent = 1;
+    params.tool_result_budget_state = Some(Arc::clone(&state));
+    params.on_tool_result_budget_records = {
+        let recorded = Arc::clone(&recorded);
+        Some(Arc::new(move |records| {
+            recorded.lock().unwrap().extend(records);
+            Box::pin(async { Ok(()) })
+        }))
+    };
+    let _: Vec<EngineEvent> = query(params, deps).collect().await;
+
+    let records = recorded.lock().unwrap().clone();
+    let mut ids: Vec<RuntimeString> = records.iter().map(|(id, _)| id.clone()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![RuntimeString::from("tu-1"), RuntimeString::from("tu-2")],
+        "the aged keeps spill even though every group fits the budget"
+    );
+    assert!(
+        !state.lock().unwrap().take_cold_reclaim_arm(),
+        "the window is consumed exactly once"
+    );
+    let sent = requests.lock().unwrap();
+    let sent_text = |id: &str| -> String {
+        sent.iter()
+            .flat_map(|request| request.messages.clone())
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_use_id == id => Some(
+                    crate::tools::result_storage::output_blocks_text(&result.content)
+                        .try_to_utf8()
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+            .expect("the tool result rides the request")
+    };
+    assert!(
+        !sent_text("tu-1").contains("MARK1"),
+        "the reclaimed body becomes a preview"
+    );
+    assert!(
+        sent_text("tu-3").contains("MARK3"),
+        "the recent window keeps its full body"
+    );
+}
+
 struct ReviewBudgetCompactor {
     mode: u8,
     attempts: Arc<AtomicUsize>,

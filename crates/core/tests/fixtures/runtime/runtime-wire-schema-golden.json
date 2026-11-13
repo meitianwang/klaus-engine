@@ -8869,6 +8869,26 @@
         "flatten": false
       },
       {
+        "rustName": "reclaim_tool_results_when_cache_cold",
+        "rustType": "bool",
+        "wireSerialize": "reclaimToolResultsWhenCacheCold",
+        "wireDeserialize": "reclaimToolResultsWhenCacheCold",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "reclaim_tool_results_keep_recent",
+        "rustType": "u64",
+        "wireSerialize": "reclaimToolResultsKeepRecent",
+        "wireDeserialize": "reclaimToolResultsKeepRecent",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
         "rustName": "max_budget_usd",
         "rustType": "Option < f64 >",
         "wireSerialize": "maxBudgetUsd",

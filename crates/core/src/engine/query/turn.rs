@@ -2383,7 +2383,10 @@ async fn run_turn_entry_hooks(
 /// re-apply byte-identically from state (no I/O), and the largest fresh results
 /// in an over-budget wire group are persisted to disk with a preview in their
 /// place. Decisions freeze per tool_use_id so a later pass never rewrites a
-/// prefix the provider already cached.
+/// prefix the provider already cached — unless the session armed the one-shot
+/// cold window after idling past the longest prompt-cache lifetime, in which
+/// case aged keeps are re-decided once under
+/// [`crate::context::tool_result_budget::ColdReclaim`].
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_tool_result_budget(
     shared: &Arc<Shared>,
@@ -2404,9 +2407,21 @@ async fn run_turn_tool_result_budget(
     let limit = config.max_tool_results_per_message_chars as usize;
     let names = crate::context::tool_result_budget::tool_name_by_use_id(messages);
     let skip: HashSet<RuntimeString> = ["read".into()].into_iter().collect();
+    // Preview cap for every spill this pass performs; also the reclaim floor,
+    // since a body at or below its preview cannot shrink when replaced.
+    const SPILL_PREVIEW_CHARS: usize = 2_000;
     let decision = {
-        let guard = state.lock_recover();
-        crate::context::tool_result_budget::decide(messages, &guard, limit, &skip, &names)
+        let mut guard = state.lock_recover();
+        // Consume the one-shot arm regardless of the knob so its semantics
+        // never depend on a settings flip mid-session.
+        let armed = guard.take_cold_reclaim_arm();
+        let reclaim = (armed && config.reclaim_tool_results_when_cache_cold).then_some(
+            crate::context::tool_result_budget::ColdReclaim {
+                keep_recent: config.reclaim_tool_results_keep_recent as usize,
+                min_chars: SPILL_PREVIEW_CHARS,
+            },
+        );
+        crate::context::tool_result_budget::decide(messages, &guard, limit, &skip, &names, reclaim)
     };
     if decision.reapply.is_empty() && decision.to_persist.is_empty() {
         return Ok(());
@@ -2432,7 +2447,7 @@ async fn run_turn_tool_result_budget(
         });
         let Some(content) = current else { continue };
         let options = SpillOptions {
-            max_chars: 2_000.0,
+            max_chars: SPILL_PREVIEW_CHARS as f64,
             dir: spill_dir.clone(),
             id: id.concat(&".aggregate".into()),
         };

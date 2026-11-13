@@ -408,6 +408,18 @@ impl SessionTurnState {
         self.thinking_context_cold.store(true, Ordering::SeqCst);
         true
     }
+
+    /// Non-sticky sibling of [`Self::latch_thinking_context_cold`]: whether
+    /// `now_ms` sits past the prompt-cache lifetime measured from the most
+    /// recent provider response. No response yet means nothing was cached
+    /// that could have gone cold, and a clock that moved backwards is not
+    /// idleness.
+    pub(crate) fn cold_cache_reclaim_due(&self, now_ms: i64, cold_after_ms: i64) -> bool {
+        let Some(last) = self.last_response_at_ms() else {
+            return false;
+        };
+        now_ms.saturating_sub(last) > cold_after_ms
+    }
 }
 
 impl ActiveTurnLease {
@@ -4361,5 +4373,30 @@ mod thinking_context_cold_tests {
         turn.mark_response_at_ms(9_000_000);
         assert!(!turn.latch_thinking_context_cold(1_000, PROMPT_CACHE_COLD_AFTER_MS));
         assert!(!turn.thinking_context_cold());
+    }
+
+    #[test]
+    fn the_reclaim_gap_check_is_fresh_every_turn_and_rewind_safe() {
+        let turn = turn_state();
+        // No response yet: nothing was cached that could have gone cold.
+        assert!(!turn
+            .cold_cache_reclaim_due(PROMPT_CACHE_COLD_AFTER_MS * 9, PROMPT_CACHE_COLD_AFTER_MS));
+        turn.mark_response_at_ms(1_000);
+        // Inside the cache lifetime the prefix may still be warm.
+        assert!(!turn.cold_cache_reclaim_due(
+            1_000 + PROMPT_CACHE_COLD_AFTER_MS,
+            PROMPT_CACHE_COLD_AFTER_MS
+        ));
+        // Past it, the reclaim is due…
+        assert!(turn.cold_cache_reclaim_due(
+            1_001 + PROMPT_CACHE_COLD_AFTER_MS,
+            PROMPT_CACHE_COLD_AFTER_MS
+        ));
+        // …and a fresh response closes the window again: unlike the thinking
+        // latch this check never sticks.
+        turn.mark_response_at_ms(9_000_000);
+        assert!(!turn.cold_cache_reclaim_due(9_000_001, PROMPT_CACHE_COLD_AFTER_MS));
+        // A clock that moved backwards is not idleness.
+        assert!(!turn.cold_cache_reclaim_due(1_000, PROMPT_CACHE_COLD_AFTER_MS));
     }
 }
