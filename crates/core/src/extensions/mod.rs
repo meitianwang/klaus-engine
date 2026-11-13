@@ -11,4 +11,5 @@ pub mod runtime_snapshot;
 
 pub mod commands;
 pub mod plugins;
+pub mod resource_references;
 pub mod skills;

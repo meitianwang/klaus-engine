@@ -119,6 +119,8 @@ pub struct Skill {
     pub paths: Option<Vec<RuntimeString>>,
     /// Shell for inline-bash directives in the body.
     pub shell: Option<RuntimeString>,
+    /// Plugin namespace when loaded from an enabled plugin (`<namespace>:<name>` in listings).
+    pub plugin_namespace: Option<RuntimeString>,
     pub body: RuntimeString,
     pub path: RuntimeString,
 }
@@ -199,11 +201,66 @@ impl RuntimeDecode for Skill {
                 disable_model_invocation: object.optional("disableModelInvocation", &[])?,
                 paths: object.optional("paths", &[])?,
                 shell: object.optional("shell", &[])?,
+                plugin_namespace: None,
                 body: object.required("body", &[])?,
                 path: object.required("path", &[])?,
             })
         })
     }
+}
+
+/// Model-facing skill identifier in the `<skill-catalog>` listing.
+///
+/// Plugin-contributed skills render as `<plugin_namespace>:<name>` unless `name`
+/// already starts with that prefix; standalone skills render as `<name>`.
+pub fn catalog_skill_name(skill: &Skill) -> RuntimeString {
+    if let Some(ns) = &skill.plugin_namespace {
+        if !ns.is_empty() {
+            let prefix = ns.concat(&RuntimeString::from(":"));
+            if !skill
+                .name
+                .starts_with(&prefix.try_to_utf8().unwrap_or_else(|_| String::from(":")))
+            {
+                return prefix.concat(&skill.name);
+            }
+        }
+    }
+    skill.name.clone()
+}
+
+/// Resolve a skill by either its `<plugin_namespace>:<name>` listing identifier,
+/// its bare `name`, or a `<plugin@marketplace>:<name>` qualified identifier.
+pub fn resolve_skill_by_name<'a>(
+    skills: &'a [Skill],
+    requested: &RuntimeString,
+) -> Option<&'a Skill> {
+    if let Some(exact_catalog) = skills.iter().find(|s| catalog_skill_name(s) == *requested) {
+        return Some(exact_catalog);
+    }
+    if let Some(exact_bare) = skills.iter().find(|s| s.name == *requested) {
+        return Some(exact_bare);
+    }
+    let req_utf8 = requested.try_to_utf8().ok()?;
+    let (raw_ns, bare_name) = req_utf8.split_once(':')?;
+    let normalized_ns = raw_ns
+        .split_once('@')
+        .map(|(plugin, _)| plugin)
+        .unwrap_or(raw_ns)
+        .trim();
+    let bare_name = bare_name.trim();
+    if normalized_ns.is_empty() || bare_name.is_empty() {
+        return None;
+    }
+    let ns_rt = RuntimeString::from(normalized_ns);
+    let bare_rt = RuntimeString::from(bare_name);
+    skills
+        .iter()
+        .find(|s| s.plugin_namespace.as_ref() == Some(&ns_rt) && s.name == bare_rt)
+        .or_else(|| {
+            (normalized_ns == bare_name)
+                .then(|| skills.iter().find(|s| s.name == bare_rt))
+                .flatten()
+        })
 }
 
 const SKILL_FILE: &str = "SKILL.md";
@@ -614,6 +671,7 @@ async fn load_one_skill_with_default(
         disable_model_invocation: Some(coerce_bool(&fm.disable_model_invocation, false)),
         paths: None,
         shell: None,
+        plugin_namespace: None,
         body: RuntimeString::from(body),
         path: RuntimeString::from(skill_path),
     };
@@ -1224,6 +1282,7 @@ mod tests {
             disable_model_invocation: Some(true),
             paths: Some(vec![exact.clone()]),
             shell: Some(exact.clone()),
+            plugin_namespace: None,
             body: exact.clone(),
             path: exact.clone(),
         };

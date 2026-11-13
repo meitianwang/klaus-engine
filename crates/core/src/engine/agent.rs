@@ -588,6 +588,20 @@ fn into_deps_result(
     }
 }
 
+fn tagged_plugin_skill(plugin: &LoadedPlugin, mut skill: Skill) -> Skill {
+    if skill.plugin_namespace.is_none() {
+        let ns = if plugin.plugin_namespace.trim().is_empty() {
+            plugin.name.trim()
+        } else {
+            plugin.plugin_namespace.trim()
+        };
+        if !ns.is_empty() {
+            skill.plugin_namespace = Some(RuntimeString::from(ns));
+        }
+    }
+    skill
+}
+
 fn merge_plugin_capabilities_into_options(opts: &mut AgentOptions) {
     if opts.plugins.is_empty() {
         return;
@@ -602,7 +616,13 @@ fn merge_plugin_capabilities_into_options(opts: &mut AgentOptions) {
     let plugin_skills = opts
         .plugins
         .iter()
-        .flat_map(|plugin| plugin.skills.iter().cloned())
+        .flat_map(|plugin| {
+            plugin
+                .skills
+                .iter()
+                .cloned()
+                .map(move |skill| tagged_plugin_skill(plugin, skill))
+        })
         .collect::<Vec<_>>();
     if !plugin_skills.is_empty() {
         let explicit = opts.skills.take();
@@ -1000,7 +1020,7 @@ impl AgentExtensionSources {
             .iter()
             .flat_map(|plugin| {
                 plugin.skills.iter().cloned().map(|skill| Sourced {
-                    value: skill,
+                    value: tagged_plugin_skill(plugin, skill),
                     source: ExtensionSource::plugin(plugin.name.clone()),
                 })
             })
@@ -1071,7 +1091,7 @@ impl AgentExtensionSources {
                 .iter()
                 .flat_map(|plugin| {
                     plugin.skills.iter().cloned().map(|value| Sourced {
-                        value,
+                        value: tagged_plugin_skill(plugin, value),
                         source: ExtensionSource::plugin(plugin.name.clone()),
                     })
                 })

@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use serde_json::{json, Map as SchemaMap, Value as SchemaValue};
 
 use super::expand_skill::{expand_skill_body, ExpandSkillOptions};
-use super::loader::{model_invocable, Skill, SkillContext};
+use super::loader::{
+    catalog_skill_name, model_invocable, resolve_skill_by_name, Skill, SkillContext,
+};
 use crate::extensions::arg_substitution::RunBashFuture;
 use crate::extensions::skills::expand_skill::{SkillBashOpts, SkillBashRunner};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString};
@@ -197,10 +199,10 @@ impl Tool for SkillTool {
         // slash command only. Same predicate the listing uses, so a name the
         // model could not have been told about is also a name it cannot run.
         let skills: Vec<Skill> = model_invocable((self.get_skills)());
-        let skill = match skills.iter().find(|skill| name == skill.name) {
+        let skill = match resolve_skill_by_name(&skills, &name) {
             Some(s) => s.clone(),
             None => {
-                let joined = runtime_join(skills.iter().map(|skill| skill.name.clone()), ", ");
+                let joined = runtime_join(skills.iter().map(catalog_skill_name), ", ");
                 let available = if joined.is_empty() {
                     RuntimeString::from("(none)")
                 } else {

@@ -2206,7 +2206,11 @@ impl Session {
                     return;
                 }
                 for (item, content) in batch.items.iter().zip(&batch.content) {
-                    mention_inputs.push((item.uuid.clone().expect("pending queue identity"), content.clone()));
+                    mention_inputs.push((
+                        item.uuid.clone().expect("pending queue identity"),
+                        content.clone(),
+                        item.is_meta == Some(true),
+                    ));
                     let message = Message::User(UserMessage {
             question_answer: None,
                         uuid: item.uuid.clone().expect("pending queue identity"),
@@ -2437,7 +2441,16 @@ impl Session {
             // `@`-mention expansion at DELIVERY (before query reads the messages).
             // Pending messages keep their own identities and expansion boundaries.
             if has_user_input {
-                mention_inputs.push((user_uuid.clone().into(), active_user_content));
+                let current_is_meta = opts.meta_input
+                    || params
+                        .goal
+                        .as_ref()
+                        .is_some_and(|goal| goal.is_goal_context_turn());
+                mention_inputs.push((
+                    user_uuid.clone().into(),
+                    active_user_content,
+                    current_is_meta,
+                ));
             }
             // Expanded content belongs to the authority captured before asynchronous reads.
             // Accounting-only changes may refresh the prompt without invalidating that content.
@@ -2447,7 +2460,8 @@ impl Session {
                 .map(|identity| identity.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner).clone());
             let mut goal_context_added = Vec::new();
-            for (mention_uuid, mention_content) in mention_inputs {
+            let mut surfaced_changed = false;
+            for (mention_uuid, mention_content, mention_is_meta) in mention_inputs {
                 let needs_at_mention = mention_content.iter().any(
                     |b| matches!(
                         b,
@@ -2455,36 +2469,76 @@ impl Session {
                             if has_at_mention(&runtime_text_to_at_mention_host(&t.text))
                     ),
                 );
+                let needs_resource_refs = !mention_is_meta
+                    && mention_content.iter().any(|b| {
+                        matches!(
+                            b,
+                            ContentBlock::Text(t)
+                                if crate::extensions::resource_references::has_explicit_resource_reference(
+                                    &runtime_text_to_at_mention_host(&t.text)
+                                )
+                        )
+                    });
+                let mut added = Vec::new();
                 if needs_at_mention {
                     let mut ctx = (mention_factory)();
                     ctx.emit = std::sync::Arc::new(|_| Box::pin(async {}));
                     ctx.signal = abort2.clone();
-                    let added = this2
-                        .expand_at_mentions(&mention_content, &ctx, read_tool.as_ref())
+                    added.extend(
+                        this2
+                            .expand_at_mentions(&mention_content, &ctx, read_tool.as_ref())
+                            .await,
+                    );
+                }
+                if needs_resource_refs {
+                    let (ref_blocks, ref_surfaced) = this2
+                        .expand_explicit_resource_references(
+                            &mention_content,
+                            &params.tools,
+                            permission.clone(),
+                            abort2.clone(),
+                            turn_collaboration_mode == crate::planning::CollaborationMode::Plan,
+                            &turn_id,
+                        )
                         .await;
-                    if !added.is_empty() {
-                        if mention_uuid == user_uuid && goal_context_authority.is_some() {
-                            goal_context_added.extend_from_slice(&added);
+                    if !ref_surfaced.is_empty() {
+                        let sink = this2.persistence.rollout().cloned();
+                        if this2
+                            .record_surfaced_tools(&this2.surfaced_tools, sink.as_ref(), ref_surfaced)
+                            .await
+                            .is_ok()
+                        {
+                            surfaced_changed = true;
                         }
-                        for m in params.messages.iter_mut() {
-                            if let Message::User(u) = m {
-                                if u.uuid == mention_uuid {
-                                    u.content.extend(added.clone());
-                                    break;
-                                }
+                    }
+                    added.extend(ref_blocks);
+                }
+                if !added.is_empty() {
+                    if mention_uuid == user_uuid && goal_context_authority.is_some() {
+                        goal_context_added.extend_from_slice(&added);
+                    }
+                    for m in params.messages.iter_mut() {
+                        if let Message::User(u) = m {
+                            if u.uuid == mention_uuid {
+                                u.content.extend(added.clone());
+                                break;
                             }
                         }
-                        let mut hist = this2.conversation.history.lock_recover();
-                        for m in hist.iter_mut() {
-                            if let Message::User(u) = m {
-                                if u.uuid == mention_uuid {
-                                    u.content.extend(added.clone());
-                                    break;
-                                }
+                    }
+                    let mut hist = this2.conversation.history.lock_recover();
+                    for m in hist.iter_mut() {
+                        if let Message::User(u) = m {
+                            if u.uuid == mention_uuid {
+                                u.content.extend(added.clone());
+                                break;
                             }
                         }
                     }
                 }
+            }
+            if surfaced_changed {
+                params.surfaced_tools =
+                    Some(this2.surfaced_tools.lock_recover().iter().cloned().collect());
             }
             let setup_claim = match this2.begin_setup_context_claim().await {
                 Ok(claim) => claim,
@@ -3211,6 +3265,355 @@ impl Session {
             }));
         }
         added
+    }
+
+    /// Resolve explicit `<referenced-resources>` and inline `klaus:` resource links
+    /// into capability cards, preloaded single-skill instructions, and auto-surfaced
+    /// MCP tool names for the current turn.
+    pub(crate) async fn expand_explicit_resource_references(
+        self: &Arc<Self>,
+        content: &[ContentBlock],
+        tools: &[AnyTool],
+        permission: crate::types::permission::PermissionContext,
+        signal: crate::types::abort::AbortSignal,
+        planning_read_only: bool,
+        turn_id: &RuntimeString,
+    ) -> (Vec<ContentBlock>, Vec<RuntimeString>) {
+        use crate::extensions::resource_references::{
+            collect_mcp_tools_for_servers, extract_explicit_resource_references,
+            match_plugin_runtime_entry, skills_for_plugin, summarize_skill_line,
+            ExplicitResourceKind, AUTO_SURFACE_PLUGIN_TOOLS_MAX,
+        };
+        use crate::extensions::runtime_snapshot::ExtensionSourceKind;
+        use crate::extensions::skills::expand_skill::{
+            expand_skill_body, ExpandSkillOptions, SkillBashOpts, SkillBashRunner,
+        };
+        use crate::extensions::skills::loader::{
+            catalog_skill_name, is_model_invocable, resolve_skill_by_name, SkillContext,
+        };
+
+        let text = join_runtime_strings(
+            &content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            "\n",
+        );
+        let host_text = runtime_text_to_at_mention_host(&text);
+        let references = extract_explicit_resource_references(&host_text);
+        if references.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let extension_snapshot = self.extension_runtime_snapshot();
+        let plugin_entries = &extension_snapshot.plugin_runtime.entries;
+        let gated_skills = self.gated_skills();
+        let invocable_skills: Vec<_> = gated_skills
+            .iter()
+            .filter(|s| is_model_invocable(s))
+            .cloned()
+            .collect();
+
+        let make_run_bash = || -> SkillBashRunner {
+            let this = self.clone();
+            let permission = permission.clone();
+            let signal = signal.clone();
+            Arc::new(move |command: String, opts: SkillBashOpts| {
+                let this = this.clone();
+                let permission = permission.clone();
+                let signal = signal.clone();
+                Box::pin(async move {
+                    let cwd = this.cwd_now();
+                    this.run_skill_bash(
+                        command,
+                        permission,
+                        runtime_path_to_skill_shell_host(&cwd),
+                        signal,
+                        Some(crate::types::tool::RunBashOptions {
+                            shell: opts.shell,
+                            allow_tools: opts.allow_tools,
+                        }),
+                        planning_read_only,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                })
+            })
+        };
+        let session_vars = vec![(
+            "KLAUS_SESSION_ID".to_string(),
+            super::runtime_session_id_to_skill_env_host(&self.id),
+        )];
+
+        let mut sections: Vec<RuntimeString> = Vec::new();
+        let mut surfaced: Vec<RuntimeString> = Vec::new();
+        let mut surfaced_seen: std::collections::HashSet<RuntimeString> =
+            std::collections::HashSet::new();
+
+        let mut push_surfaced = |names: Vec<RuntimeString>| {
+            for name in names {
+                if surfaced_seen.insert(name.clone()) {
+                    surfaced.push(name);
+                }
+            }
+        };
+
+        for reference in &references {
+            match reference.kind {
+                ExplicitResourceKind::Plugin => {
+                    let Some(entry) = match_plugin_runtime_entry(plugin_entries, reference) else {
+                        sections.push(RuntimeString::from(format!(
+                            "Referenced plugin `{}` is not installed in this session.",
+                            reference.display_label()
+                        )));
+                        continue;
+                    };
+                    let display_name = entry
+                        .display_name
+                        .as_ref()
+                        .and_then(|d| d.try_to_utf8().ok())
+                        .filter(|d| !d.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            entry
+                                .name
+                                .try_to_utf8()
+                                .unwrap_or_else(|_| reference.display_label().to_string())
+                        });
+                    let plugin_id = entry
+                        .name
+                        .try_to_utf8()
+                        .unwrap_or_else(|_| display_name.clone());
+                    if !entry.enabled {
+                        sections.push(RuntimeString::from(format!(
+                            "Referenced plugin `{display_name}` (`{plugin_id}`) is currently disabled in this session."
+                        )));
+                        continue;
+                    }
+
+                    let mut lines = vec![format!(
+                        "Capabilities from the referenced `{display_name}` (`{plugin_id}`) plugin:"
+                    )];
+
+                    // 1. MCP tools & servers belonging to this plugin.
+                    let declared_servers = &entry.permission_scope.mcp_servers;
+                    let (matching_tools, deferred_tools) =
+                        collect_mcp_tools_for_servers(tools, declared_servers);
+                    if !matching_tools.is_empty() {
+                        if matching_tools.len() <= AUTO_SURFACE_PLUGIN_TOOLS_MAX {
+                            push_surfaced(deferred_tools);
+                            let tool_list = matching_tools
+                                .iter()
+                                .filter_map(|t| t.try_to_utf8().ok())
+                                .map(|t| format!("`{t}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            lines.push(format!(
+                                "- Active MCP tools for this turn (already loaded; call directly without `tool_search`): {tool_list}"
+                            ));
+                        } else {
+                            let active_servers = declared_servers
+                                .iter()
+                                .filter_map(|s| s.try_to_utf8().ok())
+                                .filter(|s| {
+                                    let prefix = format!("mcp__{}__", s.trim());
+                                    matching_tools.iter().any(|t| {
+                                        t.try_to_utf8().is_ok_and(|u| u.starts_with(&prefix))
+                                    })
+                                })
+                                .map(|s| format!("`{s}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            lines.push(format!(
+                                "- MCP servers from this plugin ({} tools kept deferred to fit context limits): {}. Use `tool_search` (for example `select:mcp__<server>__<tool>` or server keywords) to load only the tools you need.",
+                                matching_tools.len(),
+                                active_servers
+                            ));
+                        }
+                    } else if !declared_servers.is_empty() {
+                        let unavailable = declared_servers
+                            .iter()
+                            .filter_map(|s| s.try_to_utf8().ok())
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(format!(
+                            "- Declared MCP servers with no active tools in this session: {unavailable}"
+                        ));
+                    }
+
+                    // 2. Skills contributed by this plugin.
+                    let attributed_names: std::collections::HashSet<RuntimeString> =
+                        extension_snapshot
+                            .skills
+                            .iter()
+                            .filter(|row| {
+                                row.source.kind == ExtensionSourceKind::Plugin
+                                    && row.source.id.as_ref() == Some(&entry.name)
+                            })
+                            .map(|row| row.name.clone())
+                            .collect();
+                    let plugin_skills =
+                        skills_for_plugin(&invocable_skills, entry, &attributed_names);
+
+                    let mut preloaded_body: Option<(String, RuntimeString)> = None;
+                    if plugin_skills.len() == 1
+                        && plugin_skills[0].context != Some(SkillContext::Fork)
+                    {
+                        let skill = plugin_skills[0];
+                        let qualified = catalog_skill_name(skill)
+                            .try_to_utf8()
+                            .unwrap_or_else(|_| String::from("skill"));
+                        if self.has_invoked_skill_content(&skill.path) {
+                            lines.push(format!(
+                                "- Skill `{qualified}` is already loaded in this conversation; follow its instructions directly without calling `skill` again."
+                            ));
+                        } else if let Ok(expanded) = expand_skill_body(
+                            skill,
+                            &RuntimeString::default(),
+                            ExpandSkillOptions {
+                                run_bash: Some(make_run_bash()),
+                                vars: Some(session_vars.clone()),
+                            },
+                        )
+                        .await
+                        {
+                            self.record_invoked_skill_content(None, &skill.path, &expanded);
+                            self.record_invoked_skill(None, turn_id, &skill.path);
+                            lines.push(format!(
+                                "- Skill `{qualified}` is preloaded below for this turn; follow its instructions directly without calling the `skill` tool again."
+                            ));
+                            preloaded_body = Some((qualified, expanded));
+                        } else {
+                            lines.push(format!(
+                                "- Skill from this plugin: {}",
+                                summarize_skill_line(skill)
+                            ));
+                        }
+                    } else if !plugin_skills.is_empty() {
+                        lines.push(
+                            "- Skills from this plugin (load the relevant one with the `skill` tool):"
+                                .to_string(),
+                        );
+                        for skill in &plugin_skills {
+                            lines.push(format!("  - {}", summarize_skill_line(skill)));
+                        }
+                    }
+
+                    let mut card = RuntimeString::from(lines.join("\n"));
+                    if let Some((qualified, body)) = preloaded_body {
+                        card = card
+                            .concat(&RuntimeString::from(format!(
+                                "\n\n<preloaded-skill name=\"{qualified}\">\n"
+                            )))
+                            .concat(&body)
+                            .concat(&RuntimeString::from("\n</preloaded-skill>"));
+                    }
+                    sections.push(card);
+                }
+                ExplicitResourceKind::Skill => {
+                    let requested = RuntimeString::from(reference.key());
+                    let matched = resolve_skill_by_name(&gated_skills, &requested).or_else(|| {
+                        reference.path.as_deref().and_then(|p| {
+                            let target = RuntimeString::from(p);
+                            gated_skills.iter().find(|s| s.path == target)
+                        })
+                    });
+                    let Some(skill) = matched else {
+                        continue;
+                    };
+                    if let Some(ns) = &skill.plugin_namespace {
+                        if let Some(entry) = plugin_entries
+                            .iter()
+                            .find(|e| e.enabled && (&e.plugin_namespace == ns || &e.name == ns))
+                        {
+                            let (matching_tools, deferred_tools) = collect_mcp_tools_for_servers(
+                                tools,
+                                &entry.permission_scope.mcp_servers,
+                            );
+                            if !matching_tools.is_empty()
+                                && matching_tools.len() <= AUTO_SURFACE_PLUGIN_TOOLS_MAX
+                            {
+                                push_surfaced(deferred_tools);
+                            }
+                        }
+                    }
+                    if skill.context == Some(SkillContext::Fork) {
+                        continue;
+                    }
+                    let qualified = catalog_skill_name(skill)
+                        .try_to_utf8()
+                        .unwrap_or_else(|_| reference.display_label().to_string());
+                    if self.has_invoked_skill_content(&skill.path) {
+                        sections.push(RuntimeString::from(format!(
+                            "Referenced skill `{qualified}` is already loaded in this conversation; follow its instructions directly without calling `skill` again."
+                        )));
+                    } else if let Ok(expanded) = expand_skill_body(
+                        skill,
+                        &RuntimeString::default(),
+                        ExpandSkillOptions {
+                            run_bash: Some(make_run_bash()),
+                            vars: Some(session_vars.clone()),
+                        },
+                    )
+                    .await
+                    {
+                        self.record_invoked_skill_content(None, &skill.path, &expanded);
+                        self.record_invoked_skill(None, turn_id, &skill.path);
+                        let block = RuntimeString::from(format!(
+                            "Referenced skill `{qualified}` is preloaded below for this turn (do not call the `skill` tool again for `{qualified}`):\n<preloaded-skill name=\"{qualified}\">\n"
+                        ))
+                        .concat(&expanded)
+                        .concat(&RuntimeString::from("\n</preloaded-skill>"));
+                        sections.push(block);
+                    }
+                }
+                ExplicitResourceKind::Mcp => {
+                    let server_id = RuntimeString::from(reference.key());
+                    let (matching_tools, deferred_tools) =
+                        collect_mcp_tools_for_servers(tools, std::slice::from_ref(&server_id));
+                    let label = reference.display_label();
+                    let server_str = reference.key();
+                    if matching_tools.is_empty() {
+                        sections.push(RuntimeString::from(format!(
+                            "Referenced MCP server `{label}` (`{server_str}`) has no active tools in this session."
+                        )));
+                    } else if matching_tools.len() <= AUTO_SURFACE_PLUGIN_TOOLS_MAX {
+                        push_surfaced(deferred_tools);
+                        let tool_list = matching_tools
+                            .iter()
+                            .filter_map(|t| t.try_to_utf8().ok())
+                            .map(|t| format!("`{t}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        sections.push(RuntimeString::from(format!(
+                            "Active tools from referenced MCP server `{label}` (`{server_str}`) for this turn (call directly without `tool_search`): {tool_list}"
+                        )));
+                    } else {
+                        sections.push(RuntimeString::from(format!(
+                            "Referenced MCP server `{label}` (`{server_str}`) exposes {} tools via `tool_search`; search with `mcp__{server_str}__` or server keywords to load the specific tools needed.",
+                            matching_tools.len()
+                        )));
+                    }
+                }
+            }
+        }
+
+        let blocks = sections
+            .into_iter()
+            .map(|text| {
+                ContentBlock::Text(TextBlock {
+                    text,
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })
+            })
+            .collect();
+        (blocks, surfaced)
     }
 
     /// Expand a single file/dir mention into content blocks, or `None` to drop it.

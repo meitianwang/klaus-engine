@@ -703,7 +703,7 @@ mod tests {
     }
 
     impl DummyTool {
-        fn new(name: &'static str, fail: bool) -> Arc<dyn Tool> {
+        fn erased(name: &'static str, fail: bool) -> Arc<dyn Tool> {
             Arc::new(Self {
                 name,
                 schema: json!({"type": "object", "properties": {}, "additionalProperties": true})
@@ -751,7 +751,10 @@ mod tests {
 
     #[test]
     fn planner_gate_refuses_file_edits_while_allowing_read_tools() {
-        let mut tools = vec![DummyTool::new("read", false), DummyTool::new("edit", false)];
+        let mut tools = vec![
+            DummyTool::erased("read", false),
+            DummyTool::erased("edit", false),
+        ];
         wrap_orchestration_planner_tools(&mut tools);
         let empty = RuntimeJson::Object(Default::default());
         assert!(tools[0].parse_input(&empty).is_ok());
@@ -765,7 +768,7 @@ mod tests {
     async fn executor_guard_locks_after_two_consecutive_failures() {
         let guard = OrchestratedExecutionGuard::with_limits(Arc::new(|| false), 30, 2);
         let wrapped =
-            wrap_orchestrated_executor_tools(vec![DummyTool::new("bash", true)], guard.clone());
+            wrap_orchestrated_executor_tools(vec![DummyTool::erased("bash", true)], guard.clone());
         let bash = &wrapped[0];
         let ctx = make_ctx("/tmp");
         let empty = RuntimeJson::Object(Default::default());
@@ -787,7 +790,7 @@ mod tests {
     async fn executor_guard_locks_on_stage_checkpoint_and_user_interruption() {
         let guard = OrchestratedExecutionGuard::with_limits(Arc::new(|| false), 2, 2);
         let wrapped =
-            wrap_orchestrated_executor_tools(vec![DummyTool::new("read", false)], guard.clone());
+            wrap_orchestrated_executor_tools(vec![DummyTool::erased("read", false)], guard.clone());
         let read = &wrapped[0];
         let ctx = make_ctx("/tmp");
         let empty = RuntimeJson::Object(Default::default());
@@ -802,7 +805,7 @@ mod tests {
 
         let preempted = OrchestratedExecutionGuard::with_limits(Arc::new(|| true), 30, 2);
         let wrapped_preempt = wrap_orchestrated_executor_tools(
-            vec![DummyTool::new("read", false)],
+            vec![DummyTool::erased("read", false)],
             preempted.clone(),
         );
         assert!(wrapped_preempt[0].parse_input(&empty).is_err());

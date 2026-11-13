@@ -1184,10 +1184,19 @@ async fn load_one_plugin_with_report(
     // For commands/agents/skills/outputStyles, auto-detect the conventional subdir
     // ONLY when the manifest does not list that component; a listed component is
     // loaded from its manifest paths instead.
-    let skills = match &manifest.skills {
+    let computed_namespace = plugin_namespace(&manifest.name);
+    let mut skills = match &manifest.skills {
         Some(spec) if spec.is_truthy() => load_manifest_skills(plugin_dir, spec).await,
         _ => load_skills_from_dir(&path_join(&[plugin_dir, "skills"])).await,
     };
+    if !computed_namespace.trim().is_empty() {
+        let ns_rt = crate::runtime_values::RuntimeString::from(computed_namespace.clone());
+        for skill in &mut skills {
+            if skill.plugin_namespace.is_none() {
+                skill.plugin_namespace = Some(ns_rt.clone());
+            }
+        }
+    }
     let commands = match &manifest.commands {
         Some(spec) if spec.is_truthy() => load_manifest_commands(plugin_dir, spec, &opts).await,
         _ => {

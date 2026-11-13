@@ -353,4 +353,11 @@ impl Session {
             entries.drain(..entries.len() - 32);
         }
     }
+
+    pub(crate) fn has_invoked_skill_content(&self, path: &RuntimeString) -> bool {
+        let cache = self.memory_roots.invoked_skill_content.lock_recover();
+        cache
+            .get(&None)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.path == *path))
+    }
 }

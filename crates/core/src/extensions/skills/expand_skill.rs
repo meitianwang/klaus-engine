@@ -283,6 +283,7 @@ mod tests {
             disable_model_invocation: Some(false),
             paths: None,
             shell,
+            plugin_namespace: None,
             body: RuntimeString::from(body),
             path: RuntimeString::from(path),
         }

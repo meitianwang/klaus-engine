@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::loader::{model_invocable, Skill};
+use super::loader::{catalog_skill_name, model_invocable, Skill};
 use crate::permission::bash::node_path::is_absolute;
 use crate::runtime_values::{runtime_codec, runtime_json, RuntimeString};
 use crate::schemas::content::{ContentBlock, HarnessEnvelope};
@@ -232,7 +232,7 @@ fn plugin_version_base(path: &str) -> Option<String> {
 /// leaves `- name: (location)`: the location outlives the description.
 fn render_line(s: &Skill, desc_max: usize, location: Option<&RuntimeString>) -> RuntimeString {
     let description = truncate(&describe(s), desc_max);
-    let mut line = RuntimeString::from("- ").concat(&s.name);
+    let mut line = RuntimeString::from("- ").concat(&catalog_skill_name(s));
     if description.is_empty() {
         line = line.concat(&RuntimeString::from(":"));
     } else {
@@ -365,7 +365,10 @@ fn render_listing<'a>(
     }
 
     // Step 3: descriptions shrunk to an even share of what is left after names.
-    let overhead: usize = skills.iter().map(|s| name_overhead(&s.name)).sum();
+    let overhead: usize = skills
+        .iter()
+        .map(|s| name_overhead(&catalog_skill_name(s)))
+        .sum();
     // Signed division: `budget - overhead` may be negative; only a per_desc at or
     // above the floor (necessarily positive) is used as a truncate width, where
     // truncation toward zero and floor agree.
@@ -385,7 +388,7 @@ fn render_listing<'a>(
     let mut named: Vec<&Skill> = Vec::new();
     let mut width: usize = 0;
     for (i, s) in skills.iter().enumerate() {
-        let line = RuntimeString::from("- ").concat(&s.name);
+        let line = RuntimeString::from("- ").concat(&catalog_skill_name(s));
         let cost = line.len_utf16() + usize::from(!lines.is_empty());
         if !lines.is_empty() && width + cost > budget {
             lines.push(RuntimeString::from(format!(
@@ -500,6 +503,17 @@ impl SkillListingReminderProvider {
         );
         for unit in exact.as_utf16() {
             digest.update(unit.to_le_bytes());
+        }
+        if skills.iter().any(|s| s.plugin_namespace.is_some()) {
+            for (index, skill) in skills.iter().enumerate() {
+                if let Some(ns) = &skill.plugin_namespace {
+                    digest.update((index as u64).to_le_bytes());
+                    digest.update((ns.len_utf16() as u64).to_le_bytes());
+                    for unit in ns.as_utf16() {
+                        digest.update(unit.to_le_bytes());
+                    }
+                }
+            }
         }
         digest.update((budget as u64).to_le_bytes());
         let source = format!("{:x}", digest.finalize());
@@ -648,7 +662,7 @@ impl SkillListingReminderProvider {
         let plan = AliasPlan::build(&skills);
         let fresh: Vec<Skill> = skills
             .into_iter()
-            .filter(|s| !state.sent.contains(&s.name))
+            .filter(|s| !state.sent.contains(&catalog_skill_name(s)))
             .collect();
         if fresh.is_empty() {
             return None;
@@ -664,7 +678,7 @@ impl SkillListingReminderProvider {
         // Mark only the skills actually NAMED this turn as sent — a skill hidden
         // behind the `… (+N more)` marker stays fresh so a later turn can name it.
         for s in &named {
-            state.sent.insert(s.name.clone());
+            state.sent.insert(catalog_skill_name(s));
         }
         let preamble = if changed {
             "The available skill catalog has changed. This listing replaces all previous skill listings.\n"

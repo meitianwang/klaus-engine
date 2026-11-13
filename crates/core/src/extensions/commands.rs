@@ -16,7 +16,7 @@
 use crate::extensions::skills::expand_skill::{
     expand_skill_body, ExpandSkillOptions, SkillBashRunner,
 };
-use crate::extensions::skills::loader::Skill;
+use crate::extensions::skills::loader::{catalog_skill_name, Skill};
 use crate::runtime_values::RuntimeString;
 use crate::schemas::content::{ContentBlock, TextBlock};
 use std::collections::HashMap;
@@ -272,6 +272,7 @@ pub fn skills_as_commands(skills: &[Skill], opts: SkillsAsCommandsOptions) -> Ve
                 description: Some(description),
                 argument_hint,
             };
+            let qualified = catalog_skill_name(skill).try_to_utf8().ok();
             let skill = skill.clone();
             let run_bash = opts.run_bash.clone();
             let vars = opts.vars.clone();
@@ -304,12 +305,23 @@ pub fn skills_as_commands(skills: &[Skill], opts: SkillsAsCommandsOptions) -> Ve
                     })])
                 })
             });
-            Some(Command::Prompt(PromptCommand {
-                name,
-                meta,
-                content_fn,
-            }))
+            let mut registered = vec![Command::Prompt(PromptCommand {
+                name: name.clone(),
+                meta: meta.clone(),
+                content_fn: content_fn.clone(),
+            })];
+            if let Some(qualified_name) = qualified {
+                if qualified_name != name {
+                    registered.push(Command::Prompt(PromptCommand {
+                        name: qualified_name,
+                        meta,
+                        content_fn,
+                    }));
+                }
+            }
+            Some(registered)
         })
+        .flatten()
         .collect()
 }
 
@@ -365,6 +377,7 @@ mod tests {
             disable_model_invocation: None,
             paths: None,
             shell: None,
+            plugin_namespace: None,
             body: body.into(),
             path: format!("/skills/{name}/SKILL.md").into(),
         }

@@ -246,6 +246,7 @@ mod tests {
             disable_model_invocation: Some(false),
             paths,
             shell: None,
+            plugin_namespace: None,
             body: RuntimeString::default(),
             path: RuntimeString::default(),
         }

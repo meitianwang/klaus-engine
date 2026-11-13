@@ -347,6 +347,9 @@ mod rb6903ac_sandbox_does_not_deny_user_credentials;
 #[path = "regressions/rbad2176b_spawn_agent_inherits_parent_environment.rs"]
 mod rbad2176b_spawn_agent_inherits_parent_environment;
 
+#[path = "regressions/r20261113_explicit_plugin_preassembly.rs"]
+mod r20261113_explicit_plugin_preassembly;
+
 #[path = "regressions/rcbc19b9_file_change_counts_are_per_turn_and_exact.rs"]
 mod rcbc19b9_file_change_counts_are_per_turn_and_exact;
 
