@@ -17,11 +17,13 @@ use super::compaction::query_message_uuid;
 use crate::context::compact::outcome::CompactionNoopReason;
 use crate::context::tokens::estimate_context_tokens;
 use crate::engine::deps::{CompactionResult, Compactor, NowFn};
+use crate::observability::provider_timing::record_precompute;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::config::ResolvedConfig;
 use crate::schemas::message::Message;
 use crate::types::abort::AbortSignal;
 use crate::types::provider::ModelRequest;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -49,6 +51,9 @@ pub struct PrecomputeHookOutcome {
 pub struct PrecomputeArm {
     /// Registry key: the agent identity within the owning session.
     pub agent_key: RuntimeString,
+    /// Owning session, so lifecycle records can be filtered per session like
+    /// the request-level timing records.
+    pub session_id: RuntimeString,
     /// Compactable history snapshot (protected messages excluded).
     pub snapshot: Vec<Message>,
     /// Prefix-aware full-request estimate for the maybe-compact path.
@@ -84,6 +89,7 @@ enum EntryState {
 /// One armed background checkpoint.
 pub struct PrecomputeEntry {
     agent_key: RuntimeString,
+    session_id: RuntimeString,
     /// The last message the summary covered; consumption re-locates it in the
     /// live history instead of trusting indices.
     precomputed_at_uuid: RuntimeString,
@@ -258,6 +264,7 @@ impl PrecomputeRegistry {
         let (settled, _initial) = tokio::sync::watch::channel(false);
         let entry = Arc::new(PrecomputeEntry {
             agent_key: arm.agent_key.clone(),
+            session_id: arm.session_id.clone(),
             precomputed_at_uuid: boundary_uuid,
             pre_compact_tokens: arm.pre_compact_tokens,
             model: arm.model.clone(),
@@ -274,6 +281,16 @@ impl PrecomputeRegistry {
         tracing::info!(
             tokens = arm.pre_compact_tokens,
             "compaction precompute armed"
+        );
+        record_entry_event(
+            &entry,
+            "armed",
+            json!({
+                "model": entry.model.try_to_utf8().ok(),
+                "native": entry.native.is_some(),
+                "preCompactTokens": entry.pre_compact_tokens,
+                "estimatedTokens": arm.estimated_tokens,
+            }),
         );
         tokio::spawn(run_precompute(Arc::downgrade(self), entry, arm));
         true
@@ -377,7 +394,7 @@ impl PrecomputeRegistry {
         // Staleness bounds, checked before any wait: a checkpoint whose
         // boundary no longer exists can never be applied.
         if entry.model != config.model {
-            self.invalidate(entry, "model_changed");
+            self.invalidate(entry, "model_changed", now);
             return PrecomputeConsume::Miss;
         }
         let native_is_current = || {
@@ -396,34 +413,45 @@ impl PrecomputeRegistry {
             })
         };
         if !native_is_current() {
-            self.invalidate(entry, "native_context_changed");
+            self.invalidate(entry, "native_context_changed", now);
             return PrecomputeConsume::Miss;
         }
         let Some(boundary_index) = messages_now
             .iter()
             .position(|message| query_message_uuid(message) == &entry.precomputed_at_uuid)
         else {
-            self.invalidate(entry, "boundary_uuid_missing");
+            self.invalidate(entry, "boundary_uuid_missing", now);
             return PrecomputeConsume::Miss;
         };
         let est_now = estimate_context_tokens(messages_now);
         let delta = i128::from(est_now) - i128::from(entry.pre_compact_tokens);
         if delta > GROWTH_LIMIT_TOKENS {
-            self.invalidate(entry, "grew_too_much");
+            self.invalidate(entry, "grew_too_much", now);
             return PrecomputeConsume::Miss;
         }
         if delta < -(i128::from(entry.pre_compact_tokens) / 2) {
-            self.invalidate(entry, "shrank_too_much");
+            self.invalidate(entry, "shrank_too_much", now);
             return PrecomputeConsume::Miss;
         }
         // Wait for an in-flight summary; a cancelled turn leaves the entry
         // armed for a later turn instead of discarding the work.
+        let wait_started_ms = now();
         {
             let mut settled = entry.settled.subscribe();
             while !*settled.borrow() {
                 tokio::select! {
                     biased;
-                    _ = turn_signal.cancelled() => return PrecomputeConsume::Aborted,
+                    _ = turn_signal.cancelled() => {
+                        record_entry_event(
+                            entry,
+                            "consumed",
+                            json!({
+                                "outcome": "aborted",
+                                "waitedMs": now().saturating_sub(wait_started_ms),
+                            }),
+                        );
+                        return PrecomputeConsume::Aborted;
+                    }
                     _ = entry.signal.cancelled() => return PrecomputeConsume::Miss,
                     changed = settled.changed() => {
                         if changed.is_err() {
@@ -433,8 +461,9 @@ impl PrecomputeRegistry {
                 }
             }
         }
+        let waited_ms = now().saturating_sub(wait_started_ms);
         if !native_is_current() {
-            self.invalidate(entry, "native_context_changed_while_waiting");
+            self.invalidate(entry, "native_context_changed_while_waiting", now);
             return PrecomputeConsume::Miss;
         }
         let payload = {
@@ -454,7 +483,7 @@ impl PrecomputeRegistry {
                 message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some()
             )
         }) {
-            self.invalidate(entry, "native_checkpoint_missing");
+            self.invalidate(entry, "native_checkpoint_missing", now);
             return PrecomputeConsume::Miss;
         }
         // The retained tail must survive verbatim: a rewind that removed any
@@ -480,7 +509,7 @@ impl PrecomputeRegistry {
             .iter()
             .rposition(|message| matches!(message, Message::CompactBoundary(_)))
         else {
-            self.invalidate(entry, "checkpoint_missing");
+            self.invalidate(entry, "checkpoint_missing", now);
             return PrecomputeConsume::Miss;
         };
         if retained_missing || history_rewritten {
@@ -491,6 +520,7 @@ impl PrecomputeRegistry {
                 } else {
                     "history_rewritten"
                 },
+                now,
             );
             return PrecomputeConsume::Miss;
         }
@@ -506,7 +536,7 @@ impl PrecomputeRegistry {
                 None,
             );
             if status.token_limit_reached {
-                self.invalidate(entry, "native_checkpoint_still_over_budget");
+                self.invalidate(entry, "native_checkpoint_still_over_budget", now);
                 return PrecomputeConsume::Miss;
             }
         }
@@ -522,6 +552,21 @@ impl PrecomputeRegistry {
             diagnostics: payload.result.diagnostics,
         };
         self.remove_listed(entry);
+        record_entry_event(
+            entry,
+            "consumed",
+            json!({
+                "model": entry.model.try_to_utf8().ok(),
+                "native": entry.native.is_some(),
+                "outcome": "hit",
+                "leadMs": lead_ms,
+                "totalMs": total_ms,
+                "waitedMs": waited_ms,
+                "messagesSince": messages_since,
+                "borrowed": borrowed,
+                "freedTokens": freed,
+            }),
+        );
         PrecomputeConsume::Hit(Box::new(PrecomputedSwap {
             result,
             hook_notifications: payload.hook_notifications,
@@ -533,8 +578,21 @@ impl PrecomputeRegistry {
         }))
     }
 
-    fn invalidate(&self, entry: &Arc<PrecomputeEntry>, reason: &'static str) {
+    fn invalidate(
+        &self,
+        entry: &Arc<PrecomputeEntry>,
+        reason: &'static str,
+        now: &(dyn Fn() -> i64 + Send + Sync),
+    ) {
         self.remove_listed(entry);
+        record_entry_event(
+            entry,
+            "invalidated",
+            json!({
+                "reason": reason,
+                "ageMs": now().saturating_sub(entry.started_at_ms),
+            }),
+        );
         tracing::debug!(reason, "compaction precompute invalidated");
     }
 
@@ -545,6 +603,42 @@ impl PrecomputeRegistry {
                 entries.remove(&entry.agent_key);
             }
         }
+    }
+}
+
+/// Emit one lifecycle record for an entry, merging the event-specific fields
+/// over the shared identity fields.
+fn record_entry_event(entry: &PrecomputeEntry, kind: &str, fields: Value) {
+    let mut base = json!({
+        "sessionId": entry.session_id.try_to_utf8().ok(),
+        "agentKey": entry.agent_key.try_to_utf8().ok(),
+    });
+    if let (Value::Object(base), Value::Object(fields)) = (&mut base, fields) {
+        for (key, value) in fields {
+            base.insert(key, value);
+        }
+    }
+    record_precompute(kind, base);
+}
+
+/// One cancellation record for a background task that will never settle its
+/// checkpoint; session teardown and entry replacement both take this path.
+fn record_cancelled(entry: &PrecomputeEntry, arm: &PrecomputeArm, started: i64) {
+    record_entry_event(
+        entry,
+        "cancelled",
+        json!({ "durationMs": (arm.now)().saturating_sub(started) }),
+    );
+}
+
+/// Stable content-free name for a no-op compaction outcome.
+fn noop_reason_name(reason: Option<CompactionNoopReason>) -> Option<&'static str> {
+    match reason {
+        Some(CompactionNoopReason::CircuitBreakerOpen) => Some("circuit_breaker_open"),
+        Some(CompactionNoopReason::SummaryInflated) => Some("summary_inflated"),
+        Some(CompactionNoopReason::NoProgress) => Some("no_progress"),
+        Some(CompactionNoopReason::CompactorDisabled) => Some("compactor_disabled"),
+        None => None,
     }
 }
 
@@ -559,15 +653,27 @@ async fn run_precompute(
     if let Some(hook) = &arm.hook {
         let outcome = tokio::select! {
             biased;
-            _ = entry.signal.cancelled() => return,
+            _ = entry.signal.cancelled() => {
+                record_cancelled(&entry, &arm, started);
+                return;
+            }
             outcome = hook(entry.signal.clone()) => outcome,
         };
         if entry.signal.is_cancelled() {
+            record_cancelled(&entry, &arm, started);
             return;
         }
         if outcome.blocked {
             *entry.state.lock().unwrap() = EntryState::Retired;
             entry.settled.send_replace(true);
+            record_entry_event(
+                &entry,
+                "blocked",
+                json!({
+                    "reason": "hook",
+                    "durationMs": (arm.now)().saturating_sub(started),
+                }),
+            );
             tracing::debug!("compaction precompute discarded by the hook");
             return;
         }
@@ -601,11 +707,13 @@ async fn run_precompute(
     };
     arm.compactor.bind_output_observer(None);
     if entry.signal.is_cancelled() {
+        record_cancelled(&entry, &arm, started);
         return;
     }
     let staged_output = std::mem::take(&mut *staged.lock().unwrap());
     if result.compacted && result.has_new_checkpoint(&arm.snapshot) {
         let ready_at_ms = (arm.now)();
+        let freed_tokens = result.freed_tokens;
         *entry.state.lock().unwrap() = EntryState::Ready(ReadyPayload {
             result,
             staged_output,
@@ -619,6 +727,16 @@ async fn run_precompute(
         tracing::info!(
             duration_ms = ready_at_ms.saturating_sub(started),
             "compaction precompute ready"
+        );
+        record_entry_event(
+            &entry,
+            "ready",
+            json!({
+                "model": entry.model.try_to_utf8().ok(),
+                "native": entry.native.is_some(),
+                "durationMs": ready_at_ms.saturating_sub(started),
+                "freedTokens": freed_tokens,
+            }),
         );
     } else {
         let message = result
@@ -641,16 +759,30 @@ async fn run_precompute(
             "compaction precompute failed"
         );
         *entry.state.lock().unwrap() = EntryState::Failed;
+        let mut failure_count: Option<u32> = None;
         if countable {
             if let Some(registry) = registry.upgrade() {
                 let mut failures = registry.failures.lock().unwrap();
                 let count = failures.entry(entry.agent_key.clone()).or_insert(0);
                 *count += 1;
+                failure_count = Some(*count);
                 if *count >= REARM_FAILURE_CAP {
                     tracing::info!("compaction precompute rearm capped after repeated failures");
                 }
             }
         }
+        record_entry_event(
+            &entry,
+            "failed",
+            json!({
+                "model": entry.model.try_to_utf8().ok(),
+                "native": entry.native.is_some(),
+                "durationMs": (arm.now)().saturating_sub(started),
+                "reason": noop_reason_name(result.reason),
+                "countable": countable,
+                "failureCount": failure_count,
+            }),
+        );
     }
     entry.settled.send_replace(true);
 }
@@ -750,6 +882,7 @@ mod tests {
     ) -> PrecomputeArm {
         PrecomputeArm {
             agent_key: "main".into(),
+            session_id: "synthetic-session".into(),
             pre_compact_tokens: estimate_context_tokens(&snapshot),
             estimated_tokens: estimate_context_tokens(&snapshot),
             snapshot,

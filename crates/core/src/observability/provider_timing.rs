@@ -4,9 +4,11 @@
 use super::provider_diagnostics::{record_named, TIMING_LOG_FILE_NAME};
 use crate::runtime_values::RuntimeString;
 use crate::types::abort::AbortSignal;
-use crate::types::provider::{ModelRequest, ModelStream, ModelStreamEvent};
-use futures::StreamExt;
+use crate::types::provider::{CallModel, ModelRequest, ModelStream, ModelStreamEvent};
+use crate::types::tool::UuidFn;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -222,6 +224,111 @@ impl Drop for RequestTiming {
             "dropped"
         });
     }
+}
+
+/// Passive instrumentation wrapper for a stream consumed by another loop.
+///
+/// The foreground turn loop drives its own stream through
+/// [`RequestTiming::next_event`] and owns the deadlines. Background consumers —
+/// such as the precomputed-compaction summary fork — drive the stream
+/// themselves; this wrapper only observes the passing events so those requests
+/// share the timing log and its record vocabulary with foreground ones.
+/// Deadline ownership stays with the consumer.
+struct ObservedStream {
+    inner: ModelStream,
+    timing: RequestTiming,
+}
+
+impl ObservedStream {
+    fn new(inner: ModelStream, timing: RequestTiming) -> ModelStream {
+        Box::pin(Self { inner, timing })
+    }
+}
+
+impl Stream for ObservedStream {
+    type Item = ModelStreamEvent;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Both fields are Unpin, so no pin projection is needed.
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(event)) => {
+                this.timing.observe(&event);
+                Poll::Ready(Some(event))
+            }
+            Poll::Ready(None) => {
+                // A stream that ends on an unrecovered error is a failed
+                // request; anything else that reaches the end completed.
+                // Mid-flight cancellation surfaces through `Drop`.
+                let outcome = if this.timing.last_event_kind == Some("error") {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                this.timing.finish(outcome);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Identity fields labeling one precompute fork's background summary requests
+/// in the timing log.
+pub(crate) struct PrecomputeTimingContext {
+    pub uuid: UuidFn,
+    pub provider_id: RuntimeString,
+    pub session_id: RuntimeString,
+    pub turn_id: RuntimeString,
+    pub idle_ms: u64,
+    pub total_ms: u64,
+}
+
+/// Wrap the model-call seam handed to a precompute fork so every background
+/// summary request lands in the timing log with `purpose=precompute`, next to
+/// the foreground `purpose=normal` records. The native summary transport
+/// bypasses this seam; its lifecycle is covered by the registry's own records.
+pub(crate) fn precompute_call_model(
+    inner: CallModel,
+    context: PrecomputeTimingContext,
+) -> CallModel {
+    let PrecomputeTimingContext {
+        uuid,
+        provider_id,
+        session_id,
+        turn_id,
+        idle_ms,
+        total_ms,
+    } = context;
+    Box::new(move |request: ModelRequest, signal: AbortSignal| {
+        let request_id = (uuid)();
+        let mut timing = RequestTiming::start(
+            "precompute",
+            &request_id,
+            &request.model,
+            Some(&provider_id),
+            Some(&session_id),
+            1,
+            idle_ms,
+            total_ms,
+            signal.clone(),
+        );
+        timing.bind_turn_id(&turn_id);
+        timing.record_prefix(&request);
+        ObservedStream::new(inner(request, signal), timing)
+    })
+}
+
+/// One-shot lifecycle record for background compaction precompute: the
+/// arm/ready/consume moments bracketing the request records above. Content-free
+/// like every other timing record; callers pass identifiers, counters and
+/// static reason codes only.
+pub(crate) fn record_precompute(kind: &str, fields: Value) {
+    let mut fields = fields;
+    if let Value::Object(object) = &mut fields {
+        object.insert("purpose".into(), json!("precompute"));
+    }
+    record_named(TIMING_LOG_FILE_NAME, kind, fields);
 }
 
 fn event_kind(event: &ModelStreamEvent) -> &'static str {
@@ -495,5 +602,95 @@ mod tests {
         timing.finish("completed");
         drop(timing);
         std::fs::remove_dir(path).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_stream_records_precompute_request_lifecycle() {
+        let path = std::env::temp_dir().join(format!("klaus-timing-{}.log", uuid::Uuid::new_v4()));
+        let mut timing = RequestTiming::start(
+            "precompute",
+            "synthetic-bg-request",
+            &"synthetic-model".into(),
+            Some(&"synthetic-provider".into()),
+            Some(&"synthetic-session".into()),
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        timing.test_path = Some(path.clone());
+        timing.record("started");
+        let events = vec![
+            ModelStreamEvent::MessageStart {
+                model: "synthetic-model".into(),
+            },
+            ModelStreamEvent::TextDelta {
+                text: "private summary body".into(),
+            },
+        ];
+        let mut stream = ObservedStream::new(Box::pin(futures::stream::iter(events)), timing);
+        let mut seen = 0;
+        while stream.next().await.is_some() {
+            seen += 1;
+        }
+        drop(stream);
+        assert_eq!(seen, 2);
+        let records = records(&path);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["started", "first_event", "completed"]);
+        let completed = records.last().unwrap();
+        assert_eq!(completed["purpose"], "precompute");
+        assert_eq!(completed["sessionId"], "synthetic-session");
+        assert_eq!(completed["eventCount"], 2);
+        let text = serde_json::to_string(&records).unwrap();
+        assert!(!text.contains("private summary body"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_stream_terminal_error_finishes_failed() {
+        use crate::types::errors::{ProviderError, ProviderErrorKind};
+        let path = std::env::temp_dir().join(format!("klaus-timing-{}.log", uuid::Uuid::new_v4()));
+        let mut timing = RequestTiming::start(
+            "precompute",
+            "synthetic-bg-request",
+            &"synthetic-model".into(),
+            None,
+            None,
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        timing.test_path = Some(path.clone());
+        timing.record("started");
+        let events = vec![ModelStreamEvent::Error {
+            error: ProviderError {
+                kind: ProviderErrorKind::Network,
+                message: "private upstream body".into(),
+                status: None,
+                code: None,
+                error_type: None,
+                media_origins: None,
+                media_repair_complete: false,
+                credential_recovery: None,
+                retry_after_ms: None,
+                request_id: None,
+            },
+        }];
+        let mut stream = ObservedStream::new(Box::pin(futures::stream::iter(events)), timing);
+        while stream.next().await.is_some() {}
+        drop(stream);
+        let records = records(&path);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["started", "failed"]);
+        assert_eq!(records.last().unwrap()["errorKind"], "network");
+        let text = serde_json::to_string(&records).unwrap();
+        assert!(!text.contains("private upstream body"), "{text}");
     }
 }

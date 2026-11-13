@@ -3698,7 +3698,20 @@ async fn consume_precomputed_compaction(
         )
         .await
     {
-        super::precompute::PrecomputeConsume::Miss => None,
+        super::precompute::PrecomputeConsume::Miss => {
+            // The boundary fell back to synchronous compaction; one
+            // content-free marker shows no precomputed checkpoint was
+            // available to swap in.
+            crate::observability::provider_timing::record_precompute(
+                "consumed",
+                serde_json::json!({
+                    "sessionId": thread_id.try_to_utf8().ok(),
+                    "agentKey": agent_key.try_to_utf8().ok(),
+                    "outcome": "miss",
+                }),
+            );
+            None
+        }
         super::precompute::PrecomputeConsume::Aborted => Some(Err(CompactionFailure::Aborted)),
         super::precompute::PrecomputeConsume::Hit(swap) => Some(
             apply_precomputed_compaction(
@@ -3761,7 +3774,23 @@ fn maybe_arm_compaction_precompute(
     }
     let deps = shared.deps();
     let now = deps.now.clone();
-    let Ok(compactor) = deps.compactor.fork_precompute(deps.call_model, config) else {
+    // Route the fork's model calls through the timing log so background
+    // summary requests are visible next to the foreground ones under their
+    // own purpose. The native summary transport bypasses this seam; its
+    // lifecycle is covered by the registry's own records.
+    let timing_context = crate::observability::provider_timing::PrecomputeTimingContext {
+        uuid: deps.uuid.clone(),
+        provider_id: deps.provider_id.clone(),
+        session_id: thread_id.clone(),
+        turn_id: shared.params.turn_id.clone(),
+        idle_ms: config.stream_idle_timeout_ms,
+        total_ms: config.stream_total_timeout_ms,
+    };
+    let call_model = crate::observability::provider_timing::precompute_call_model(
+        deps.call_model,
+        timing_context,
+    );
+    let Ok(compactor) = deps.compactor.fork_precompute(call_model, config) else {
         return;
     };
     let (compactable, _protected) =
@@ -3785,6 +3814,7 @@ fn maybe_arm_compaction_precompute(
         .map(|bus| precompute_hook_runner(bus.clone(), cwd.clone(), thread_id.clone()));
     registry.arm(super::precompute::PrecomputeArm {
         agent_key,
+        session_id: thread_id.clone(),
         pre_compact_tokens: crate::context::tokens::estimate_context_tokens(&compactable),
         estimated_tokens: estimate_context_tokens_with_prefix(messages, prefix_tokens),
         snapshot: compactable,
