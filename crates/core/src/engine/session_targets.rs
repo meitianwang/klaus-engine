@@ -751,6 +751,14 @@ impl ModelProvider for SummaryProvider {
         model: &RuntimeString,
         signal: &crate::types::abort::AbortSignal,
     ) -> Result<bool, crate::types::errors::ProviderError> {
+        if checkpoint
+            .comp_hash
+            .as_ref()
+            .zip(self.compaction_compatibility_hash(model))
+            .is_some_and(|(saved, current)| saved != &current)
+        {
+            return Ok(false);
+        }
         self.inner
             .native_checkpoint_compatibility(checkpoint, model, signal)
             .await
@@ -912,6 +920,12 @@ impl ModelProvider for SummaryProvider {
         request.bind_media_capabilities(&capabilities);
         if !capabilities.vision {
             crate::engine::query::request::omit_request_images(&mut request.messages);
+        }
+        if !capabilities.native_pdf {
+            crate::engine::query::request::omit_historical_request_documents(
+                &mut request.messages,
+                false,
+            );
         }
         crate::engine::query::tool_dispatch::gate_request_images(&mut request);
         let sink = self.sink.clone();

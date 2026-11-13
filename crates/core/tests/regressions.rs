@@ -769,3 +769,6 @@ mod r20261108_shell_yield_defaults;
 
 #[path = "regressions/r20261113_side_task_checkpoint_ancestry.rs"]
 mod r20261113_side_task_checkpoint_ancestry;
+
+#[path = "regressions/r20261113_target_model_downshift_compaction.rs"]
+mod r20261113_target_model_downshift_compaction;

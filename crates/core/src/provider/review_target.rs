@@ -35,6 +35,14 @@ impl ModelProvider for ReviewCatalogProvider {
         model: &RuntimeString,
         signal: &crate::types::abort::AbortSignal,
     ) -> Result<bool, crate::types::errors::ProviderError> {
+        if checkpoint
+            .comp_hash
+            .as_ref()
+            .zip(self.compaction_compatibility_hash(model))
+            .is_some_and(|(saved, current)| saved != &current)
+        {
+            return Ok(false);
+        }
         self.inner
             .native_checkpoint_compatibility(checkpoint, model, signal)
             .await

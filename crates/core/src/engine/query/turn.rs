@@ -2528,10 +2528,13 @@ async fn run_turn_compaction_check(
             turn_override, effective_max_output, messages, prepared,
         ) => result,
     };
-    if let Err(error) = migration {
-        emit_compaction_failure(shared, error);
-        return false;
-    }
+    let migrated = match migration {
+        Ok(migrated) => migrated,
+        Err(error) => {
+            emit_compaction_failure(shared, error);
+            return false;
+        }
+    };
 
     let prefix_tokens = fixed_prefix_tokens(&prepared.request);
     let estimate = super::request::rendered_context_tokens(&prepared.request);
@@ -2557,7 +2560,7 @@ async fn run_turn_compaction_check(
             .as_ref()
             .and_then(|state| state.prefill()),
     );
-    if !config.compaction_disabled && config.auto_compaction {
+    if !migrated && !config.compaction_disabled && config.auto_compaction {
         if !status.token_limit_reached {
             // Arm the background checkpoint summary while there is still lead
             // room before the automatic-compaction boundary.

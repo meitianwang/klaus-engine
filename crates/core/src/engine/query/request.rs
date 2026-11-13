@@ -654,6 +654,12 @@ impl Shared {
         if !capabilities.vision {
             omit_request_images(&mut prepared.request.messages);
         }
+        if !capabilities.native_pdf {
+            omit_historical_request_documents(
+                &mut prepared.request.messages,
+                self.params.input_pdf_documents > 0,
+            );
+        }
         crate::provider::native_media::project_history_media(
             &mut prepared.request.messages,
             messages,
@@ -900,6 +906,70 @@ fn omit_content_images(blocks: &mut Vec<ContentBlock>) {
         blocks.retain(|block| !matches!(block, ContentBlock::Image(_)));
         blocks.push(ContentBlock::Text(note));
     }
+}
+
+/// Omit historical native PDF blocks when the selected model cannot read PDFs,
+/// while preserving any fresh PDF attachment on the current user turn so
+/// explicit input validation still surfaces a clear rejection.
+pub(crate) fn omit_historical_request_documents(
+    messages: &mut [Message],
+    preserve_latest_user_documents: bool,
+) {
+    let protected_user = if preserve_latest_user_documents {
+        messages.iter().rposition(|message| {
+            matches!(
+                message,
+                Message::User(user)
+                    if user.is_meta != Some(true)
+                        && user
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::Document(_)))
+            )
+        })
+    } else {
+        None
+    };
+    for (index, message) in messages.iter_mut().enumerate() {
+        if Some(index) == protected_user {
+            continue;
+        }
+        match message {
+            Message::User(user) => omit_content_documents(&mut user.content),
+            Message::Assistant(assistant) => omit_content_documents(&mut assistant.content),
+            Message::ToolResult(result) => {
+                if let Some(blocks) = &mut result.extra_user_blocks {
+                    omit_content_documents(blocks);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn omit_content_documents(blocks: &mut Vec<ContentBlock>) {
+    let mut dropped = 0usize;
+    for block in blocks.iter() {
+        if matches!(block, ContentBlock::Document(_)) {
+            dropped += 1;
+        }
+    }
+    if dropped == 0 {
+        return;
+    }
+    blocks.retain(|block| !matches!(block, ContentBlock::Document(_)));
+    let note = if dropped == 1 {
+        "[1 PDF document was omitted from this model request: this model cannot read PDF attachments directly. The attachment remains in the conversation.]"
+    } else {
+        "[PDF documents were omitted from this model request: this model cannot read PDF attachments directly. The attachments remain in the conversation.]"
+    };
+    blocks.push(ContentBlock::Text(TextBlock {
+        text: RuntimeString::from(note),
+        citations: None,
+        harness_envelope: None,
+        message_id: None,
+        phase: None,
+    }));
 }
 
 fn image_omission_note(dropped: usize) -> Option<TextBlock> {

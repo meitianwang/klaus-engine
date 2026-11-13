@@ -195,6 +195,11 @@ impl OpenAIProvider {
         if self.api != OpenAiApi::Responses
             || self.remote_compaction_support(model) == RemoteCompactionSupport::Unsupported
             || checkpoint.source != self.request_base_url.trim_end_matches('/')
+            || checkpoint
+                .comp_hash
+                .as_ref()
+                .zip(self.compaction_compatibility_hash(model))
+                .is_some_and(|(saved, current)| saved != &current)
         {
             return Ok(false);
         }
@@ -236,6 +241,11 @@ impl OpenAIProvider {
                 || self.remote_compaction_support(&request.model)
                     == RemoteCompactionSupport::Unsupported
                 || checkpoint.source != self.request_base_url.trim_end_matches('/')
+                || checkpoint
+                    .comp_hash
+                    .as_ref()
+                    .zip(self.compaction_compatibility_hash(&request.model))
+                    .is_some_and(|(saved, current)| saved != &current)
                 || scope
                     .as_ref()
                     .is_some_and(|scope| scope != &checkpoint.auth_scope)

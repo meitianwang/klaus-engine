@@ -1,6 +1,7 @@
-//! Defect: publication could forward an incompatible checkpoint to a new model source.
-//! Root cause: migration considered only smaller windows and retried arbitrary target providers.
-//! Fix: 5dea2d9b; create and commit source-preserving context checkpoints.
+//! Defect: switching model sources either forwarded an incompatible native
+//! checkpoint or called the deselected model source to convert context.
+//! Fix: 5dea2d9b / 2026-11-13; recover portable history from durable local
+//! rollout records and run all compaction exclusively on the selected target.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -10,8 +11,9 @@ use klaus_agent_core::runtime_process::RuntimeProcessContext;
 use klaus_agent_core::runtime_values::RuntimeString;
 use klaus_agent_core::schemas::content::{ContentBlock, TextBlock};
 use klaus_agent_core::schemas::message::{
-    CompactBoundaryMessage, Message, NativeCompactionCheckpoint, Usage, UserMessage,
+    AssistantMessage, Message, NativeCompactionCheckpoint, Usage, UserMessage,
 };
+use klaus_agent_core::store::jsonl_store::{JsonlSessionStore, JsonlSessionStoreOptions};
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::errors::{ProviderError, ProviderErrorKind};
 use klaus_agent_core::types::events::EngineEvent;
@@ -103,7 +105,15 @@ impl ModelProvider for Provider {
         model: &RuntimeString,
         _: &AbortSignal,
     ) -> Result<bool, ProviderError> {
-        Ok(self.remote && checkpoint.auth_scope == self.info.name && &checkpoint.model == model)
+        let hash_compatible = checkpoint
+            .comp_hash
+            .as_ref()
+            .zip(self.compaction_compatibility_hash(model))
+            .is_none_or(|(saved, current)| saved == &current);
+        Ok(self.remote
+            && checkpoint.auth_scope == self.info.name
+            && &checkpoint.model == model
+            && hash_compatible)
     }
     async fn compact_remote(
         &self,
@@ -116,7 +126,7 @@ impl ModelProvider for Provider {
             .push((self.info.name.try_to_utf8().unwrap(), "native", request));
         if self.native_network_failures.load(Ordering::SeqCst) > 0 {
             self.native_network_failures.fetch_sub(1, Ordering::SeqCst);
-            return Err(provider_error(ProviderErrorKind::Network, "dns_error"));
+            return Err(provider_error(ProviderErrorKind::Network, "dns_failure"));
         }
         match self.reply {
             NativeReply::Success => Ok(RemoteCompactionResult {
@@ -232,19 +242,37 @@ pub(super) fn spec(name: &'static str, model: &'static str, hash: Option<&'stati
     }
 }
 
-fn user() -> Message {
-    Message::User(UserMessage {
-        uuid: "original-requirement".into(),
-        content: vec![ContentBlock::Text(TextBlock {
-            text: "Keep the original requirement.".into(),
-            citations: None,
-            harness_envelope: None,
-            message_id: None,
-            phase: None,
-        })],
-        is_meta: None,
-        question_answer: None,
-    })
+fn initial_history(large: bool) -> Vec<Message> {
+    vec![
+        Message::User(UserMessage {
+            uuid: "original-requirement".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "Keep the original requirement.".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_meta: None,
+            question_answer: None,
+        }),
+        Message::Assistant(AssistantMessage {
+            uuid: "prior-progress".into(),
+            model: "old-model".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: if large {
+                    "p".repeat(360_000).into()
+                } else {
+                    "Initial work recorded.".into()
+                },
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            usage: None,
+        }),
+    ]
 }
 
 pub(super) struct Fixture {
@@ -255,7 +283,7 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    pub(super) fn new(source: Spec, native_history: bool) -> Self {
+    pub(super) async fn open(source: Spec, native_history: bool, large: bool) -> Self {
         let process = RuntimeProcessContext::initialize(
             super::r7c876d49_spec_restores_latest_permission_policy::process_supervisor(),
         )
@@ -265,28 +293,36 @@ impl Fixture {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+            dir: Some(dir.join("sessions").to_string_lossy().into_owned()),
+            archive_dir: None,
+        }));
         let trace = Trace::default();
         let provider = source.provider(&trace);
-        let mut history = vec![user()];
-        if native_history {
-            history.push(Message::CompactBoundary(CompactBoundaryMessage {
-                uuid: "previous-native-checkpoint".into(),
-                summary: RuntimeString::default(),
-                native_compaction: Some(provider.checkpoint()),
-            }));
-        }
         let mut options =
             super::r7c876d49_spec_restores_latest_permission_policy::agent_options(process.clone());
         options.provider = provider;
         options.cwd = Some(dir.to_string_lossy().into_owned());
         options.tools = Some(Vec::new());
         options.config = Some(config(&source));
-        let session = Agent::new(options).start_session(StartSessionOptions {
-            user_config_dir: Some(dir.to_string_lossy().into_owned().into()),
-            base_instructions: Some("Continue the user's task.".into()),
-            initial_history: Some(history),
-            ..Default::default()
-        });
+        let session = Agent::new(options)
+            .open_session(
+                store,
+                StartSessionOptions {
+                    user_config_dir: Some(dir.to_string_lossy().into_owned().into()),
+                    base_instructions: Some("Continue the user's task.".into()),
+                    initial_history: Some(initial_history(large)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if native_history {
+            let outcome = session.compact(None).await.unwrap();
+            assert!(outcome.compacted);
+            session.flush_rollout().await.unwrap();
+            trace.lock().unwrap().clear();
+        }
         Self {
             session,
             trace,
@@ -333,7 +369,7 @@ impl Fixture {
 fn config(spec: &Spec) -> serde_json::Value {
     json!({ "model":spec.model,"contextWindow":spec.window,"prewarm":false,"thinking":false,
         "autoMemory":false,"autoDream":false,"memoryRecall":false,"loopDetection":false,
-        "compactionStreamMaxRetries":0,"approval_policy":"never","sandbox_mode":"danger-full-access",
+        "compactionStreamMaxRetries":spec.max_retries,"approval_policy":"never","sandbox_mode":"danger-full-access",
         "modelSource":{"source":spec.name,"modelId":spec.model,"selection":format!("{}:{}",spec.name,spec.model)} })
 }
 
@@ -347,56 +383,55 @@ pub(super) fn succeeded(events: &[EngineEvent]) -> bool {
 }
 
 #[tokio::test]
-async fn compatibility_hash_change_compacts_fitting_history_without_a_downshift() {
-    let fixture = Fixture::new(spec("old", "same-model", Some("v1")), false);
+async fn compatibility_hash_change_without_native_checkpoint_skips_deselected_source() {
+    let fixture = Fixture::open(spec("old", "same-model", Some("v1")), false, false).await;
     fixture.select(spec("new", "same-model", Some("v2")));
     let events = fixture.run().await;
     assert!(succeeded(&events), "{events:?}");
-    assert_eq!(
-        fixture.routes(),
-        [("old".into(), "local"), ("new".into(), "normal")]
-    );
+    assert_eq!(fixture.routes(), [("new".into(), "normal")]);
     fixture.close().await;
 }
 
 #[tokio::test]
-async fn native_checkpoint_is_localized_by_its_owner_before_a_wider_unsupported_target() {
-    let fixture = Fixture::new(
+async fn native_checkpoint_expands_from_local_rollout_without_calling_previous_owner() {
+    let fixture = Fixture::open(
         Spec {
             remote: true,
             ..spec("old", "old-model", Some("v1"))
         },
         true,
-    );
+        false,
+    )
+    .await;
     fixture.select(Spec {
         window: 200_000,
         ..spec("new", "new-model", None)
     });
     let events = fixture.run().await;
     assert!(succeeded(&events), "{events:?}");
-    assert_eq!(
-        fixture.routes(),
-        [("old".into(), "local"), ("new".into(), "normal")]
-    );
+    assert_eq!(fixture.routes(), [("new".into(), "normal")]);
     {
         let trace = fixture.trace.lock().unwrap();
-        assert!(trace[0].2.messages.iter().any(|message| matches!(message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some())));
-        assert!(!trace[1].2.messages.iter().any(|message| matches!(message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some())));
+        assert!(!trace[0].2.messages.iter().any(|message| matches!(message, Message::CompactBoundary(boundary) if boundary.native_compaction.is_some())));
     }
     fixture.close().await;
 }
 
 #[tokio::test]
-async fn failed_native_migration_retries_only_an_explicitly_eligible_target() {
-    let fixture = Fixture::new(
+async fn downshift_to_native_target_compacts_directly_on_target_without_touching_old_source() {
+    let fixture = Fixture::open(
         Spec {
+            window: 200_000,
             remote: true,
             reply: NativeReply::Unavailable,
             ..spec("old", "old-model", Some("v1"))
         },
         false,
-    );
+        true,
+    )
+    .await;
     fixture.select(Spec {
+        window: 100_000,
         remote: true,
         eligible: true,
         ..spec("new", "new-model", Some("v2"))
@@ -405,32 +440,32 @@ async fn failed_native_migration_retries_only_an_explicitly_eligible_target() {
     assert!(succeeded(&events), "{events:?}");
     assert_eq!(
         fixture.routes(),
-        [
-            ("old".into(), "native"),
-            ("new".into(), "native"),
-            ("new".into(), "normal")
-        ]
+        [("new".into(), "native"), ("new".into(), "normal")]
     );
     fixture.close().await;
 }
 
 #[tokio::test]
-async fn unsupported_fallback_target_never_receives_the_failed_migration_history() {
-    let fixture = Fixture::new(
+async fn failed_target_native_downshift_never_sends_uncompacted_history_to_normal_inference() {
+    let fixture = Fixture::open(
         Spec {
+            window: 200_000,
             remote: true,
-            reply: NativeReply::Unavailable,
             ..spec("old", "old-model", Some("v1"))
         },
         false,
-    );
+        true,
+    )
+    .await;
     fixture.select(Spec {
+        window: 100_000,
         remote: true,
+        reply: NativeReply::Unavailable,
         ..spec("new", "new-model", Some("v2"))
     });
     let events = fixture.run().await;
     assert!(!succeeded(&events));
-    assert_eq!(fixture.routes(), [("old".into(), "native")]);
+    assert_eq!(fixture.routes(), [("new".into(), "native")]);
     assert!(fixture.session.history().iter().any(
         |message| matches!(message, Message::User(user) if user.uuid == "original-requirement")
     ));
@@ -438,43 +473,49 @@ async fn unsupported_fallback_target_never_receives_the_failed_migration_history
 }
 
 #[tokio::test]
-async fn session_budget_refusal_cannot_rotate_to_another_model() {
-    let fixture = Fixture::new(
+async fn target_session_budget_refusal_aborts_downshift_without_calling_old_source() {
+    let fixture = Fixture::open(
         Spec {
+            window: 200_000,
             remote: true,
-            reply: NativeReply::Budget,
             ..spec("old", "old-model", Some("v1"))
         },
         false,
-    );
+        true,
+    )
+    .await;
     fixture.select(Spec {
+        window: 100_000,
         remote: true,
-        eligible: true,
+        reply: NativeReply::Budget,
         ..spec("new", "new-model", Some("v2"))
     });
     let events = fixture.run().await;
     assert!(!succeeded(&events));
-    assert_eq!(fixture.routes(), [("old".into(), "native")]);
+    assert_eq!(fixture.routes(), [("new".into(), "native")]);
     fixture.close().await;
 }
 
 #[tokio::test]
-async fn cancelled_native_migration_preserves_history_without_target_fallback() {
-    let fixture = Fixture::new(
+async fn cancelled_target_native_downshift_preserves_history() {
+    let fixture = Fixture::open(
         Spec {
+            window: 200_000,
             remote: true,
-            reply: NativeReply::Cancel,
             ..spec("old", "old-model", Some("v1"))
         },
         false,
-    );
+        true,
+    )
+    .await;
     fixture.select(Spec {
+        window: 100_000,
         remote: true,
-        eligible: true,
+        reply: NativeReply::Cancel,
         ..spec("new", "new-model", Some("v2"))
     });
     let events = fixture.run().await;
-    assert_eq!(fixture.routes(), [("old".into(), "native")]);
+    assert_eq!(fixture.routes(), [("new".into(), "native")]);
     assert!(events
         .iter()
         .any(|event| matches!(event, EngineEvent::TurnCompleted { .. })));

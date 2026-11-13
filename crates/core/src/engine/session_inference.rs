@@ -41,22 +41,32 @@ pub(crate) struct InferenceBundle {
     /// Immutable rate table carried by the request that captured this bundle,
     /// so a later publication cannot reprice work already in flight.
     pub rates: PricingTable,
-    /// The previous transport remains available until its history fits the new
-    /// model. Each publication owns its completion state independently.
-    pub context_migration: Option<Arc<ContextWindowMigration>>,
+    /// Usable context window of the larger prior selection when switching down
+    /// to a smaller model, without retaining the deselected provider.
+    pub context_downshift: Option<Arc<ContextWindowDownshift>>,
 }
 
-pub(crate) struct ContextWindowMigration {
-    source: Mutex<Option<Arc<InferenceBundle>>>,
+pub(crate) struct ContextWindowDownshift {
+    previous_usable_window: u64,
+    completed: std::sync::atomic::AtomicBool,
 }
 
-impl ContextWindowMigration {
-    pub(crate) fn source(&self) -> Option<Arc<InferenceBundle>> {
-        self.source.lock_recover().clone()
+impl ContextWindowDownshift {
+    pub(crate) fn new(previous_usable_window: u64) -> Self {
+        Self {
+            previous_usable_window,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn previous_usable_window(&self) -> Option<u64> {
+        (!self.completed.load(std::sync::atomic::Ordering::Acquire))
+            .then_some(self.previous_usable_window)
     }
 
     pub(crate) fn complete(&self) {
-        self.source.lock_recover().take();
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -88,39 +98,22 @@ pub(crate) async fn prepare_review_requirements_for_provider(
 }
 
 impl InferenceBundle {
-    fn migration_to(
-        self: &Arc<Self>,
-        target: &ResolvedConfig,
-        target_provider: &Arc<dyn ModelProvider>,
-    ) -> Option<Arc<ContextWindowMigration>> {
-        let source = self
-            .context_migration
+    fn downshift_to(&self, target: &ResolvedConfig) -> Option<Arc<ContextWindowDownshift>> {
+        let previous_usable_window = self
+            .context_downshift
             .as_ref()
-            .and_then(|migration| migration.source())
-            .unwrap_or_else(|| self.clone());
-        let smaller = crate::context::compact::window::actual_model_window(&source.config)
-            > crate::context::compact::window::actual_model_window(target);
-        let previous_hash = source
-            .provider
-            .compaction_compatibility_hash(&source.config.model);
-        let target_hash = target_provider.compaction_compatibility_hash(&target.model);
-        let incompatible = previous_hash
-            .zip(target_hash)
-            .is_some_and(|(previous, current)| previous != current);
-        let native_source = source
-            .provider
-            .remote_compaction_support(&source.config.model)
-            != crate::types::provider::RemoteCompactionSupport::Unsupported;
-        // Preserve the old binding until any opaque checkpoint has been checked
-        // against the target's actual endpoint and credential identity.
-        if !smaller && !incompatible && !native_source {
+            .and_then(|downshift| downshift.previous_usable_window())
+            .unwrap_or_else(|| {
+                crate::context::compact::policy::usable_context_window(&self.config)
+            });
+        let target_usable_window = crate::context::compact::policy::usable_context_window(target);
+        if previous_usable_window <= target_usable_window {
             return None;
         }
-        // Keep one frozen source rather than a chain of rapid, unused selections.
-        let mut source = (*source).clone();
-        source.context_migration = None;
-        Some(Arc::new(ContextWindowMigration {
-            source: Mutex::new(Some(Arc::new(source))),
+        // Keep one high-water prior window across rapid, unused selections.
+        Some(Arc::new(ContextWindowDownshift {
+            previous_usable_window,
+            completed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -888,7 +881,7 @@ impl Session {
         // summary kept riding the model it was first pinned to.
         // The change is not host-published, so it clears any prior changeId.
         next.change_id = None;
-        next.context_migration = previous.migration_to(&selected.config, &selected.provider);
+        next.context_downshift = previous.downshift_to(&selected.config);
         self.mode.set_pending_model(Some(model.clone()));
         if active {
             if let Some(turn) = turns.last() {
@@ -1161,7 +1154,7 @@ impl Session {
             feature_targets: feature_targets.clone(),
             source: next_source.clone(),
             rates: rates.clone(),
-            context_migration: None,
+            context_downshift: None,
         }
         .summary_deps(
             self.cost.clone(),
@@ -1237,10 +1230,9 @@ impl Session {
             feature_targets,
             source: next_source,
             rates,
-            context_migration: None,
+            context_downshift: None,
         };
-        next.context_migration =
-            previous.migration_to(&next.config_for_model(&next.config.model), &next.provider);
+        next.context_downshift = previous.downshift_to(&next.config_for_model(&next.config.model));
         *current = Arc::new(next);
         if next_policy != previous_policy {
             next_policy.generation = previous_policy.generation.saturating_add(1);
@@ -1263,6 +1255,68 @@ impl Session {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.schedule_transport_prewarm();
         Ok(revision)
+    }
+
+    pub(crate) fn restore_resumed_context_downshift(
+        &self,
+        raw_items: &[crate::schemas::rollout::RolloutItem],
+    ) {
+        use crate::schemas::rollout::RolloutItem;
+        let mut current = self.inference.write_recover();
+        let config = current.config_for_model(&current.config.model);
+        let usable = crate::context::compact::policy::usable_context_window(&config);
+        let history = self.history_snapshot();
+        let estimated = crate::context::tokens::estimate_context_tokens(&history);
+        let current_source = config
+            .model_source
+            .as_ref()
+            .and_then(|source| source.source.clone())
+            .map(crate::runtime_values::RuntimeString::from);
+        let model_changed = raw_items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::UsageLedger(entry) => Some(
+                    entry.model != config.model
+                        || entry.inference.as_ref().is_some_and(|identity| {
+                            identity.source.is_some() && identity.source != current_source
+                        }),
+                ),
+                RolloutItem::TurnContext { ctx } => Some(ctx.model != config.model),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let prior_high_water = estimated.max(
+            history
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::schemas::message::Message::Assistant(assistant) => assistant
+                        .usage
+                        .as_ref()
+                        .map(|usage| {
+                            usage.total_tokens.unwrap_or(
+                                usage
+                                    .input_tokens
+                                    .saturating_add(usage.cache_read_input_tokens)
+                                    .saturating_add(usage.cache_creation_input_tokens)
+                                    .saturating_add(usage.output_tokens),
+                            )
+                        })
+                        .filter(|tokens| *tokens > 0),
+                    _ => None,
+                })
+                .unwrap_or(0),
+        );
+        if estimated >= usable || (model_changed && prior_high_water > usable) {
+            let mut next = (**current).clone();
+            next.context_downshift = Some(Arc::new(ContextWindowDownshift::new(
+                prior_high_water
+                    .saturating_add(1)
+                    .max(usable.saturating_add(1)),
+            )));
+            *current = Arc::new(next);
+        }
     }
 }
 
@@ -1410,7 +1464,7 @@ mod media_capture_tests {
             feature_targets: Default::default(),
             source: None,
             rates: DEFAULT_PRICING.clone(),
-            context_migration: None,
+            context_downshift: None,
         });
         let models = ["summary".into(), "undeclared".into()];
         let captured = bundle.capture(&models);

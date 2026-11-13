@@ -649,7 +649,7 @@ impl Compactor for RecoveryCompactor {
 }
 
 #[tokio::test]
-async fn payload_413_defers_old_source_compaction_until_the_next_turn_before_a_smaller_target() {
+async fn payload_413_defers_compaction_until_the_next_turn_on_the_smaller_target() {
     let compactor = Arc::new(RecoveryCompactor::default());
     let fixture = Fixture::new(Some(compactor.clone()));
     fixture.a.enqueue(Reply::Text, None);
@@ -790,10 +790,10 @@ async fn payload_413_defers_old_source_compaction_until_the_next_turn_before_a_s
     assert_eq!(sent[1].1.max_output_tokens, 1_536);
     let observed = compactor.observed.lock().unwrap().clone();
     assert_eq!(observed.len(), 1);
-    assert_eq!(observed[0].model, "snapshot-a");
+    assert_eq!(observed[0].model, "snapshot-b");
     assert_eq!(
         observed[0].model_source.as_ref().unwrap().source.as_deref(),
-        Some("custom")
+        Some("local")
     );
     let requests = starts(&events);
     assert_eq!(requests.len(), 2);

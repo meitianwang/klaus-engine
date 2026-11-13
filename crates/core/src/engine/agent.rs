@@ -3587,6 +3587,7 @@ impl Agent {
         session.restore_file_changes(file_changes);
         session.context_hint_state.restore_rollout(&raw_items);
         session.restore_context_usage_checkpoint(&raw_items);
+        session.restore_resumed_context_downshift(&raw_items);
         // Which turn each message belongs to, and how each turn ENDED. The rollout
         // records it (`turn_lifecycle`), the replay rebuilds it, and dropping it
         // here made every resumed turn look like a normal completed one — a turn

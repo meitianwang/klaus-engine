@@ -1426,7 +1426,7 @@ impl Session {
                 feature_targets: Default::default(),
                 source: None,
                 rates: inference_rates,
-                context_migration: None,
+                context_downshift: None,
             })),
             inference_admission: Arc::new(Mutex::new(super::InferenceAdmission::default())),
             inference_changed: tokio::sync::Notify::new(),
