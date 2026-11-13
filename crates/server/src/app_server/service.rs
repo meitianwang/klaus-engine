@@ -744,6 +744,7 @@ async fn run_app_server_inner<I, O>(
     on_state(state.clone());
     state.maintenance.start(state.config_path.clone());
     let queue_watcher = queue::watch(&state);
+    let catalog_watcher = watch_model_catalogs(&state);
     let login_lifetime = super::antigravity::login::ConnectionGuard::new(
         Arc::as_ptr(&state) as usize,
         state.connection_closed.clone(),
@@ -851,6 +852,8 @@ async fn run_app_server_inner<I, O>(
     drop(login_lifetime);
     drop(trae_login_lifetime);
     drop(kiro_login_lifetime);
+    catalog_watcher.abort();
+    let _ = catalog_watcher.await;
     queue_watcher.abort();
     let _ = queue_watcher.await;
 
@@ -1639,6 +1642,37 @@ async fn notify_thread_deleted(state: &Arc<AppServerState>, event: &Value) {
             .unwrap(),
         )
         .await;
+}
+
+fn watch_model_catalogs(state: &Arc<AppServerState>) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(state);
+    let mut receiver = model_sources::subscribe_catalog_changes();
+    tokio::spawn(async move {
+        loop {
+            let change = match receiver.recv().await {
+                Ok(change) => change,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if !state.initialized.load(Ordering::Acquire)
+                || model_sources::config_root_of(&state.config_path) != change.config_root
+            {
+                continue;
+            }
+            state
+                .notify(
+                    "model/catalogChanged",
+                    serde_json::to_value(wire::ModelCatalogChangedNotification {
+                        source: change.source,
+                    })
+                    .unwrap(),
+                )
+                .await;
+        }
+    })
 }
 
 /// Settle the parked waiter for this envelope's submission id, if any. Stream

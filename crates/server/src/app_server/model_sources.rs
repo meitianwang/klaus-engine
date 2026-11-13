@@ -2209,6 +2209,29 @@ pub fn config_root_of(config_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CatalogChange {
+    pub config_root: PathBuf,
+    pub source: String,
+}
+
+fn catalog_changes() -> &'static tokio::sync::broadcast::Sender<CatalogChange> {
+    static CHANGES: std::sync::OnceLock<tokio::sync::broadcast::Sender<CatalogChange>> =
+        std::sync::OnceLock::new();
+    CHANGES.get_or_init(|| tokio::sync::broadcast::channel(64).0)
+}
+
+pub(super) fn subscribe_catalog_changes() -> tokio::sync::broadcast::Receiver<CatalogChange> {
+    catalog_changes().subscribe()
+}
+
+pub(super) fn notify_catalog_changed(config_root: PathBuf, source: &str) {
+    let _ = catalog_changes().send(CatalogChange {
+        config_root,
+        source: source.to_string(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

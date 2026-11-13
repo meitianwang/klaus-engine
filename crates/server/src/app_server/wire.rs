@@ -2243,6 +2243,12 @@ pub struct WindowsSandboxSetupCompletedNotification {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogChangedNotification {
+    pub source: String,
+}
+
 /// `model/credential/write` request params: store a BYO model provider's API key
 /// in the endpoint credential store, keyed by the provider `id`. The engine is
 /// the only reader (session assembly) and writer; the key never lands in the

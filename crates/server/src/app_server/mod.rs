@@ -84,6 +84,9 @@ pub fn schema_bundle() -> Value {
             "engine/windowsSandboxSetupCompleted": {
                 "params": schema_for!(wire::WindowsSandboxSetupCompletedNotification),
             },
+            "model/catalogChanged": {
+                "params": schema_for!(wire::ModelCatalogChangedNotification),
+            },
             "engine/dictationEvent": {"params": {"type":"object", "required":["operationId","seq","type"], "properties":{"operationId":{"type":"string"},"seq":{"type":"integer"},"type":{"enum":["partial","final","error"]},"text":{"type":"string"},"code":{"type":"string"}}}},
             "session/realtimeEvent": {"params": {"type":"object", "required":["sessionId","requestId","event"], "properties":{"sessionId":{"type":"string"},"requestId":{"type":"string"},"event":{"type":"object"}}}},
             "session/event": {

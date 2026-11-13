@@ -257,17 +257,18 @@ async fn a_stale_credential_snapshot_paints_first_and_revalidates_behind_the_cal
     let rows = response["result"]["models"].as_array().unwrap();
     assert!(rows.iter().any(|row| row["id"] == "stale-only"));
 
+    let notification = client
+        .next_message_with_timeout(Duration::from_secs(2))
+        .await;
+    assert_eq!(notification["method"], "model/catalogChanged");
+    assert_eq!(notification["params"], json!({"source": "antigravity"}));
     let snapshot = root.path().join("antigravity-models.json");
     assert!(
-        wait_until(
-            || std::fs::read_to_string(&snapshot)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .is_some_and(|value| value["payload"]["models"]["live-model"].is_object()),
-            Duration::from_secs(2)
-        )
-        .await,
-        "a stale snapshot must revalidate in the background"
+        std::fs::read_to_string(&snapshot)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|value| value["payload"]["models"]["live-model"].is_object()),
+        "a stale snapshot must revalidate in the background before notifying"
     );
     let response = catalog_request(&mut client, 102).await;
     assert_eq!(response["result"]["catalogBaseline"], false);
@@ -275,6 +276,38 @@ async fn a_stale_credential_snapshot_paints_first_and_revalidates_behind_the_cal
     assert!(rows.iter().any(|row| row["id"] == "live-model"));
     assert!(!rows.iter().any(|row| row["id"] == "stale-only"));
     assert_eq!(server.requests(), 1);
+
+    // An unchanged revalidation keeps the client quiet instead of pulsing UI caches.
+    antigravity::set_config_root(&root.path().join("other"));
+    antigravity::set_config_root(root.path());
+    let before = antigravity::refresh_completions();
+    let response = catalog_request(&mut client, 103).await;
+    assert!(response["result"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == "live-model"));
+    assert!(
+        wait_until(
+            || antigravity::refresh_completions() > before,
+            Duration::from_secs(2)
+        )
+        .await,
+        "disk snapshot revalidation must settle"
+    );
+    assert_eq!(server.requests(), 2);
+    client
+        .send(json!({"id":104,"method":"antigravity/models","params":{"read":"cached"}}))
+        .await;
+    let (_, seen) = client
+        .response_for_with_timeout(104, Duration::from_secs(2))
+        .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|msg| msg["method"] == "model/catalogChanged"),
+        "an identical catalog payload must not emit a change notification: {seen:?}"
+    );
 
     client.close().await;
     antigravity::auth::logout().await.unwrap();

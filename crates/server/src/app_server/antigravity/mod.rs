@@ -211,29 +211,40 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
     // a refresh that finishes after either event must not recreate the snapshot
     // they just invalidated or write it under a different configuration root.
     let _credential = auth::credential_lock().lock().await;
-    let _publish = CATALOG_PUBLISH_FENCE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if !auth::is_current(generation) {
-        return Err("antigravity_credential_changed".into());
-    }
-    if config_root() != root {
-        return Err("antigravity_credential_changed".into());
-    }
-    let fetched_at = chrono::Utc::now().timestamp_millis();
-    *cache().lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedCatalog {
-        generation: generation.to_string(),
-        payload: payload.clone(),
-        fetched_at,
-        from_disk: false,
-    });
-    let snapshot = json!({
-        "generation":generation,"payload":payload,"fetchedAt":fetched_at,
-        "clientIdentity":cloud::client_identity(),
-    });
-    let path = root.join("antigravity-models.json");
-    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-        let _ = std::fs::write(path, bytes);
+    let changed = {
+        let _publish = CATALOG_PUBLISH_FENCE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !auth::is_current(generation) {
+            return Err("antigravity_credential_changed".into());
+        }
+        if config_root() != root {
+            return Err("antigravity_credential_changed".into());
+        }
+        let changed = cached_payload(generation)
+            .map(|cached| cached.payload)
+            .as_ref()
+            != Some(&payload);
+        let fetched_at = chrono::Utc::now().timestamp_millis();
+        *cache().lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedCatalog {
+            generation: generation.to_string(),
+            payload: payload.clone(),
+            fetched_at,
+            from_disk: false,
+        });
+        let snapshot = json!({
+            "generation":generation,"payload":payload,"fetchedAt":fetched_at,
+            "clientIdentity":cloud::client_identity(),
+        });
+        let path = root.join("antigravity-models.json");
+        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+            let _ = std::fs::write(path, bytes);
+        }
+        changed
+    };
+    drop(_credential);
+    if changed {
+        super::model_sources::notify_catalog_changed(root, "antigravity");
     }
     Ok(payload)
 }
