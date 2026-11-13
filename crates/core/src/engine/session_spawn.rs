@@ -2729,6 +2729,7 @@ impl Session {
                                         shell: None,
                                         model: Some(child_model2.clone()),
                                         is_worktree: false,
+                                        windows_shell: None,
                                     },
                                 );
                             }

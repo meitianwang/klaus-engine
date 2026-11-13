@@ -195,6 +195,7 @@ impl Session {
                             shell: None,
                             model: Some(config.model.clone()),
                             is_worktree: self.workspace.is_in_worktree(),
+                            windows_shell: None,
                         },
                     );
                 }

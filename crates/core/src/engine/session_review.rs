@@ -595,6 +595,7 @@ impl Session {
                         shell: None,
                         model: Some(model_for_env.clone()),
                         is_worktree,
+                        windows_shell: None,
                     },
                 );
                 Box::pin(async move {

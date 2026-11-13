@@ -13,6 +13,7 @@ use crate::runtime_process::{
 use crate::runtime_values::NodeBufferUtf8;
 use crate::runtime_values::{RuntimePath, RuntimeString};
 use crate::schemas::config::ResolvedConfig;
+use crate::tools::shell::{process_env, resolve_windows_shell, ShellKind, ShellResolution};
 
 /// The platform label: `win32`/`darwin` pass through, every
 /// other POSIX normalizes to `linux`.
@@ -117,10 +118,15 @@ pub fn os_version_line(plat: Platform) -> String {
     }
 }
 
-/// The Shell line: `$SHELL` collapsed to `zsh`/`bash`
-/// when it contains those, else the raw value. On Windows a note steers the
-/// model to Unix shell syntax.
-pub fn shell_line(plat: Platform, shell: &str) -> String {
+/// The POSIX Shell line: `$SHELL` collapsed to `zsh`/`bash`
+/// when it contains those, else the raw value.
+///
+/// Windows does not use this. `$SHELL` is a POSIX convention that is usually
+/// unset there, and the shell that actually executes a command is chosen by a
+/// separate resolver with a fallback chain, so the two could disagree. Windows
+/// reports the resolved shell through [`windows_shell_line`] instead. The
+/// `plat` argument is retained for call-site stability.
+pub fn shell_line(_plat: Platform, shell: &str) -> String {
     let shell_name = if shell.contains("zsh") {
         "zsh"
     } else if shell.contains("bash") {
@@ -128,12 +134,51 @@ pub fn shell_line(plat: Platform, shell: &str) -> String {
     } else {
         shell
     };
-    if plat == Platform::Win32 {
-        format!(
-            "Shell: {shell_name} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)"
-        )
-    } else {
-        format!("Shell: {shell_name}")
+    format!("Shell: {shell_name}")
+}
+
+/// The Windows Shell line, derived from the shell the command runtime will
+/// actually execute rather than from `$SHELL`.
+///
+/// Reporting an unconditional "use Unix shell syntax" note here was wrong
+/// whenever the resolver fell back past bash: in PowerShell the advice sends
+/// the model to `/dev/null` instead of `$null`, and in `cmd.exe` its built-in
+/// `find` is a text searcher rather than the POSIX file finder, so a
+/// POSIX-shaped `find` returns plausible-looking wrong results instead of
+/// failing. Each kind now states which shell runs, which syntax to write, and
+/// what to use in place of the missing coreutils.
+pub fn windows_shell_line(resolution: &ShellResolution) -> String {
+    let path = &resolution.path;
+    match resolution.kind {
+        ShellKind::Bash => format!(
+            "Shell: bash ({path}) — a real POSIX shell (Git for Windows / MSYS or WSL), so \
+             commands run verbatim with coreutils available. Write POSIX shell syntax."
+        ),
+        ShellKind::Pwsh | ShellKind::Powershell => {
+            let name = if resolution.kind == ShellKind::Pwsh {
+                "PowerShell 7 (pwsh)"
+            } else {
+                "Windows PowerShell"
+            };
+            format!(
+                "Shell: {name} at {path} — no POSIX shell is installed, so commands run in \
+                 PowerShell rather than bash. POSIX syntax and coreutils (grep, find, ls, cat, \
+                 sed, awk, xargs, head, tail, wc) are unavailable and will fail. Prefer the \
+                 dedicated glob, grep, file_search, read and ls tools for searching and reading. \
+                 When the shell is genuinely needed, ripgrep is on PATH as `rg` (`rg PATTERN` to \
+                 search contents, `rg --files` to list files); use `$null`, not /dev/null."
+            )
+        }
+        ShellKind::Cmd => format!(
+            "Shell: cmd.exe at {path} — neither a POSIX shell nor PowerShell was found, so \
+             commands run in the Windows command prompt. POSIX syntax and coreutils (grep, ls, \
+             cat, sed, awk, xargs, head, tail, wc) are unavailable. The built-in `find` is a \
+             TEXT searcher with unrelated syntax, not the POSIX file finder — never use it to \
+             locate files. Prefer the dedicated glob, grep, file_search, read and ls tools for \
+             searching and reading. When the shell is genuinely needed, ripgrep is on PATH as \
+             `rg` (`rg PATTERN` to search contents, `rg --files` to list files); use `NUL`, not \
+             /dev/null."
+        ),
     }
 }
 
@@ -148,6 +193,10 @@ pub struct EnvBlockOptions {
     pub shell: Option<String>,
     pub model: Option<RuntimeString>,
     pub is_worktree: bool,
+    /// Windows only: the shell resolution to report. `None` resolves it the
+    /// same way the command runtime does, so the block cannot disagree with
+    /// the shell that executes the command. Pinned by tests for determinism.
+    pub windows_shell: Option<ShellResolution>,
 }
 
 /// Assemble the `# Environment` markdown block.
@@ -198,10 +247,18 @@ pub fn environment_block(
         " - Platform: {}",
         plat.as_str()
     )));
-    lines.push(RuntimeString::from(format!(
-        " - {}",
+    // On Windows the reported shell must be the one the command runtime will
+    // actually execute, so resolve it the same way instead of reading `$SHELL`.
+    let shell_line_text = if plat == Platform::Win32 {
+        let resolution = opts
+            .windows_shell
+            .clone()
+            .unwrap_or_else(|| resolve_windows_shell(&process_env()));
+        windows_shell_line(&resolution)
+    } else {
         shell_line(plat, &shell)
-    )));
+    };
+    lines.push(RuntimeString::from(format!(" - {shell_line_text}")));
     lines.push(RuntimeString::from(format!(
         " - OS Version: {}",
         os_version_line(plat)
@@ -378,9 +435,59 @@ mod tests {
             "Shell: /usr/local/bin/fish"
         );
         assert_eq!(shell_line(Platform::Darwin, "unknown"), "Shell: unknown");
+        // The dialect note moved to `windows_shell_line`: this function no longer
+        // claims a syntax the resolved shell may not actually speak.
         let win = shell_line(Platform::Win32, "C:\\\\cmd.exe");
         assert!(win.contains("Shell: C:\\\\cmd.exe"));
-        assert!(win.contains("use Unix shell syntax"));
+        assert!(!win.contains("Unix shell syntax"));
+    }
+
+    #[test]
+    fn windows_shell_line_bash_keeps_posix_guidance() {
+        let line = windows_shell_line(&ShellResolution {
+            path: "C:\\Program Files\\Git\\bin\\bash.exe".to_string(),
+            kind: ShellKind::Bash,
+        });
+        assert!(line.contains("Shell: bash"));
+        assert!(line.contains("Write POSIX shell syntax"));
+        // A real POSIX shell has coreutils, so it must not be told to avoid them.
+        assert!(!line.contains("are unavailable"));
+        assert!(!line.contains("NUL"));
+    }
+
+    #[test]
+    fn windows_shell_line_degraded_kinds_warn_and_redirect() {
+        let pwsh = windows_shell_line(&ShellResolution {
+            path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
+            kind: ShellKind::Pwsh,
+        });
+        assert!(pwsh.contains("PowerShell 7 (pwsh)"));
+        assert!(pwsh.contains("$null"));
+        assert!(pwsh.contains("rg --files"));
+        assert!(pwsh.contains("glob, grep, file_search, read and ls"));
+        assert!(!pwsh.contains("Write POSIX shell syntax"));
+
+        let ps = windows_shell_line(&ShellResolution {
+            path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".to_string(),
+            kind: ShellKind::Powershell,
+        });
+        assert!(ps.contains("Windows PowerShell"));
+        assert!(ps.contains("$null"));
+        assert!(!ps.contains("Write POSIX shell syntax"));
+
+        let cmd = windows_shell_line(&ShellResolution {
+            path: "cmd.exe".to_string(),
+            kind: ShellKind::Cmd,
+        });
+        // cmd's `find` is a text searcher: the trap that returns plausible
+        // wrong results instead of failing, so it is called out by name.
+        assert!(cmd.contains("TEXT searcher"));
+        assert!(cmd.contains("never use it to locate files"));
+        assert!(cmd.contains("NUL"));
+        assert!(cmd.contains("rg --files"));
+        assert!(!cmd.contains("Write POSIX shell syntax"));
+        // cmd has no PowerShell either, so it must not be pointed at `$null`.
+        assert!(!cmd.contains("$null"));
     }
 
     #[test]

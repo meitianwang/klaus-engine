@@ -1448,6 +1448,7 @@ impl Session {
                                         shell: None,
                                         model: Some(turn_model.clone()),
                                         is_worktree: is_wt,
+                                        windows_shell: None,
                                     },
                                 );
                             }
