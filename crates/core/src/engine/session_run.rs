@@ -353,9 +353,14 @@ impl Session {
             let snapshot = store.read_thread(&thread).await.map_err(|error| {
                 RuntimeString::from(format!("Cannot read original local context: {error}"))
             })?;
+            // Side tasks and subagents link to their origin through the parent
+            // thread while forks use the fork source; both inherit history whose
+            // checkpoint archives live in the origin rollout.
             let parent = snapshot
                 .meta
                 .forked_from_id
+                .clone()
+                .or_else(|| snapshot.meta.parent_thread_id.clone())
                 .and_then(|id| id.try_to_utf8().ok());
             snapshots.push(snapshot.raw_items);
             match crate::store::portable_history::recover_portable_history(&messages, &snapshots) {
@@ -1847,6 +1852,20 @@ impl Session {
                 }
                 planning_protected.insert(present.unwrap_or(context_id));
             }
+        }
+        // One-shot tool-result reclaim: this turn starts after the provider's
+        // prompt cache has certainly expired, so the whole prefix re-sends
+        // regardless and the budget pass may trade aged full-size results down
+        // to their persisted previews at no extra cache cost.
+        if this.config.aggregate_tool_results
+            && this.config.reclaim_tool_results_when_cache_cold
+            && this
+                .turn
+                .cold_cache_reclaim_due((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS)
+        {
+            this.tool_result_budget_state()
+                .lock_recover()
+                .arm_cold_reclaim();
         }
         let params = QueryParams {
             multi_agent_instructions: this.meta.role
