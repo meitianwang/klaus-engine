@@ -329,6 +329,9 @@ pub struct SessionModelRuntimeResult {
     /// Non-secret advisor status, or null when advisor consultation is off.
     #[serde(default)]
     pub advisor_target: Value,
+    /// Non-secret orchestration execution target status, or null when reusing the medium tier.
+    #[serde(default)]
+    pub orchestrator_target: Value,
     /// Non-secret per-feature target status; a null slot follows the main model.
     #[serde(default)]
     pub feature_targets: Value,
@@ -336,6 +339,8 @@ pub struct SessionModelRuntimeResult {
     pub thinking: Value,
     #[serde(default)]
     pub ultra_mode: bool,
+    #[serde(default)]
+    pub orchestration_mode: bool,
     #[serde(default)]
     pub fast_mode: bool,
     pub context_window: u64,
@@ -1763,6 +1768,10 @@ pub struct SessionRoutingInitSchema {
     pub model_tier_targets: Option<ModelTierTargets>,
     /// Independent target; omitted/null turns the advisor off on start and full reconfigure.
     pub advisor_target: Option<ModelTierTarget>,
+    /// Optional explicit execution target for orchestration mode; omitted/null reuses the medium tier.
+    pub orchestrator_target: Option<ModelTierTarget>,
+    /// Whether orchestration mode is active for this conversation.
+    pub orchestration_mode: Option<bool>,
     /// Independent targets for named auxiliary features (title generation,
     /// message prediction, memory maintenance); an omitted/null slot follows
     /// the session's main model on start and full reconfigure.

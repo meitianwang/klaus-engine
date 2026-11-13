@@ -256,6 +256,8 @@ async fn restored_session_continues_after_account_replacement_without_summary_co
                         change_id: None,
                         targets: None,
                         advisor_target: None,
+                        orchestrator_target: None,
+                        orchestration_mode: false,
                         feature_targets: Default::default(),
                         source: None,
                         rates: None,

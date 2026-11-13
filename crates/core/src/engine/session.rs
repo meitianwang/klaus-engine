@@ -271,6 +271,8 @@ mod session_approval_async_part;
 mod session_approval_review_part;
 #[path = "session_core_state.rs"]
 mod session_core_state_part;
+#[path = "session_orchestrator.rs"]
+mod session_orchestrator_part;
 #[path = "session_usage.rs"]
 mod session_usage_part;
 

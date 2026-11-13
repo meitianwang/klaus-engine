@@ -36,6 +36,8 @@ pub(crate) struct InferenceBundle {
     pub pricing: PricingRuntimeSnapshot,
     pub targets: Option<InferenceTargets>,
     pub advisor_target: Option<InferenceTargetState>,
+    pub orchestrator_target: Option<InferenceTargetState>,
+    pub orchestration_mode: bool,
     pub feature_targets: FeatureTargets,
     pub source: Option<(String, String)>,
     /// Immutable rate table carried by the request that captured this bundle,
@@ -157,6 +159,16 @@ impl InferenceBundle {
         models.dedup();
         let mut captured = (**self).clone();
         captured.advisor_target = self.advisor_target.as_ref().map(|state| match state {
+            InferenceTargetState::Ready(target) => InferenceTargetState::Ready(InferenceTarget {
+                provider: crate::provider::model_catalog::capture_model_provider(
+                    target.provider.clone(),
+                    std::slice::from_ref(&target.model),
+                ),
+                ..target.clone()
+            }),
+            state => state.clone(),
+        });
+        captured.orchestrator_target = self.orchestrator_target.as_ref().map(|state| match state {
             InferenceTargetState::Ready(target) => InferenceTargetState::Ready(InferenceTarget {
                 provider: crate::provider::model_catalog::capture_model_provider(
                     target.provider.clone(),
@@ -936,6 +948,8 @@ impl Session {
                 change_id,
                 targets: None,
                 advisor_target: self.inference_snapshot().advisor_target.clone(),
+                orchestrator_target: self.inference_snapshot().orchestrator_target.clone(),
+                orchestration_mode: self.inference_snapshot().orchestration_mode,
                 feature_targets: self.inference_snapshot().feature_targets.clone(),
                 source: None,
                 rates: None,
@@ -987,6 +1001,8 @@ impl Session {
             change_id,
             targets: mut publication_targets,
             mut advisor_target,
+            mut orchestrator_target,
+            orchestration_mode,
             mut feature_targets,
             source: publication_source,
             rates: publication_rates,
@@ -1005,6 +1021,11 @@ impl Session {
         super::session_targets_part::prepare_targets_requirements_sync(
             &mut publication_targets,
             &mut advisor_target,
+        )
+        .map_err(&fail_preparation)?;
+        super::session_targets_part::prepare_targets_requirements_sync(
+            &mut None,
+            &mut orchestrator_target,
         )
         .map_err(&fail_preparation)?;
         super::session_targets_part::prepare_feature_requirements_sync(&mut feature_targets)
@@ -1073,6 +1094,19 @@ impl Session {
             }) => format!("advisor=unavailable:{source}:{model_id}:{code}:{message}"),
             None => "advisor=disabled".to_string(),
         });
+        target_ids.push(match &orchestrator_target {
+            Some(InferenceTargetState::Ready(target)) => {
+                format!("orchestrator=ready:{}:{}", target.source, target.model_id)
+            }
+            Some(InferenceTargetState::Unavailable {
+                source,
+                model_id,
+                code,
+                message,
+            }) => format!("orchestrator=unavailable:{source}:{model_id}:{code}:{message}"),
+            None => "orchestrator=medium".to_string(),
+        });
+        target_ids.push(format!("orchestration_mode={orchestration_mode}"));
         for (name, state) in feature_targets.slots() {
             target_ids.push(match state {
                 Some(InferenceTargetState::Ready(target)) => {
@@ -1151,6 +1185,8 @@ impl Session {
             pricing: pricing_runtime.clone(),
             targets: next_targets.clone(),
             advisor_target: advisor_target.clone(),
+            orchestrator_target: orchestrator_target.clone(),
+            orchestration_mode,
             feature_targets: feature_targets.clone(),
             source: next_source.clone(),
             rates: rates.clone(),
@@ -1227,6 +1263,8 @@ impl Session {
             pricing: pricing_runtime,
             targets: next_targets,
             advisor_target,
+            orchestrator_target,
+            orchestration_mode,
             feature_targets,
             source: next_source,
             rates,
@@ -1461,6 +1499,8 @@ mod media_capture_tests {
             },
             targets: None,
             advisor_target: None,
+            orchestrator_target: None,
+            orchestration_mode: false,
             feature_targets: Default::default(),
             source: None,
             rates: DEFAULT_PRICING.clone(),

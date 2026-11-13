@@ -414,6 +414,8 @@ async fn a_different_model_resets_effort_before_role_effort_fields_override() {
                         change_id: None,
                         targets: None,
                         advisor_target: None,
+                        orchestrator_target: None,
+                        orchestration_mode: false,
                         feature_targets: Default::default(),
                         source: Some(("custom".into(), "test-model".into())),
                         rates: None,

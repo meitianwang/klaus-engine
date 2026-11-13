@@ -1016,6 +1016,8 @@ struct SessionInitState {
     pricing: Option<PricingTable>,
     targets: Option<klaus_agent_core::engine::session::InferenceTargets>,
     advisor_target: Option<klaus_agent_core::engine::session::InferenceTargetState>,
+    orchestrator_target: Option<klaus_agent_core::engine::session::InferenceTargetState>,
+    orchestration_mode: bool,
     feature_targets: klaus_agent_core::engine::session::FeatureTargets,
 }
 
@@ -1976,6 +1978,15 @@ impl ProtocolServer {
             ) {
                 decorate_model_target(target, decorate);
             }
+            let mut orchestrator_target =
+                orchestrator_target_from_init(&init, self.inner.credential_store.clone()).await?;
+            if let (Some(target), Some(decorate)) = (
+                orchestrator_target.as_mut(),
+                self.inner.provider_decorator.lock().unwrap().as_ref(),
+            ) {
+                decorate_model_target(target, decorate);
+            }
+            let orchestration_mode = init.orchestration_mode.unwrap_or(false);
             let mut feature_targets =
                 feature_targets_from_init(&init, self.inner.credential_store.clone()).await?;
             if let Some(decorate) = self.inner.provider_decorator.lock().unwrap().as_ref() {
@@ -2026,6 +2037,9 @@ impl ProtocolServer {
             session
                 .prepare_inference_targets(&mut targets, &mut advisor_target)
                 .await;
+            session
+                .prepare_orchestrator_target(&mut orchestrator_target)
+                .await;
             session.prepare_feature_targets(&mut feature_targets).await;
             if self.is_closing() {
                 return Err("cannot reconfigure a closing protocol session".to_string());
@@ -2040,6 +2054,8 @@ impl ProtocolServer {
                     change_id: change_id.clone(),
                     targets,
                     advisor_target,
+                    orchestrator_target,
+                    orchestration_mode,
                     feature_targets,
                     source: model_source_from_init(&init)?,
                     rates: None,
@@ -7738,6 +7754,21 @@ impl ServerInner {
         ) {
             decorate_model_target(target, decorate);
         }
+        let mut orchestrator_target =
+            match orchestrator_target_from_init(&init, self.credential_store.clone()).await {
+                Ok(target) => target,
+                Err(error) => {
+                    self.report_op_error(&submission_id, error.into()).await;
+                    return;
+                }
+            };
+        if let (Some(target), Some(decorate)) = (
+            orchestrator_target.as_mut(),
+            self.provider_decorator.lock().unwrap().as_ref(),
+        ) {
+            decorate_model_target(target, decorate);
+        }
+        let orchestration_mode = init.orchestration_mode.unwrap_or(false);
         let mut feature_targets =
             match feature_targets_from_init(&init, self.credential_store.clone()).await {
                 Ok(targets) => targets,
@@ -7757,6 +7788,8 @@ impl ServerInner {
             pricing,
             targets,
             advisor_target,
+            orchestrator_target,
+            orchestration_mode,
             feature_targets,
             raw: init,
             provider,
@@ -9173,6 +9206,9 @@ impl ServerInner {
             .prepare_inference_targets(&mut prepared.targets, &mut prepared.advisor_target)
             .await;
         session
+            .prepare_orchestrator_target(&mut prepared.orchestrator_target)
+            .await;
+        session
             .prepare_feature_targets(&mut prepared.feature_targets)
             .await;
         session.install_inference_targets(
@@ -9181,6 +9217,7 @@ impl ServerInner {
             prepared.pricing,
         )?;
         session.install_advisor_target(prepared.advisor_target)?;
+        session.install_orchestration(prepared.orchestration_mode, prepared.orchestrator_target)?;
         session.install_feature_targets(prepared.feature_targets)?;
         {
             let mut inflight = self
@@ -11804,6 +11841,8 @@ fn canonical_inference_key(init: &ProtocolSessionInit) -> Result<String, String>
         model_source: init.model_source.clone(),
         model_tier_targets: init.model_tier_targets.clone(),
         advisor_target: init.advisor_target.clone(),
+        orchestrator_target: init.orchestrator_target.clone(),
+        orchestration_mode: init.orchestration_mode,
         feature_targets: init.feature_targets.clone(),
         pricing: init.pricing.clone(),
         capabilities: init.capabilities.clone(),
@@ -12954,6 +12993,30 @@ async fn advisor_target_from_init(
         return Ok(None);
     };
     let value = scalar_json_value(value, "advisor target")?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let target = target_from_value(&value, store)
+        .await
+        .unwrap_or_else(|message| {
+            klaus_agent_core::engine::session::InferenceTargetState::Unavailable {
+                source: value["source"].as_str().unwrap_or_default().to_string(),
+                model_id: value["modelId"].as_str().unwrap_or_default().to_string(),
+                code: "MODEL_TARGET_UNAVAILABLE".into(),
+                message,
+            }
+        });
+    Ok(Some(target))
+}
+
+async fn orchestrator_target_from_init(
+    init: &ProtocolSessionInit,
+    store: Option<Arc<dyn CredentialStore>>,
+) -> Result<Option<klaus_agent_core::engine::session::InferenceTargetState>, String> {
+    let Some(value) = init.orchestrator_target.as_ref() else {
+        return Ok(None);
+    };
+    let value = scalar_json_value(value, "orchestrator target")?;
     if value.is_null() {
         return Ok(None);
     }

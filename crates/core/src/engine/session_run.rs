@@ -711,6 +711,7 @@ impl Session {
         };
         let initial_bundle = inference_activity.bundle.clone();
         let advisor_enabled = initial_bundle.advisor_target.is_some();
+        let is_main_role = this.meta.role.is_none() || this.meta.role == Some(SessionRole::Main);
         let turn_model = opts
             .model
             .clone()
@@ -1026,14 +1027,47 @@ impl Session {
             Some(&initial_bundle.config.web_search),
             initial_bundle.provider.capabilities(&turn_model).web_search,
         );
+        let orchestration_enabled = is_main_role
+            && initial_bundle.orchestration_mode
+            && turn_collaboration_mode != crate::planning::CollaborationMode::Plan;
+        let build_orchestrate_tool = {
+            let session = this.clone();
+            let slot = inference_slot.clone();
+            let initial = initial_bundle.clone();
+            move || {
+                let session = session.clone();
+                let slot = slot.clone();
+                let initial = initial.clone();
+                crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(Arc::new(
+                    move |request, ctx| {
+                        let session = session.clone();
+                        let mut captured = (*Session::bundle_from_slot(&slot, &initial)).clone();
+                        captured.orchestrator_target = initial.orchestrator_target.clone();
+                        captured.orchestration_mode = initial.orchestration_mode;
+                        let captured = Arc::new(captured);
+                        Box::pin(async move {
+                            session
+                                .run_orchestrated_execution(captured, request, ctx)
+                                .await
+                        })
+                    },
+                ))
+            }
+        };
         let mut available_tools = web_selection.tools;
         available_tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
         crate::planning::tools::retain_for_mode(
             &mut available_tools,
             turn_collaboration_mode,
-            this.meta.role.is_none() || this.meta.role == Some(SessionRole::Main),
+            is_main_role,
             this.config.request_user_input_default,
         );
+        if orchestration_enabled {
+            crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
+                &mut available_tools,
+            );
+            available_tools.push(build_orchestrate_tool());
+        }
         if let Some(definition) = &this.root_agent_definition {
             definition.retain_tools(&mut available_tools);
         }
@@ -1086,9 +1120,29 @@ impl Session {
                     crate::planning::tools::retain_for_mode(
                         &mut tools,
                         turn_collaboration_mode,
-                        this.meta.role.is_none() || this.meta.role == Some(SessionRole::Main),
+                        is_main_role,
                         this.config.request_user_input_default,
                     );
+                    if orchestration_enabled {
+                        crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
+                            &mut tools,
+                        );
+                        let exec_session = this.clone();
+                        let exec_initial = bundle.clone();
+                        tools.push(
+                            crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
+                                Arc::new(move |request, ctx| {
+                                    let exec_session = exec_session.clone();
+                                    let exec_initial = exec_initial.clone();
+                                    Box::pin(async move {
+                                        exec_session
+                                            .run_orchestrated_execution(exec_initial, request, ctx)
+                                            .await
+                                    })
+                                }),
+                            ),
+                        );
+                    }
                     if let Some(definition) = &this.root_agent_definition {
                         definition.retain_tools(&mut tools);
                     }
@@ -1398,6 +1452,9 @@ impl Session {
 
         // Per-turn system prompt.
         let advisor_exposed = tools.iter().any(|tool| tool.name() == "advisor");
+        let orchestration_exposed = tools.iter().any(|tool| {
+            tool.name() == crate::tools::builtins::orchestrate::ORCHESTRATE_EXECUTION_TOOL_NAME
+        });
         let subagents_exposed = tools.iter().any(|tool| tool.name() == "task");
         let system_prompt: SystemPromptThunk = {
             let this = this.clone();
@@ -1434,6 +1491,18 @@ impl Session {
                             })
                             .unwrap_or(parts.len());
                         parts.insert(boundary, crate::context::system_prompt::advisor_guidance());
+                    }
+                    if orchestration_exposed {
+                        let boundary = parts
+                            .iter()
+                            .position(|part| {
+                                part.cache_scope != Some(crate::types::provider::CacheScope::Global)
+                            })
+                            .unwrap_or(parts.len());
+                        parts.insert(
+                            boundary,
+                            crate::context::system_prompt::orchestration_guidance(),
+                        );
                     }
                     if this.system_prompt_is_default {
                         let is_wt = this.workspace.is_in_worktree();
@@ -2223,6 +2292,26 @@ impl Session {
                 params.tools = selected.tools;
                 params.tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
                 crate::planning::tools::retain_for_mode(&mut params.tools,turn_collaboration_mode,this2.meta.role.is_none()||this2.meta.role==Some(SessionRole::Main),this2.config.request_user_input_default);
+                if orchestration_enabled {
+                    crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
+                        &mut params.tools,
+                    );
+                    let exec_session = this2.clone();
+                    let exec_initial = initial_bundle.clone();
+                    params.tools.push(
+                        crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
+                            Arc::new(move |request, ctx| {
+                                let exec_session = exec_session.clone();
+                                let exec_initial = exec_initial.clone();
+                                Box::pin(async move {
+                                    exec_session
+                                        .run_orchestrated_execution(exec_initial, request, ctx)
+                                        .await
+                                })
+                            }),
+                        ),
+                    );
+                }
                 if let Some(definition) = &this2.root_agent_definition {
                     definition.retain_tools(&mut params.tools);
                 }

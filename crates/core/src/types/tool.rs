@@ -388,6 +388,10 @@ pub struct SpawnSubAgentOptions {
     /// the tier-only subagent model policy and resolves against the captured
     /// feature targets, falling back to the parent bundle when unavailable.
     pub feature_target_model: bool,
+    /// Internal orchestration execution target (`medium` or explicit `source:modelId`).
+    /// Skips the tier-only subagent model gate and refuses silent fallback to the
+    /// parent model when an explicit execution target is unavailable.
+    pub orchestrator_target_model: bool,
     /// Canonical policy restrictions, intersected with the parent authority.
     pub runtime_policy: Option<crate::engine::session::RuntimePolicyUpdate>,
     /// Per-call reasoning effort for the child.

@@ -171,6 +171,7 @@ impl Session {
             targets.and_then(|targets| targets.medium.as_ref()),
             targets.and_then(|targets| targets.low.as_ref()),
             captured.advisor_target.as_ref(),
+            captured.orchestrator_target.as_ref(),
             captured.feature_targets.title.as_ref(),
             captured.feature_targets.prediction.as_ref(),
             captured.feature_targets.memory.as_ref(),

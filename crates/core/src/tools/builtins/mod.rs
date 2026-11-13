@@ -23,6 +23,7 @@ pub mod ls;
 pub mod lsp_tools;
 pub mod multi_edit;
 pub mod notebook_edit;
+pub mod orchestrate;
 pub mod plugin_management;
 pub mod plugin_search;
 pub mod read;

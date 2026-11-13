@@ -242,6 +242,8 @@ pub struct InferencePublication {
     pub change_id: Option<String>,
     pub targets: Option<super::InferenceTargets>,
     pub advisor_target: Option<super::InferenceTargetState>,
+    pub orchestrator_target: Option<super::InferenceTargetState>,
+    pub orchestration_mode: bool,
     /// The complete desired per-feature target state; a default value turns
     /// every feature slot back onto the session's main model.
     pub feature_targets: super::FeatureTargets,

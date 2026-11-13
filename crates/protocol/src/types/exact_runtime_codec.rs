@@ -941,6 +941,8 @@ impl_runtime_struct!(ProtocolSessionInit, deny_unknown: true, {
     capabilities_by_model => "capabilitiesByModel": optional,
     model_tier_targets => "modelTierTargets": optional,
     advisor_target => "advisorTarget": optional,
+    orchestrator_target => "orchestratorTarget": optional,
+    orchestration_mode => "orchestrationMode": optional,
     feature_targets => "featureTargets": optional,
     model_source => "modelSource": optional,
 });

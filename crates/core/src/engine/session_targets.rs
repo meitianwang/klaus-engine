@@ -405,6 +405,15 @@ impl Session {
         slots.push(("advisor", advisor));
         self.prepare_slot_requirements(&mut slots).await;
     }
+    /// Prepares an optional explicit orchestration execution target before publication.
+    pub async fn prepare_orchestrator_target(
+        &self,
+        orchestrator: &mut Option<InferenceTargetState>,
+    ) {
+        let mut slots: Vec<(&'static str, &mut Option<InferenceTargetState>)> =
+            vec![("orchestrator", orchestrator)];
+        self.prepare_slot_requirements(&mut slots).await;
+    }
     /// Prepares each configured feature account before its target can be published.
     ///
     /// Preparation failures degrade the affected slot instead of failing; see

@@ -1297,6 +1297,10 @@ pub struct ProtocolSessionInit {
     pub model_tier_targets: Option<RuntimeJson>,
     /// Independent advisor target; omitted/null disables advisor consultation.
     pub advisor_target: Option<RuntimeJson>,
+    /// Optional explicit execution target for orchestration mode; omitted/null reuses the medium tier.
+    pub orchestrator_target: Option<RuntimeJson>,
+    /// Whether orchestration mode is active for this conversation.
+    pub orchestration_mode: Option<bool>,
     /// Independent per-feature auxiliary targets (title, prediction, memory
     /// maintenance); a missing/null slot follows the session's main model.
     pub feature_targets: Option<RuntimeJson>,

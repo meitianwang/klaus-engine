@@ -1423,6 +1423,8 @@ impl Session {
                 pricing: extension_runtime.pricing.clone(),
                 targets: None,
                 advisor_target: None,
+                orchestrator_target: None,
+                orchestration_mode: false,
                 feature_targets: Default::default(),
                 source: None,
                 rates: inference_rates,

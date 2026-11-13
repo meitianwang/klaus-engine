@@ -6403,6 +6403,8 @@ mod tests {
             change_id: None,
             targets: None,
             advisor_target: None,
+            orchestrator_target: None,
+            orchestration_mode: false,
             feature_targets: Default::default(),
             source: None,
             rates: None,

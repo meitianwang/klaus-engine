@@ -361,7 +361,10 @@ impl Session {
                 let tier = ["low", "medium", "high"]
                     .iter()
                     .any(|tier| selection == *tier);
-                let selection_policy = if opts.model.is_some() && !opts.feature_target_model {
+                let selection_policy = if opts.model.is_some()
+                    && !opts.feature_target_model
+                    && !opts.orchestrator_target_model
+                {
                     if bundle.config.subagent_model_catalog {
                         if tier || bundle.config.subagent_model_options.is_empty() {
                             return Err("Model-directory mode requires an available concrete model from the captured directory.".into());
@@ -395,7 +398,9 @@ impl Session {
                 } {
                     Ok(selected) => selected,
                     Err(SubagentInferenceError::Unavailable(error))
-                        if !signal.is_cancelled() && !self.is_disposed() =>
+                        if !opts.orchestrator_target_model
+                            && !signal.is_cancelled()
+                            && !self.is_disposed() =>
                     {
                         tracing::warn!(
                             selection = ?selection,
@@ -1577,8 +1582,12 @@ impl Session {
                 child_tools.extend(mcp_runtime.role_tools(role_mcp));
             }
 
-            // Consultation belongs to the parent query, whose live snapshot the child cannot own.
-            child_tools.retain(|tool| tool.name() != "advisor");
+            // Consultation and orchestration handoff belong to the parent query.
+            child_tools.retain(|tool| {
+                let name = tool.name();
+                name != "advisor"
+                    && name != crate::tools::builtins::orchestrate::ORCHESTRATE_EXECUTION_TOOL_NAME
+            });
 
             // Web-search selection for the sub-agent.
             let child_restricted = opts.tools.is_some() || def.as_ref().and_then(|d| d.tools.as_ref()).is_some();
@@ -2135,7 +2144,11 @@ impl Session {
                     let mcp_runtime = mcp_runtime.clone();
                     Box::pin(async move {
                         let mut parts = mcp_runtime.rebind_instruction_parts(base().await);
-                        parts.retain(|part| part.name != "collaboration-mode" && part.name != "advisor");
+                        parts.retain(|part| {
+                            part.name != "collaboration-mode"
+                                && part.name != "advisor"
+                                && part.name != "orchestration-mode"
+                        });
                         parts.push(crate::planning::instructions::instruction_part(&config, child_collaboration_mode));
                         parts
                     })

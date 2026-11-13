@@ -4558,6 +4558,8 @@ const INIT_RESOLVER_FIELDS: &[&str] = &[
     "modelTierSelections",
     "modelTierTargets",
     "advisorTarget",
+    "orchestratorTarget",
+    "orchestrationMode",
     "featureTargets",
     "modelSource",
     "capabilities",
@@ -4647,6 +4649,9 @@ async fn resolve_model_provider(state: &AppServerState, init: &mut Value) -> Res
     let advisor = init
         .as_object_mut()
         .and_then(|object| object.remove("advisorTarget"));
+    let orchestrator = init
+        .as_object_mut()
+        .and_then(|object| object.remove("orchestratorTarget"));
     let features = init
         .as_object_mut()
         .and_then(|object| object.remove("featureTargets"));
@@ -4702,6 +4707,17 @@ async fn resolve_model_provider(state: &AppServerState, init: &mut Value) -> Res
         init.as_object_mut()
             .ok_or("model init must be an object")?
             .insert("advisorTarget".into(), value);
+    }
+    if let Some(orchestrator) = orchestrator {
+        let target: Option<wire::ModelTierTarget> = serde_json::from_value(orchestrator)
+            .map_err(|error| format!("invalid orchestratorTarget: {error}"))?;
+        let value = match target {
+            None => Value::Null,
+            Some(target) => resolve_tier_target(state, target).await?,
+        };
+        init.as_object_mut()
+            .ok_or("model init must be an object")?
+            .insert("orchestratorTarget".into(), value);
     }
     if let Some(features) = features {
         let features: Option<wire::FeatureTargets> = serde_json::from_value(features)
@@ -9320,11 +9336,15 @@ fn model_runtime_value(
         pending_change_id,
         model_update_error,
         advisor_target,
+        orchestrator_target,
+        orchestration_mode,
         feature_targets,
     ) = loop {
         let (revision, config, capabilities) = session.model_runtime();
         let (change_id, pending_change_id, model_update_error) = session.model_update_status();
         let advisor_target = session.advisor_target_runtime();
+        let orchestrator_target = session.orchestrator_target_runtime();
+        let orchestration_mode = session.orchestration_mode_runtime();
         let feature_targets = session.feature_targets_runtime();
         if session.model_revision() == revision {
             break (
@@ -9335,6 +9355,8 @@ fn model_runtime_value(
                 pending_change_id,
                 model_update_error,
                 advisor_target,
+                orchestrator_target,
+                orchestration_mode,
                 feature_targets,
             );
         }
@@ -9349,10 +9371,12 @@ fn model_runtime_value(
         model_tiers: serde_json::to_value(config.model_tiers).map_err(|error| error.to_string())?,
         model_tier_targets: session.model_tier_targets_runtime(),
         advisor_target,
+        orchestrator_target,
         feature_targets,
         effort: serde_json::to_value(config.effort).map_err(|error| error.to_string())?,
         thinking: serde_json::to_value(config.thinking).map_err(|error| error.to_string())?,
         ultra_mode: config.ultra_mode,
+        orchestration_mode,
         fast_mode: config.fast_mode,
         context_window: config.context_window,
         max_output_tokens: config
@@ -9487,6 +9511,8 @@ fn validate_inference_init(init: &Value) -> Result<(), String> {
             "modelTierSelections",
             "modelTierTargets",
             "advisorTarget",
+            "orchestratorTarget",
+            "orchestrationMode",
             "featureTargets",
             "modelSource",
             "capabilities",
@@ -9551,6 +9577,18 @@ fn validate_inference_init(init: &Value) -> Result<(), String> {
                 format!("advisorTarget must be null or a source, resolved, or unavailable target: {error}")
             },
         )?;
+    }
+    if let Some(orchestrator) = object.get("orchestratorTarget") {
+        serde_json::from_value::<Option<wire::ModelTierTarget>>(orchestrator.clone()).map_err(
+            |error| {
+                format!("orchestratorTarget must be null or a source, resolved, or unavailable target: {error}")
+            },
+        )?;
+    }
+    if let Some(mode) = object.get("orchestrationMode") {
+        if !mode.is_null() && !mode.is_boolean() {
+            return Err("orchestrationMode must be a boolean or null".to_string());
+        }
     }
     if let Some(features) = object.get("featureTargets") {
         serde_json::from_value::<Option<wire::FeatureTargets>>(features.clone()).map_err(
