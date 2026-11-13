@@ -1444,6 +1444,9 @@ async fn stream_and_dispatch_inner(
         }
     }
 
+    let empty_refusal = stop_reason == ModelStopReason::Refusal
+        && trim_ecmascript_whitespace(&text_buf).is_empty()
+        && !has_tool_call;
     let assistant = AssistantMessage {
         uuid: assistant_uuid.into(),
         content: blocks.clone(),
@@ -1453,23 +1456,25 @@ async fn stream_and_dispatch_inner(
     if let Some(receipt) = &mut usage_receipt {
         receipt.settle();
     }
-    if let Some(cb) = &shared.params.on_message {
-        if let Err(message) = cb(Message::Assistant(assistant.clone())).await {
-            return Outcome::ProviderAdmissionError { message };
+    if !empty_refusal {
+        if let Some(cb) = &shared.params.on_message {
+            if let Err(message) = cb(Message::Assistant(assistant.clone())).await {
+                return Outcome::ProviderAdmissionError { message };
+            }
         }
-    }
-    for (position, block) in blocks.iter().enumerate() {
-        if let ContentBlock::Thinking(thinking) = block {
-            shared.q.push(EngineEvent::ItemCompleted {
-                inference: None,
-                item: ThreadItem::Reasoning {
-                    id: thinking
-                        .message_id
-                        .clone()
-                        .unwrap_or_else(|| format!("{assistant_uuid}-{position}").into()),
-                    text: thinking.text.clone(),
-                },
-            });
+        for (position, block) in blocks.iter().enumerate() {
+            if let ContentBlock::Thinking(thinking) = block {
+                shared.q.push(EngineEvent::ItemCompleted {
+                    inference: None,
+                    item: ThreadItem::Reasoning {
+                        id: thinking
+                            .message_id
+                            .clone()
+                            .unwrap_or_else(|| format!("{assistant_uuid}-{position}").into()),
+                        text: thinking.text.clone(),
+                    },
+                });
+            }
         }
     }
     for message in text_messages {
@@ -1496,7 +1501,9 @@ async fn stream_and_dispatch_inner(
         ),
     });
     let mut messages: Vec<Message> = req.messages.clone();
-    messages.push(Message::Assistant(assistant));
+    if !empty_refusal {
+        messages.push(Message::Assistant(assistant));
+    }
     let calls: Vec<ResolvedToolCall> = blocks
         .iter()
         .filter_map(|b| match b {

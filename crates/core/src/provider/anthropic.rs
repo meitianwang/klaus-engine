@@ -2873,7 +2873,9 @@ fn map_web_search_result(
 fn map_stop_reason(sr: &RuntimeString) -> ModelStopReason {
     match sr {
         sr if sr == "tool_use" => ModelStopReason::ToolUse,
-        sr if sr == "max_tokens" => ModelStopReason::MaxTokens,
+        sr if sr == "max_tokens" || sr == "model_context_window_exceeded" => {
+            ModelStopReason::MaxTokens
+        }
         sr if sr == "stop_sequence" => ModelStopReason::StopSequence,
         sr if sr == "refusal" => ModelStopReason::Refusal,
         sr if sr == "pause_turn" => ModelStopReason::EndTurn,
@@ -3401,15 +3403,14 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
                     i += 1;
                 }
                 content.extend(deferred);
-                if !content.is_empty() {
-                    out.push(vobj(vec![
-                        ("role", vs("user")),
-                        ("content", Value::Array(content)),
-                    ]));
-                }
+                push_user_content(&mut out, content);
                 continue;
             }
             Message::User(u) => {
+                if is_superseded_empty_closing_nudge(u, &messages[i + 1..]) {
+                    i += 1;
+                    continue;
+                }
                 let content = map_blocks(&u.content, tools);
                 push_user_content(&mut out, content);
             }
@@ -3544,12 +3545,65 @@ fn render_anthropic_compact_boundary_exact(
         .concat(&RuntimeString::from(suffix))
 }
 
+/// Whether a meta user message is an empty-closing retry nudge from an earlier
+/// step that has already been followed by newer conversation items.
+fn is_superseded_empty_closing_nudge(
+    user: &crate::schemas::message::UserMessage,
+    remaining: &[Message],
+) -> bool {
+    if user.is_meta != Some(true)
+        || !remaining
+            .iter()
+            .any(|message| !matches!(message, Message::System(_)))
+    {
+        return false;
+    }
+    user.content.len() == 1
+        && matches!(
+            &user.content[0],
+            ContentBlock::Text(text)
+                if text.text.try_to_utf8().ok().is_some_and(|body| {
+                    body.contains(
+                        "Your previous response contained only internal reasoning and no visible answer.",
+                    ) || body.contains(
+                        "Your previous response was empty. The work done so far is visible to the user",
+                    )
+                })
+        )
+}
+
+/// Remove an orphaned thinking-only assistant turn before appending the next
+/// user turn so prior failed/empty reasoning responses never violate thinking
+/// block placement or condition subsequent turns to reply empty.
+fn pop_trailing_thinking_only_assistant(out: &mut Vec<Value>) {
+    let is_thinking_only = out.last().is_some_and(|last| {
+        last.get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "assistant")
+            && last
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().all(|block| {
+                        block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|tag| tag == "thinking" || tag == "redacted_thinking")
+                    })
+                })
+    });
+    if is_thinking_only {
+        out.pop();
+    }
+}
+
 /// Append user content, coalescing into a preceding user message so roles
 /// always alternate while keeping any `tool_result` blocks contiguous at the front.
 fn push_user_content(out: &mut Vec<Value>, content: Vec<Value>) {
     if content.is_empty() {
         return;
     }
+    pop_trailing_thinking_only_assistant(out);
     let last_is_user = out.last().is_some_and(|last| {
         last.get("role")
             .and_then(Value::as_str)

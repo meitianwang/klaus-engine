@@ -23,6 +23,7 @@ use klaus_agent_core::schemas::rollout::RolloutItem;
 use klaus_agent_core::store::jsonl_store::{JsonlSessionStore, JsonlSessionStoreOptions};
 use klaus_agent_core::store::session_store::SessionStore;
 use klaus_agent_core::store::thread_history::project_thread_history;
+use klaus_agent_core::types::errors::ProviderErrorKind;
 use klaus_agent_core::types::events::EngineEvent;
 use klaus_agent_core::types::provider::ModelCapabilities;
 use serde_json::{json, Value};
@@ -55,6 +56,30 @@ fn reply_thinking_only_signed(model: &str, signature: &str) -> String {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn"},
             "usage": {"output_tokens": 120}
+        }))
+        + &sse_event(json!({"type": "message_stop"}))
+}
+
+fn reply_thinking_refusal(model: &str, signature: &str) -> String {
+    sse_event(json!({
+        "type": "message_start",
+        "message": {"model": model, "usage": {"input_tokens": 100, "output_tokens": 0}}
+    })) + &sse_event(json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "thinking", "thinking": ""}
+    })) + &sse_event(json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "signature_delta", "signature": signature}
+    })) + &sse_event(json!({"type": "content_block_stop", "index": 0}))
+        + &sse_event(json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "cyber", "explanation": null}
+            },
+            "usage": {"output_tokens": 240}
         }))
         + &sse_event(json!({"type": "message_stop"}))
 }
@@ -539,6 +564,170 @@ async fn continuing_after_interrupted_partial_assistant_text_or_tool_result_avoi
         assert!(penultimate["content"]
             .to_string()
             .contains("已完成前两步字幕时间轴对齐"));
+    }
+
+    session.shutdown_and_wait().await.unwrap();
+    process.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn refusal_stop_reason_reports_withheld_without_retry_or_history_pollution_and_strips_same_model_orphans(
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_server = captured.clone();
+
+    let server = tokio::spawn(async move {
+        for round in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = read_http_json(&mut socket).await;
+            captured_server.lock().unwrap().push(body.clone());
+            let sse = match round {
+                0 => reply_thinking_refusal("claude-opus-5-5", "OPUS_REFUSAL_SIG"),
+                _ => reply_text("claude-opus-5-5", "群聊气泡已打码并导出到下载目录。"),
+            };
+            write_sse_or_error(&mut socket, &body, &sse).await;
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+        dir: Some(dir.path().join("sessions").to_string_lossy().into_owned()),
+        archive_dir: None,
+    }));
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let decode =
+        |v: Value| -> Message { runtime_codec::decode_text(&v.to_string().into()).unwrap() };
+
+    let initial_history = vec![
+        decode(json!({
+            "type": "user",
+            "uuid": "u-prev",
+            "content": [{"type": "text", "text": "先看下素材目录"}]
+        })),
+        decode(json!({
+            "type": "assistant",
+            "uuid": "a-same-model-orphan",
+            "model": "claude-opus-5-5",
+            "content": [{"type": "thinking", "text": "orphaned same-model reasoning", "signature": "SAME_MODEL_SIG"}]
+        })),
+        decode(json!({
+            "type": "user",
+            "uuid": "u-stale-nudge",
+            "isMeta": true,
+            "content": [{
+                "type": "text",
+                "text": "<system-reminder>\nYour previous response contained only internal reasoning and no visible answer. Please respond directly to the user — do not respond empty again.\n</system-reminder>",
+                "harnessEnvelope": "system-reminder"
+            }]
+        })),
+    ];
+
+    let mut options = agent_options(process.clone());
+    options.provider = anthropic_provider(&base_url, "claude-opus-5-5");
+    options.config = Some(session_config("claude-opus-5-5", "subscription:opus"));
+    options.cwd = Some(dir.path().to_string_lossy().into_owned());
+    options.include_default_agents = Some(false);
+
+    let session = Agent::new(options)
+        .open_session(
+            store.clone(),
+            StartSessionOptions {
+                initial_history: Some(initial_history),
+                user_config_dir: Some(dir.path().to_string_lossy().into_owned().into()),
+                base_instructions: Some("Edit talking-head video.".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let turn1_events: Vec<_> = session
+        .run_streamed(
+            Input::Text("按截图制作群聊样式".into()),
+            TurnOptions::default(),
+        )
+        .events
+        .collect()
+        .await;
+
+    let failed = turn1_events
+        .iter()
+        .find_map(|e| match e {
+            EngineEvent::TurnFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("refusal turn must fail explicitly");
+    assert_eq!(
+        failed.provider_kind,
+        Some(ProviderErrorKind::Withheld),
+        "refusal must classify as ProviderErrorKind::Withheld rather than generic empty output: {failed:?}"
+    );
+    assert!(
+        !failed
+            .message
+            .try_to_utf8()
+            .unwrap()
+            .contains("returned no content"),
+        "refusal must not masquerade as 'the model returned no content for this turn': {failed:?}"
+    );
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "refusal must not trigger an empty-closing retry request"
+    );
+
+    let turn2_events: Vec<_> = session
+        .run_streamed(
+            Input::Text("继续剪吧，名字和头像打码放到下载目录".into()),
+            TurnOptions::default(),
+        )
+        .events
+        .collect()
+        .await;
+    assert!(
+        !turn2_events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TurnFailed { .. })),
+        "follow-up turn must succeed cleanly: {turn2_events:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+
+    {
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (idx, req) in requests.iter().enumerate() {
+            let msgs = req["messages"].as_array().unwrap();
+            let serialized = req["messages"].to_string();
+            assert!(
+                !serialized.contains("orphaned same-model reasoning"),
+                "request {idx} leaked orphaned thinking-only assistant turn: {serialized}"
+            );
+            assert!(
+                !serialized.contains("Your previous response contained only internal reasoning"),
+                "request {idx} leaked superseded empty-closing retry nudge: {serialized}"
+            );
+            assert!(
+                !serialized.contains("OPUS_REFUSAL_SIG"),
+                "request {idx} leaked refused thinking block: {serialized}"
+            );
+            for m in msgs {
+                if m["role"] == "assistant" {
+                    let blocks = m["content"].as_array().unwrap();
+                    assert!(
+                        blocks
+                            .iter()
+                            .any(|b| b["type"] != "thinking" && b["type"] != "redacted_thinking"),
+                        "request {idx} contained thinking-only assistant message: {m}"
+                    );
+                }
+            }
+        }
     }
 
     session.shutdown_and_wait().await.unwrap();

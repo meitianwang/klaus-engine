@@ -1757,6 +1757,7 @@ async fn run_turn(
         if !private_review
             && !signal.is_cancelled()
             && stop_reason != ModelStopReason::MaxTokens
+            && stop_reason != ModelStopReason::Refusal
             && !response_produced_output
             && (produced_output || response_is_thinking_only)
             && empty_closing_retries < MAX_EMPTY_CLOSING_RETRIES
@@ -1950,9 +1951,29 @@ async fn run_turn(
                 .is_some_and(|goal| goal.is_automatic_turn())
         {
             let truncated = stop_reason == ModelStopReason::MaxTokens;
+            let refused = stop_reason == ModelStopReason::Refusal;
             let closing_response_empty = !response_produced_output;
             let turn_produced_nothing = !produced_output;
             if closing_response_empty || turn_produced_nothing {
+                if refused {
+                    emit_provider_failure(
+                        &shared,
+                        ProviderError {
+                            kind: ProviderErrorKind::Withheld,
+                            message: "the model declined to respond to this request".into(),
+                            status: None,
+                            code: Some("refusal".into()),
+                            error_type: Some("refusal".into()),
+                            media_origins: None,
+                            media_repair_complete: false,
+                            credential_recovery: None,
+                            retry_after_ms: None,
+                            request_id: None,
+                        },
+                        "refusal: terminal by policy",
+                    );
+                    return;
+                }
                 if !turn_produced_nothing && !truncated {
                     // (c) A normal-stop empty closing after visible work: the
                     // step-4.8 ladder spent its single retry. Park on the user
