@@ -3873,7 +3873,7 @@ fn pinned_prompt_prefix(source: bool) -> Result<RuntimeJson, String> {
     } else {
         (
             include_str!("../../tests/fixtures/prompt_policy/shared-prefix.json"),
-            "dc6476bde9d879996eabb2526e03c7ca3b4c9d6621df990f0500270a4d524b56",
+            "dbc94fa06bb9623dff3e2f856b63f0e98c76b18060d3b2527265dcf505178510",
         )
     };
     let value = runtime_json::parse(&RuntimeString::from(text))
@@ -21687,9 +21687,9 @@ mod tests {
         let current = canonical_reference_host_pointers(&[request.clone()], 1).unwrap();
         assert_eq!(
             current,
-            vec![RuntimeString::from("/modelRequests/0/system/4/text")]
+            vec![RuntimeString::from("/modelRequests/0/system/5/text")]
         );
-        assert_eq!(request["system"].as_array().unwrap()[4], env);
+        assert_eq!(request["system"].as_array().unwrap()[5], env);
     }
 
     #[test]
