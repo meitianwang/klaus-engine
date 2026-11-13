@@ -1059,7 +1059,7 @@ impl TurnIndexDb {
                 } else {
                     header.message.as_ref()
                 };
-                let message_id = if header.kind == "compacted" {
+                let message_id = if header.kind == "compacted" && !step.skip_item {
                     Some(format!("history-compaction-{position}"))
                 } else {
                     message.and_then(|message| message.uuid.clone())

@@ -772,3 +772,6 @@ mod r20261113_side_task_checkpoint_ancestry;
 
 #[path = "regressions/r20261113_target_model_downshift_compaction.rs"]
 mod r20261113_target_model_downshift_compaction;
+
+#[path = "regressions/r20261113_anthropic_model_switch_prefill_and_repair_boundary.rs"]
+mod r20261113_anthropic_model_switch_prefill_and_repair_boundary;

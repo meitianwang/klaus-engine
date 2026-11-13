@@ -47,7 +47,7 @@ use crate::runtime_values::{
 use crate::schemas::config::ClearToolInputs;
 use crate::schemas::config::ContextManagementConfig;
 use crate::schemas::content::{
-    Citation, ContentBlock, DocumentBlock, NativeSearchResult, OutputBlock, TextBlock,
+    Citation, ContentBlock, DocumentBlock, NativeSearchResult, OutputBlock,
 };
 use crate::schemas::effort::{EffortLevel, EffortValue};
 use crate::schemas::message::{Message, ToolResultMessage, Usage};
@@ -2936,6 +2936,29 @@ fn build_params_with_media_limits(
         .map(|p| vobj(vec![("type", vs("text")), ("text", vs(p.text.clone()))]))
         .collect();
     let mut messages = to_api_messages(&req.messages, &diagnostic_string(&req.model), &req.tools);
+    // Modern Claude models reject assistant message prefill (400 when the final
+    // message has role="assistant"). Ensure empty-input continuations after a
+    // partial assistant turn always end on a user message.
+    if messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| role == "assistant")
+    {
+        messages.push(vobj(vec![
+            ("role", vs("user")),
+            (
+                "content",
+                Value::Array(vec![vobj(vec![
+                    ("type", vs("text")),
+                    (
+                        "text",
+                        vs("<system-reminder>\nContinue from where you left off without repeating content already shown to the user.\n</system-reminder>"),
+                    ),
+                ])]),
+            ),
+        ]));
+    }
     // The final per-image ceiling precedes aggregate shedding. Otherwise an
     // invalid historical image could be silently discarded instead of refused.
     validate_final_images(&messages, image_limits.max_base64_chars)?;
@@ -3328,10 +3351,11 @@ fn normalize_runtime_model_id(model: &RuntimeString) -> RuntimeString {
 }
 
 /// Drop signed thinking / redacted_thinking blocks from an assistant message
-/// produced by a DIFFERENT model (signatures are model-bound). A placeholder
-/// keeps roles alternating if stripping would empty the message.
+/// produced by a DIFFERENT model (signatures are model-bound). Thinking-only
+/// messages become empty so `to_api_messages` omits them instead of fabricating
+/// a synthetic assistant reply that triggers prefill rejection on continuation.
 fn strip_stale_thinking(content: &[ContentBlock]) -> Vec<ContentBlock> {
-    let kept: Vec<ContentBlock> = content
+    content
         .iter()
         .filter(|b| {
             !matches!(
@@ -3340,21 +3364,7 @@ fn strip_stale_thinking(content: &[ContentBlock]) -> Vec<ContentBlock> {
             )
         })
         .cloned()
-        .collect();
-    if kept.len() == content.len() {
-        return content.to_vec();
-    }
-    if !kept.is_empty() {
-        kept
-    } else {
-        vec![ContentBlock::Text(TextBlock {
-            text: "[Thinking removed for model switch]".into(),
-            citations: None,
-            harness_envelope: None,
-            message_id: None,
-            phase: None,
-        })]
-    }
+        .collect()
 }
 
 fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec]) -> Vec<Value> {
@@ -3457,7 +3467,8 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
 
     // The API rejects a request whose FINAL assistant message ends in a thinking /
     // redacted_thinking block — strip the trailing run from the last assistant
-    // message only. A placeholder keeps it non-empty.
+    // message, dropping the message completely if nothing visible remains.
+    let mut pop_empty_last = false;
     if let Some(last) = out.last_mut() {
         if last
             .get("role")
@@ -3477,14 +3488,14 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
                     if end > 0 {
                         content.truncate(end);
                     } else {
-                        *content = vec![vobj(vec![
-                            ("type", vs("text")),
-                            ("text", vs("[no content]")),
-                        ])];
+                        pop_empty_last = true;
                     }
                 }
             }
         }
+    }
+    if pop_empty_last {
+        out.pop();
     }
     out
 }
@@ -3533,34 +3544,47 @@ fn render_anthropic_compact_boundary_exact(
         .concat(&RuntimeString::from(suffix))
 }
 
-/// Append plain user content, coalescing into a preceding plain-user message
-/// (never a tool_result message) to keep roles alternating.
+/// Append user content, coalescing into a preceding user message so roles
+/// always alternate while keeping any `tool_result` blocks contiguous at the front.
 fn push_user_content(out: &mut Vec<Value>, content: Vec<Value>) {
     if content.is_empty() {
         return;
     }
-    let can_merge = out.last().is_some_and(|last| {
+    let last_is_user = out.last().is_some_and(|last| {
         last.get("role")
             .and_then(Value::as_str)
             .is_some_and(|role| role == "user")
-            && last
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|arr| {
-                    !arr.iter().any(|b| {
-                        b.get("type")
-                            .and_then(Value::as_str)
-                            .is_some_and(|tag| tag == "tool_result")
-                    })
-                })
     });
-    if can_merge {
+    if last_is_user {
         if let Some(prev) = out
             .last_mut()
             .and_then(|l| l.get_mut("content"))
             .and_then(Value::as_array_mut)
         {
-            prev.extend(content);
+            let incoming_has_tool_result = content.iter().any(|b| {
+                b.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_result")
+            });
+            if incoming_has_tool_result {
+                let insert_at = prev
+                    .iter()
+                    .position(|b| {
+                        b.get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|tag| tag != "tool_result")
+                    })
+                    .unwrap_or(prev.len());
+                let (results, others): (Vec<_>, Vec<_>) = content.into_iter().partition(|b| {
+                    b.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tag| tag == "tool_result")
+                });
+                prev.splice(insert_at..insert_at, results);
+                prev.extend(others);
+            } else {
+                prev.extend(content);
+            }
             return;
         }
     }
@@ -6194,7 +6218,7 @@ mod tests {
 mod context_hint_transport_tests {
     use super::*;
     use crate::context::context_hints::{ContextHintRequest, CONTEXT_HINT_CLEARED_MARKER};
-    use crate::schemas::content::ToolUseBlock;
+    use crate::schemas::content::{TextBlock, ToolUseBlock};
     use crate::schemas::message::AssistantMessage;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

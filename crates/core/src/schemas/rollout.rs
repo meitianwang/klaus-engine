@@ -427,6 +427,30 @@ impl TurnContextSnapshot {
 impl_runtime_object_codec!(TurnContextSnapshot);
 
 impl CompactedItem {
+    /// True when this record is an in-place history repair (usage invalidation,
+    /// instruction projection cleanup, or media repair) rather than a context
+    /// compaction that introduced a summary boundary.
+    pub fn is_history_repair(&self) -> bool {
+        let Some(replacement) = &self.replacement_history else {
+            return false;
+        };
+        if !self.summary.is_empty() {
+            return false;
+        }
+        let prior_ids: std::collections::HashSet<_> = self
+            .source_message_ids
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        !replacement.iter().any(|message| {
+            matches!(
+                message,
+                Message::CompactBoundary(boundary) if !prior_ids.contains(&boundary.uuid)
+            )
+        })
+    }
+
     fn encode_fields(&self) -> Result<RuntimeObject, RuntimeCodecError> {
         let mut object = RuntimeObjectEncoder::new();
         object.field("summary", &self.summary)?;

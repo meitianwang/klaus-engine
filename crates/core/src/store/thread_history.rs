@@ -215,7 +215,7 @@ pub fn project_thread_history(items: Vec<RolloutItem>) -> ThreadHistory {
                 }
                 history.push(message);
             }
-            RolloutItem::Compacted(compacted) => {
+            RolloutItem::Compacted(compacted) if !compacted.is_history_repair() => {
                 let uuid: RuntimeString = format!("history-compaction-{position}").into();
                 if let Some(turn_id) = &current_turn {
                     turn_index

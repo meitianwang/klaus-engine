@@ -197,10 +197,23 @@ fn prepare(
             reader: Read::by_ref(source).take(len),
             cancelled: cancelled.clone(),
         };
-        step.summary = Some(scan::compaction(&mut BufReader::with_capacity(
-            64 * 1024,
-            reader,
-        ))?);
+        let summary = scan::compaction(&mut BufReader::with_capacity(64 * 1024, reader))?;
+        if summary.is_empty() {
+            let bytes = load::record_raw(source, offset, len)?;
+            let is_repair = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(parse_rollout_line)
+                .is_some_and(
+                    |item| matches!(item, RolloutItem::Compacted(c) if c.is_history_repair()),
+                );
+            if is_repair {
+                step.skip_item = true;
+            } else {
+                step.summary = Some(summary);
+            }
+        } else {
+            step.summary = Some(summary);
+        }
     } else if header.event.as_deref() == Some("tool_result_output") {
         step.payload = Some(field(
             source,
