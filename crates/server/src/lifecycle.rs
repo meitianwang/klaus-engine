@@ -797,7 +797,7 @@ fn session_options_from_handlers(
 }
 
 /// The config-driven search backend picker: a session whose resolved config
-/// names a model subscription (`codex`, `qoder`, `qoderwork`) searches through
+/// names a model subscription (`codex`, `qoder`) searches through
 /// that subscription's own service. Absent credentials fail the search loudly
 /// instead of silently falling back to the browser backend.
 fn subscription_web_search_factory(

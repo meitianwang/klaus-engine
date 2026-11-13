@@ -23,7 +23,6 @@ pub const MODEL_TARGET_SOURCES: &[&str] = &[
     "codex",
     "qoder",
     "qwenwork",
-    "qoderwork",
     "workbuddy",
     "cursor",
     "kimi",

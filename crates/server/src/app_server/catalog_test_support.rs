@@ -80,7 +80,7 @@ impl Gateway {
         let row = json!({ "key": "live-model", "id": "live-model", "display_name": "Live", "name": "Live", "enable": true, "supportsToolCall": true });
         let body = match source {
             "qoder" => json!({ "assistant": [row] }),
-            "qoderwork" | "qwenwork" => json!({ "qwork": [row] }),
+            "qwenwork" => json!({ "qwork": [row] }),
             "workbuddy" => json!({ "models": [row] }),
             _ => json!({ "data": [row], "has_more": false }),
         };

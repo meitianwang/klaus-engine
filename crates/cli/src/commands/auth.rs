@@ -156,7 +156,7 @@ async fn effective_lines() -> Vec<String> {
         ),
     });
     lines.push(
-        "           a subscription answers only when `--model subscription:… / codex:… / qoder:… / qwenwork:… / qoderwork:…` names one"
+        "           a subscription answers only when `--model subscription:… / codex:… / qoder:… / qwenwork:…` names one"
             .to_string(),
     );
     lines

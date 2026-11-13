@@ -55,7 +55,6 @@ struct Running {
 pub(crate) enum BridgeSource {
     Qoder,
     QwenWork,
-    QoderWork,
 }
 
 impl BridgeSource {
@@ -63,7 +62,6 @@ impl BridgeSource {
         match self {
             Self::Qoder => "Qoder",
             Self::QwenWork => "QwenWork",
-            Self::QoderWork => "QoderWork",
         }
     }
 
@@ -71,7 +69,6 @@ impl BridgeSource {
         match self {
             Self::Qoder => "qoder",
             Self::QwenWork => "qwenwork",
-            Self::QoderWork => "qoderwork",
         }
     }
 }
@@ -406,9 +403,6 @@ async fn handle_conn(
             BridgeSource::QwenWork => super::super::qwenwork::fetch_models()
                 .await
                 .unwrap_or_default(),
-            BridgeSource::QoderWork => super::super::qoderwork::fetch_models()
-                .await
-                .unwrap_or_default(),
         };
         let data: Vec<Value> = models
             .iter()
@@ -483,7 +477,6 @@ async fn handle_chat_completions(
     let model_info = match source {
         BridgeSource::Qoder => super::catalog::lookup_model(&model_key).await,
         BridgeSource::QwenWork => super::super::qwenwork::lookup_model(&model_key).await,
-        BridgeSource::QoderWork => super::super::qoderwork::lookup_model(&model_key).await,
     };
     if let Err(error) = validate_fast_mode(&body, model_info.as_ref()) {
         return write_json(
@@ -506,7 +499,6 @@ async fn handle_chat_completions(
     let refresh = match source {
         BridgeSource::Qoder => super::auth::ensure_fresh_token().await,
         BridgeSource::QwenWork => super::super::qwenwork::ensure_fresh_token().await,
-        BridgeSource::QoderWork => super::super::qoderwork::ensure_fresh_token().await,
     };
     if let Err(error) = refresh {
         return write_json(
@@ -726,10 +718,6 @@ fn sign_for(
             super::super::qwenwork::catalog::sign_infer_request(body_json, model_key)
                 .map_err(|error| error.message)
         }
-        BridgeSource::QoderWork => {
-            super::super::qoderwork::catalog::sign_infer_request(body_json, model_key)
-                .map_err(|error| error.message)
-        }
     }
 }
 
@@ -829,7 +817,6 @@ async fn reread_local_credential(source: BridgeSource) -> &'static str {
     let outcome = match source {
         BridgeSource::Qoder => super::auth::import_local(),
         BridgeSource::QwenWork => super::super::qwenwork::import_local(),
-        BridgeSource::QoderWork => super::super::qoderwork::import_local(),
     };
     match outcome {
         Ok(result) if result.get("ok") == Some(&json!(true)) => "ok",

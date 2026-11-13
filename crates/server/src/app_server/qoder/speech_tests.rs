@@ -42,7 +42,7 @@ async fn live_transcript_fixture(
 // utterance as the complete recording discarded all but the last sentence.
 #[tokio::test]
 async fn live_multisentence_revisions_keep_completed_utterances() {
-    for source in [Source::Qoder, Source::QoderWork, Source::QwenWork] {
+    for source in [Source::Qoder, Source::QwenWork] {
         let (result, snapshots) = live_transcript_fixture(
             source,
             vec![
@@ -521,7 +521,7 @@ async fn live_feed_rechecks_account_identity_after_the_last_transcript_event() {
     let current = Arc::new(AtomicBool::new(true));
     let check = current.clone();
     let result = transcribe_feed(
-        Source::QoderWork,
+        Source::QwenWork,
         socket,
         AudioFeed::Live(receiver),
         "test-session",
@@ -697,7 +697,7 @@ async fn qwen_final_segment_total_remains_bounded() {
 
 #[test]
 fn shared_audio_failures_keep_the_selected_source_identity() {
-    for source in [Source::Qoder, Source::QoderWork, Source::QwenWork] {
+    for source in [Source::Qoder, Source::QwenWork] {
         assert_eq!(
             source.source_error("qoder_transcription_login_expired"),
             format!("{}_transcription_login_expired", source.name())

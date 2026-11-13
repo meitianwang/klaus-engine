@@ -143,7 +143,7 @@ mod tests {
         assert!(a.signal().is_cancelled());
         assert!(!b.signal().is_cancelled());
         let c = operations.register("qoder", None).unwrap();
-        let d = operations.register("qoderwork", None).unwrap();
+        let d = operations.register("qwenwork", None).unwrap();
         assert!(operations.register("codex", None).is_err());
         drop(a);
         let e = operations.register("codex", None).unwrap();

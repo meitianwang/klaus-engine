@@ -179,8 +179,7 @@ pub fn log_path() -> PathBuf {
 pub struct ProviderFailure<'a> {
     /// Failure family: `turn_failed`, `upstream_rejected`, `bridge_token_mismatch`, …
     pub kind: &'a str,
-    /// Subscription source when the failure has one (`qoder`, `qwenwork`,
-    /// `qoderwork`).
+    /// Subscription source when the failure has one (`qoder`, `qwenwork`).
     pub source: Option<&'a str>,
     /// Model or selection the request named.
     pub model: Option<&'a str>,

@@ -1,8 +1,8 @@
 //! Kimi (Moonshot AI) membership support.
 //!
 //! Kimi Code serves the Kimi membership's coding allowance over the ordinary
-//! Anthropic wire (`{base}/v1/messages`), so unlike Qoder, QwenWork and
-//! QoderWork there is no signer and no local bridge to translate a proprietary
+//! Anthropic wire (`{base}/v1/messages`), so unlike Qoder and QwenWork there
+//! is no signer and no local bridge to translate a proprietary
 //! protocol: the engine's own Anthropic provider is pointed straight at the
 //! gateway. The Kimi-specific knowledge left is which credential the caller
 //! holds, which models the plan serves, and what the allowance looks like.

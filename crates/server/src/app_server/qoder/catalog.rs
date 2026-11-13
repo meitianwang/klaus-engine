@@ -192,7 +192,7 @@ pub fn parse_model_scenes(parsed: &Value) -> Vec<Value> {
 }
 
 /// Project one of the COSY model scenes into the engine's shared catalog shape.
-/// Qoder serves `assistant`/`chat`; QwenWork and QoderWork serve `qwork` on the same signed
+/// Qoder serves `assistant`/`chat`; QwenWork serves `qwork` on the same signed
 /// catalog route.
 pub(crate) fn parse_model_scene_names(parsed: &Value, names: &[&str]) -> Vec<Value> {
     let scene = names

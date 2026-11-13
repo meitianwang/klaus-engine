@@ -679,21 +679,6 @@ pub async fn resolve(
             pricing: None,
         }));
     }
-    if let Some(key) = selection.strip_prefix("qoderwork:") {
-        super::qoderwork::set_config_root(config_root);
-        let key = qoderwork_main_model(key, tiers);
-        let model = super::qoderwork::resolved_model(&key).await;
-        let (provider, auth) = super::qoderwork::resolve(&model).await?;
-        let (model_tiers, capabilities_by_model) = qoderwork_tiers(&model, tiers).await;
-        return Ok(Some(Resolved {
-            provider,
-            auth,
-            capabilities: super::qoderwork::model_capabilities(&model).await,
-            capabilities_by_model,
-            model_tiers,
-            pricing: None,
-        }));
-    }
     if let Some(key) = selection.strip_prefix("cursor:") {
         super::cursor::set_config_root(config_root);
         let model = cursor_main_model(key, tiers).await?;
@@ -1332,14 +1317,6 @@ pub(super) fn qwenwork_main_model<'a>(model: &'a str, tiers: &'a TierSelections)
     super::qwenwork::wire_model(pick)
 }
 
-pub(super) fn qoderwork_main_model<'a>(model: &'a str, tiers: &'a TierSelections) -> String {
-    let pick = match model {
-        tier @ ("high" | "medium" | "low") => tier_pick(tiers, tier).unwrap_or("auto"),
-        other => other,
-    };
-    super::qoderwork::wire_model(pick)
-}
-
 pub(super) async fn cursor_main_model(
     model: &str,
     tiers: &TierSelections,
@@ -1796,33 +1773,6 @@ async fn qwenwork_tiers(
         by_model.push(json!({
             "model": pick,
             "capabilities": super::qwenwork::model_capabilities(pick).await,
-        }));
-    }
-    (tiers, by_model)
-}
-
-async fn qoderwork_tiers(
-    main_model: &str,
-    selections: &TierSelections,
-) -> (Map<String, Value>, Vec<Value>) {
-    let mut tiers = Map::new();
-    let mut by_model = Vec::new();
-    let mut seen = vec![main_model.to_string()];
-    for tier in ["high", "medium", "low"] {
-        let Some(pick) = tier_pick(selections, tier) else {
-            continue;
-        };
-        if super::qoderwork::lookup_model(pick).await.is_none() {
-            continue;
-        }
-        tiers.insert(tier.to_string(), json!(pick));
-        if seen.contains(&pick.to_string()) {
-            continue;
-        }
-        seen.push(pick.to_string());
-        by_model.push(json!({
-            "model": pick,
-            "capabilities": super::qoderwork::model_capabilities(pick).await,
         }));
     }
     (tiers, by_model)

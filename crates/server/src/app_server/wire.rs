@@ -1081,7 +1081,7 @@ pub struct EngineBuiltinAgentsParams {
     pub submission_id: Option<String>,
 }
 
-/// `qoder/*`, `qwenwork/*` and `qoderwork/*` request params for the calls that
+/// `qoder/*` and `qwenwork/*` request params for the calls that
 /// take nothing but a correlation id: status, logout, importLocal, loginStart.
 ///
 /// These subscriptions are endpoint state, not session state — a settings page
@@ -1111,7 +1111,7 @@ pub struct WorkBuddyLoginStartParams {
     pub submission_id: Option<String>,
 }
 
-/// `qoder/loginPoll`, `qwenwork/loginPoll` and `qoderwork/loginPoll` params: the
+/// `qoder/loginPoll` and `qwenwork/loginPoll` params: the
 /// flow handle the corresponding `loginStart` call answered with, passed back
 /// verbatim so the shape stays the login flow's own business.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1123,10 +1123,9 @@ pub struct QoderPollParams {
     pub submission_id: Option<String>,
 }
 
-/// `qoder/adoptCredential`, `qwenwork/adoptCredential` and
-/// `qoderwork/adoptCredential` params: a profile the HOST read out of a store the
-/// engine deliberately cannot open. QwenWork and QoderWork also carry the device
-/// id that their safeStorage token was issued under.
+/// `qoder/adoptCredential` and `qwenwork/adoptCredential` params: a profile the
+/// HOST read out of a store the engine deliberately cannot open. QwenWork also
+/// carries the device id that its safeStorage token was issued under.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QoderAdoptParams {
@@ -1595,7 +1594,7 @@ pub struct AntigravityTranscribeParams {
     pub expected_credential_generation: Option<String>,
 }
 
-/// Which catalog read `qoder/models`, `qwenwork/models` or `qoderwork/models`
+/// Which catalog read `qoder/models` or `qwenwork/models`
 /// performs. The reads are not interchangeable, so the caller states which one it
 /// needs rather than getting a cache-freshness knob and hoping.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1612,7 +1611,7 @@ pub enum QoderCatalogRead {
     Cached,
 }
 
-/// `qoder/models`, `qwenwork/models` and `qoderwork/models` params.
+/// `qoder/models` and `qwenwork/models` params.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QoderModelsParams {
@@ -1842,8 +1841,7 @@ pub struct QwenWorkCancelOperationParams {
     pub operation_id: String,
 }
 
-/// `qoder/generateImage` and `qoderwork/generateImage`
-/// params.
+/// `qoder/generateImage` params.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QoderImageParams {
@@ -1855,8 +1853,7 @@ pub struct QoderImageParams {
     pub submission_id: Option<String>,
 }
 
-/// `qoder/setThinkingLevel`, `qwenwork/setThinkingLevel` and
-/// `qoderwork/setThinkingLevel` params. Absent means
+/// `qoder/setThinkingLevel` and `qwenwork/setThinkingLevel` params. Absent means
 /// "no tier", which the bridge maps onto whatever the selected model advertises
 /// as its default.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

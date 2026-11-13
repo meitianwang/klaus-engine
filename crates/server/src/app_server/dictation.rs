@@ -63,7 +63,6 @@ async fn start(
         "trae",
         "antigravity",
         "qoder",
-        "qoderwork",
         "qwenwork",
     ]
     .contains(&params.source.as_str())
@@ -115,7 +114,6 @@ async fn start(
         "trae" => crate::app_server::trae::set_config_root(&root),
         "antigravity" => crate::app_server::antigravity::set_config_root(&root),
         "qoder" => crate::app_server::qoder::set_config_root(&root),
-        "qoderwork" => crate::app_server::qoderwork::set_config_root(&root),
         "qwenwork" => crate::app_server::qwenwork::set_config_root(&root),
         _ => unreachable!(),
     }
@@ -222,11 +220,7 @@ async fn start(
                     .await
                 }
                 _ => {
-                    let source = if source == "qoder" {
-                        crate::app_server::qoder::speech::Source::Qoder
-                    } else {
-                        crate::app_server::qoder::speech::Source::QoderWork
-                    };
+                    let source = crate::app_server::qoder::speech::Source::Qoder;
                     crate::app_server::qoder::speech::stream_dictation(
                         source,
                         input,

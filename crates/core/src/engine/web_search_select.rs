@@ -17,14 +17,13 @@ pub const CLIENT_WEB_SEARCH_TOOL: &str = "web_search";
 
 /// Model subscriptions whose own search service backs the client `web_search`
 /// tool when named by `WebSearchConfig::source`.
-pub const SUBSCRIPTION_SEARCH_SOURCES: [&str; 14] = [
+pub const SUBSCRIPTION_SEARCH_SOURCES: [&str; 13] = [
     "trae",
     "kiro",
     "subscription",
     "codex",
     "cursor",
     "qoder",
-    "qoderwork",
     "qwenwork",
     "workbuddy",
     "antigravity",

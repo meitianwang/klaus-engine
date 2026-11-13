@@ -75,12 +75,6 @@ async fn model_selection_resolve_pins_the_source_without_requiring_credentials()
         (json!({"source":"qoder", "selection":"high", "modelTierSelections":{"high":"ultimate"}}), "qoder:ultimate"),
         (json!({"source":"qwenwork", "selection":"auto"}), "qwenwork:qwork-auto"),
         (json!({"source":"qwenwork", "selection":"high", "modelTierSelections":{"high":"flash"}}), "qwenwork:flash"),
-        // QoderWork serves the same `qwork` scene on the Qoder family's gateway.
-        // With no catalog reachable the default names the client's own default
-        // model rather than a synthetic automatic route.
-        (json!({"source":"qoderwork", "selection":"auto"}), "qoderwork:qmodel_38max"),
-        (json!({"source":"qoderwork", "selection":"high", "modelTierSelections":{"high":"qwork-ultimate"}}), "qoderwork:qwork-ultimate"),
-        (json!({"source":"qoderwork", "selection":"qoderwork:qwork-ultimate"}), "qoderwork:qwork-ultimate"),
         // Preserve the automatic identity without consulting credentials or a
         // runtime catalog. Provider initialization resolves its service model.
         (json!({"source":"workbuddy", "selection":"auto"}), "workbuddy:auto"),

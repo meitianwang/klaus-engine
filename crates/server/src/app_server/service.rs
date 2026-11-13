@@ -2977,10 +2977,7 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
         // The Qoder subscription, for the same reason: it is endpoint state, and a
         // settings page signs in before any session exists. Each arm is a thin call
         // into `qoder`, which owns the credential, the signer and the bridge.
-        "qoder/transcribeAudio"
-        | "qoder/cancelTranscription"
-        | "qoderwork/transcribeAudio"
-        | "qoderwork/cancelTranscription" => {
+        "qoder/transcribeAudio" | "qoder/cancelTranscription" => {
             let params = scalar_params!();
             dispatch_qoder_speech(state, id, &method, params).await;
         }
@@ -3017,19 +3014,6 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
         | "qwenwork/setThinkingLevel" => {
             let params = scalar_params!();
             dispatch_qwenwork(state, id, &method, params).await;
-        }
-        "qoderwork/status"
-        | "qoderwork/loginStart"
-        | "qoderwork/loginPoll"
-        | "qoderwork/logout"
-        | "qoderwork/importLocal"
-        | "qoderwork/adoptCredential"
-        | "qoderwork/models"
-        | "qoderwork/usage"
-        | "qoderwork/generateImage"
-        | "qoderwork/setThinkingLevel" => {
-            let params = scalar_params!();
-            dispatch_qoderwork(state, id, &method, params).await;
         }
         // WorkBuddy's gateway signs nothing, so there is no `setThinkingLevel`
         // side channel here: the engine sends `reasoning_effort` itself, from the
@@ -4763,7 +4747,6 @@ async fn resolve_tier_target(
         "codex",
         "qoder",
         "qwenwork",
-        "qoderwork",
         "workbuddy",
         "cursor",
         "kimi",
@@ -5298,11 +5281,7 @@ async fn send_hooks_error(state: &AppServerState, id: &Value, error: &HooksStore
 /// endpoint-state methods, so the dispatcher is never blocked on a network call.
 async fn dispatch_qoder_speech(state: Arc<AppServerState>, id: Value, method: &str, params: Value) {
     use super::qoder::speech::Source;
-    let source = if method.starts_with("qoderwork/") {
-        Source::QoderWork
-    } else {
-        Source::Qoder
-    };
+    let source = Source::Qoder;
     if method.ends_with("/cancelTranscription") {
         let params =
             match serde_json::from_value::<wire::SubscriptionCancelTranscriptionParams>(params) {
@@ -5347,7 +5326,6 @@ async fn dispatch_qoder_speech(state: Arc<AppServerState>, id: Value, method: &s
     let root = super::model_sources::config_root_of(&state.config_path);
     match source {
         Source::Qoder => super::qoder::set_config_root(&root),
-        Source::QoderWork => super::qoderwork::set_config_root(&root),
         Source::QwenWork => unreachable!("QwenWork prepares its own transcription credential"),
     }
     tokio::spawn(async move {
@@ -5701,110 +5679,6 @@ async fn spawn_qwenwork_operation<F, Fut>(
                 provider_operation: Some(operation),
             })
             .await;
-    });
-}
-
-async fn dispatch_qoderwork(state: Arc<AppServerState>, id: Value, method: &str, params: Value) {
-    // The credential follows the endpoint's config root, so every method here sees
-    // the same profile the sessions do.
-    super::qoderwork::set_config_root(&super::model_sources::config_root_of(&state.config_path));
-    let method = method.to_string();
-    tokio::spawn(async move {
-        let outcome: Result<Value, String> = match method.as_str() {
-            "qoderwork/status" => Ok(super::qoderwork::auth_status()),
-            "qoderwork/loginStart" => super::qoderwork::start().await.map_err(render_qoder_error),
-            "qoderwork/loginPoll" => match decode_qoder::<wire::QoderPollParams>(&params) {
-                Ok(params) => super::qoderwork::poll(&params.flow)
-                    .await
-                    .map_err(render_qoder_error),
-                Err(error) => Err(error),
-            },
-            "qoderwork/logout" => super::qoderwork::logout().map_err(render_qoder_error),
-            "qoderwork/importLocal" => super::qoderwork::import_local().map_err(render_qoder_error),
-            "qoderwork/adoptCredential" => match decode_qoder::<wire::QoderAdoptParams>(&params) {
-                Ok(params) => {
-                    super::qoderwork::adopt_credential(params.user_info, params.machine_id)
-                        .map_err(render_qoder_error)
-                }
-                Err(error) => Err(error),
-            },
-            "qoderwork/models" => match decode_qoder::<wire::QoderModelsParams>(&params) {
-                Ok(params) => {
-                    // Renew a nearly-expired token before spending it on the
-                    // catalog: this gateway has no revoke and no server-side
-                    // session, so the stored token is the only thing standing
-                    // between this request and a 401. Signed out this is a no-op,
-                    // and the read below is what reports that.
-                    match super::qoderwork::ensure_fresh_token().await {
-                        Ok(()) => {
-                            let models = match params.read {
-                                wire::QoderCatalogRead::Warm => {
-                                    super::qoderwork::fetch_models_warm().await
-                                }
-                                wire::QoderCatalogRead::Cached => {
-                                    super::qoderwork::fetch_models().await
-                                }
-                            };
-                            models
-                                .map(|models| {
-                                    super::conversation_catalog::response("qoderwork", models)
-                                })
-                                // The host recovers from a dead copied token by
-                                // rereading the official desktop store, which only
-                                // it can decrypt; it keys that recovery on this
-                                // stable code rather than on the gateway's prose.
-                                .map_err(|error| {
-                                    if error.login_expired {
-                                        "qoderwork_login_expired".to_string()
-                                    } else {
-                                        error.message
-                                    }
-                                })
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            },
-            "qoderwork/usage" => super::qoderwork::usage().await,
-            "qoderwork/generateImage" => match decode_qoder::<wire::QoderImageParams>(&params) {
-                Ok(params) => super::qoderwork::generate_image(
-                    &params.prompt,
-                    params.size.as_deref(),
-                    &params.session_id,
-                )
-                .await
-                // Base64 rather than a byte array: the bytes cross a JSON-RPC wire,
-                // and an array of a few hundred thousand numbers is both enormous
-                // and unreadable.
-                .map(|bytes| {
-                    use base64::Engine as _;
-                    serde_json::json!({
-                        "imageBase64": base64::engine::general_purpose::STANDARD.encode(bytes)
-                    })
-                })
-                .map_err(|error| error.message),
-                Err(error) => Err(error),
-            },
-            "qoderwork/setThinkingLevel" => {
-                match decode_qoder::<wire::QoderThinkingParams>(&params) {
-                    Ok(params) => {
-                        super::qoderwork::set_thinking_level(params.level);
-                        Ok(serde_json::json!({ "ok": true }))
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            other => Err(format!("unknown method {other}")),
-        };
-        match outcome {
-            Ok(value) => state.send(wire::response(&id, value)).await,
-            Err(error) => {
-                state
-                    .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
-                    .await
-            }
-        }
     });
 }
 
@@ -9501,7 +9375,6 @@ const MODEL_SOURCES: &[&str] = &[
     "codex",
     "qoder",
     "qwenwork",
-    "qoderwork",
     "workbuddy",
     "cursor",
     "kimi",

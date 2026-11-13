@@ -5,7 +5,7 @@
 use super::{make_create_session, TestClient};
 use crate::app_server::catalog_test_support::{store_credential, Gateway};
 use crate::app_server::{
-    antigravity, ark, bailian, kimi, minimax, qoder, qoderwork, qwenwork, workbuddy, zhipu,
+    antigravity, ark, bailian, kimi, minimax, qoder, qwenwork, workbuddy, zhipu,
 };
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -44,7 +44,6 @@ fn source_lock(source: &str) -> &'static tokio::sync::Mutex<()> {
     match source {
         "qoder" => qoder::test_env_lock(),
         "qwenwork" => qwenwork::test_env_lock(),
-        "qoderwork" => qoderwork::test_env_lock(),
         "workbuddy" => workbuddy::test_env_lock(),
         "kimi" => kimi::test_env_lock(),
         "bailian" => bailian::test_env_lock(),
@@ -63,10 +62,6 @@ fn source_root(source: &str, root: &std::path::Path) -> String {
         "qwenwork" => {
             qwenwork::set_config_root(root);
             qwenwork::auth::catalog_fingerprint()
-        }
-        "qoderwork" => {
-            qoderwork::set_config_root(root);
-            qoderwork::auth::catalog_fingerprint()
         }
         "workbuddy" => {
             workbuddy::set_config_root(root);
@@ -195,7 +190,7 @@ async fn live_source_projections_preserve_purpose_before_normalizing_metadata() 
         }
         let body = match source {
             "qoder" => json!({"assistant":rows}),
-            "qwenwork" | "qoderwork" => json!({"qwork":rows}),
+            "qwenwork" => json!({"qwork":rows}),
             "workbuddy" => json!({"models":rows}),
             _ => json!({"data":rows,"has_more":false}),
         };

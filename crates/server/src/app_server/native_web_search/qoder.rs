@@ -1,6 +1,6 @@
-//! Qoder / QoderWork search backend.
+//! Qoder search backend.
 //!
-//! Both subscriptions answer search through the gateway's signed one-shot
+//! The subscription answers search through the gateway's signed one-shot
 //! search route: a JSON envelope whose `payload` is the stringified search
 //! request, signed with the same COSY context the inference bridge uses. The
 //! answer is plain JSON holding `pageItems` (title / link / snippet). Domain
@@ -19,14 +19,12 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
     Qoder,
-    QoderWork,
 }
 
 impl Source {
     fn label(self) -> &'static str {
         match self {
             Source::Qoder => "Qoder",
-            Source::QoderWork => "QoderWork",
         }
     }
     /// Refresh the stored token before signing, so a lapsed bearer does not
@@ -34,14 +32,11 @@ impl Source {
     async fn refresh(self) -> Result<(), String> {
         match self {
             Source::Qoder => crate::app_server::qoder::auth::ensure_fresh_token().await,
-            Source::QoderWork => crate::app_server::qoderwork::auth::ensure_fresh_token().await,
         }
     }
     fn sign(self, body: &str) -> Result<crate::app_server::qoder::sign::SignedRequest, String> {
         match self {
             Source::Qoder => crate::app_server::qoder::catalog::sign_search_post(body)
-                .map_err(|error| error.message),
-            Source::QoderWork => crate::app_server::qoderwork::catalog::sign_search_post(body)
                 .map_err(|error| error.message),
         }
     }

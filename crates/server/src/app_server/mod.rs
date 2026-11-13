@@ -28,7 +28,6 @@ pub(crate) mod native_web_fetch;
 pub(crate) mod native_web_search;
 pub(crate) mod provider_operations;
 pub mod qoder;
-pub mod qoderwork;
 mod queue_store;
 mod queue_wire;
 pub mod qwenwork;

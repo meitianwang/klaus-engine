@@ -32,7 +32,6 @@ pub const SOURCE_PREFIXES: &[&str] = &[
     "codex:",
     "qoder:",
     "qwenwork:",
-    "qoderwork:",
     "workbuddy:",
     "cursor:",
     "kimi:",

@@ -46,10 +46,9 @@ fn source_pin(source: &str, root: &std::path::Path) -> Result<Option<Publication
             super::super::trae::auth::is_current(&expected)
         })));
     }
-    use super::super::{qoder, qoderwork, qwenwork, subscription_speech, workbuddy};
+    use super::super::{qoder, qwenwork, subscription_speech, workbuddy};
     let read: Option<CredentialReader> = match source {
         "qoder" => Some(qoder::auth::credential),
-        "qoderwork" => Some(qoderwork::auth::credential),
         "qwenwork" => Some(qwenwork::auth::credential),
         "workbuddy" => Some(workbuddy::auth::credential),
         _ => None,
@@ -78,10 +77,9 @@ async fn prepare_token(source: &str) -> Result<(), String> {
         super::super::trae::auth::credential(None).await?;
         return Ok(());
     }
-    use super::super::{qoder, qoderwork, qwenwork};
+    use super::super::{qoder, qwenwork};
     let read: Option<CredentialReader> = match source {
         "qoder" => Some(qoder::auth::credential),
-        "qoderwork" => Some(qoderwork::auth::credential),
         "qwenwork" => Some(qwenwork::auth::credential),
         _ => None,
     };
@@ -91,7 +89,6 @@ async fn prepare_token(source: &str) -> Result<(), String> {
     let before = read().ok_or("text_completion_model_unavailable")?;
     let refresh = match source {
         "qoder" => qoder::auth::ensure_fresh_token().await,
-        "qoderwork" => qoderwork::auth::ensure_fresh_token().await,
         "qwenwork" => qwenwork::ensure_fresh_token().await,
         _ => unreachable!(),
     };
@@ -224,7 +221,6 @@ async fn complete(
         "kiro" => super::super::kiro::set_config_root(&root),
         "trae" => super::super::trae::set_config_root(&root),
         "qoder" => super::super::qoder::set_config_root(&root),
-        "qoderwork" => super::super::qoderwork::set_config_root(&root),
         "qwenwork" => super::super::qwenwork::set_config_root(&root),
         "workbuddy" => super::super::workbuddy::set_config_root(&root),
         _ => {}

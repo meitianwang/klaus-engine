@@ -730,7 +730,7 @@ pub struct WebSearchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<WebSearchContextSize>,
     /// Which model subscription's own search service backs the client
-    /// `web_search` tool (`codex`, `qoder`, `qoderwork`, `bailian`, `cursor`, `qwenwork`). Absent means the
+    /// `web_search` tool (`codex`, `qoder`, `bailian`, `cursor`, `qwenwork`). Absent means the
     /// ordinary backend: the injected host backend or the engine browser.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,

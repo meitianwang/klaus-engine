@@ -147,7 +147,6 @@ fn dedicated_identity(source: &str, key: &str) -> bool {
                         .iter()
                         .any(|task| key.split('-').any(|component| component == *task)))
         }
-        "qoderwork" => key == "safety",
         "minimax" => {
             key == "image-01" || key.starts_with("speech-") || key.starts_with("minimax-h3")
         }
@@ -189,7 +188,6 @@ mod tests {
     fn explicit_exclusions_are_scoped_to_their_source() {
         for (source, key) in [
             ("bailian", "decision-model-preview"),
-            ("qoderwork", "safety"),
             ("kiro", "auto"),
             ("kiro", "auto::effort=max"),
         ] {

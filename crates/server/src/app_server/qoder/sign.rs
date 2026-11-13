@@ -169,22 +169,6 @@ impl CosyProfile {
         data_policy: "disagree",
         qwenwork_wire: true,
     };
-
-    /// QoderWork's signing profile. Its client metadata is the desktop
-    /// generation's (`qoder_work` product, agent business type, client type 6) and
-    /// its scene is the one the QoderWork client pins for its own agent, which is
-    /// also the catalog scene the gateway answers for this client. The sealed
-    /// account shape is the six-field one, so `qwenwork_wire` is on.
-    ///
-    /// The version is the signing generation this client speaks as, not the app
-    /// version; the two are reported separately in [`super::qoderwork::auth`].
-    pub(crate) const QODERWORK: Self = Self {
-        version: "1.1.26",
-        business_product: "qoder_work",
-        scene: "qwork",
-        data_policy: "disagree",
-        qwenwork_wire: true,
-    };
 }
 /// `Cosy-MachineType`, the desktop-client machine class in Qoder's own signer.
 const MACHINE_TYPE: &str = "5";

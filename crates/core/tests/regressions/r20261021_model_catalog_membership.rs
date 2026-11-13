@@ -4,25 +4,16 @@
 
 use super::{make_create_session, TestClient};
 use crate::app_server::catalog_test_support::{store_credential, Gateway};
-use crate::app_server::{ark, bailian, qoder, qoderwork, qwenwork, workbuddy, zhipu};
+use crate::app_server::{ark, bailian, qoder, qwenwork, workbuddy, zhipu};
 use serde_json::{json, Value};
 use std::time::Duration;
 
 #[tokio::test]
 async fn named_model_catalogs_keep_upstream_rows_and_replace_filtered_snapshots() {
-    for source in [
-        "qoder",
-        "qwenwork",
-        "qoderwork",
-        "workbuddy",
-        "bailian",
-        "zhipu",
-        "ark",
-    ] {
+    for source in ["qoder", "qwenwork", "workbuddy", "bailian", "zhipu", "ark"] {
         let lock = match source {
             "qoder" => qoder::test_env_lock(),
             "qwenwork" => qwenwork::test_env_lock(),
-            "qoderwork" => qoderwork::test_env_lock(),
             "workbuddy" => workbuddy::test_env_lock(),
             "zhipu" => zhipu::test_env_lock(),
             "bailian" => bailian::test_env_lock(),
@@ -39,10 +30,6 @@ async fn named_model_catalogs_keep_upstream_rows_and_replace_filtered_snapshots(
             "qwenwork" => {
                 qwenwork::set_config_root(root.path());
                 qwenwork::auth::catalog_fingerprint()
-            }
-            "qoderwork" => {
-                qoderwork::set_config_root(root.path());
-                qoderwork::auth::catalog_fingerprint()
             }
             "workbuddy" => {
                 workbuddy::set_config_root(root.path());
@@ -81,7 +68,7 @@ async fn named_model_catalogs_keep_upstream_rows_and_replace_filtered_snapshots(
         ]);
         let body = match source {
             "qoder" => json!({"assistant":rows}),
-            "qwenwork" | "qoderwork" => json!({"qwork":rows}),
+            "qwenwork" => json!({"qwork":rows}),
             "workbuddy" => {
                 json!({"models":rows,"agents":[{"name":"cli","models":["ready-model"]}]})
             }

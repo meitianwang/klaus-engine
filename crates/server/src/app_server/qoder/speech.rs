@@ -28,7 +28,6 @@ const FRAME_BYTES: usize = 3_200;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Source {
     Qoder,
-    QoderWork,
     QwenWork,
 }
 
@@ -36,7 +35,6 @@ impl Source {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Qoder => "qoder",
-            Self::QoderWork => "qoderwork",
             Self::QwenWork => "qwenwork",
         }
     }
@@ -51,7 +49,6 @@ impl Source {
     fn credential(self) -> Option<(String, Value)> {
         match self {
             Self::Qoder => super::auth::credential(),
-            Self::QoderWork => super::super::qoderwork::auth::credential(),
             Self::QwenWork => None,
         }
     }
@@ -410,7 +407,7 @@ fn audio_request(
         .map_err(|_| "qoder_transcription_request_invalid")?;
     let business_id = uuid::Uuid::new_v4().to_string();
     let business = json!({
-        "product":if matches!(source, Source::QwenWork | Source::QoderWork) { "qoder_work" } else { "ide" },
+        "product":if matches!(source, Source::QwenWork) { "qoder_work" } else { "ide" },
         "type":"asr_chat", "id":business_id,
         "begin_at":chrono::Utc::now().timestamp_millis(),
         "name":format!("asr_chat-{business_id}"),
@@ -423,7 +420,7 @@ fn audio_request(
     for (name, value) in headers.chain([
         (
             "X-IDE-Platform".into(),
-            if matches!(source, Source::QwenWork | Source::QoderWork) {
+            if matches!(source, Source::QwenWork) {
                 "qoder_work"
             } else {
                 "Klaus"

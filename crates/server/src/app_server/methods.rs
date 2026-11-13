@@ -381,26 +381,6 @@ facade_methods! {
     QwenWorkCancelTranscription => "qwenwork/cancelTranscription" (wire::SubscriptionCancelTranscriptionParams) -> Value;
     QwenWorkSetThinkingLevel => "qwenwork/setThinkingLevel" (wire::QoderThinkingParams) -> Value;
 
-    /// The QoderWork subscription. The engine owns the device flow, the request
-    /// signing and the model catalog; the host opens the browser page and reads
-    /// the login this process cannot decrypt. Its OAuth client, deep link and
-    /// credential store are its own, so a QoderWork login is a distinct session
-    /// from any other subscription on the same machine. There is deliberately no
-    /// `refreshToken` method: this gateway exposes none, so a dead login is
-    /// recovered by rereading the official store instead.
-    QoderWorkStatus => "qoderwork/status" (wire::QoderParams) -> Value;
-    QoderWorkLoginStart => "qoderwork/loginStart" (wire::QoderParams) -> Value;
-    QoderWorkLoginPoll => "qoderwork/loginPoll" (wire::QoderPollParams) -> Value;
-    QoderWorkLogout => "qoderwork/logout" (wire::QoderParams) -> Value;
-    QoderWorkImportLocal => "qoderwork/importLocal" (wire::QoderParams) -> Value;
-    QoderWorkAdoptCredential => "qoderwork/adoptCredential" (wire::QoderAdoptParams) -> Value;
-    QoderWorkModels => "qoderwork/models" (wire::QoderModelsParams) -> Value;
-    QoderWorkUsage => "qoderwork/usage" (wire::QoderParams) -> Value;
-    QoderWorkTranscribeAudio => "qoderwork/transcribeAudio" (wire::SubscriptionTranscribeParams) -> wire::SubscriptionTranscriptResult;
-    QoderWorkCancelTranscription => "qoderwork/cancelTranscription" (wire::SubscriptionCancelTranscriptionParams) -> wire::SubscriptionCancelTranscriptionResult;
-    QoderWorkGenerateImage => "qoderwork/generateImage" (wire::QoderImageParams) -> Value;
-    QoderWorkSetThinkingLevel => "qoderwork/setThinkingLevel" (wire::QoderThinkingParams) -> Value;
-
     /// The WorkBuddy subscription. Same endpoint-owned login and catalog shape as
     /// QwenWork, but the gateway signs nothing, so there is no `setThinkingLevel`
     /// side channel: the engine talks OpenAI chat completions to it directly and

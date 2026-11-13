@@ -85,10 +85,6 @@ pub(super) async fn resolve(
             super::qwenwork::set_config_root(&model_sources::config_root_of(config_path));
             model_sources::qwenwork_main_model(value, &params.model_tier_selections)
         }
-        "qoderwork" => {
-            super::qoderwork::set_config_root(&model_sources::config_root_of(config_path));
-            model_sources::qoderwork_main_model(value, &params.model_tier_selections)
-        }
         "cursor" => {
             super::cursor::set_config_root(&model_sources::config_root_of(config_path));
             model_sources::cursor_main_model(value, &params.model_tier_selections).await?

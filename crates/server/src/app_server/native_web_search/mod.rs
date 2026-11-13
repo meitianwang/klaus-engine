@@ -42,7 +42,6 @@ pub fn source_backend_factory() -> WebSearchBackendFactory {
             source,
             Some(
                 "qoder"
-                    | "qoderwork"
                     | "bailian"
                     | "cursor"
                     | "workbuddy"
@@ -71,7 +70,6 @@ pub fn source_backend_factory() -> WebSearchBackendFactory {
             Some("antigravity") => Some(super::antigravity::search_backend()),
             Some("codex") => Some(codex::backend(config.access)),
             Some("qoder") => Some(qoder::backend(qoder::Source::Qoder)),
-            Some("qoderwork") => Some(qoder::backend(qoder::Source::QoderWork)),
             Some("bailian") => Some(bailian::backend()),
             Some("cursor") => Some(cursor::backend()),
             Some("workbuddy") => Some(workbuddy::backend()),
@@ -111,7 +109,6 @@ mod tests {
             "subscription",
             "codex",
             "qoder",
-            "qoderwork",
             "bailian",
             "cursor",
             "workbuddy",
@@ -139,7 +136,6 @@ mod tests {
         let factory = source_backend_factory();
         for source in [
             "qoder",
-            "qoderwork",
             "bailian",
             "cursor",
             "workbuddy",
@@ -233,12 +229,6 @@ mod tests {
     #[ignore = "live network call against the real Qoder subscription"]
     async fn live_qoder_search() {
         live_search("qoder").await;
-    }
-
-    #[tokio::test]
-    #[ignore = "live network call against the real QoderWork subscription"]
-    async fn live_qoderwork_search() {
-        live_search("qoderwork").await;
     }
 
     #[tokio::test]

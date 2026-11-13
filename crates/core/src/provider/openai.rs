@@ -398,7 +398,7 @@ pub fn local_bridge_fast_mode(
     enabled: bool,
 ) -> Option<bool> {
     (api == OpenAiApi::Chat
-        && matches!(source, Some("qoder" | "qoderwork"))
+        && source == Some("qoder")
         && dialect == OpenAiReasoningDialect::Qoder
         && base_url.is_some_and(|base| {
             url::Url::parse(base).ok().is_some_and(|url| {
@@ -6991,7 +6991,7 @@ mod tests {
     /// developer role, so it cannot become the latest human request.
     #[test]
     fn bridge_fast_mode_scope_requires_a_supported_source_chat_dialect_and_loopback() {
-        for source in ["qoder", "qoderwork"] {
+        for source in ["qoder"] {
             for enabled in [true, false] {
                 assert_eq!(
                     local_bridge_fast_mode(

@@ -82,8 +82,6 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("AntigravityCancelOperation", Reach::Withheld("The CLI does not start standalone source operations")),
     ("QoderTranscribeAudio", Reach::Withheld("The CLI does not record standalone dictation audio")),
     ("QoderCancelTranscription", Reach::Withheld("The CLI does not start standalone dictation operations")),
-    ("QoderWorkTranscribeAudio", Reach::Withheld("The CLI does not record standalone dictation audio")),
-    ("QoderWorkCancelTranscription", Reach::Withheld("The CLI does not start standalone dictation operations")),
     ("CursorStatus", Reach::Withheld("The CLI has no Cursor account-management command")),
     ("CursorLoginStart", Reach::Withheld("The CLI has no account browser-login command")),
     ("CursorLoginPoll", Reach::Withheld("The CLI does not poll account login flows")),
@@ -510,49 +508,6 @@ const COVERAGE: &[(&str, Reach)] = &[
     ),
     (
         "QwenWorkSetThinkingLevel",
-        Reach::Withheld(
-            "`klaus` has no thinking-tier surface to push; the level comes from the engine's own config",
-        ),
-    ),
-    // ---- The QoderWork subscription ----------------------------------------
-    (
-        "QoderWorkStatus",
-        Reach::Withheld("the CLI has no QoderWork account-management surface"),
-    ),
-    (
-        "QoderWorkLoginStart",
-        Reach::Withheld("the CLI has no QoderWork device-login command"),
-    ),
-    (
-        "QoderWorkLoginPoll",
-        Reach::Withheld("the CLI has no QoderWork device-login command"),
-    ),
-    (
-        "QoderWorkLogout",
-        Reach::Withheld("the CLI has no QoderWork account-management surface"),
-    ),
-    (
-        "QoderWorkImportLocal",
-        Reach::Withheld("the CLI has no QoderWork account-management surface"),
-    ),
-    (
-        "QoderWorkAdoptCredential",
-        Reach::Withheld("the CLI host has no desktop safeStorage capability"),
-    ),
-    (
-        "QoderWorkModels",
-        Reach::Withheld("`klaus` lists no provider catalogs; `--model` takes an id"),
-    ),
-    (
-        "QoderWorkUsage",
-        Reach::Withheld("`klaus` draws no quota gauge, so it has nothing to fill"),
-    ),
-    (
-        "QoderWorkGenerateImage",
-        Reach::Withheld("the CLI hosts no dynamic tool registry, so it generates no images"),
-    ),
-    (
-        "QoderWorkSetThinkingLevel",
         Reach::Withheld(
             "`klaus` has no thinking-tier surface to push; the level comes from the engine's own config",
         ),
