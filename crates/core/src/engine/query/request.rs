@@ -145,14 +145,13 @@ pub(super) fn render_stop_hook_continuation(
     render_query_envelope_producer(QueryEnvelopeProducer::StopHookContinuation, text, profile)
 }
 
-/// The continuation nudge for a response cut off WITH visible text on screen.
-///
-/// The sentence is addressed to the model: it has to read "break your work into
-/// smaller pieces" as an instruction to change shape, not just resume.
+/// The continuation nudge for a response cut off WITH visible text on screen:
+/// resume and finish, and re-open any code fence or table header the cut left
+/// unclosed so the continued text stays well-formed.
 pub(super) fn render_truncation_continuation(profile: &ProviderBehaviorProfile) -> RuntimeString {
     render_query_envelope_producer(
         QueryEnvelopeProducer::TruncationContinuation,
-        "Your response was cut off because it exceeded the output token limit. Please break your work into smaller pieces. Continue from where you left off.".into(),
+        "Your response was cut off because it exceeded the output token limit. Continue from where you left off and finish the response. Start a new code fence or table header first if you were inside one.".into(),
         profile,
     )
 }
@@ -161,13 +160,15 @@ pub(super) fn render_truncation_continuation(profile: &ProviderBehaviorProfile) 
 /// whole budget went to reasoning the user never sees.
 ///
 /// Injected as a reminder rather than as a bare instruction so the model treats
-/// it as harness guidance about its own output shape.
+/// it as harness guidance about its own output shape. The wording states that
+/// the lost reasoning is NOT part of the conversation, so the model resumes
+/// from the visible context instead of trying to continue invisible thoughts.
 pub(super) fn render_reasoning_over_limit_reminder(
     profile: &ProviderBehaviorProfile,
 ) -> RuntimeString {
     render_query_envelope_producer(
         QueryEnvelopeProducer::ReasoningOverLimit,
-        "Please keep your thinking concise and avoid overly long reasoning chains. Focus on the key steps and respond directly.".into(),
+        "Output token limit hit while you were still reasoning, before this response produced any text or tool call. That reasoning was not kept and is not part of this conversation, so there is nothing to resume. Continue from the conversation above: reason much more briefly and produce your answer or next tool call well within the output limit.".into(),
         profile,
     )
 }

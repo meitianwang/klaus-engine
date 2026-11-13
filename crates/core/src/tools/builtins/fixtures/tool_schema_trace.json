@@ -1202,6 +1202,10 @@
           "pages": {
             "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
             "type": "string"
+          },
+          "allow_large": {
+            "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+            "type": "boolean"
           }
         },
         "required": [

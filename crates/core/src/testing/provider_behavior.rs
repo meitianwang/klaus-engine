@@ -5535,7 +5535,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "19fcb71d1244143413b8a1ce7b0edfeed499b4eef9308331449e97467be5d75e";
+    "73e39daa21437118d4db35e292204eedfc1723777036cff8fb322f3ea3f4b761";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -12278,13 +12278,13 @@ fn reconstruct_bash_outcome(
     let key = RuntimeString::from_utf8(&format!(".klaus/tool-results/bash-{name}.txt"));
     let note = if capture.elided_bytes > 0 {
         RuntimeString::from_utf8(&format!(
-            "\n\nTool output was truncated. The captured {} chars (head and tail of a larger stream; {} middle bytes were dropped during capture and are unrecoverable) were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
+            "\n\nTool output was truncated. The captured {} chars (head and tail of a larger stream; {} middle bytes were dropped during capture and are unrecoverable) were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt. Answer from the output shown if it is enough. A summary or a count needs the whole result, so open the saved file for that. If you cannot open it, or your answer rests on only part of the result, say so.",
             output.len_utf16(),
             capture.elided_bytes
         ))
     } else {
         RuntimeString::from_utf8(&format!(
-            "\n\nTool output was truncated. The full {} chars were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
+            "\n\nTool output was truncated. The full {} chars were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt. Answer from the output shown if it is enough. A summary or a count needs the whole result, so open the saved file for that. If you cannot open it, or your answer rests on only part of the result, say so.",
             output.len_utf16()
         ))
     };

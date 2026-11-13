@@ -1639,6 +1639,19 @@ async fn stream_and_dispatch_inner(
     } else {
         None
     };
+    // When the cut is confirmed to be the output token limit, say
+    // so explicitly — the call did not run, nothing of it was kept, and the
+    // retry should be shorter and split. An ordinary malformed call (no limit
+    // involved) keeps its own wording.
+    let dropped_base_message = if tool_output_over_limit {
+        RuntimeString::from(
+            "Your response was cut off because it exceeded the output token limit. The cut fell inside a tool call, so that call did not run and nothing of it was kept. Make the call again in a shorter response: split long content across several smaller tool calls. For a long file, write the first part and then append the rest in later calls.",
+        )
+    } else {
+        RuntimeString::from(
+            "This tool call was dropped: its arguments arrived incomplete, so they cannot be read. Issue the call again, on its own if it is long.",
+        )
+    };
     let mut tool_results = Vec::with_capacity(dropped.len());
     for (index, call) in dropped.iter().enumerate() {
         // Keep the original lifecycle order while awaiting each acknowledgement.
@@ -1650,9 +1663,7 @@ async fn stream_and_dispatch_inner(
         tool_results.push(truncated_call_result(
             call,
             shared,
-            RuntimeString::from(
-                "This tool call was dropped: its arguments arrived incomplete, so they cannot be read. Issue the call again, on its own if it is long.",
-            ),
+            dropped_base_message.clone(),
             &extra,
         ).await);
     }

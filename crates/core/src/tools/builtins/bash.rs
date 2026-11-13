@@ -204,10 +204,16 @@ pub(crate) fn render_bash_outcome_text(
     // surrogates from lossy sources) has no UTF-8 length and passes through
     // unchanged instead of being corrupted by a lossy rewrite.
     let mut total_lines_section = None;
+    let mut head_section: Option<String> = None;
     let mut truncated = false;
     let body = match content.try_to_utf8() {
         Ok(utf8) if utf8.len() > policy.byte_budget() => {
             let total_lines = utf8.lines().count();
+            // Head preview: the visible body keeps the newest tail,
+            // so quote the OLDEST slice in the metadata header (before
+            // `Output:`), where tail truncation cannot remove it. The head is
+            // what tells the model whether the saved file is worth opening.
+            head_section = Some(bash_head_preview(&utf8));
             // Truncate the command output alone and re-prepend the failure
             // context: tail truncation elides the head, so a prefix inside
             // the truncated body would be the first thing lost.
@@ -245,6 +251,13 @@ pub(crate) fn render_bash_outcome_text(
         text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
     }
     if let Some(section) = capture_note_section {
+        text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
+    }
+    if let Some(snippet) = head_section {
+        let section = format!(
+            "Oldest output (first {} chars):\n{snippet}",
+            snippet.chars().count()
+        );
         text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
     }
     (
@@ -305,10 +318,32 @@ async fn spill_truncated_bash_output(
     }
 }
 
+/// Oldest-output preview quoted in the metadata header of a truncated command
+/// result: the first [`BASH_HEAD_PREVIEW_CHARS`] characters of the captured
+/// text, shortened to the last line boundary inside the second half of the
+/// window so the preview does not end mid-line. A pure function of the
+/// recorded output, so contract replay re-renders the exact text.
+const BASH_HEAD_PREVIEW_CHARS: usize = 2_000;
+fn bash_head_preview(utf8: &str) -> String {
+    let mut chars: Vec<char> = utf8.chars().take(BASH_HEAD_PREVIEW_CHARS).collect();
+    if chars.len() == BASH_HEAD_PREVIEW_CHARS {
+        if let Some(cut) = chars
+            .iter()
+            .rposition(|c| *c == '\n')
+            .filter(|pos| *pos >= BASH_HEAD_PREVIEW_CHARS / 2)
+        {
+            chars.truncate(cut);
+        }
+    }
+    chars.into_iter().collect()
+}
+
 /// The reference note appended to a truncated command's model-visible text.
 /// When the capture buffer itself dropped bytes, the note says the saved file
 /// holds the captured head and tail — not the complete stream — so the model
-/// never treats a capture window as the full output.
+/// never treats a capture window as the full output. The guidance is neutral:
+/// it tells the model when opening the file is worth it instead of
+/// discouraging the read outright.
 fn bash_spill_note(full_chars: usize, elided_bytes: usize, path: &RuntimePath) -> RuntimeString {
     let lead = if elided_bytes > 0 {
         format!(
@@ -320,7 +355,7 @@ fn bash_spill_note(full_chars: usize, elided_bytes: usize, path: &RuntimePath) -
     RuntimeString::from_utf8(&lead)
         .concat(path.as_runtime_string())
         .concat(&RuntimeString::from(
-            "; read it only if the omitted content is needed.",
+            ". Answer from the output shown if it is enough. A summary or a count needs the whole result, so open the saved file for that. If you cannot open it, or your answer rests on only part of the result, say so.",
         ))
 }
 
@@ -1298,15 +1333,26 @@ mod tests {
         let text = text.try_to_utf8().unwrap();
         // The body totals 18,890 bytes; the retained newest 10,000 start
         // exactly at "line 1000", and the elided head is marked with its
-        // size.
+        // size. The metadata header now also quotes the oldest slice, so the
+        // "elided head is gone" checks are scoped to the body.
         assert!(
             text.starts_with(
-                "Exit code: 0\nWall time: 0 seconds\nTotal output lines: 2000\nOutput:\n…8890 chars truncated…line 1000\n"
+                "Exit code: 0\nWall time: 0 seconds\nTotal output lines: 2000\nOldest output (first "
             ),
             "{text}"
         );
-        assert!(text.ends_with("line 1999\n"), "{text}");
-        assert!(!text.contains("line 0\n"), "{text}");
+        assert!(
+            text.contains("chars):\nline 0\nline 1\n"),
+            "the head preview quotes the oldest lines: {text}"
+        );
+        let body =
+            &text[text.find("\nOutput:\n").expect("body label") + "\nOutput:\n".len()..];
+        assert!(
+            body.starts_with("…8890 chars truncated…line 1000\n"),
+            "{body}"
+        );
+        assert!(body.ends_with("line 1999\n"), "{body}");
+        assert!(!body.contains("line 999\n"), "{body}");
     }
 
     #[test]
@@ -1401,7 +1447,7 @@ mod tests {
         );
         assert!(full.contains("bash-0011223344556677.txt"), "{full}");
         assert!(
-            full.ends_with("; read it only if the omitted content is needed."),
+            full.ends_with("If you cannot open it, or your answer rests on only part of the result, say so."),
             "{full}"
         );
         let elided = bash_spill_note(1234, 99, &path).try_to_utf8().unwrap();
@@ -1412,8 +1458,65 @@ mod tests {
             "{elided}"
         );
         assert!(
-            elided.ends_with("; read it only if the omitted content is needed."),
+            elided.ends_with("If you cannot open it, or your answer rests on only part of the result, say so."),
             "{elided}"
+        );
+    }
+
+    #[test]
+    fn truncated_outcome_quotes_the_oldest_output_in_the_header() {
+        let output = rs(format!("{}\nTAIL", "x".repeat(20_000)));
+        let (text, _, truncated) = render_bash_outcome_text(
+            &output,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::default(),
+        );
+        assert!(truncated);
+        let text = text.try_to_utf8().unwrap();
+        // The oldest slice is quoted in the metadata header, above the tail
+        // body, so one look tells the model what the saved file starts with.
+        let head_at = text.find("Oldest output (first ").expect("head section");
+        let output_at = text.find("Output:\n").expect("body label");
+        assert!(head_at < output_at, "{text}");
+        assert!(
+            text[head_at..].starts_with("Oldest output (first 2000 chars):\nxxxx"),
+            "{}",
+            &text[head_at..head_at + 60]
+        );
+    }
+
+    #[test]
+    fn head_preview_prefers_a_line_boundary_and_reports_its_true_length() {
+        let output = rs("line\n".repeat(5_000)); // 25_000 chars, newline every 5
+        let (text, _, truncated) = render_bash_outcome_text(
+            &output,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::default(),
+        );
+        assert!(truncated);
+        let text = text.try_to_utf8().unwrap();
+        let head_at = text.find("Oldest output (first ").expect("head section");
+        let after = &text[head_at..];
+        // The cut walks back to the last newline inside the second half of the
+        // window: 400 full "line\n" groups fill 2000 chars, so the preview
+        // keeps 399 groups plus "line" — 1999 chars, no dangling newline.
+        assert!(
+            after.starts_with("Oldest output (first 1999 chars):\n"),
+            "{}",
+            &after[..60]
+        );
+        let snippet_end = after.find("\nOutput:\n").expect("body follows");
+        assert!(
+            after[..snippet_end].ends_with("line"),
+            "snippet ends on a line boundary"
         );
     }
 

@@ -436,7 +436,7 @@
       "style": "anthropic",
       "name": "Read",
       "sourceSha256": "5ed1e346ee040129d31ed65e1780c0cae4d2f6020cb04d00c2bc3d30f3d4197b",
-      "targetSha256": "c79c993f529a67618b7bb3ea971ab0ee3025da732419d6140642c469ac2e23b3",
+      "targetSha256": "1abea16d861aa556fc18f7bd6bb952afc3a651a838636de0945470969ff277ee",
       "source": {
         "name": "Read",
         "description": "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image; other binary files are refused. For a large file, read only the range you need with offset/limit rather than the whole file; do not re-read a file you just edited to verify — edit/write already error if a write fails.\n\n<system-reminder>\nCall `Read` with `file_path`. Use `offset` and `limit` for large text files instead of reading the whole file.\n</system-reminder>",
@@ -495,6 +495,10 @@
             "pages": {
               "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
               "type": "string"
+            },
+            "allow_large": {
+              "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -1168,7 +1172,7 @@
       "style": "generic",
       "name": "read",
       "sourceSha256": "ffb4520dc64f8a4ccbd70fb8e1ac7f4a364b5660e6c3b27a365437ed68805dbd",
-      "targetSha256": "4bbefa77d2051b8876cfc2fa4f9b9835401e269827bf1d115ed04c4b0ed078a5",
+      "targetSha256": "8b6be1197f40f45821fa690cccd4425c37c25bb6465d3b1798aff1a0b55f3e9c",
       "source": {
         "name": "read",
         "description": "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image; other binary files are refused. For a large file, read only the range you need with offset/limit rather than the whole file; do not re-read a file you just edited to verify — edit/write already error if a write fails.",
@@ -1227,6 +1231,10 @@
             "pages": {
               "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
               "type": "string"
+            },
+            "allow_large": {
+              "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -1876,7 +1884,7 @@
       "style": "openai",
       "name": "read",
       "sourceSha256": "ffb4520dc64f8a4ccbd70fb8e1ac7f4a364b5660e6c3b27a365437ed68805dbd",
-      "targetSha256": "4bbefa77d2051b8876cfc2fa4f9b9835401e269827bf1d115ed04c4b0ed078a5",
+      "targetSha256": "8b6be1197f40f45821fa690cccd4425c37c25bb6465d3b1798aff1a0b55f3e9c",
       "source": {
         "name": "read",
         "description": "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image; other binary files are refused. For a large file, read only the range you need with offset/limit rather than the whole file; do not re-read a file you just edited to verify — edit/write already error if a write fails.",
@@ -1935,6 +1943,10 @@
             "pages": {
               "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
               "type": "string"
+            },
+            "allow_large": {
+              "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+              "type": "boolean"
             }
           },
           "required": [

@@ -47,7 +47,8 @@ const DEFAULT_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// The static, model-facing description (becomes the ToolSpec description).
 const READ_DESCRIPTION: &str = "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image. Small PDFs can be delivered natively when the model supports PDFs; use pages with a bounded, 1-based range to render selected PDF pages as images when needed (requires vision). Large PDFs require selected page ranges. Other binary formats are refused. For a large text file, read only the range you need with offset/limit rather than the whole file. Avoid redundant reads solely to confirm that a successful edit/write call completed; inspect the current contents when needed to validate the requested behavior, resolve uncertainty, or account for concurrent changes.";
-const INPUT_SCHEMA_PROPERTY_ORDER: &[&str] = &["path", "offset", "limit", "pages"];
+const INPUT_SCHEMA_PROPERTY_ORDER: &[&str] =
+    &["path", "offset", "limit", "pages", "allow_large"];
 
 /// Options controlling the read tool's size/token caps.
 #[derive(Debug, Clone, Default)]
@@ -88,6 +89,7 @@ pub fn create_read_tool_with_options(opts: ReadToolOptions) -> Arc<dyn Tool> {
 
 /// Build the tool's input JSON Schema (the exact normalized shape the model sees).
 fn build_input_schema() -> JsonSchema {
+    let allow_large_desc = "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.";
     let pages_desc = format!(
         "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most {PDF_MAX_PAGES_PER_READ} pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it."
     );
@@ -113,6 +115,10 @@ fn build_input_schema() -> JsonSchema {
             "pages": {
                 "description": pages_desc,
                 "type": "string"
+            },
+            "allow_large": {
+                "description": allow_large_desc,
+                "type": "boolean"
             }
         },
         "required": ["path"],
@@ -202,6 +208,11 @@ impl Tool for ReadTool {
         let offset = input.get("offset").and_then(json_positive_integer);
         let limit = input.get("limit").and_then(json_positive_integer);
         let pages = input.get("pages").and_then(RuntimeJson::as_string).cloned();
+        // Escape hatch: one-shot whole read past the token cap.
+        let allow_large = input
+            .get("allow_large")
+            .and_then(RuntimeJson::as_bool)
+            .unwrap_or(false);
 
         let abs = resolve_runtime(&ctx.cwd, &[RuntimePath::from(path.clone())])
             .map_err(|error| ToolError::new(runtime_to_host_summary(error.message())))?;
@@ -639,12 +650,19 @@ impl Tool for ReadTool {
         };
         let raw_slice = join_runtime(&all_lines[start..end], "\n");
         let output_tokens = raw_slice.to_node_utf8().len().div_ceil(bytes_per_token);
-        if output_tokens > self.max_tokens {
+        // Escape hatch: allow_large returns the whole file (or whole
+        // requested range) in one call, bounded by the same hard byte cap that
+        // gates a limit-less read — beyond that only shell extraction remains.
+        let whole_read_allowed =
+            allow_large && (raw_slice.to_node_utf8().len() as u64) <= self.max_bytes;
+        if output_tokens > self.max_tokens && !whole_read_allowed {
             let ranged = offset.is_some() || limit.is_some();
-            let how = if ranged {
-                "Request a smaller range with offset and limit."
+            let how = if allow_large {
+                "Even a whole read cannot exceed the byte cap; extract part of it with a shell command (e.g. sed -n)."
+            } else if ranged {
+                "Request a smaller range with offset and limit. Only if you genuinely need this whole range, call read again with allow_large: true, which returns it whole when it still fits in your context."
             } else {
-                "Read a section with the offset and limit parameters, or search it with grep."
+                "Read a section with the offset and limit parameters, or search it with grep. Only if you genuinely need all of it, call read again with allow_large: true, which reads it whole when it still fits in your context."
             };
             let range_word = if ranged { "this range of " } else { "" };
             return Ok(text_result(
@@ -691,7 +709,7 @@ impl Tool for ReadTool {
         // Goal-owned snapshot reads keep their complete-text contract: a
         // confined session must see the entire objective body in one read, so
         // the model-visible budget does not apply to them.
-        let numbered = if goal_snapshot.is_some() {
+        let numbered = if goal_snapshot.is_some() || whole_read_allowed {
             numbered
         } else {
             let (truncated, read_truncated) =
@@ -1209,12 +1227,104 @@ mod tests {
                 "pages": {
                     "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
                     "type": "string"
+                },
+                "allow_large": {
+                    "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+                    "type": "boolean"
                 }
             },
             "required": ["path"],
             "additionalProperties": false
         });
         assert_eq!(tool.input_schema(), runtime(expected));
+    }
+
+    #[tokio::test]
+    async fn token_refusal_points_at_the_allow_large_escape_hatch() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let abs = dir.join("big.txt");
+        std::fs::write(&abs, "word ".repeat(3_000)).unwrap();
+        let ctx = make_ctx(&cwd, Arc::new(RecordingFileState::default()), None);
+        let tool = create_read_tool_with_options(ReadToolOptions {
+            max_tokens: Some(50),
+            ..Default::default()
+        });
+        let res = tool
+            .call(
+                runtime(json!({ "path": abs.to_string_lossy() })),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(true));
+        let text = text_of(&res).try_to_utf8().unwrap();
+        assert!(
+            text.contains(
+                "call read again with allow_large: true, which reads it whole when it still fits in your context."
+            ),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn allow_large_returns_the_whole_text_without_the_visible_budget() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let abs = dir.join("big.txt");
+        std::fs::write(&abs, "word ".repeat(3_000)).unwrap();
+        let ctx = make_ctx(&cwd, Arc::new(RecordingFileState::default()), None);
+        let tool = create_read_tool_with_options(ReadToolOptions {
+            max_tokens: Some(50),
+            ..Default::default()
+        });
+        let res = tool
+            .call(
+                runtime(json!({ "path": abs.to_string_lossy(), "allow_large": true })),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(false));
+        let text = text_of(&res).try_to_utf8().unwrap();
+        // Whole file in one call: no refusal, no in-tool truncation marker,
+        // and the very end of the file is present.
+        assert!(!text.contains("Content truncated."), "{:.120}", text);
+        assert!(!text.contains("over the "), "{:.120}", text);
+        assert!(text.ends_with("word "), "{:.120}", &text[text.len().saturating_sub(60)..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn allow_large_still_refuses_beyond_the_byte_cap() {
+        let dir = temp_dir();
+        let cwd = dir.to_string_lossy().into_owned();
+        let abs = dir.join("big.txt");
+        std::fs::write(&abs, "word ".repeat(400)).unwrap();
+        let ctx = make_ctx(&cwd, Arc::new(RecordingFileState::default()), None);
+        let tool = create_read_tool_with_options(ReadToolOptions {
+            max_bytes: Some(1_000),
+            max_tokens: Some(50),
+            ..Default::default()
+        });
+        let res = tool
+            .call(
+                runtime(json!({ "path": abs.to_string_lossy(), "limit": 1, "allow_large": true })),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.serializable.is_error, Some(true));
+        let text = text_of(&res).try_to_utf8().unwrap();
+        assert!(
+            text.contains("Even a whole read cannot exceed the byte cap"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1586,7 +1696,7 @@ mod tests {
         assert_eq!(
             text_of(&res),
             format!(
-                "Reading {abs} would return ~3 tokens, over the 1-token read limit. Read a section with the offset and limit parameters, or search it with grep."
+                "Reading {abs} would return ~3 tokens, over the 1-token read limit. Read a section with the offset and limit parameters, or search it with grep. Only if you genuinely need all of it, call read again with allow_large: true, which reads it whole when it still fits in your context."
             )
         );
         std::fs::remove_dir_all(&dir).ok();

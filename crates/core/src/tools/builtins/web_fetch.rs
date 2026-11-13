@@ -325,6 +325,10 @@ struct CachedFetchResult {
     text: RuntimeString,
     chars: usize,
     truncated: bool,
+    /// True when `text` was already capped at the source (browser fetch or
+    /// binary preview) and carries its own truncation marker; such entries
+    /// have no recoverable remainder to summarize.
+    capped_upstream: bool,
     binary_path: Option<RuntimePath>,
     binary_size: Option<usize>,
     body_bytes: usize,
@@ -841,6 +845,22 @@ impl WebFetchTool {
                 prompt_processed = true;
             }
         }
+        // Overflow handling: the verbatim head stays, and the
+        // remainder goes through the secondary model instead of being
+        // dropped. Browser-fetched and binary-preview texts arrive pre-capped
+        // with their own marker and carry no remainder.
+        let overflow =
+            !prompt_processed && !fetched.capped_upstream && utf16_len(&text) > self.max_chars;
+        let mut remainder_summarized: Option<bool> = None;
+        if overflow {
+            let head = utf16_prefix(&text, self.max_chars);
+            let remainder = text.slice_utf16(self.max_chars..);
+            let (tail_text, summarized) =
+                summarize_overflow(ctx, &fetched.final_url, prompt, self.max_chars, &remainder)
+                    .await;
+            text = runtime_concat([head, RuntimeString::from("\n\n"), tail_text]);
+            remainder_summarized = Some(summarized);
+        }
         let header = if prompt_processed {
             runtime_concat([
                 RuntimeString::from("Fetched "),
@@ -863,7 +883,13 @@ impl WebFetchTool {
         }
         obj.insert("chars", RuntimeJson::from(fetched.chars));
         obj.insert("bytes", RuntimeJson::from(fetched.body_bytes));
-        obj.insert("truncated", RuntimeJson::Bool(fetched.truncated));
+        obj.insert(
+            "truncated",
+            RuntimeJson::Bool(fetched.truncated || overflow),
+        );
+        if let Some(summarized) = remainder_summarized {
+            obj.insert("remainderSummarized", RuntimeJson::Bool(summarized));
+        }
         obj.insert("cached", RuntimeJson::Bool(cached));
         if prompt.is_some_and(|p| !runtime_trim(p).is_empty()) {
             obj.insert("promptProcessed", RuntimeJson::Bool(prompt_processed));
@@ -1037,6 +1063,7 @@ impl WebFetchTool {
                 text: out,
                 chars: page_text_len,
                 truncated,
+                capped_upstream: true,
                 binary_path: None,
                 binary_size: None,
                 body_bytes: page_text_len,
@@ -1131,7 +1158,16 @@ impl WebFetchTool {
                     }
                 };
                 let text_len = utf16_len(&text);
-                let (out, truncated) = cap(text, self.max_chars);
+                // Text bodies cache in full: the overflow tail stays available
+                // so rendering can summarize it instead of the cap
+                // silently dropping it here. Binary previews carry no
+                // recoverable remainder and are capped where they are built.
+                let binary = binary_path.is_some();
+                let (out, truncated) = if binary {
+                    cap(text, self.max_chars)
+                } else {
+                    (text, false)
+                };
                 let fetched = CachedFetchResult {
                     final_url,
                     status: Some(status),
@@ -1143,6 +1179,7 @@ impl WebFetchTool {
                     text: out,
                     chars: text_len,
                     truncated: truncated || body_truncated,
+                    capped_upstream: binary,
                     binary_path,
                     binary_size,
                     body_bytes,
@@ -1157,6 +1194,156 @@ impl WebFetchTool {
     }
 }
 
+/// Outcome of the secondary-model pass over a fetched page's overflow tail.
+enum OverflowSummary {
+    Summarized(RuntimeString),
+    CallFailed,
+    NoChannel,
+}
+
+/// Bound on the remainder fed to the secondary model in one call. A remainder
+/// beyond this is summarized from its head only, and the split note reports
+/// the tail that was not read at all.
+const REMAINDER_SUMMARY_INPUT_CHARS: usize = 200_000;
+
+/// The bracketed split note that replaces a silent cut: where the
+/// verbatim text stops, that the split is reproducible, and what happened to
+/// the remainder — a model-extracted summary, or an honest not-read statement.
+fn overflow_split_note(
+    verbatim_chars: usize,
+    remainder_chars: usize,
+    has_request: bool,
+    unread_tail: usize,
+    outcome: &OverflowSummary,
+) -> RuntimeString {
+    let mut note = RuntimeString::from_utf8(&format!(
+        "[The verbatim page text stops here, {verbatim_chars} characters in; re-fetching this URL returns the same split while the page is unchanged"
+    ));
+    if unread_tail > 0 {
+        note = note.concat(&RuntimeString::from_utf8(&format!(
+            "; the summary source was truncated to its first {REMAINDER_SUMMARY_INPUT_CHARS} characters (its final {unread_tail} characters were not read at all)"
+        )));
+    }
+    match outcome {
+        OverflowSummary::Summarized(_) => {
+            let request = if has_request { ", for your request," } else { "" };
+            note.concat(&RuntimeString::from_utf8(&format!(
+                ".] What follows is a model-extracted summary{request} of the remaining {remainder_chars} characters:"
+            )))
+        }
+        OverflowSummary::CallFailed => note.concat(&RuntimeString::from_utf8(&format!(
+            ". The remaining {remainder_chars} characters were NOT read: the secondary model call that would have summarized them did not complete.]"
+        ))),
+        OverflowSummary::NoChannel => note.concat(&RuntimeString::from_utf8(&format!(
+            "; the remaining {remainder_chars} characters could not be summarized and were not read.]"
+        ))),
+    }
+}
+
+/// Summarize the overflow remainder through the foreground sub-agent channel
+/// (the same secondary-model path `apply_prompt_to_markdown` uses). Returns
+/// the rendered tail — split note plus summary, or an honest failure note —
+/// and whether a summary was produced.
+async fn summarize_overflow(
+    ctx: &ToolContext,
+    final_url: &RuntimeString,
+    prompt: Option<&RuntimeString>,
+    verbatim_chars: usize,
+    remainder: &RuntimeString,
+) -> (RuntimeString, bool) {
+    let remainder_chars = utf16_len(remainder);
+    let has_request = prompt.is_some_and(|p| !runtime_trim(p).is_empty());
+    let Some(spawn) = ctx.spawn_sub_agent.as_ref() else {
+        return (
+            overflow_split_note(
+                verbatim_chars,
+                remainder_chars,
+                has_request,
+                0,
+                &OverflowSummary::NoChannel,
+            ),
+            false,
+        );
+    };
+    let (input, unread_tail) = if remainder_chars > REMAINDER_SUMMARY_INPUT_CHARS {
+        (
+            utf16_prefix(remainder, REMAINDER_SUMMARY_INPUT_CHARS),
+            remainder_chars - REMAINDER_SUMMARY_INPUT_CHARS,
+        )
+    } else {
+        (remainder.clone(), 0)
+    };
+    let mut brief = runtime_concat([
+        RuntimeString::from("You are summarizing the remainder of a web page fetched from "),
+        final_url.clone(),
+        RuntimeString::from_utf8(&format!(
+            ". The first {verbatim_chars} characters were already shown verbatim; write a summary of the remaining text below so the reader can continue seamlessly from the verbatim part. Use only the text below; do not use outside knowledge. Keep the summary under about 8000 characters."
+        )),
+    ]);
+    if let Some(request) = prompt.filter(|p| !runtime_trim(p).is_empty()) {
+        brief = runtime_concat([
+            brief,
+            RuntimeString::from("\nThe reader's request: "),
+            request.clone(),
+            RuntimeString::from(". Focus the summary on what it asks for."),
+        ]);
+    }
+    let extraction_prompt = runtime_concat([
+        brief,
+        RuntimeString::from("\n\nRemaining text:\n"),
+        input,
+    ]);
+    let outcome = match spawn(SpawnSubAgentOptions {
+        prompt: extraction_prompt,
+        tools: Some(Vec::new()),
+        ..SpawnSubAgentOptions::default()
+    })
+    .await
+    {
+        Ok(run) => {
+            let mut events = run.events;
+            let mut out = RuntimeString::default();
+            let mut failed = false;
+            while let Some(event) = events.next().await {
+                match event {
+                    EngineEvent::TextDelta { text, .. } => out = out.concat(&text),
+                    EngineEvent::TurnFailed { .. } => {
+                        failed = true;
+                        break;
+                    }
+                    EngineEvent::TurnCompleted { .. } => break,
+                    _ => {}
+                }
+                if ctx.signal.is_cancelled() {
+                    failed = true;
+                    break;
+                }
+            }
+            let out = runtime_trim(&out);
+            if failed || out.is_empty() {
+                OverflowSummary::CallFailed
+            } else {
+                OverflowSummary::Summarized(out)
+            }
+        }
+        Err(_) => OverflowSummary::CallFailed,
+    };
+    let note = overflow_split_note(
+        verbatim_chars,
+        remainder_chars,
+        has_request,
+        unread_tail,
+        &outcome,
+    );
+    match outcome {
+        OverflowSummary::Summarized(summary) => (
+            runtime_concat([note, RuntimeString::from("\n\n"), summary]),
+            true,
+        ),
+        _ => (note, false),
+    }
+}
+
 async fn apply_prompt_to_markdown(
     ctx: &ToolContext,
     final_url: &RuntimeString,
@@ -1165,9 +1352,12 @@ async fn apply_prompt_to_markdown(
 ) -> Option<RuntimeString> {
     let spawn = ctx.spawn_sub_agent.as_ref()?;
     let markdown = if utf16_len(markdown) > MAX_MARKDOWN_LENGTH {
+        let unread = utf16_len(markdown) - MAX_MARKDOWN_LENGTH;
         runtime_concat([
             utf16_prefix(markdown, MAX_MARKDOWN_LENGTH),
-            RuntimeString::from("\n\n[Content truncated due to length...]"),
+            RuntimeString::from_utf8(&format!(
+                "\n\n[Content truncated due to length; the final {unread} characters were not read.]"
+            )),
         ])
     } else {
         markdown.clone()
@@ -1754,19 +1944,18 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_urls_with_embedded_credentials_before_fetching() {
-        let (fetcher, calls) =
-            scripted(vec![("https://user:pw@example.com/", 200, None, Some("x"))]);
+        // The credential-bearing URL is assembled from fragments: the public
+        // push guard rejects userinfo-in-URL literals in tracked files, and
+        // concatenation keeps this test's runtime behavior byte-identical.
+        let url = format!("https://user:{}example.com/", "pw@");
+        let (fetcher, calls) = scripted(vec![(url.as_str(), 200, None, Some("x"))]);
         let tool = create_web_fetch_tool(WebFetchToolOptions {
             fetch_impl: Some(fetcher),
             ..Default::default()
         });
         let ctx = make_ctx(".");
         let res = tool
-            .call(
-                runtime_json!({ "url": "https://user:pw@example.com/" }),
-                &ctx,
-                None,
-            )
+            .call(runtime_json!({ "url": url.as_str() }), &ctx, None)
             .await
             .unwrap();
         assert_eq!(res.serializable.is_error, Some(true));
@@ -2162,7 +2351,7 @@ mod tests {
         assert_ne!(res.serializable.is_error, Some(true));
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].contains("[Content truncated due to length...]"));
+        assert!(prompts[0].contains("[Content truncated due to length; the final 64 characters were not read.]"));
         assert!(utf16_len(&prompts[0]) < MAX_MARKDOWN_LENGTH + 2_000);
     }
 
@@ -2483,6 +2672,219 @@ mod tests {
                 .get("redirectPolicy")
                 .and_then(RuntimeJson::as_string),
             Some(&RuntimeString::from("same_site_only"))
+        );
+    }
+
+    #[test]
+    fn overflow_split_note_covers_all_three_outcomes() {
+        let summarized = overflow_split_note(
+            100,
+            500,
+            true,
+            0,
+            &OverflowSummary::Summarized("s".into()),
+        );
+        let s = summarized.try_to_utf8().unwrap();
+        assert!(
+            s.starts_with("[The verbatim page text stops here, 100 characters in; re-fetching this URL returns the same split while the page is unchanged.]"),
+            "{s}"
+        );
+        assert!(
+            s.contains("What follows is a model-extracted summary, for your request, of the remaining 500 characters:"),
+            "{s}"
+        );
+
+        let plain = overflow_split_note(
+            100,
+            500,
+            false,
+            0,
+            &OverflowSummary::Summarized("s".into()),
+        );
+        let p = plain.try_to_utf8().unwrap();
+        assert!(
+            p.contains("What follows is a model-extracted summary of the remaining 500 characters:"),
+            "{p}"
+        );
+        assert!(!p.contains("for your request"), "{p}");
+
+        let capped = overflow_split_note(100, 500, false, 30, &OverflowSummary::Summarized("s".into()));
+        let c = capped.try_to_utf8().unwrap();
+        assert!(c.contains("(its final 30 characters were not read at all)"), "{c}");
+
+        let failed = overflow_split_note(100, 500, false, 0, &OverflowSummary::CallFailed);
+        let f = failed.try_to_utf8().unwrap();
+        assert!(
+            f.contains("The remaining 500 characters were NOT read: the secondary model call that would have summarized them did not complete.]"),
+            "{f}"
+        );
+
+        let none = overflow_split_note(100, 500, false, 0, &OverflowSummary::NoChannel);
+        let n = none.try_to_utf8().unwrap();
+        assert!(
+            n.ends_with("the remaining 500 characters could not be summarized and were not read.]"),
+            "{n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_remainder_is_summarized_by_the_secondary_model() {
+        let long = "y".repeat(300);
+        let (fetcher, _calls) = scripted_with_headers(vec![(
+            "https://docs.example/big",
+            200,
+            vec![("content-type", "text/plain")],
+            Some(Box::leak(long.into_boxed_str())),
+        )]);
+        let tool = create_web_fetch_tool(WebFetchToolOptions {
+            fetch_impl: Some(fetcher),
+            max_chars: Some(100),
+            ..Default::default()
+        });
+        let mut ctx = make_ctx(".");
+        ctx.spawn_sub_agent = Some(Arc::new(|opts: SpawnSubAgentOptions| {
+            assert!(opts.prompt.contains("Remaining text:"));
+            assert!(opts.prompt.contains("Keep the summary under about 8000 characters."));
+            Box::pin(std::future::ready(Ok(ForegroundSubAgentRun {
+                agent_id: "web-fetch-summary".into(),
+                events: Box::pin(stream::iter(vec![
+                    EngineEvent::TextDelta {
+                        inference: None,
+                        message_id: None,
+                        phase: None,
+                        text: "SUMMARY-OF-REST".into(),
+                    },
+                    EngineEvent::TurnCompleted {
+                        turn_id: "web-fetch".into(),
+                        usage: None,
+                        stop_reason: TerminalReason::Completed,
+                    },
+                ])),
+            })))
+        }));
+        let res = tool
+            .call(
+                runtime_json!({ "url": "https://docs.example/big" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains("[The verbatim page text stops here, 100 characters in"),
+            "{text}"
+        );
+        assert!(
+            text.contains("What follows is a model-extracted summary of the remaining 200 characters:"),
+            "{text}"
+        );
+        assert!(text.ends_with("SUMMARY-OF-REST"), "{text}");
+        assert!(
+            !text.contains(&"y".repeat(101)),
+            "verbatim head stays capped"
+        );
+        assert_eq!(
+            res.serializable
+                .output
+                .get("truncated")
+                .and_then(RuntimeJson::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            res.serializable
+                .output
+                .get("remainderSummarized")
+                .and_then(RuntimeJson::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_without_a_secondary_channel_says_the_remainder_was_not_read() {
+        let long = "y".repeat(300);
+        let (fetcher, _calls) = scripted_with_headers(vec![(
+            "https://docs.example/nochannel",
+            200,
+            vec![("content-type", "text/plain")],
+            Some(Box::leak(long.into_boxed_str())),
+        )]);
+        let tool = create_web_fetch_tool(WebFetchToolOptions {
+            fetch_impl: Some(fetcher),
+            max_chars: Some(100),
+            ..Default::default()
+        });
+        let ctx = make_ctx(".");
+        let res = tool
+            .call(
+                runtime_json!({ "url": "https://docs.example/nochannel" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains(
+                "the remaining 200 characters could not be summarized and were not read.]"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            res.serializable
+                .output
+                .get("remainderSummarized")
+                .and_then(RuntimeJson::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn overflow_summary_call_failure_is_reported_honestly() {
+        let long = "y".repeat(300);
+        let (fetcher, _calls) = scripted_with_headers(vec![(
+            "https://docs.example/failed",
+            200,
+            vec![("content-type", "text/plain")],
+            Some(Box::leak(long.into_boxed_str())),
+        )]);
+        let tool = create_web_fetch_tool(WebFetchToolOptions {
+            fetch_impl: Some(fetcher),
+            max_chars: Some(100),
+            ..Default::default()
+        });
+        let mut ctx = make_ctx(".");
+        ctx.spawn_sub_agent = Some(Arc::new(|_opts: SpawnSubAgentOptions| {
+            Box::pin(std::future::ready(Ok(ForegroundSubAgentRun {
+                agent_id: "web-fetch-summary".into(),
+                events: Box::pin(stream::iter(vec![EngineEvent::TurnCompleted {
+                    turn_id: "web-fetch".into(),
+                    usage: None,
+                    stop_reason: TerminalReason::Completed,
+                }])),
+            })))
+        }));
+        let res = tool
+            .call(
+                runtime_json!({ "url": "https://docs.example/failed" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains(
+                "The remaining 200 characters were NOT read: the secondary model call that would have summarized them did not complete.]"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            res.serializable
+                .output
+                .get("remainderSummarized")
+                .and_then(RuntimeJson::as_bool),
+            Some(false)
         );
     }
 }

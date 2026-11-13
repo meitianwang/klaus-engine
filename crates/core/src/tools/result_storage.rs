@@ -173,10 +173,12 @@ where
     })]
 }
 
-/// Note leads an earlier spill appended: bash's own note and the provider
-/// styles rendered by `engine/query/result_trim.rs`.
-const SPILL_NOTE_LEADS: [&str; 3] = [
+/// Note leads an earlier spill appended: bash's own notes (full-stream and
+/// capture-window wordings) and the provider styles rendered by
+/// `engine/query/result_trim.rs`.
+const SPILL_NOTE_LEADS: [&str; 4] = [
     "Tool output was truncated. The full ",
+    "Tool output was truncated. The captured ",
     "The full output is ",
     "\u{2026} [output truncated; full ",
 ];
@@ -1011,6 +1013,12 @@ mod tests {
             "body\n\n\u{2026} [output truncated; full 9000 chars saved to /w/y.txt] \u{2026}",
         );
         assert!(trailing_spill_note(&generic).is_some());
+
+        // The capture-window wording of the bash note is a lead of its own.
+        let captured = RuntimeString::from(
+            "body\n\nTool output was truncated. The captured 9000 chars (head and tail of a larger stream; 99 middle bytes were dropped during capture and are unrecoverable) were saved to /w/.klaus/tool-results/bash-bb.txt. Answer from the output shown if it is enough.",
+        );
+        assert!(trailing_spill_note(&captured).is_some());
 
         // A lead without a blank-line anchor is quoted body content, not a
         // note this engine appended.

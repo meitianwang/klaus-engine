@@ -1269,7 +1269,14 @@ fn render_anthropic_read_schema(schema: &RuntimeJson) -> RuntimeJson {
     copy_properties(
         &properties,
         &mut rendered,
-        &[("offset", "offset"), ("limit", "limit"), ("pages", "pages")],
+        &[
+            ("offset", "offset"),
+            ("limit", "limit"),
+            ("pages", "pages"),
+            // The anthropic wire surface exposes the same whole-read escape
+            // hatch as the internal schema.
+            ("allow_large", "allow_large"),
+        ],
     );
     closed_object_schema(rendered, &["file_path"])
 }
