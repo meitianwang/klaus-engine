@@ -69,6 +69,10 @@ pub struct SpillOptions {
     pub max_chars: f64,
     pub dir: RuntimePath,
     pub id: RuntimeString,
+    /// Re-append a spill note the replaced text already ends with, so an
+    /// aggregate replacement keeps pointing at the earlier artifact instead of
+    /// burying that pointer inside the new spill file.
+    pub preserve_trailing_note: bool,
 }
 
 /// The outcome of [`maybe_spill_result`]: the (possibly replaced) content plus
@@ -136,21 +140,93 @@ pub fn plan_spill_result(content: &[OutputBlock], opts: &SpillOptions) -> Option
 /// The path handed to `format_spilled` is POSIX-rendered: it goes into the tool result the
 /// model reads, and the engine spells model-facing paths with `/` on every host. The plan
 /// keeps the host spelling, which is what actually opens the file.
-pub fn render_spill_plan_content<F>(plan: &SpillPlan, format_spilled: F) -> Vec<OutputBlock>
+pub fn render_spill_plan_content<F>(
+    plan: &SpillPlan,
+    preserve_trailing_note: bool,
+    format_spilled: F,
+) -> Vec<OutputBlock>
 where
     F: Fn(&RuntimeString, usize, &RuntimePath) -> RuntimeString,
 {
+    let rendered = format_spilled(
+        &plan.preview,
+        plan.full_chars,
+        &posix_rendered_runtime(&plan.path),
+    );
+    // An aggregate replacement of an already-spilled result would otherwise
+    // bury the earlier artifact pointer inside the new spill file; carry it
+    // along so the model stays one hop from every saved artifact.
+    let text = if preserve_trailing_note {
+        match trailing_spill_note(&plan.full_text) {
+            Some(note) => rendered.concat(&RuntimeString::from("\n\n")).concat(&note),
+            None => rendered,
+        }
+    } else {
+        rendered
+    };
     vec![OutputBlock::Text(TextBlock {
-        text: format_spilled(
-            &plan.preview,
-            plan.full_chars,
-            &posix_rendered_runtime(&plan.path),
-        ),
+        text,
         citations: None,
         harness_envelope: None,
         message_id: None,
         phase: None,
     })]
+}
+
+/// Note leads an earlier spill appended: bash's own note and the provider
+/// styles rendered by `engine/query/result_trim.rs`.
+const SPILL_NOTE_LEADS: [&str; 3] = [
+    "Tool output was truncated. The full ",
+    "The full output is ",
+    "\u{2026} [output truncated; full ",
+];
+
+/// A trailing segment longer than this is body content quoting a spill
+/// message, not a note this engine appended.
+const SPILL_NOTE_MAX_UNITS: usize = 1_000;
+
+fn find_last_subslice(haystack: &[u16], needle: &[u16]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|start| haystack[*start..*start + needle.len()] == *needle)
+}
+
+/// The spill note `text` ends with, when an earlier spill appended one. The
+/// segment starts after the nearest preceding blank line — a provider envelope
+/// between the blank line and the lead travels with the note — and runs to the
+/// end of the text. Without a blank-line anchor the lead is quoted body
+/// content, not an appended note, and is not preserved.
+pub fn trailing_spill_note(text: &RuntimeString) -> Option<RuntimeString> {
+    let units = text.as_utf16();
+    let newline = b'\n' as u16;
+    let mut best: Option<(usize, usize)> = None;
+    for lead in SPILL_NOTE_LEADS {
+        let pattern: Vec<u16> = lead.encode_utf16().collect();
+        let Some(pos) = find_last_subslice(units, &pattern) else {
+            continue;
+        };
+        if best.is_some_and(|(best_pos, _)| best_pos >= pos) {
+            continue;
+        }
+        let mut start = None;
+        let mut i = pos;
+        while i >= 2 {
+            if units[i - 1] == newline && units[i - 2] == newline {
+                start = Some(i);
+                break;
+            }
+            i -= 1;
+        }
+        let Some(start) = start else { continue };
+        if units.len() - start > SPILL_NOTE_MAX_UNITS {
+            continue;
+        }
+        best = Some((pos, start));
+    }
+    best.map(|(_, start)| RuntimeString::from_utf16(units[start..].to_vec()))
 }
 
 /// Level 1 — per-tool spill: if a single tool result exceeds its budget, write
@@ -222,7 +298,7 @@ where
             spilled_path: None,
         };
     }
-    let replaced = render_spill_plan_content(&plan, format_spilled);
+    let replaced = render_spill_plan_content(&plan, opts.preserve_trailing_note, format_spilled);
     SpillResult {
         content: replaced,
         // Reported, never opened: the same POSIX rendering the model sees, so a trace
@@ -271,11 +347,13 @@ where
             max_chars: 2_000.0,
             dir: dir.clone(),
             id: results[index].tool_use_id.concat(&".aggregate".into()),
+            preserve_trailing_note: true,
         };
         let Some(plan) = plan_spill_result(&results[index].content, &options) else {
             continue;
         };
-        let replacement = render_spill_plan_content(&plan, &format_spilled);
+        let replacement =
+            render_spill_plan_content(&plan, options.preserve_trailing_note, &format_spilled);
         let replacement_size = len_utf16(&output_blocks_text(&replacement));
         if replacement_size >= size {
             continue;
@@ -440,6 +518,7 @@ mod tests {
                 max_chars: 7.0,
                 dir: "$WORKSPACE/.klaus/tool-results".into(),
                 id: "unicode-call".into(),
+                preserve_trailing_note: false,
             },
         )
         .unwrap();
@@ -578,6 +657,7 @@ mod tests {
                 max_chars: 30_000.0,
                 dir: runtime_path(&dir),
                 id: "call-1".into(),
+                preserve_trailing_note: false,
             },
             move |preview, full, path| {
                 *spill_sink.lock().unwrap() = Some((preview.clone(), full, path.clone()));
@@ -660,6 +740,7 @@ mod tests {
                 max_chars: 1.0,
                 dir: runtime_path(&dir),
                 id: "node-utf8".into(),
+                preserve_trailing_note: false,
             },
             |preview, _, _| preview.clone(),
         )
@@ -682,6 +763,7 @@ mod tests {
             max_chars: 100.0,
             dir: runtime_path(&dir.join("s")),
             id: "a".into(),
+            preserve_trailing_note: false,
         };
         let r = maybe_spill_result(content.clone(), opts, |_, _, _| {
             panic!("small result must not invoke formatter")
@@ -700,6 +782,7 @@ mod tests {
             max_chars: f64::INFINITY,
             dir: runtime_path(&dir.join("s")),
             id: "infinite".into(),
+            preserve_trailing_note: false,
         };
         let r = maybe_spill_result(content.clone(), opts, |_, _, _| {
             panic!("non-finite threshold must not invoke formatter")
@@ -718,6 +801,7 @@ mod tests {
             max_chars: 100.0,
             dir: runtime_path(&s_dir),
             id: "b".into(),
+            preserve_trailing_note: false,
         };
         let r = maybe_spill_result(big(5_000), opts, |preview, full, path| {
             concat(&[
@@ -753,6 +837,7 @@ mod tests {
             max_chars: 100.0,
             dir: runtime_path(&dir.join("blocker").join("nested")),
             id: "c".into(),
+            preserve_trailing_note: false,
         };
         let r = maybe_spill_result(content.clone(), opts, |_, _, _| {
             panic!("failed spill must not invoke formatter")
@@ -786,6 +871,7 @@ mod tests {
                     max_chars: DEFAULT_MAX_RESULT_CHARS,
                     dir: runtime_path(&dir),
                     id: media.tool_use_id.clone(),
+                    preserve_trailing_note: false,
                 }
             )
             .is_none(),
@@ -893,5 +979,84 @@ mod tests {
         assert_eq!(out[0].native_tool_output, result.native_tool_output);
         assert_eq!(out[0].output, result.output);
         assert_eq!(out[0].extra_user_blocks, result.extra_user_blocks);
+    }
+
+    #[test]
+    fn trailing_spill_note_finds_engine_appended_notes_only() {
+        let bash_note = RuntimeString::from(
+            "body text\n\nTool output was truncated. The full 9000 chars were saved to /w/.klaus/tool-results/bash-aa.txt; read it only if the omitted content is needed.",
+        );
+        let note = trailing_spill_note(&bash_note)
+            .expect("bash note")
+            .try_to_utf8()
+            .unwrap();
+        assert!(
+            note.starts_with("Tool output was truncated. The full 9000 chars"),
+            "{note}"
+        );
+
+        // A provider envelope between the blank line and the lead travels
+        // with the note.
+        let enveloped = RuntimeString::from(
+            "preview here\n\n<system-reminder>\nThe full output is 9000 chars and was saved to /w/x.txt. Read that file only if the omitted content is needed for the task.\n</system-reminder>",
+        );
+        let note = trailing_spill_note(&enveloped)
+            .expect("enveloped note")
+            .try_to_utf8()
+            .unwrap();
+        assert!(note.starts_with("<system-reminder>"), "{note}");
+        assert!(note.ends_with("</system-reminder>"), "{note}");
+
+        let generic = RuntimeString::from(
+            "body\n\n\u{2026} [output truncated; full 9000 chars saved to /w/y.txt] \u{2026}",
+        );
+        assert!(trailing_spill_note(&generic).is_some());
+
+        // A lead without a blank-line anchor is quoted body content, not a
+        // note this engine appended.
+        let plain = RuntimeString::from("The full output is 3 chars and nothing was appended.");
+        assert!(trailing_spill_note(&plain).is_none());
+        assert!(trailing_spill_note(&RuntimeString::from("plain body")).is_none());
+    }
+
+    #[test]
+    fn aggregate_render_preserves_a_trailing_spill_pointer() {
+        let text = RuntimeString::from(
+            "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nbody\n\nTool output was truncated. The full 9000 chars were saved to /w/.klaus/tool-results/bash-aa.txt; read it only if the omitted content is needed.",
+        );
+        let plan = plan_spill_result(
+            &[OutputBlock::Text(TextBlock {
+                text,
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            &SpillOptions {
+                max_chars: 20.0,
+                dir: "$WORKSPACE/.klaus/tool-results".into(),
+                id: "tu1.aggregate".into(),
+                preserve_trailing_note: true,
+            },
+        )
+        .expect("oversized text spills");
+        let formatter = |preview: &RuntimeString, _full: usize, path: &RuntimePath| {
+            preview
+                .clone()
+                .concat(&RuntimeString::from(" [saved to "))
+                .concat(path.as_runtime_string())
+                .concat(&RuntimeString::from("]"))
+        };
+        let preserved = output_blocks_text(&render_spill_plan_content(&plan, true, formatter));
+        let preserved = preserved.try_to_utf8().unwrap();
+        // The replacement carries both pointers: the new aggregate artifact
+        // and the earlier per-tool spill the replaced text already ended with.
+        assert!(preserved.contains("tu1.aggregate.txt"), "{preserved}");
+        assert!(preserved.contains("bash-aa.txt"), "{preserved}");
+
+        let bare = output_blocks_text(&render_spill_plan_content(&plan, false, formatter));
+        let bare = bare.try_to_utf8().unwrap();
+        assert!(bare.contains("tu1.aggregate.txt"), "{bare}");
+        assert!(!bare.contains("bash-aa.txt"), "{bare}");
     }
 }

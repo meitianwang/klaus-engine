@@ -2450,6 +2450,7 @@ async fn run_turn_tool_result_budget(
             max_chars: SPILL_PREVIEW_CHARS as f64,
             dir: spill_dir.clone(),
             id: id.concat(&".aggregate".into()),
+            preserve_trailing_note: true,
         };
         let spill = maybe_spill_result(content, options, |preview, full, path| {
             render_spilled_tool_result(preview, full, path, profile)

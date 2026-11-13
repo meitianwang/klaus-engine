@@ -1494,6 +1494,7 @@ fn execute_tool_call_body(
                         max_chars,
                         dir: spill_dir,
                         id: call.visible.id.clone(),
+                        preserve_trailing_note: false,
                     },
                     |preview, full, path| {
                         render_spilled_tool_result(preview, full, path, &call.profile)

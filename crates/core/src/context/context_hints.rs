@@ -565,6 +565,7 @@ pub async fn project_hint_edits(
                     max_chars: 0.0,
                     dir: dir.clone(),
                     id: hint_spill_id(&id),
+                    preserve_trailing_note: false,
                 },
                 |_, _, path| {
                     RuntimeString::from(CONTEXT_HINT_PERSISTED_PREFIX)

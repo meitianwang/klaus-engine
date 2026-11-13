@@ -7075,6 +7075,7 @@ fn migrate_baseline_bash_outcome_envelopes(
             aborted,
             std::time::Duration::ZERO,
             crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            crate::tools::builtins::bash::CaptureLoss::default(),
         );
         let new_content = runtime_codec::encode_value(&render_tool_result_content(
             vec![reconstructed_text(new_text)],
@@ -12216,6 +12217,8 @@ fn reconstruct_bash_outcome(
             "wallTimeMs",
             "sandboxDenied",
             "sandboxRetried",
+            "capturedElidedBytes",
+            "streamLineCount",
         ]
         .iter()
         .any(|candidate| runtime_eq_utf8(&key, candidate))
@@ -12231,6 +12234,19 @@ fn reconstruct_bash_outcome(
     // Predecessor rows carry no wall time; their migrated envelope pins the
     // zero-duration rendering, so an absent field reconstructs as zero.
     let wall_ms = result.get("wallTimeMs").and_then(Json::as_u64).unwrap_or(0);
+    // Capture-loss metadata is absent on rows recorded before the engine
+    // started recording it (and on every row whose stream fit the capture
+    // buffer); the default reconstructs those renderings unchanged.
+    let capture = crate::tools::builtins::bash::CaptureLoss {
+        elided_bytes: result
+            .get("capturedElidedBytes")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize,
+        streamed_lines: result
+            .get("streamLineCount")
+            .and_then(Json::as_u64)
+            .unwrap_or(0) as usize,
+    };
     let (text, is_error, truncated) = crate::tools::builtins::bash::render_bash_outcome_text(
         output,
         exit_code,
@@ -12238,6 +12254,7 @@ fn reconstruct_bash_outcome(
         aborted,
         std::time::Duration::from_millis(wall_ms),
         crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+        capture,
     );
     let expected_status = if is_error { "failed" } else { "completed" };
     let expected_error = is_error.then(|| exact_json!({ "message": "tool reported an error" }));
@@ -12259,10 +12276,18 @@ fn reconstruct_bash_outcome(
     let hash = sha256_hex(&output.to_node_utf8());
     let name = &hash[..16];
     let key = RuntimeString::from_utf8(&format!(".klaus/tool-results/bash-{name}.txt"));
-    let note = RuntimeString::from_utf8(&format!(
-        "\n\nTool output was truncated. The full {} chars were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
-        output.len_utf16()
-    ));
+    let note = if capture.elided_bytes > 0 {
+        RuntimeString::from_utf8(&format!(
+            "\n\nTool output was truncated. The captured {} chars (head and tail of a larger stream; {} middle bytes were dropped during capture and are unrecoverable) were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
+            output.len_utf16(),
+            capture.elided_bytes
+        ))
+    } else {
+        RuntimeString::from_utf8(&format!(
+            "\n\nTool output was truncated. The full {} chars were saved to $WORKSPACE/.klaus/tool-results/bash-{name}.txt; read it only if the omitted content is needed.",
+            output.len_utf16()
+        ))
+    };
     Ok((text.concat(&note), is_error, Some((key, output.clone()))))
 }
 
@@ -13484,6 +13509,7 @@ async fn validate_tool_result_reconstruction(
             max_chars,
             dir: RuntimePath::from("$WORKSPACE/.klaus/tool-results"),
             id: RuntimeString::from(&id),
+            preserve_trailing_note: false,
         };
         if let Some(plan) = plan_spill_result(&raw_content, &spill_options) {
             let expected_spill_key = format!(".klaus/tool-results/{id}.txt");
@@ -13505,7 +13531,7 @@ async fn validate_tool_result_reconstruction(
                     ))
                 })?;
             files.insert(spill_key, plan.full_text.clone());
-            raw_content = render_spill_plan_content(&plan, |preview, full_chars, path| {
+            raw_content = render_spill_plan_content(&plan, false, |preview, full_chars, path| {
                 crate::engine::query::render_spilled_tool_result(
                     preview, full_chars, path, &profile,
                 )
@@ -24239,6 +24265,7 @@ mod tests {
                 false,
                 std::time::Duration::from_millis(wall_ms),
                 crate::tools::output_truncation::DEFAULT_OUTPUT_TRUNCATION_POLICY,
+                crate::tools::builtins::bash::CaptureLoss::default(),
             );
         assert!(!is_error);
         assert!(truncated);

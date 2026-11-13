@@ -37,6 +37,7 @@ fn options(dir: &std::path::Path, id: &str) -> SpillOptions {
         max_chars: 2_000.0,
         dir: RuntimePath::from(dir.to_str().unwrap()),
         id: id.into(),
+        preserve_trailing_note: false,
     }
 }
 

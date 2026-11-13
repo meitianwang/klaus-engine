@@ -30,6 +30,7 @@ pub async fn tool_result_trace() -> Result<RuntimeJson, RuntimeCodecError> {
             max_chars: 100.0,
             dir: runtime_path(&base_dir.join("spill")),
             id: "small".into(),
+            preserve_trailing_note: false,
         },
         legacy_spill_text,
     )
@@ -42,6 +43,7 @@ pub async fn tool_result_trace() -> Result<RuntimeJson, RuntimeCodecError> {
             max_chars: 7.0,
             dir: runtime_path(&base_dir.join("spill")),
             id: "oversized".into(),
+            preserve_trailing_note: false,
         },
         legacy_spill_text,
     )
@@ -58,6 +60,7 @@ pub async fn tool_result_trace() -> Result<RuntimeJson, RuntimeCodecError> {
             max_chars: 7.0,
             dir: runtime_path(&base_dir.join("blocker").join("nested")),
             id: "blocked".into(),
+            preserve_trailing_note: false,
         },
         legacy_spill_text,
     )

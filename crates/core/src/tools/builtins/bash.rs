@@ -134,9 +134,33 @@ pub fn resolve_bash_timeout(
         .min(max_timeout_ms)
 }
 
+/// Capture-level loss from the bounded output aggregator. When the stream
+/// exceeded the capture buffer, the middle is gone from both the model-visible
+/// text and the spilled artifact; the rendered outcome must say so instead of
+/// implying the saved file is the complete stream. Both values are recorded in
+/// the result payload so any consumer can re-render the exact text from the
+/// recorded fields alone.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CaptureLoss {
+    /// Bytes dropped from the middle of the stream by the capture buffer.
+    pub(crate) elided_bytes: usize,
+    /// Lines observed across the whole stream (`str::lines` semantics).
+    pub(crate) streamed_lines: usize,
+}
+
+impl CaptureLoss {
+    fn from_result(result: &RunShellResult) -> Self {
+        Self {
+            elided_bytes: result.elided_bytes,
+            streamed_lines: result.total_lines,
+        }
+    }
+}
+
 /// Render the model-visible outcome of one foreground command as structured
 /// sections: exit code, wall time, the original line count when truncation
-/// changed it, and the output body under the shared truncation policy. An
+/// changed it, a capture-loss note when the stream exceeded the capture
+/// buffer, and the output body under the shared truncation policy. An
 /// oversized body keeps its newest tail: a command's final state and error
 /// diagnostics land at the end of its output. Failure context (timeout,
 /// abort) is re-prepended after truncation so it survives an output of any
@@ -153,6 +177,7 @@ pub(crate) fn render_bash_outcome_text(
     aborted: bool,
     wall_time: std::time::Duration,
     policy: TruncationPolicy,
+    capture: CaptureLoss,
 ) -> (RuntimeString, bool, bool) {
     let is_error = exit_code != Some(0) || timed_out || aborted;
     let base = if output.is_empty() {
@@ -198,6 +223,17 @@ pub(crate) fn render_bash_outcome_text(
         }
         _ => content,
     };
+    if capture.elided_bytes > 0 {
+        // The captured text lost its middle before rendering, so its own line
+        // count undercounts the stream; report the count observed live.
+        total_lines_section = Some(format!("Total output lines: {}", capture.streamed_lines));
+    }
+    let capture_note_section = (capture.elided_bytes > 0).then(|| {
+        format!(
+            "Capture note: the stream exceeded the capture buffer; {} bytes from the middle were dropped and are unrecoverable.",
+            capture.elided_bytes
+        )
+    });
     // Round to one decimal place for a stable, compact metadata line.
     let duration_seconds = ((wall_time.as_secs_f32()) * 10.0).round() / 10.0;
     let mut text = RuntimeString::from("Exit code: ")
@@ -206,6 +242,9 @@ pub(crate) fn render_bash_outcome_text(
             "\nWall time: {duration_seconds} seconds"
         )));
     if let Some(section) = total_lines_section {
+        text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
+    }
+    if let Some(section) = capture_note_section {
         text = text.concat(&RuntimeString::from_utf8(&format!("\n{section}")));
     }
     (
@@ -225,6 +264,7 @@ pub(crate) fn render_bash_outcome_text(
 async fn spill_truncated_bash_output(
     output: &RuntimeString,
     cwd: &RuntimePath,
+    elided_bytes: usize,
 ) -> Option<RuntimeString> {
     let digest = Sha256::digest(output.to_node_utf8());
     let mut id = String::from("bash-");
@@ -254,22 +294,34 @@ async fn spill_truncated_bash_output(
             max_chars: 0.0,
             dir,
             id: RuntimeString::from_utf8(&id),
+            preserve_trailing_note: false,
         },
-        |_preview, full_chars, path| {
-            RuntimeString::from_utf8(&format!(
-                "\n\nTool output was truncated. The full {full_chars} chars were saved to "
-            ))
-            .concat(path.as_runtime_string())
-            .concat(&RuntimeString::from(
-                "; read it only if the omitted content is needed.",
-            ))
-        },
+        |_preview, full_chars, path| bash_spill_note(full_chars, elided_bytes, path),
     )
     .await;
     match (&spilled.spilled_path, spilled.content.first()) {
         (Some(_), Some(OutputBlock::Text(note))) => Some(note.text.clone()),
         _ => None,
     }
+}
+
+/// The reference note appended to a truncated command's model-visible text.
+/// When the capture buffer itself dropped bytes, the note says the saved file
+/// holds the captured head and tail — not the complete stream — so the model
+/// never treats a capture window as the full output.
+fn bash_spill_note(full_chars: usize, elided_bytes: usize, path: &RuntimePath) -> RuntimeString {
+    let lead = if elided_bytes > 0 {
+        format!(
+            "\n\nTool output was truncated. The captured {full_chars} chars (head and tail of a larger stream; {elided_bytes} middle bytes were dropped during capture and are unrecoverable) were saved to "
+        )
+    } else {
+        format!("\n\nTool output was truncated. The full {full_chars} chars were saved to ")
+    };
+    RuntimeString::from_utf8(&lead)
+        .concat(path.as_runtime_string())
+        .concat(&RuntimeString::from(
+            "; read it only if the omitted content is needed.",
+        ))
 }
 
 fn bash_spill_path_dialect() -> NodePathDialect {
@@ -714,6 +766,7 @@ impl Tool for BashTool {
             res.aborted,
             wall_time,
             DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::from_result(&res),
         );
         // A command that genuinely failed (not a timeout/abort) MAY have been blocked
         // by the active sandbox rather than failing on its own — surface that so the
@@ -779,9 +832,12 @@ impl Tool for BashTool {
                     rerun.aborted,
                     std::time::Duration::from_millis(rerun_wall_ms),
                     DEFAULT_OUTPUT_TRUNCATION_POLICY,
+                    CaptureLoss::from_result(&rerun),
                 );
                 if rerun_truncated {
-                    if let Some(note) = spill_truncated_bash_output(&rerun.output, &cwd).await {
+                    if let Some(note) =
+                        spill_truncated_bash_output(&rerun.output, &cwd, rerun.elided_bytes).await
+                    {
                         rtext = rtext.concat(&note);
                     }
                 }
@@ -808,6 +864,16 @@ impl Tool for BashTool {
                 output.insert("aborted", RuntimeJson::Bool(rerun.aborted));
                 output.insert("wallTimeMs", RuntimeJson::from(rerun_wall_ms));
                 output.insert("sandboxRetried", RuntimeJson::Bool(true));
+                if rerun.elided_bytes > 0 {
+                    output.insert(
+                        "capturedElidedBytes",
+                        RuntimeJson::from(u64::try_from(rerun.elided_bytes).unwrap_or(u64::MAX)),
+                    );
+                    output.insert(
+                        "streamLineCount",
+                        RuntimeJson::from(u64::try_from(rerun.total_lines).unwrap_or(u64::MAX)),
+                    );
+                }
                 return Ok(ToolResult {
                     serializable: ToolResultSerializable {
                         output: RuntimeJson::Object(output),
@@ -836,10 +902,13 @@ impl Tool for BashTool {
             res.aborted,
             wall_time,
             DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::from_result(&res),
         );
         debug_assert_eq!(is_error, reconstructed_is_error);
         if truncated {
-            if let Some(note) = spill_truncated_bash_output(&res.output, &cwd).await {
+            if let Some(note) =
+                spill_truncated_bash_output(&res.output, &cwd, res.elided_bytes).await
+            {
                 text = text.concat(&note);
             }
         }
@@ -875,6 +944,21 @@ impl Tool for BashTool {
         output.insert("wallTimeMs", RuntimeJson::from(wall_ms));
         if sandbox_denied {
             output.insert("sandboxDenied", RuntimeJson::Bool(true));
+        }
+        if res.elided_bytes > 0 {
+            // Capture-loss metadata: the model-visible header quotes these
+            // values, and contract replay re-renders the exact text from the
+            // recorded payload alone, so they travel with the result. Absent
+            // (never zero) when nothing was elided, which keeps every
+            // pre-existing recording byte-identical.
+            output.insert(
+                "capturedElidedBytes",
+                RuntimeJson::from(u64::try_from(res.elided_bytes).unwrap_or(u64::MAX)),
+            );
+            output.insert(
+                "streamLineCount",
+                RuntimeJson::from(u64::try_from(res.total_lines).unwrap_or(u64::MAX)),
+            );
         }
 
         Ok(text_result(RuntimeJson::Object(output), text, is_error))
@@ -1188,6 +1272,7 @@ mod tests {
                     aborted,
                     std::time::Duration::from_millis(wall_ms),
                     DEFAULT_OUTPUT_TRUNCATION_POLICY,
+                    CaptureLoss::default(),
                 ),
                 (rs(expected), is_error, false)
             );
@@ -1206,6 +1291,7 @@ mod tests {
             false,
             std::time::Duration::ZERO,
             DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::default(),
         );
         assert!(truncated);
         assert!(!is_error);
@@ -1233,6 +1319,7 @@ mod tests {
             false,
             std::time::Duration::from_millis(123),
             DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::default(),
         );
         assert!(truncated);
         assert!(is_error);
@@ -1246,6 +1333,88 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("xxxx"), "{text}");
+    }
+
+    #[test]
+    fn outcome_reports_true_line_count_and_capture_note_when_the_stream_was_elided() {
+        let captured = rs("HEAD\n… [200000 bytes elided] …\nTAIL");
+        let (text, is_error, truncated) = render_bash_outcome_text(
+            &captured,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            TruncationPolicy::Bytes(16),
+            CaptureLoss {
+                elided_bytes: 200_000,
+                streamed_lines: 42_000,
+            },
+        );
+        assert!(truncated);
+        assert!(!is_error);
+        let text = text.try_to_utf8().unwrap();
+        // The header reports the true stream totals even though the captured
+        // text is a head+tail window, and the capture note sits in the
+        // metadata header so tail truncation of the body cannot remove it.
+        assert!(text.contains("Total output lines: 42000"), "{text}");
+        assert!(
+            text.contains(
+                "Capture note: the stream exceeded the capture buffer; 200000 bytes from the middle were dropped and are unrecoverable."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.find("Capture note:").unwrap() < text.find("Output:\n").unwrap(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn capture_note_survives_even_when_the_body_fits_the_policy() {
+        let captured = rs("HEAD\nTAIL");
+        let (text, _, truncated) = render_bash_outcome_text(
+            &captured,
+            Some(0),
+            false,
+            false,
+            std::time::Duration::ZERO,
+            DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss {
+                elided_bytes: 99,
+                streamed_lines: 2,
+            },
+        );
+        assert!(!truncated);
+        let text = text.try_to_utf8().unwrap();
+        assert!(text.contains("Total output lines: 2"), "{text}");
+        assert!(text.contains("Capture note:"), "{text}");
+        assert!(text.ends_with("Output:\nHEAD\nTAIL"), "{text}");
+    }
+
+    #[test]
+    fn spill_note_distinguishes_a_capture_window_from_the_full_stream() {
+        let path = RuntimePath::from("/w/.klaus/tool-results/bash-0011223344556677.txt");
+        let full = bash_spill_note(1234, 0, &path).try_to_utf8().unwrap();
+        assert!(
+            full.starts_with("\n\nTool output was truncated. The full 1234 chars were saved to "),
+            "{full}"
+        );
+        assert!(full.contains("bash-0011223344556677.txt"), "{full}");
+        assert!(
+            full.ends_with("; read it only if the omitted content is needed."),
+            "{full}"
+        );
+        let elided = bash_spill_note(1234, 99, &path).try_to_utf8().unwrap();
+        assert!(
+            elided.contains(
+                "The captured 1234 chars (head and tail of a larger stream; 99 middle bytes were dropped during capture and are unrecoverable) were saved to "
+            ),
+            "{elided}"
+        );
+        assert!(
+            elided.ends_with("; read it only if the omitted content is needed."),
+            "{elided}"
+        );
     }
 
     #[cfg(unix)]
@@ -2084,6 +2253,7 @@ mod exact_tests {
             false,
             std::time::Duration::ZERO,
             DEFAULT_OUTPUT_TRUNCATION_POLICY,
+            CaptureLoss::default(),
         );
         let expected =
             RuntimeString::from("Exit code: 0\nWall time: 0 seconds\nOutput:\n").concat(&output);

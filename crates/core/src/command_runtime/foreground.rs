@@ -29,6 +29,11 @@ struct BoundedOutput {
     elided: usize,
     head_limit: usize,
     tail_limit: usize,
+    /// Newlines seen across the whole stream, including elided bytes.
+    newlines_seen: usize,
+    /// Whether the last pushed byte was a newline (no trailing partial line).
+    ends_with_newline: bool,
+    pushed_any: bool,
 }
 
 impl BoundedOutput {
@@ -43,10 +48,18 @@ impl BoundedOutput {
             elided: 0,
             head_limit,
             tail_limit,
+            newlines_seen: 0,
+            ends_with_newline: false,
+            pushed_any: false,
         }
     }
 
     fn push(&mut self, input: &[u8]) {
+        if !input.is_empty() {
+            self.newlines_seen += input.iter().filter(|byte| **byte == b'\n').count();
+            self.ends_with_newline = *input.last().expect("checked non-empty") == b'\n';
+            self.pushed_any = true;
+        }
         let mut buf: &[u8] = input;
         if self.head_bytes < self.head_limit {
             let room = self.head_limit - self.head_bytes;
@@ -82,6 +95,16 @@ impl BoundedOutput {
 
     fn elided_bytes(&self) -> usize {
         self.elided
+    }
+
+    /// Lines the process produced across the whole stream, with `str::lines`
+    /// semantics (a trailing partial line counts as one). Stays correct when
+    /// the middle was elided, unlike counting the rendered text's lines.
+    fn total_lines_seen(&self) -> usize {
+        if !self.pushed_any {
+            return 0;
+        }
+        self.newlines_seen + usize::from(!self.ends_with_newline)
     }
 
     /// The aggregated text: head + tail verbatim, with an elision marker spliced
@@ -152,6 +175,9 @@ pub struct RunShellResult {
     pub timed_out: bool,
     pub aborted: bool,
     pub elided_bytes: usize,
+    /// Lines counted across the whole stream, including bytes the capture
+    /// buffer elided; `output` alone undercounts once elision happened.
+    pub total_lines: usize,
 }
 
 /// The signal name the close event reports for a signal number (POSIX names).
@@ -300,6 +326,7 @@ pub async fn run_shell(opts: RunShellOptions<'_>) -> RunShellResult {
                 timed_out,
                 aborted,
                 elided_bytes: agg.elided_bytes(),
+                total_lines: agg.total_lines_seen(),
             };
         }
     };
@@ -409,6 +436,7 @@ pub async fn run_shell(opts: RunShellOptions<'_>) -> RunShellResult {
         timed_out,
         aborted,
         elided_bytes: agg.elided_bytes(),
+        total_lines: agg.total_lines_seen(),
     }
 }
 
@@ -467,6 +495,24 @@ mod tests {
         b.push(b"9ABCDEF"); // overflows the tail, dropping the older tail bytes
         assert_eq!(b.render(), "012345\n… [6 bytes elided] …\nCDEF");
         assert_eq!(b.elided_bytes(), 6);
+    }
+
+    #[test]
+    fn bounded_output_counts_stream_lines_across_elision() {
+        // cap 10 → head_limit 6, tail_limit 4.
+        let mut b = BoundedOutput::new(10);
+        assert_eq!(b.total_lines_seen(), 0);
+        b.push(b"a\nb\n");
+        assert_eq!(b.total_lines_seen(), 2);
+        b.push(b"c");
+        // A trailing partial line counts as one, matching `str::lines`.
+        assert_eq!(b.total_lines_seen(), 3);
+        b.push(b"ddddd");
+        b.push(b"\n");
+        assert!(b.elided_bytes() > 0);
+        // "cddddd\n" completes the third line: the count spans the whole
+        // stream even though the middle was elided from the retained bytes.
+        assert_eq!(b.total_lines_seen(), 3);
     }
 
     // ---- test sandbox backends ----
