@@ -319,5 +319,5 @@ async fn first_request_advertises_optional_checklists_and_persistent_work() {
     assert!(request
         .system
         .iter()
-        .any(|part| { part.name == "base" && part.text.contains("# Autonomy and persistence") }));
+        .any(|part| { part.name == "base" && part.text.contains("# Task execution") }));
 }

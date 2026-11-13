@@ -712,7 +712,7 @@ mod tests {
         let bases: Vec<_> = parts.iter().filter(|part| part.name == "base").collect();
         assert_eq!(bases.len(), 1);
         assert_eq!(bases[0].text, RuntimeString::from(BASE_INSTRUCTIONS));
-        assert!(bases[0].text.contains("# Autonomy and persistence"));
+        assert!(bases[0].text.contains("# Task execution"));
         assert!(bases[0].text.contains("any material risks or limitations"));
         assert!(bases[0].text.contains("Summarize routine verification"));
         assert!(bases[0].text.contains("# Using skills"));

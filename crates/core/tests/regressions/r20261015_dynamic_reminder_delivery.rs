@@ -953,7 +953,7 @@ async fn a_session_keeps_the_human_task_across_two_tool_rounds() {
             "tool rounds preserve the fixed instruction prefix"
         );
         let all_text = wire.iter().map(content_text).collect::<Vec<_>>().join("\n");
-        assert_eq!(all_text.matches("# Autonomy and persistence").count(), 1);
+        assert_eq!(all_text.matches("# Task execution").count(), 1);
         assert!(!all_text.contains("How to write the reply that ends this turn"));
         assert!(!all_text.contains("Risks you found while working DO go in"));
         let request = &captured[round];
