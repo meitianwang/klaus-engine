@@ -552,8 +552,10 @@ async fn delayed_stop_replacement(expected_fence: bool) {
     if expected_fence {
         params["expectedTurnId"] = "original-foreground".into();
     }
-    let (ack, _) = request(&mut fixture.client, 5, "turn/interrupt", params).await;
-    assert_eq!(ack["result"]["submissionId"], "delayed-fenced-stop");
+    fixture
+        .client
+        .send(json!({"id":5,"method":"turn/interrupt","params":params}))
+        .await;
     control.entered.notified().await;
     assert!(!script.signals.lock().unwrap()[0].is_cancelled());
     // Replacement admission preserves goal content and control intent while
@@ -573,7 +575,9 @@ async fn delayed_stop_replacement(expected_fence: bool) {
         "actual provider admission adds only its run-marker revision without a goal edit"
     );
     control.release.add_permits(1);
-    let settled = wait_interrupt(&mut fixture.client, Vec::new(), "delayed-fenced-stop").await;
+    let (ack, seen) = fixture.client.response_for(5).await;
+    assert_eq!(ack["result"]["submissionId"], "delayed-fenced-stop");
+    let settled = wait_interrupt(&mut fixture.client, seen, "delayed-fenced-stop").await;
     assert_eq!(settled["turnInterrupt"]["accepted"], false, "{settled}");
     assert!(settled["error"].as_str().unwrap().contains("changed"));
     assert!(settled["turnInterrupt"]["goalPauseError"]
@@ -957,22 +961,18 @@ async fn a_critical_stop_deadline_revokes_a_late_pause_writer_before_it_can_comm
         .unwrap();
     let stop_started = std::time::Instant::now();
     control.block.store(true, Ordering::SeqCst);
-    let (ack, frames) = request(
-        &mut fixture.client,
-        5,
-        "turn/interrupt",
-        json!({
+    fixture
+        .client
+        .send(json!({"id":5,"method":"turn/interrupt","params":{
             "sessionId":fixture.session_id,"submissionId":"deadline-stop","origin":"user-stop",
             "expectedTurnId":"deadline-foreground"
-        }),
-    )
-    .await;
-    assert_eq!(ack["result"]["submissionId"], "deadline-stop");
+        }}))
+        .await;
     if tokio::time::timeout(REPLY_TIMEOUT, control.entered.notified())
         .await
         .is_err()
     {
-        let settled = wait_interrupt(&mut fixture.client, frames, "deadline-stop").await;
+        let settled = wait_interrupt(&mut fixture.client, Vec::new(), "deadline-stop").await;
         let current = goal_store::get_record("interrupt-origin-thread").await;
         panic!("the active Stop must reach its evidence flush before expiry: result={settled}; goal={current:?}");
     }
@@ -981,6 +981,8 @@ async fn a_critical_stop_deadline_revokes_a_late_pause_writer_before_it_can_comm
         stop_started.elapsed().as_millis()
     );
     assert!(!script.signals.lock().unwrap()[0].is_cancelled());
+    let (ack, frames) = fixture.client.response_for(5).await;
+    assert_eq!(ack["result"]["submissionId"], "deadline-stop");
     let settled = wait_interrupt(&mut fixture.client, frames, "deadline-stop").await;
     eprintln!(
         "[goal-stop-deadline] settledMs={} result={settled}",
@@ -1318,19 +1320,17 @@ async fn an_idle_user_stop_cannot_pause_or_cancel_a_later_human_reservation() {
         .unwrap();
     let clock = FrozenClock::new();
     control.block.store(true, Ordering::SeqCst);
-    let (_, frames) = request(
-        &mut fixture.client,
-        4,
-        "turn/interrupt",
-        json!({
+    fixture
+        .client
+        .send(json!({"id":4,"method":"turn/interrupt","params":{
             "sessionId":fixture.session_id,"submissionId":"idle-delayed-stop","origin":"user-stop"
-        }),
-    )
-    .await;
+        }}))
+        .await;
     control.entered.notified().await;
     start_foreground(&mut fixture, 5, "human-after-idle-stop").await;
     script.entered.notified().await;
     control.release.add_permits(1);
+    let (_, frames) = fixture.client.response_for(4).await;
     let settled = wait_interrupt(&mut fixture.client, frames, "idle-delayed-stop").await;
     assert_eq!(settled["turnInterrupt"]["accepted"], false, "{settled}");
     assert_eq!(
@@ -1518,13 +1518,14 @@ async fn an_unfenced_stop_cancels_its_owner_and_preserves_a_queued_human_turn() 
         .unwrap();
     let clock = FrozenClock::new();
     control.block.store(true, Ordering::SeqCst);
-    let (_, frames) = request(&mut fixture.client, 5, "turn/interrupt", json!({
+    fixture.client.send(json!({"id":5,"method":"turn/interrupt","params":{
         "sessionId":fixture.session_id,"submissionId":"unfenced-stop-preserve-queue","origin":"user-stop"
-    })).await;
+    }})).await;
     control.entered.notified().await;
     start_foreground(&mut fixture, 6, "queued-human-after-stop").await;
     assert_eq!(script.calls.load(Ordering::SeqCst), 1);
     control.release.add_permits(1);
+    let (_, frames) = fixture.client.response_for(5).await;
     let settled = wait_interrupt(&mut fixture.client, frames, "unfenced-stop-preserve-queue").await;
     assert_eq!(settled["turnInterrupt"]["accepted"], true, "{settled}");
     assert_eq!(

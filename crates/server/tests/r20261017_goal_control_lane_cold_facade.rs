@@ -101,17 +101,11 @@ async fn a_queued_cold_stop_cannot_adopt_a_same_endpoint_goal_edit_without_a_tur
     trace.note("urgent.capacity.submit");
     for index in 0..4 {
         let submission = format!("held-cold-system-{index}");
-        let (ack, observed) = request(
-            &mut client,
-            10 + index,
-            "turn/interrupt",
-            json!({
+        client
+            .send(json!({"id":10+index,"method":"turn/interrupt","params":{
                 "sessionId":session_id,"submissionId":submission,"origin":"system"
-            }),
-        )
-        .await;
-        assert_eq!(ack["result"]["submissionId"], submission);
-        frames.extend(observed);
+            }}))
+            .await;
     }
     tokio::time::timeout(REPLY_TIMEOUT, entered.acquire_many(4))
         .await
@@ -122,17 +116,11 @@ async fn a_queued_cold_stop_cannot_adopt_a_same_endpoint_goal_edit_without_a_tur
     assert_eq!(handled.load(Ordering::SeqCst), 4);
     assert_eq!(creates.load(Ordering::SeqCst), 0);
     assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
-    let (ack, observed) = request(
-        &mut client,
-        20,
-        "turn/interrupt",
-        json!({
+    client
+        .send(json!({"id":20,"method":"turn/interrupt","params":{
             "sessionId":session_id,"submissionId":"queued-cold-user-stop","origin":"user-stop"
-        }),
-    )
-    .await;
-    assert_eq!(ack["result"]["submissionId"], "queued-cold-user-stop");
-    frames.extend(observed);
+        }}))
+        .await;
     trace.note("queued.stop.ack");
     let (edited, observed) = request(&mut client, 21, "session/setGoal", json!({
         "sessionId":session_id,"objective":"The later local goal edit owns this paused intent",

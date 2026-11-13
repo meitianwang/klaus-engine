@@ -246,9 +246,12 @@ async fn interrupt(fixture: &mut Fixture) -> (Value, Vec<Value>) {
     )
     .await;
     assert_eq!(
-        ack,
-        json!({"submissionId":"stop-old"}),
-        "dispatch ACK is not final settlement"
+        ack["submissionId"], "stop-old",
+        "the settled reply echoes the stop submission"
+    );
+    assert_eq!(
+        ack["accepted"], true,
+        "the settled reply confirms cancellation"
     );
     let mut pending = VecDeque::from(seen);
     let mut frames = Vec::new();
@@ -475,7 +478,14 @@ async fn stop_pending_preparation_confirms_before_immediate_submit() {
         }),
     )
     .await;
-    assert_eq!(ack, json!({"submissionId":"stop-old"}));
+    assert_eq!(
+        ack["submissionId"], "stop-old",
+        "the settled reply echoes the stop submission"
+    );
+    assert_eq!(
+        ack["accepted"], true,
+        "the settled reply confirms cancellation while preparation is pending"
+    );
     let mut pending = VecDeque::from(seen);
     let mut frames = Vec::new();
     let final_confirmation = tokio::time::timeout(STOP_BUDGET, async {

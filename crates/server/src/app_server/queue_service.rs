@@ -179,12 +179,15 @@ pub(super) async fn interrupt(
             ))
             .await;
     }
-    state
-        .send(wire::response(
-            &id,
-            serde_json::json!({"submissionId":submission_id}),
-        ))
-        .await;
+    // The reply is the confirmation: park it here; the settled interruption
+    // outcome envelope releases it from the sole ordered event pump.
+    handle.pending_interrupt_replies.lock().unwrap().insert(
+        submission_id,
+        PendingInterruptReply {
+            state: Arc::downgrade(&state),
+            id,
+        },
+    );
 }
 
 fn store_for(state: &AppServerState) -> Store {

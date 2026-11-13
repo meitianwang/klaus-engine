@@ -115,6 +115,7 @@ typed_results! {
     wire::ThreadQueueMutationResult,
     wire::ThreadQueueStartResult,
     wire::SubmissionAck,
+    wire::TurnInterruptResponse,
     wire::SessionSubscriptionResult,
     wire::SessionFollowResult,
     wire::ApprovalReviewDenialsResult,
@@ -216,7 +217,7 @@ facade_methods! {
     SessionResumePending => "session/resumePending" (wire::SessionResumePendingParams) -> wire::TurnStartResult;
     /// Explicit foreground continuation of preserved queue input after stop or failure.
     SessionResumeQueued => "session/resumeQueued" (wire::SessionResumeQueuedParams) -> wire::TurnStartResult;
-    TurnInterrupt => "turn/interrupt" (wire::TurnInterruptParams) -> wire::SubmissionAck;
+    TurnInterrupt => "turn/interrupt" (wire::TurnInterruptParams) -> wire::TurnInterruptResponse;
     SessionClose => "session/close" (wire::SessionCloseParams) -> Empty;
 
     /// Standalone dictation accepts live PCM and publishes transcript snapshots.

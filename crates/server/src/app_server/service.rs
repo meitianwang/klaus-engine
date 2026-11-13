@@ -130,6 +130,13 @@ struct OrderedResponse {
     kind: OrderedResponseKind,
 }
 
+/// A parked `turn/interrupt` request whose reply is released only by the
+/// settled interruption outcome envelope: the reply itself is the confirmation.
+struct PendingInterruptReply {
+    state: std::sync::Weak<AppServerState>,
+    id: Value,
+}
+
 /// One live session: its inner protocol server plus the plumbing to reach it.
 struct SessionHandle {
     ps: Arc<ProtocolServer>,
@@ -143,6 +150,7 @@ struct SessionHandle {
     waiters: Arc<Mutex<HashMap<String, oneshot::Sender<WaiterReply>>>>,
     ordered_responses: Mutex<HashMap<String, OrderedResponse>>,
     interrupt_changes: Mutex<HashMap<String, queue::InterruptChange>>,
+    pending_interrupt_replies: Mutex<HashMap<String, PendingInterruptReply>>,
     event_stream_closed: AtomicBool,
     realtime_events: broadcast::Sender<RuntimeJson>,
     read_items: Mutex<super::thread_read::LiveItems>,
@@ -168,6 +176,23 @@ impl SessionHandle {
             waiters.clear();
         }
         self.interrupt_changes.lock().unwrap().clear();
+        let parked: Vec<_> = self
+            .pending_interrupt_replies
+            .lock()
+            .unwrap()
+            .drain()
+            .collect();
+        for (parked_submission, reply) in parked {
+            if let Some(state) = reply.state.upgrade() {
+                let id = reply.id;
+                state
+                    .send(wire::response(
+                        &id,
+                        serde_json::json!({"submissionId": parked_submission, "accepted": false}),
+                    ))
+                    .await;
+            }
+        }
         let replies: Vec<_> = self
             .ordered_responses
             .lock()
@@ -1573,6 +1598,7 @@ fn ensure_control_handle(state: &Arc<AppServerState>) -> Arc<SessionHandle> {
         waiters: Arc::new(Mutex::new(HashMap::new())),
         ordered_responses: Mutex::new(HashMap::new()),
         interrupt_changes: Mutex::new(HashMap::new()),
+        pending_interrupt_replies: Mutex::new(HashMap::new()),
         event_stream_closed: AtomicBool::new(false),
         realtime_events: broadcast::channel(512).0,
         read_items: Mutex::new(super::thread_read::LiveItems::default()),
@@ -9035,6 +9061,7 @@ async fn session_start_impl(
         waiters: Arc::new(Mutex::new(HashMap::new())),
         ordered_responses: Mutex::new(HashMap::new()),
         interrupt_changes: Mutex::new(HashMap::new()),
+        pending_interrupt_replies: Mutex::new(HashMap::new()),
         event_stream_closed: AtomicBool::new(false),
         realtime_events: broadcast::channel(512).0,
         read_items: Mutex::new(super::thread_read::LiveItems::default()),
@@ -9787,6 +9814,33 @@ async fn pump_session_events(
         let submission_id = exact_text(exact_field(&event, "submissionId")).unwrap_or_default();
         if event.get("turnInterrupt").is_some() || event.get("error").is_some() {
             queue::publish_interrupt_change(&state, &handle, &submission_id).await;
+        }
+        // Release the parked reply with the settled outcome: from here on the
+        // response arrival is the client's interruption confirmation.
+        if event.get("turnInterrupt").is_some() {
+            let parked = handle
+                .pending_interrupt_replies
+                .lock()
+                .unwrap()
+                .remove(&submission_id);
+            if let Some(parked) = parked {
+                if let Some(parked_state) = parked.state.upgrade() {
+                    let outcome = exact_field(&event, "turnInterrupt");
+                    let mut fields = vec![
+                        ("submissionId", exact_field(&event, "submissionId").clone()),
+                        ("accepted", exact_field(outcome, "accepted").clone()),
+                    ];
+                    for name in ["interruptedTurnId", "goalPauseError"] {
+                        if let Some(value) = outcome.get(name) {
+                            fields.push((name, value.clone()));
+                        }
+                    }
+                    let reply = exact_payload::response(&parked.id, exact_payload::object(fields));
+                    // Deliver off-pump: a client that is not draining must not be
+                    // able to stall the session event pump through this reply.
+                    tokio::spawn(async move { parked_state.send(reply).await });
+                }
+            }
         }
         if !submission_id.is_empty() && kind.as_deref() == Some("turn.started") {
             handle.turns.lock().unwrap().insert(submission_id.clone());
@@ -10545,6 +10599,7 @@ mod model_provider_tests {
             waiters: Arc::new(Mutex::new(HashMap::new())),
             ordered_responses: Mutex::new(HashMap::new()),
             interrupt_changes: Mutex::new(HashMap::new()),
+            pending_interrupt_replies: Mutex::new(HashMap::new()),
             event_stream_closed: AtomicBool::new(false),
             realtime_events: broadcast::channel(512).0,
             read_items: Mutex::new(super::super::thread_read::LiveItems::default()),
@@ -10605,6 +10660,7 @@ mod model_provider_tests {
             realtime_events: broadcast::channel(512).0,
             ordered_responses: Mutex::new(HashMap::new()),
             interrupt_changes: Mutex::new(HashMap::new()),
+            pending_interrupt_replies: Mutex::new(HashMap::new()),
             read_items: Mutex::new(items),
             stream: Mutex::new(SessionStream::new()),
             read_seed: None,

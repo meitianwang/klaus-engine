@@ -536,6 +536,20 @@ pub struct TurnInterruptParams {
     pub expected_turn_id: Option<String>,
 }
 
+/// `turn/interrupt` response: the settled interruption outcome. The reply is
+/// deferred until cancellation lands (or answers `accepted:false` at once when
+/// nothing was running), so its arrival confirms the interruption.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnInterruptResponse {
+    pub submission_id: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_pause_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnInterruptOrigin {

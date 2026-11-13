@@ -90,28 +90,16 @@ async fn interrupt_prior_work(
     client
         .send(json!({"id":request_id,"method":"turn/interrupt","params":params}))
         .await;
-    let (ack, initial) = client.response_for(request_id).await;
     trace.note("idle.stop.ack");
-    assert_eq!(ack["result"]["submissionId"], "old-idle-stop");
-    let mut observed = initial.clone();
-    let mut initial = VecDeque::from(initial);
+    let mut observed = Vec::new();
     trace.note("old.stop.settled.await");
     tokio::time::timeout(REPLY_TIMEOUT, async {
         loop {
-            let frame = match initial.pop_front() {
-                Some(frame) => frame,
-                None => {
-                    let frame = client.next_message().await;
-                    observed.push(frame.clone());
-                    frame
-                }
-            };
+            let frame = client.next_message().await;
+            observed.push(frame.clone());
             let event = &frame["params"]["event"];
             if event["submissionId"] == "old-idle-stop" && event.get("turnInterrupt").is_some() {
                 trace.note("idle.stop.result.received");
-                if event["turnInterrupt"]["accepted"] != true {
-                    trace.note("idle.stop.result.refused");
-                }
                 assert_eq!(event["turnInterrupt"]["accepted"], true, "{event}");
                 assert!(
                     event["turnInterrupt"].get("goalPauseError").is_none(),
@@ -445,10 +433,6 @@ async fn an_executing_model_create_cannot_cross_a_newer_stop_epoch_or_clear_its_
     client.send(json!({"id":20,"method":"turn/interrupt","params":{
         "sessionId":id,"submissionId":"newer-stop-with-old-create","origin":"user-stop","expectedTurnId":"provider-before-newer-stop"
     }})).await;
-    let (ack, observed) = client.response_for(20).await;
-    trace.note("new.stop.ack");
-    assert_eq!(ack["result"]["submissionId"], "newer-stop-with-old-create");
-    frames.extend(observed);
     trace.note("new.stop.hook.await");
     stop_entered.notified().await;
     trace.note("new.stop.hook.observed");
@@ -513,6 +497,10 @@ async fn an_executing_model_create_cannot_cross_a_newer_stop_epoch_or_clear_its_
     .await
     .expect("the newer Stop must settle after its released snapshot");
     trace.note("new.stop.settled");
+    let (ack, observed) = client.response_for(20).await;
+    trace.note("new.stop.ack");
+    assert_eq!(ack["result"]["submissionId"], "newer-stop-with-old-create");
+    frames.extend(observed);
     assert!(
         runtime.continuation_suppressed(),
         "the old tool cannot clear the newer Stop latch"

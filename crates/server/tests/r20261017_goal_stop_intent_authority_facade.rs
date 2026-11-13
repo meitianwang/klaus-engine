@@ -96,11 +96,10 @@ async fn newer_goal_intent_during_stop(window: Window, intent: Intent) {
         automatic: fixture.automatic_release.clone(),
     };
     trace.note("stop.submit");
-    let (ack, frames) = request(&mut fixture.client, 5, "turn/interrupt", json!({
+    fixture.client.send(json!({"id":5,"method":"turn/interrupt","params":{
         "sessionId":fixture.session_id,"submissionId":"older-stop","origin":"user-stop","expectedTurnId":"same-foreground"
-    })).await;
+    }})).await;
     trace.note("stop.ack");
-    assert_eq!(ack["result"]["submissionId"], "older-stop");
     trace.note("stop.hook.await");
     entered.notified().await;
     trace.note("stop.hook.observed");
@@ -172,6 +171,8 @@ async fn newer_goal_intent_during_stop(window: Window, intent: Intent) {
     trace.note("stop.release");
     barrier.add_permits(1);
     trace.note("stop.settled.await");
+    let (ack, frames) = fixture.client.response_for(5).await;
+    assert_eq!(ack["result"]["submissionId"], "older-stop");
     let settled = wait_interrupt(&mut fixture.client, frames, "older-stop").await;
     trace.note("stop.settled");
     assert_eq!(
@@ -324,14 +325,9 @@ async fn lazy_stop_keeps_its_captured_intent(origin: &'static str, had_goal: boo
     .await;
     let session_id = started["result"]["sessionId"].clone();
     let clock = FrozenClock::new();
-    let (_, frames) = request(
-        &mut lazy,
-        3,
-        "turn/interrupt",
-        json!({
-            "sessionId":session_id,"submissionId":"captured-lazy-stop","origin":origin
-        }),
-    )
+    lazy.send(json!({"id":3,"method":"turn/interrupt","params":{
+        "sessionId":session_id,"submissionId":"captured-lazy-stop","origin":origin
+    }}))
     .await;
     entered.notified().await;
     assert_eq!(
@@ -400,6 +396,7 @@ async fn lazy_stop_keeps_its_captured_intent(origin: &'static str, had_goal: boo
         .unwrap()
         .raw_items;
     release.add_permits(1);
+    let (_, frames) = lazy.response_for(3).await;
     let settled = wait_interrupt(&mut lazy, frames, "captured-lazy-stop").await;
     assert_eq!(
         settled["turnInterrupt"]["accepted"], true,
