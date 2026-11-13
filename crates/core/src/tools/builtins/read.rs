@@ -47,8 +47,7 @@ const DEFAULT_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// The static, model-facing description (becomes the ToolSpec description).
 const READ_DESCRIPTION: &str = "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image. Small PDFs can be delivered natively when the model supports PDFs; use pages with a bounded, 1-based range to render selected PDF pages as images when needed (requires vision). Large PDFs require selected page ranges. Other binary formats are refused. For a large text file, read only the range you need with offset/limit rather than the whole file. Avoid redundant reads solely to confirm that a successful edit/write call completed; inspect the current contents when needed to validate the requested behavior, resolve uncertainty, or account for concurrent changes.";
-const INPUT_SCHEMA_PROPERTY_ORDER: &[&str] =
-    &["path", "offset", "limit", "pages", "allow_large"];
+const INPUT_SCHEMA_PROPERTY_ORDER: &[&str] = &["path", "offset", "limit", "pages", "allow_large"];
 
 /// Options controlling the read tool's size/token caps.
 #[derive(Debug, Clone, Default)]
@@ -1294,7 +1293,11 @@ mod tests {
         // and the very end of the file is present.
         assert!(!text.contains("Content truncated."), "{:.120}", text);
         assert!(!text.contains("over the "), "{:.120}", text);
-        assert!(text.ends_with("word "), "{:.120}", &text[text.len().saturating_sub(60)..]);
+        assert!(
+            text.ends_with("word "),
+            "{:.120}",
+            &text[text.len().saturating_sub(60)..]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

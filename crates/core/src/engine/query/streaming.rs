@@ -1660,12 +1660,8 @@ async fn stream_and_dispatch_inner(
             (Some(_), 0) => vec![tool_over_limit_halve_text()],
             _ => Vec::new(),
         };
-        tool_results.push(truncated_call_result(
-            call,
-            shared,
-            dropped_base_message.clone(),
-            &extra,
-        ).await);
+        tool_results
+            .push(truncated_call_result(call, shared, dropped_base_message.clone(), &extra).await);
     }
     if calls.is_empty() {
         messages.extend(tool_results.iter().cloned().map(Message::ToolResult));

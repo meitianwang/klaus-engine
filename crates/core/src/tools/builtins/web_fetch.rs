@@ -1288,11 +1288,8 @@ async fn summarize_overflow(
             RuntimeString::from(". Focus the summary on what it asks for."),
         ]);
     }
-    let extraction_prompt = runtime_concat([
-        brief,
-        RuntimeString::from("\n\nRemaining text:\n"),
-        input,
-    ]);
+    let extraction_prompt =
+        runtime_concat([brief, RuntimeString::from("\n\nRemaining text:\n"), input]);
     let outcome = match spawn(SpawnSubAgentOptions {
         prompt: extraction_prompt,
         tools: Some(Vec::new()),
@@ -2351,7 +2348,8 @@ mod tests {
         assert_ne!(res.serializable.is_error, Some(true));
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].contains("[Content truncated due to length; the final 64 characters were not read.]"));
+        assert!(prompts[0]
+            .contains("[Content truncated due to length; the final 64 characters were not read.]"));
         assert!(utf16_len(&prompts[0]) < MAX_MARKDOWN_LENGTH + 2_000);
     }
 
@@ -2677,13 +2675,8 @@ mod tests {
 
     #[test]
     fn overflow_split_note_covers_all_three_outcomes() {
-        let summarized = overflow_split_note(
-            100,
-            500,
-            true,
-            0,
-            &OverflowSummary::Summarized("s".into()),
-        );
+        let summarized =
+            overflow_split_note(100, 500, true, 0, &OverflowSummary::Summarized("s".into()));
         let s = summarized.try_to_utf8().unwrap();
         assert!(
             s.starts_with("[The verbatim page text stops here, 100 characters in; re-fetching this URL returns the same split while the page is unchanged.]"),
@@ -2694,23 +2687,29 @@ mod tests {
             "{s}"
         );
 
-        let plain = overflow_split_note(
-            100,
-            500,
-            false,
-            0,
-            &OverflowSummary::Summarized("s".into()),
-        );
+        let plain =
+            overflow_split_note(100, 500, false, 0, &OverflowSummary::Summarized("s".into()));
         let p = plain.try_to_utf8().unwrap();
         assert!(
-            p.contains("What follows is a model-extracted summary of the remaining 500 characters:"),
+            p.contains(
+                "What follows is a model-extracted summary of the remaining 500 characters:"
+            ),
             "{p}"
         );
         assert!(!p.contains("for your request"), "{p}");
 
-        let capped = overflow_split_note(100, 500, false, 30, &OverflowSummary::Summarized("s".into()));
+        let capped = overflow_split_note(
+            100,
+            500,
+            false,
+            30,
+            &OverflowSummary::Summarized("s".into()),
+        );
         let c = capped.try_to_utf8().unwrap();
-        assert!(c.contains("(its final 30 characters were not read at all)"), "{c}");
+        assert!(
+            c.contains("(its final 30 characters were not read at all)"),
+            "{c}"
+        );
 
         let failed = overflow_split_note(100, 500, false, 0, &OverflowSummary::CallFailed);
         let f = failed.try_to_utf8().unwrap();
@@ -2744,7 +2743,9 @@ mod tests {
         let mut ctx = make_ctx(".");
         ctx.spawn_sub_agent = Some(Arc::new(|opts: SpawnSubAgentOptions| {
             assert!(opts.prompt.contains("Remaining text:"));
-            assert!(opts.prompt.contains("Keep the summary under about 8000 characters."));
+            assert!(opts
+                .prompt
+                .contains("Keep the summary under about 8000 characters."));
             Box::pin(std::future::ready(Ok(ForegroundSubAgentRun {
                 agent_id: "web-fetch-summary".into(),
                 events: Box::pin(stream::iter(vec![
@@ -2776,7 +2777,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("What follows is a model-extracted summary of the remaining 200 characters:"),
+            text.contains(
+                "What follows is a model-extracted summary of the remaining 200 characters:"
+            ),
             "{text}"
         );
         assert!(text.ends_with("SUMMARY-OF-REST"), "{text}");

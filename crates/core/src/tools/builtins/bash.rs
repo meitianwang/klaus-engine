@@ -1345,8 +1345,7 @@ mod tests {
             text.contains("chars):\nline 0\nline 1\n"),
             "the head preview quotes the oldest lines: {text}"
         );
-        let body =
-            &text[text.find("\nOutput:\n").expect("body label") + "\nOutput:\n".len()..];
+        let body = &text[text.find("\nOutput:\n").expect("body label") + "\nOutput:\n".len()..];
         assert!(
             body.starts_with("…8890 chars truncated…line 1000\n"),
             "{body}"
@@ -1447,7 +1446,9 @@ mod tests {
         );
         assert!(full.contains("bash-0011223344556677.txt"), "{full}");
         assert!(
-            full.ends_with("If you cannot open it, or your answer rests on only part of the result, say so."),
+            full.ends_with(
+                "If you cannot open it, or your answer rests on only part of the result, say so."
+            ),
             "{full}"
         );
         let elided = bash_spill_note(1234, 99, &path).try_to_utf8().unwrap();
@@ -1458,7 +1459,9 @@ mod tests {
             "{elided}"
         );
         assert!(
-            elided.ends_with("If you cannot open it, or your answer rests on only part of the result, say so."),
+            elided.ends_with(
+                "If you cannot open it, or your answer rests on only part of the result, say so."
+            ),
             "{elided}"
         );
     }
