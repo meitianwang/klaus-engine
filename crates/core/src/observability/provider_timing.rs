@@ -240,7 +240,7 @@ struct ObservedStream {
 }
 
 impl ObservedStream {
-    fn new(inner: ModelStream, timing: RequestTiming) -> ModelStream {
+    fn boxed(inner: ModelStream, timing: RequestTiming) -> ModelStream {
         Box::pin(Self { inner, timing })
     }
 }
@@ -315,7 +315,7 @@ pub(crate) fn precompute_call_model(
         );
         timing.bind_turn_id(&turn_id);
         timing.record_prefix(&request);
-        ObservedStream::new(inner(request, signal), timing)
+        ObservedStream::boxed(inner(request, signal), timing)
     })
 }
 
@@ -628,7 +628,7 @@ mod tests {
                 text: "private summary body".into(),
             },
         ];
-        let mut stream = ObservedStream::new(Box::pin(futures::stream::iter(events)), timing);
+        let mut stream = ObservedStream::boxed(Box::pin(futures::stream::iter(events)), timing);
         let mut seen = 0;
         while stream.next().await.is_some() {
             seen += 1;
@@ -680,7 +680,7 @@ mod tests {
                 request_id: None,
             },
         }];
-        let mut stream = ObservedStream::new(Box::pin(futures::stream::iter(events)), timing);
+        let mut stream = ObservedStream::boxed(Box::pin(futures::stream::iter(events)), timing);
         while stream.next().await.is_some() {}
         drop(stream);
         let records = records(&path);

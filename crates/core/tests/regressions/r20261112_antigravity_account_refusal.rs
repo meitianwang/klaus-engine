@@ -16,7 +16,7 @@ fn account_refusals_remain_terminal_without_becoming_auth_or_network_failures() 
         let error = classify_error(&RawProviderError {
             status: Some(403),
             code: Some(code.into()),
-            message: format!("{code}: account service refusal").into(),
+            message: format!("{code}: account service refusal"),
             ..Default::default()
         });
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
