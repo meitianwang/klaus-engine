@@ -726,7 +726,7 @@ mod tests {
             "subscription:opus",
             "codex:gpt-5.6-sol",
             "qoder:auto",
-            "local:llama3",
+            "antigravity:gemini-4-carbon-high",
         ] {
             let globals = with_model(Some(selection));
             assert_eq!(

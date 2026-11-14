@@ -117,8 +117,6 @@ async fn model_selection_resolve_pins_the_source_without_requiring_credentials()
         (json!({"source":"ark", "selection":"auto"}), "ark:ark-code-latest"),
         (json!({"source":"ark", "selection":"high", "modelTierSelections":{"high":"doubao-seed-2.1-pro"}}), "ark:doubao-seed-2.1-pro"),
         (json!({"source":"ark", "selection":"ark:kimi-k3"}), "ark:kimi-k3"),
-        (json!({"source":"local", "selection":"auto", "catalog":[{"value":"local:on-device.gguf"}]}), "local:on-device.gguf"),
-        (json!({"source":"local", "selection":"high", "modelTierSelections":{"high":"auto"}, "catalog":[{"value":"local:on-device.gguf"}]}), "local:on-device.gguf"),
     ].into_iter().enumerate() {
         let id = index as u64 + 10;
         let source = params["source"].clone();
@@ -133,6 +131,7 @@ async fn model_selection_resolve_pins_the_source_without_requiring_credentials()
         json!({"source":"custom", "selection":"custom:"}),
         json!({"source":"custom", "selection":"auto", "catalog":[{"value":"custom:forged"}]}),
         json!({"source":"local", "selection":"auto"}),
+        json!({"source":"local", "selection":"local:on-device.gguf"}),
     ]
     .into_iter()
     .enumerate()

@@ -288,7 +288,9 @@ use session_inference_part::InferenceAdmission;
 pub(crate) use session_inference_part::{
     InferenceActivityGuard, InferenceBundle, InferenceSlot, InputModelRevision,
 };
-pub use session_subagent_targets_part::{SubagentTargetResolver, MODEL_TARGET_SOURCES};
+pub use session_subagent_targets_part::{
+    is_supported_model_source, SubagentTargetResolver, MODEL_TARGET_SOURCES,
+};
 pub(crate) use session_targets_part::TargetSnapshot;
 pub use session_targets_part::{
     FeatureSlot, FeatureTargets, InferenceTarget, InferenceTargetState, InferenceTargets,

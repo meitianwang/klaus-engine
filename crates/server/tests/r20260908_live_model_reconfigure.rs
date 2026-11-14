@@ -454,7 +454,7 @@ async fn global_model_tiers_mix_real_http_title_agent_compaction_and_price_ident
         "high":tier_target(&high,"subscription","high-catalog-id","high-key",64000,2048,2.0),
         "medium":tier_target(&medium,"custom","medium-entry","medium-key",6000,700,3.0),
         "low":{
-            "type":"resolved","source":"local","modelId":"local-file",
+            "type":"resolved","source":"codex","modelId":"low-catalog-id",
             "provider":{"type":"openai","api":"chat","model":"same-name","baseUrl":low.url},
             "auth":{"type":"api_key","key":"low-capability-token"},
             "capabilities":{"tools":false,"structuredOutput":true,"contextWindow":9000,"maxOutputTokens":300},
@@ -465,7 +465,7 @@ async fn global_model_tiers_mix_real_http_title_agent_compaction_and_price_ident
     // pin the same resolved provider so this leg keeps exercising real HTTP.
     init["featureTargets"] = json!({
         "title":{
-            "type":"resolved","source":"local","modelId":"local-file",
+            "type":"resolved","source":"codex","modelId":"low-catalog-id",
             "provider":{"type":"openai","api":"chat","model":"same-name","baseUrl":low.url.clone()},
             "auth":{"type":"api_key","key":"low-capability-token"},
             "capabilities":{"tools":false,"structuredOutput":true,"contextWindow":9000,"maxOutputTokens":300},
@@ -578,7 +578,7 @@ async fn global_model_tiers_mix_real_http_title_agent_compaction_and_price_ident
     assert!(costs
         .models
         .iter()
-        .any(|model| model.totals.model == "local:local-file" && model.totals.cost_usd == 0.0));
+        .any(|model| model.totals.model == "codex:low-catalog-id" && model.totals.cost_usd == 0.0));
     let high_cost = costs
         .models
         .iter()
@@ -816,7 +816,7 @@ async fn global_model_tiers_unavailable_tiers_degrade_to_main_and_null_follows_m
     let mut init = main.init("low");
     init["modelTierTargets"] = json!({
         "low":{"type":"unavailable","source":"custom","modelId":"deleted","code":"MODEL_REMOVED","message":"The selected model was deleted."},
-        "medium":{"type":"unavailable","source":"local","modelId":"deleted-file","code":"MODEL_REMOVED","message":"The selected model was deleted."}
+        "medium":{"type":"unavailable","source":"codex","modelId":"deleted-model","code":"MODEL_REMOVED","message":"The selected model was deleted."}
     });
     assert_eq!(
         reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
@@ -905,15 +905,14 @@ async fn global_model_tiers_selection_resolve_is_readonly_and_does_not_return_au
     let provider = LoopbackProvider::start().await;
     let mut fixture = Fixture::new(false, None).await;
     fixture.client.send(json!({"id":20,"method":"model/selection/resolve","params":{
-        "source":"local","selection":"main-file",
-        "catalog":[{"value":"local:main-file"}],
+        "source":"subscription","selection":"opus",
         "modelTierTargets":{
             "high":tier_target(&provider,"custom","other-entry","secret-never-returned",8000,300,1.0),
             "low":{"type":"source","source":"custom","modelId":"deleted-entry"}
         }
     }})).await;
     let (reply, _) = fixture.client.response_for(20).await;
-    assert_eq!(reply["result"]["selection"], "local:main-file", "{reply}");
+    assert_eq!(reply["result"]["selection"], "subscription:opus", "{reply}");
     assert_eq!(reply["result"]["modelTierTargets"]["high"]["type"], "ready");
     assert_eq!(
         reply["result"]["modelTierTargets"]["low"]["type"],
@@ -1822,7 +1821,7 @@ async fn snapshot_named_facade_streams_a_then_requests_b_in_the_same_main_turn_w
     )
     .await;
     assert_eq!(begin["result"]["revision"], 1, "{begin}");
-    let mut init_b = snapshot_init(&b, "fixture-b", "local", true);
+    let mut init_b = snapshot_init(&b, "fixture-b", "subscription", true);
     init_b["config"]["contextWindow"] = json!(161000);
     let published = named_with_events(
         &mut fixture.client,
@@ -1895,7 +1894,7 @@ async fn snapshot_named_facade_streams_a_then_requests_b_in_the_same_main_turn_w
     assert_eq!(request_events.len(), 3);
     facade_identity(request_events[0], 1, "fixture-a", "custom", "main-a");
     for event in &request_events[1..] {
-        facade_identity(event, 2, "fixture-b", "local", "main-b");
+        facade_identity(event, 2, "fixture-b", "subscription", "main-b");
     }
     for event in events.iter().map(inner_event).filter(|event| {
         matches!(
@@ -1905,7 +1904,7 @@ async fn snapshot_named_facade_streams_a_then_requests_b_in_the_same_main_turn_w
     }) {
         match event["inference"]["revision"].as_u64() {
             Some(1) => facade_identity(event, 1, "fixture-a", "custom", "main-a"),
-            Some(2) => facade_identity(event, 2, "fixture-b", "local", "main-b"),
+            Some(2) => facade_identity(event, 2, "fixture-b", "subscription", "main-b"),
             other => panic!("request-level attribution missing or unexpected: {other:?} {event}"),
         }
     }
@@ -2036,7 +2035,7 @@ async fn snapshot_named_begin_failure_blocks_new_work_instead_of_using_cached_a(
         "side",
         "unbegun",
         1,
-        snapshot_init(&provider, "fixture-b", "local", true),
+        snapshot_init(&provider, "fixture-b", "subscription", true),
     )
     .await;
     assert!(
@@ -2102,7 +2101,7 @@ async fn snapshot_named_begin_failure_blocks_new_work_instead_of_using_cached_a(
             "side",
             "recover-b",
             1,
-            snapshot_init(&provider, "fixture-b", "local", true)
+            snapshot_init(&provider, "fixture-b", "subscription", true)
         )
         .await["result"]["revision"],
         2
@@ -2151,7 +2150,7 @@ async fn snapshot_latest_named_selector_supersedes_slow_preparation_without_clea
         "side",
         "winner",
         99,
-        snapshot_init(&provider, "fixture-winner", "local", true),
+        snapshot_init(&provider, "fixture-winner", "subscription", true),
     )
     .await;
     assert!(
@@ -2195,7 +2194,7 @@ async fn snapshot_latest_named_selector_supersedes_slow_preparation_without_clea
             "side",
             "winner-retry",
             0,
-            snapshot_init(&provider, "fixture-winner", "local", true)
+            snapshot_init(&provider, "fixture-winner", "subscription", true)
         )
         .await["result"]["revision"],
         1

@@ -1,5 +1,5 @@
-//! Defect: Antigravity models configured for orchestration, advisor, tiers, or feature targets failed with HOST_TARGET_REQUIRED.
-//! Root cause: `resolve_tier_target` and `text_completion` omitted `"antigravity"` from source target resolution and credential pinning.
+//! Defect: Auxiliary/orchestration target resolution maintained separate hardcoded source lists and retired on-device `HOST_TARGET_REQUIRED` branches.
+//! Root cause: `resolve_tier_target`, `validate_model_source`, CLI `--model` parsing, and `text_completion` drifted instead of sharing `is_supported_model_source`.
 //! Work item: 20261113 Antigravity auxiliary and orchestration model targets.
 //! Mounted by the app-server aggregate to exercise the public session facade.
 
@@ -125,6 +125,21 @@ async fn antigravity_orchestrator_advisor_tier_and_feature_targets_are_ready_on_
     assert_eq!(
         rejected["orchestratorTarget"]["code"], "MODEL_TARGET_UNAVAILABLE",
         "{rejected}"
+    );
+
+    let mut retired_local = main.init("fixture-main");
+    retired_local["orchestratorTarget"] =
+        json!({"type": "source", "source": "local", "modelId": "retired-gguf"});
+    let reply = reconfigure(&mut fixture, 206, retired_local, Some(2)).await;
+    assert_eq!(reply["result"]["revision"], 3, "{reply}");
+    let rejected_local = super::runtime(&mut fixture, 207).await;
+    assert_eq!(
+        rejected_local["orchestratorTarget"]["type"], "unavailable",
+        "{rejected_local}"
+    );
+    assert_eq!(
+        rejected_local["orchestratorTarget"]["code"], "MODEL_TARGET_UNAVAILABLE",
+        "{rejected_local}"
     );
     fixture.close().await;
 }

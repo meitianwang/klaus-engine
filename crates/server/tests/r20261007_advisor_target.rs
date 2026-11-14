@@ -12,7 +12,7 @@ mod antigravity_model_targets;
 
 fn resolved_advisor(provider: &LoopbackProvider, model_id: &str) -> Value {
     json!({
-        "type":"resolved","source":"local","modelId":model_id,
+        "type":"resolved","source":"codex","modelId":model_id,
         "provider":{"type":"openai","api":"chat","model":"advisor-model","baseUrl":provider.url},
         "auth":{"type":"api_key","key":"fixture-advisor-secret"},
         "capabilities":{"tools":false,"contextWindow":12000,"maxOutputTokens":512},
@@ -37,7 +37,7 @@ fn unavailable_advisors() -> Vec<Value> {
         json!({"type":"unavailable","source":"custom","modelId":"removed-advisor",
             "code":"MODEL_REMOVED","message":"The advisor model was removed."}),
         json!({"type":"source","source":"custom","modelId":"missing-advisor"}),
-        json!({"type":"source","source":"local","modelId":"host-only-advisor"}),
+        json!({"type":"source","source":"local","modelId":"retired-local-advisor"}),
         json!({"type":"source","source":"custom","modelId":""}),
         json!({"type":"source","source":"custom","modelId":"high"}),
         invalid_provider,
@@ -140,7 +140,7 @@ async fn start_resolved_cross_source_advisor_is_independent_of_tier_targets() {
     // Keep routing assertions independent of prompt catalog compaction.
     init["config"]["contextWindow"] = json!(131000);
     init["modelSource"] = json!({"source":"custom","modelId":"main-entry"});
-    init["advisorTarget"] = resolved_advisor(&advisor, "local-advisor");
+    init["advisorTarget"] = resolved_advisor(&advisor, "codex-advisor");
     init["modelTierTargets"] = json!({
         "high":tier_target(&tier,"custom","high-entry","high-key",32000,1024,1.0)
     });
@@ -148,8 +148,8 @@ async fn start_resolved_cross_source_advisor_is_independent_of_tier_targets() {
     let runtime = named_runtime(&mut fixture.client, 102, "advisor-cross-source").await;
     assert_eq!(runtime["model"], "main-model");
     assert_eq!(runtime["advisorTarget"]["type"], "ready", "{runtime}");
-    assert_eq!(runtime["advisorTarget"]["source"], "local");
-    assert_eq!(runtime["advisorTarget"]["modelId"], "local-advisor");
+    assert_eq!(runtime["advisorTarget"]["source"], "codex");
+    assert_eq!(runtime["advisorTarget"]["modelId"], "codex-advisor");
     assert_eq!(runtime["advisorTarget"]["model"], "advisor-model");
     assert_eq!(runtime["modelTierTargets"]["high"]["modelId"], "high-entry");
     assert_non_secret(&runtime);

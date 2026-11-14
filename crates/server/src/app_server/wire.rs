@@ -1664,23 +1664,14 @@ pub struct SubscriptionModelsParams {
     pub submission_id: Option<String>,
 }
 
-/// A host-owned catalog entry. Only the on-device source uses this input;
-/// subscription and custom catalogs are owned by the engine.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ModelSelectionCatalogEntry {
-    pub value: String,
-}
-
 /// Resolve a persisted model choice without starting a session or requiring a key.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelSelectionResolveParams {
     pub source: String,
     pub selection: String,
     #[serde(default)]
     pub model_tier_selections: serde_json::Map<String, Value>,
-    #[serde(default)]
-    pub catalog: Vec<ModelSelectionCatalogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier_targets: Option<ModelTierTargets>,
 }
@@ -1703,8 +1694,8 @@ pub struct ModelSourceRef {
     pub model_id: String,
 }
 
-/// Host targets use the existing provider/auth/capabilities/pricing wire shapes.
-/// The facade resolves engine-owned source references into the same shape.
+/// Auxiliary and orchestration model targets resolve engine-owned source
+/// references into concrete provider/auth/capabilities/pricing bindings.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "type",

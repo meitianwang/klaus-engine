@@ -20,29 +20,6 @@
 //! by selection and then ask it for a different model by name, and the engine has
 //! no rule for which of the two wins.
 
-/// The model-source prefixes, the same set the desktop client writes.
-///
-/// Held with the colon attached so a model id that merely contains one (`us.
-/// anthropic.claude-opus-4:1`) is not read as a source. A value carrying none of
-/// these is a model name.
-pub const SOURCE_PREFIXES: &[&str] = &[
-    "trae:",
-    "kiro:",
-    "subscription:",
-    "codex:",
-    "qoder:",
-    "qwenwork:",
-    "workbuddy:",
-    "cursor:",
-    "kimi:",
-    "bailian:",
-    "minimax:",
-    "zhipu:",
-    "ark:",
-    "local:",
-    "custom:",
-];
-
 /// The selection that leaves the choice to the endpoint's own default.
 pub const AUTO: &str = "auto";
 
@@ -61,9 +38,9 @@ impl<'a> ModelRef<'a> {
     pub fn parse(value: &'a str) -> Self {
         let value = value.trim();
         if value == AUTO
-            || SOURCE_PREFIXES
-                .iter()
-                .any(|prefix| value.starts_with(prefix))
+            || value.split_once(':').is_some_and(|(source, _)| {
+                klaus_agent_core::engine::session::is_supported_model_source(source)
+            })
         {
             Self::Selection(value)
         } else {
@@ -94,11 +71,11 @@ mod tests {
     #[test]
     fn a_source_prefix_makes_it_a_selection() {
         for value in [
+            "antigravity:gemini-4-carbon-high",
             "subscription:opus",
             "codex:gpt-5.6-sol",
             "qoder:auto",
             "qwenwork:auto",
-            "local:llama3",
             "custom:5f344546",
         ] {
             assert_eq!(
@@ -119,6 +96,7 @@ mod tests {
             "gpt-5.5",
             "us.anthropic.claude-opus-4:1",
             "moonshotai/kimi-k2.6",
+            "local:retired-gguf",
         ] {
             assert_eq!(ModelRef::parse(value), ModelRef::Name(value), "{value}");
         }

@@ -14,7 +14,8 @@ pub type SubagentTargetResolver = Arc<
         + Sync,
 >;
 
-/// Reserved source prefixes shared by endpoint selection and child admission.
+/// Supported engine-owned model sources shared across main-model selection,
+/// auxiliary/orchestration targets, sub-agent admission, and CLI `--model` parsing.
 pub const MODEL_TARGET_SOURCES: &[&str] = &[
     "antigravity",
     "trae",
@@ -31,8 +32,11 @@ pub const MODEL_TARGET_SOURCES: &[&str] = &[
     "zhipu",
     "ark",
     "custom",
-    "local",
 ];
+
+pub fn is_supported_model_source(source: &str) -> bool {
+    MODEL_TARGET_SOURCES.contains(&source)
+}
 
 pub(super) enum SubagentInferenceError {
     Unavailable(String),
@@ -108,7 +112,7 @@ impl Session {
         let Some((source, model_id)) = text.as_deref().and_then(|text| text.split_once(':')) else {
             return captured.for_selection(selection).map_err(Unavailable);
         };
-        if !MODEL_TARGET_SOURCES.contains(&source) {
+        if !is_supported_model_source(source) {
             return captured.for_selection(selection).map_err(Unavailable);
         }
         if source.is_empty()

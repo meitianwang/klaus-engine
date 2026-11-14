@@ -585,7 +585,7 @@ impl<'a> Turn<'a> {
         match self.on_interrupt {
             OnInterrupt::Turn => {
                 self.engine
-                    .ack::<TurnInterrupt>(wire::TurnInterruptParams {
+                    .call::<TurnInterrupt>(wire::TurnInterruptParams {
                         session_id: self.engine.session_id().to_string(),
                         submission_id: None,
                         origin: None,

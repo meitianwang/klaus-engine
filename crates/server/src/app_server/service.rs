@@ -4783,27 +4783,9 @@ async fn resolve_tier_target(
         qualify_tier_oauth(&mut value);
         return Ok(value);
     };
-    if ![
-        "antigravity",
-        "trae",
-        "kiro",
-        "subscription",
-        "codex",
-        "qoder",
-        "qwenwork",
-        "workbuddy",
-        "cursor",
-        "kimi",
-        "bailian",
-        "minimax",
-        "zhipu",
-        "ark",
-        "custom",
-    ]
-    .contains(&source.as_str())
-    {
+    if !klaus_agent_core::engine::session::is_supported_model_source(&source) {
         return Ok(
-            serde_json::json!({"type":"unavailable","source":source,"modelId":model_id,"code":"HOST_TARGET_REQUIRED","message":"This model source requires a host-resolved provider target."}),
+            serde_json::json!({"type":"unavailable","source":source,"modelId":model_id,"code":"MODEL_TARGET_UNAVAILABLE","message":format!("Unsupported model source: {source}")}),
         );
     }
     if model_id.trim().is_empty()
@@ -9424,25 +9406,6 @@ fn model_runtime_value(
     .map_err(|error| error.to_string())
 }
 
-const MODEL_SOURCES: &[&str] = &[
-    "trae",
-    "kiro",
-    "antigravity",
-    "subscription",
-    "codex",
-    "qoder",
-    "qwenwork",
-    "workbuddy",
-    "cursor",
-    "kimi",
-    "bailian",
-    "minimax",
-    "zhipu",
-    "ark",
-    "custom",
-    "local",
-];
-
 /// `modelSource` is the non-secret attribution identity that inference events
 /// and the composer's actual-request label carry. It must never become a
 /// channel for a credential or an upstream URL, so its field set is closed here
@@ -9480,7 +9443,7 @@ fn validate_model_source(init: &Map<String, Value>) -> Result<(), String> {
         }
     }
     if let Some(source_name) = source.get("source").and_then(Value::as_str) {
-        if !MODEL_SOURCES.contains(&source_name) {
+        if !klaus_agent_core::engine::session::is_supported_model_source(source_name) {
             return Err("modelSource.source must name a supported model source".to_string());
         }
         if let Some((prefix, _)) = source
@@ -9488,7 +9451,9 @@ fn validate_model_source(init: &Map<String, Value>) -> Result<(), String> {
             .and_then(Value::as_str)
             .and_then(|selection| selection.split_once(':'))
         {
-            if MODEL_SOURCES.contains(&prefix) && prefix != source_name {
+            if klaus_agent_core::engine::session::is_supported_model_source(prefix)
+                && prefix != source_name
+            {
                 return Err(
                     "modelSource.selection must belong to its modelSource source".to_string(),
                 );
@@ -9508,7 +9473,9 @@ fn preserve_model_selection_metadata(init: &mut Map<String, Value>) {
             .as_deref()
             .and_then(|selection| selection.split_once(':'))
         {
-            if MODEL_SOURCES.contains(&source) && !model_id.is_empty() {
+            if klaus_agent_core::engine::session::is_supported_model_source(source)
+                && !model_id.is_empty()
+            {
                 init.insert(
                     "modelSource".to_string(),
                     serde_json::json!({
@@ -10508,8 +10475,8 @@ mod model_provider_tests {
             "modelSource": {"source": "custom", "modelId": "entry-main"},
             "modelTierTargets": {
                 "high": {"type": "source", "source": "subscription", "modelId": "opus"},
-                "medium": {"type": "resolved", "source": "local", "modelId": "local-model",
-                    "provider": {"type": "openai", "model": "local-model"},
+                "medium": {"type": "resolved", "source": "custom", "modelId": "resolved-model",
+                    "provider": {"type": "openai", "model": "resolved-model"},
                     "auth": {"type": "bearer", "token": "private-route-token"},
                     "capabilities": {"tools": false}, "pricing": []},
                 "low": {"type": "unavailable", "source": "kimi", "modelId": "gone",
@@ -10532,7 +10499,7 @@ mod model_provider_tests {
         validate_inference_init(&following).unwrap();
         for bad_target in [
             serde_json::json!({"unexpected": null}),
-            serde_json::json!({"high": {"type": "resolved", "source": "local", "modelId": "m"}}),
+            serde_json::json!({"high": {"type": "resolved", "source": "custom", "modelId": "m"}}),
             serde_json::json!({"low": {"type": "source", "source": "custom", "modelId": "m", "cwd": "/elsewhere"}}),
         ] {
             following["modelTierTargets"] = bad_target;
@@ -10547,6 +10514,7 @@ mod model_provider_tests {
             serde_json::json!({"source": "custom", "modelId": "m", "baseUrl": "https://private.invalid"}),
             serde_json::json!({"source": "custom", "modelId": " m "}),
             serde_json::json!({"source": "klaus", "modelId": "retired-model"}),
+            serde_json::json!({"source": "local", "modelId": "retired-local"}),
             serde_json::json!({"source": "custom", "modelId": "m", "selection": "codex:m"}),
         ] {
             assert!(validate_inference_init(&serde_json::json!({

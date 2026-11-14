@@ -4,18 +4,16 @@
 use std::path::Path;
 
 use klaus_agent_core::config_store;
-use klaus_agent_core::engine::session::MODEL_TARGET_SOURCES as SOURCES;
+use klaus_agent_core::engine::session::is_supported_model_source;
 use serde_json::{Map, Value};
 
 use super::model_sources;
-use super::wire::{
-    ModelSelectionCatalogEntry, ModelSelectionResolution, ModelSelectionResolveParams,
-};
+use super::wire::{ModelSelectionResolution, ModelSelectionResolveParams};
 
 fn scoped_value<'a>(source: &str, selection: &'a str) -> Result<&'a str, String> {
     let selection = selection.trim();
     if let Some((prefix, value)) = selection.split_once(':') {
-        if SOURCES.contains(&prefix) {
+        if is_supported_model_source(prefix) {
             if prefix != source {
                 return Err(format!(
                     "model selection {selection} does not belong to source {source}"
@@ -36,13 +34,10 @@ pub(super) async fn resolve(
     params: &ModelSelectionResolveParams,
 ) -> Result<ModelSelectionResolution, String> {
     let source = params.source.trim();
-    if !SOURCES.contains(&source) {
+    if !is_supported_model_source(source) {
         return Err(format!("unsupported model source: {source}"));
     }
     let value = scoped_value(source, &params.selection)?;
-    if source != "local" && !params.catalog.is_empty() {
-        return Err(format!("the engine owns the {source} model catalog"));
-    }
     let value = match source {
         "kiro" => {
             super::kiro::set_config_root(&model_sources::config_root_of(config_path));
@@ -115,12 +110,6 @@ pub(super) async fn resolve(
             super::ark::set_config_root(&model_sources::config_root_of(config_path));
             model_sources::ark_main_model(value, &params.model_tier_selections)
         }
-        "local" => host_model(
-            source,
-            value,
-            &params.catalog,
-            &params.model_tier_selections,
-        )?,
         _ => unreachable!("validated source"),
     };
     Ok(ModelSelectionResolution {
@@ -186,35 +175,4 @@ pub(super) fn custom_model_id<'a>(
                 "cannot resolve model {selection}: no models are configured in [modelProviders]"
             )
         })
-}
-
-fn host_model(
-    source: &str,
-    selection: &str,
-    catalog: &[ModelSelectionCatalogEntry],
-    tiers: &Map<String, Value>,
-) -> Result<String, String> {
-    if !matches!(selection, "" | "auto" | "high" | "medium" | "low") {
-        return Ok(selection.to_string());
-    }
-    if let Some(pick) = tiers
-        .get(selection)
-        .and_then(Value::as_str)
-        .filter(|pick| !pick.trim().is_empty())
-    {
-        let pick = scoped_value(source, pick)?;
-        if !matches!(pick, "" | "auto" | "high" | "medium" | "low") {
-            return Ok(pick.to_string());
-        }
-    }
-    let entry = catalog
-        .first()
-        .ok_or_else(|| format!("no models are available for source {source}"))?;
-    let value = scoped_value(source, &entry.value)?;
-    if value.is_empty() || matches!(value, "auto" | "high" | "medium" | "low") {
-        return Err(format!(
-            "the {source} catalog default must name a concrete model"
-        ));
-    }
-    Ok(value.to_string())
 }
