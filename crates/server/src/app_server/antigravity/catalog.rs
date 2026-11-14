@@ -337,6 +337,106 @@ pub(super) fn is_chat_model(entry: &Value) -> bool {
     super::super::conversation_catalog::is_conversation_model("antigravity", entry)
 }
 
+fn variant_family_and_order(id: &str) -> Option<(&str, i64)> {
+    match id {
+        "gemini-3.5-flash-extra-low" => return Some(("gemini-3.5-flash", 0)),
+        "gemini-3.5-flash-low" => return Some(("gemini-3.5-flash", 2)),
+        "gemini-3-flash-agent" => return Some(("gemini-3.5-flash", 3)),
+        _ => {}
+    }
+    for (suffix, order) in [
+        ("-extra-low", 0),
+        ("-minimal", 0),
+        ("-low", 1),
+        ("-medium", 2),
+        ("-high", 3),
+        ("-extra-high", 4),
+        ("-xhigh", 4),
+        ("-max", 5),
+    ] {
+        if let Some(family) = id.strip_suffix(suffix).filter(|family| !family.is_empty()) {
+            return Some((family, order));
+        }
+    }
+    None
+}
+
+type VariantRank = (u8, i64, i64);
+type VariantFamilyKey = (String, String);
+
+fn variant_reasoning_rank(entry: &Value, suffix_order: i64) -> VariantRank {
+    if let Some(level) = positive_integer(entry.get("thinkingLevel")) {
+        let rank = match level {
+            4 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            5 | 100 => 4,
+            6 | 200 => 5,
+            other => other as i64,
+        };
+        return (0, rank, suffix_order);
+    }
+    if let Some(budget) = declared_thinking_budget(entry) {
+        let rank = if budget == -1 { i64::MAX } else { budget };
+        return (1, rank, suffix_order);
+    }
+    (2, suffix_order, suffix_order)
+}
+
+/// Map higher-reasoning sibling variants to the lowest-reasoning chat variant
+/// offered in the same model family.
+pub(super) fn minimal_reasoning_models(
+    payload: &Value,
+) -> std::collections::HashMap<String, String> {
+    let entries = normalize_models(payload);
+    let mut families: std::collections::BTreeMap<VariantFamilyKey, Vec<(String, VariantRank)>> =
+        std::collections::BTreeMap::new();
+    for entry in &entries {
+        if !is_chat_model(entry) || entry.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(id) = entry.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((family, suffix_order)) = variant_family_and_order(id) else {
+            continue;
+        };
+        let provider = entry
+            .get("modelProvider")
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let rank = variant_reasoning_rank(entry, suffix_order);
+        families
+            .entry((family.to_string(), provider))
+            .or_default()
+            .push((id.to_string(), rank));
+    }
+    let mut result = std::collections::HashMap::new();
+    for members in families.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let Some((lowest_id, lowest_rank)) = members
+            .iter()
+            .min_by(|(left_id, left_rank), (right_id, right_rank)| {
+                left_rank
+                    .cmp(right_rank)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        for (id, rank) in members {
+            if rank > lowest_rank {
+                result.insert(id, lowest_id.clone());
+            }
+        }
+    }
+    result
+}
+
 /// Project only fields accepted by the engine's capability contract.
 pub fn model_capabilities(entry: &Value) -> Value {
     let raw = entry.get("providerMetadata").unwrap_or(entry);
@@ -1446,5 +1546,105 @@ mod tests {
             ]})),
             vec!["low", "medium", "high", "xhigh", "max"]
         );
+    }
+
+    #[test]
+    fn minimal_reasoning_models_maps_variant_families_to_lowest_offered_chat_member() {
+        let payload = json!({
+            "models": {
+                "gemini-4-carbon-high": {
+                    "displayName": "Gemini 4 Carbon (High)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-4-carbon-medium": {
+                    "displayName": "Gemini 4 Carbon (Medium)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 2,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-4-carbon-low": {
+                    "displayName": "Gemini 4 Carbon (Low)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 1,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-4-hydrogen-xhigh": {
+                    "displayName": "Gemini 4 Hydrogen (XHigh)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 100,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-4-hydrogen-low": {
+                    "displayName": "Gemini 4 Hydrogen (Low)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 1,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-3.8-flash-high": {
+                    "displayName": "Gemini 3.8 Flash (High)",
+                    "supportsThinking": true,
+                    "thinkingBudget": -1,
+                    "minThinkingBudget": 32,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "gemini-3.8-flash-low": {
+                    "displayName": "Gemini 3.8 Flash (Low)",
+                    "supportsThinking": true,
+                    "thinkingBudget": 1000,
+                    "minThinkingBudget": 32,
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                },
+                "claude-opus-5-5-max": {
+                    "displayName": "Claude Opus 5.5 (Max)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 200,
+                    "modelProvider": "MODEL_PROVIDER_ANTHROPIC"
+                },
+                "claude-opus-5-5-high": {
+                    "displayName": "Claude Opus 5.5 (High)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3,
+                    "modelProvider": "MODEL_PROVIDER_ANTHROPIC"
+                },
+                "claude-opus-5-5-low": {
+                    "displayName": "Claude Opus 5.5 (Low)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 1,
+                    "disabled": true,
+                    "modelProvider": "MODEL_PROVIDER_ANTHROPIC"
+                },
+                "gpt-oss-120b-medium": {
+                    "displayName": "GPT-OSS 120B (Medium)",
+                    "supportsThinking": true,
+                    "thinkingBudget": 8192,
+                    "modelProvider": "MODEL_PROVIDER_OPENAI"
+                }
+            }
+        });
+        let mapped = minimal_reasoning_models(&payload);
+        assert_eq!(
+            mapped.get("gemini-4-carbon-high").map(String::as_str),
+            Some("gemini-4-carbon-low")
+        );
+        assert_eq!(
+            mapped.get("gemini-4-carbon-medium").map(String::as_str),
+            Some("gemini-4-carbon-low")
+        );
+        assert!(!mapped.contains_key("gemini-4-carbon-low"));
+        assert_eq!(
+            mapped.get("gemini-4-hydrogen-xhigh").map(String::as_str),
+            Some("gemini-4-hydrogen-low")
+        );
+        assert_eq!(
+            mapped.get("gemini-3.8-flash-high").map(String::as_str),
+            Some("gemini-3.8-flash-low")
+        );
+        assert_eq!(
+            mapped.get("claude-opus-5-5-max").map(String::as_str),
+            Some("claude-opus-5-5-high")
+        );
+        assert!(!mapped.contains_key("gpt-oss-120b-medium"));
     }
 }

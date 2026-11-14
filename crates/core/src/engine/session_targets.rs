@@ -121,10 +121,15 @@ pub(super) fn frozen_target_state(
 ) -> Option<InferenceTargetState> {
     match state {
         Some(InferenceTargetState::Ready(target)) => {
+            let mut captured_models = vec![target.model.clone()];
+            let minimal = target.provider.minimal_reasoning_model(&target.model);
+            if minimal != target.model {
+                captured_models.push(minimal);
+            }
             Some(InferenceTargetState::Ready(InferenceTarget {
                 provider: crate::provider::model_catalog::capture_model_provider(
                     target.provider.clone(),
-                    std::slice::from_ref(&target.model),
+                    &captured_models,
                 ),
                 ..target.clone()
             }))
@@ -914,6 +919,9 @@ impl ModelProvider for SummaryProvider {
     }
     fn has_model_capabilities(&self, model: &RuntimeString) -> bool {
         self.inner.has_model_capabilities(model)
+    }
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        self.inner.minimal_reasoning_model(model)
     }
     fn stream(
         &self,

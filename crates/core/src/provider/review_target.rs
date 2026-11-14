@@ -188,6 +188,9 @@ impl ModelProvider for ReviewCatalogProvider {
                 .unwrap_or_else(|| self.inner.clone()),
         )
     }
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        self.inner.minimal_reasoning_model(model)
+    }
     fn stream(&self, request: ModelRequest, signal: AbortSignal) -> ModelStream {
         self.inner.stream(request, signal)
     }
@@ -483,6 +486,9 @@ impl ModelProvider for DeclaredReviewTarget {
     }
     fn offline_model_catalog(&self) -> Vec<(RuntimeString, ModelCapabilities)> {
         self.root.offline_model_catalog()
+    }
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        self.root.minimal_reasoning_model(model)
     }
     fn approval_review_preferred_model(&self) -> RuntimeString {
         self.root.approval_review_preferred_model()

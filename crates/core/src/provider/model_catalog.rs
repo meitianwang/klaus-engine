@@ -915,6 +915,15 @@ impl ModelProvider for CapturedModelProvider {
         self.capabilities.contains_key(model)
     }
 
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        let candidate = self.inner.minimal_reasoning_model(model);
+        if self.capabilities.contains_key(&candidate) {
+            candidate
+        } else {
+            model.clone()
+        }
+    }
+
     fn stream(&self, mut req: ModelRequest, signal: AbortSignal) -> ModelStream {
         let Some(capabilities) = self.capabilities.get(&req.model) else {
             return uncaptured_model_stream(&req.model);
@@ -1213,6 +1222,10 @@ impl ModelProvider for CatalogModelProvider {
 
     fn has_model_capabilities(&self, model: &RuntimeString) -> bool {
         self.inner.has_model_capabilities(model)
+    }
+
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        self.inner.minimal_reasoning_model(model)
     }
 
     fn estimate_tokens(&self, req: &ModelRequest) -> Option<u64> {

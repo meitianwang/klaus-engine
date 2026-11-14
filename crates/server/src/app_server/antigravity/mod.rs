@@ -908,6 +908,37 @@ pub(super) fn decorate(
             by_model.insert(id, provider.model_metadata(&entry.model));
         }
     }
+    let minimal_reasoning_models: HashMap<String, RuntimeString> = auth::generation()
+        .map(|generation| {
+            let payload = cached_payload(&generation)
+                .map(|cached| cached.payload)
+                .unwrap_or_else(catalog::bundled_payload);
+            let mut mapped = HashMap::new();
+            for (from, to) in catalog::minimal_reasoning_models(&payload) {
+                if !by_model.contains_key(&from) {
+                    continue;
+                }
+                if !by_model.contains_key(&to) {
+                    if let Some(details) = catalog::model_details(&payload, &to) {
+                        let raw_caps = catalog::model_capabilities(&details);
+                        if let Ok(caps) =
+                            klaus_agent_core::runtime_values::runtime_codec::decode_text::<
+                                klaus_agent_core::types::provider::ModelCapabilities,
+                            >(&RuntimeString::from(
+                                raw_caps.to_string(),
+                            ))
+                        {
+                            by_model.insert(to.clone(), caps);
+                        }
+                    }
+                }
+                if by_model.contains_key(&to) {
+                    mapped.insert(from, RuntimeString::from(to));
+                }
+            }
+            mapped
+        })
+        .unwrap_or_default();
     let thinking_dialects_by_model = by_model
         .keys()
         .map(|id| {
@@ -937,6 +968,7 @@ pub(super) fn decorate(
         capabilities_by_model: Some(by_model),
         thinking_dialect: Some(selected_dialect(&model, init)),
         thinking_dialects_by_model: Some(thinking_dialects_by_model),
+        minimal_reasoning_models: Some(minimal_reasoning_models),
         adapter_policy: GeminiAdapterPolicy {
             replay_signed_parts: true,
             scope_signatures_to_model: true,

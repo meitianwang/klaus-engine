@@ -148,6 +148,7 @@ impl InferenceBundle {
     ) -> Arc<Self> {
         let mut models = extra_models.to_vec();
         models.push(self.config.model.clone());
+        models.push(self.provider.minimal_reasoning_model(&self.config.model));
         models.push(self.provider.info().default_model.clone());
         models.extend(self.config.fallback_models.iter().cloned());
         models.extend(

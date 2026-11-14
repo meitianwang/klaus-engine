@@ -2270,6 +2270,11 @@ pub trait ModelProvider: Send + Sync {
     fn has_model_capabilities(&self, _model: &RuntimeString) -> bool {
         true
     }
+    /// Return the lowest-reasoning variant of `model` within the same model
+    /// family when a source encodes reasoning rungs as distinct model IDs.
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        model.clone()
+    }
     fn stream(&self, req: ModelRequest, signal: AbortSignal) -> ModelStream;
     /// Pre-turn token estimate (engine supplies a chars/4 fallback if absent —
     /// modeled as `None`).

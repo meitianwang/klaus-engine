@@ -3530,16 +3530,19 @@ impl Session {
                 usage: None,
             });
         }
-        let prompt = match instructions.and_then(nonempty_trimmed) {
-            Some(extra) => description
-                .concat(&RuntimeString::from("\n\nAdditional title guidance: "))
+        let system_append = match instructions.and_then(nonempty_trimmed) {
+            Some(extra) => RuntimeString::from(SESSION_TITLE_PROMPT)
+                .concat(&RuntimeString::from("\n\nAdditional title guidance:\n"))
                 .concat(&RuntimeString::from(extra)),
-            None => description,
+            None => RuntimeString::from(SESSION_TITLE_PROMPT),
         };
+        let framed_input = RuntimeString::from("<conversation>\n")
+            .concat(&description)
+            .concat(&RuntimeString::from("\n</conversation>"));
         let outcome = self
             .run_readonly_query(ReadonlyQueryOptions {
-                input: Input::Text(prompt),
-                system_append: Some(SESSION_TITLE_PROMPT.into()),
+                input: Input::Text(framed_input),
+                system_append: Some(system_append),
                 output_schema: Some(title_output_schema()),
                 // The budget must leave room for reasoning on thinking
                 // models; a starved budget returns no title text at all.
@@ -3861,7 +3864,13 @@ impl Session {
         if opts.signal.is_cancelled() {
             return Err(opts.cancelled_error.to_string());
         }
-        let model = bundle.config.model.clone();
+        let model = if opts.inherit_session_reasoning {
+            bundle.config.model.clone()
+        } else {
+            bundle
+                .provider
+                .minimal_reasoning_model(&bundle.config.model)
+        };
         // Side questions have their own 5 x 10 MiB binary budget. Validate each
         // part through the standard model/payload gate without imposing the
         // ordinary turn's separate 20 MiB aggregate PDF budget.

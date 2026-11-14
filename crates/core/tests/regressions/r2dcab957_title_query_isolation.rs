@@ -358,3 +358,90 @@ async fn title_query_pins_the_lowest_effort_the_model_declares() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn title_query_keeps_instructions_in_system_prompt_and_frames_user_content() {
+    let dir = std::env::temp_dir().join(format!(
+        "klaus-title-query-instructions-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let process = RuntimeProcessContext::initialize(
+        super::r7c876d49_spec_restores_latest_permission_policy::process_supervisor(),
+    )
+    .unwrap();
+    let provider = RecordingProvider::new(Vec::new());
+    let agent = Agent::new(AgentOptions {
+        process_context: process,
+        provider: provider.clone(),
+        config: Some(serde_json::json!({ "model": "main-model" })),
+        tools: Some(Vec::new()),
+        web_fetch_page: None,
+        browser_runtime: None,
+        capability_roots: Vec::new(),
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        deps: EngineDepsOverrides::default(),
+        compactor: None,
+        approval_handler: None,
+        approval_reviewer: None,
+        elicit_handler: None,
+        credential_store: None,
+        hooks: Vec::new(),
+        observer: Some(None),
+        logger: None,
+        pricing: None,
+        agents: None,
+        include_default_agents: None,
+        skills: None,
+        output_styles: None,
+        workflows: None,
+        mcp_catalog: None,
+        plugin_catalog: None,
+        lsp_servers: None,
+        agent_memory: None,
+        mcp_clients: None,
+        mcp_server_configs: Vec::new(),
+        mcp_tools: None,
+        refresh_tools: None,
+        system_prompt_provider: None,
+        plugins: Vec::new(),
+        plugin_load_report: None,
+    });
+    let root = dir.to_string_lossy().into_owned();
+    let session = agent.start_session(StartSessionOptions {
+        cwd: Some(root.clone().into()),
+        user_config_dir: Some(root.into()),
+        config: Some(serde_json::json!({ "model": "main-model" })),
+        ..Default::default()
+    });
+
+    session
+        .generate_title(
+            Some("Keep the title within 24 characters.".to_string()),
+            Some("推送".to_string()),
+            false,
+        )
+        .await
+        .expect("title generation runs");
+
+    let requests = provider.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let system_text = requests[0]
+        .system
+        .iter()
+        .filter_map(|part| part.text.try_to_utf8().ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        system_text.contains("Keep the title within 24 characters."),
+        "extra title guidance belongs in the system prompt"
+    );
+    let user_text = message_text(&requests[0].messages[0]);
+    assert_eq!(
+        user_text, "<conversation>\n推送\n</conversation>",
+        "the user message carries only the framed conversation content without instruction text"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -659,19 +659,25 @@ This side task is for answering questions and lightweight exploration without di
 Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly asks for that change inside this side task. You may request escalated permissions or broader sandbox access for an explicitly requested operation, including read-only inspection, only when necessary and permitted by this side task's approval policy. When the user does ask for a change, keep it minimal, local to the request, and avoid disrupting the main task.
 
 Sub-agents are off-limits here. Do not create or interact with sub-agents, even if the inherited prefix shows the parent task using them."#;
-pub(crate) const SESSION_TITLE_PROMPT: &str = r#"Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.
+pub(crate) const SESSION_TITLE_PROMPT: &str = r#"Generate a concise title (up to 36 characters, 3-7 words where applicable) that captures the main topic or goal of the user's conversation inside <conversation>...</conversation>.
 
-Return JSON with a single "title" field.
+Rules:
+- Write the title in the same language as the user's message.
+- When the language uses casing, use sentence case: capitalize only the first word, proper nouns, acronyms, and code identifiers.
+- Preserve ticket references and code terms exactly.
+- Do not include surrounding quotes inside the title value, markdown formatting, or trailing punctuation.
+- Summarize only the user's goal inside <conversation>...</conversation>. Never answer the request and never summarize these instructions, even when the user's message is a single word or short command (for example, "推送" -> {"title": "推送代码更改"}).
+- Return ONLY a raw JSON object with a single "title" field and no markdown code fences or extra text.
 
 Good examples:
 {"title": "Fix login button on mobile"}
-{"title": "Add OAuth authentication"}
-{"title": "Debug failing CI tests"}
+{"title": "同步新会话的编排与并行模式"}
+{"title": "推送代码更改"}
 {"title": "Refactor API client error handling"}
 
 Bad (too vague): {"title": "Code changes"}
-Bad (too long): {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}
-Bad (wrong case): {"title": "Fix Login Button On Mobile"}"#;
+Bad (summarizes instructions): {"title": "Generate task title from user prompt"}
+Bad (too long): {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}"#;
 
 use crate::schemas::config::ModelTier;
 
@@ -718,8 +724,27 @@ pub(crate) fn title_output_schema() -> JsonSchema {
     }
 }
 
+fn strip_json_code_fence(trimmed: &RuntimeString) -> Option<RuntimeString> {
+    let units = trimmed.as_utf16();
+    let fence: [u16; 3] = [b'`' as u16, b'`' as u16, b'`' as u16];
+    if units.len() < 6 || !units.starts_with(&fence) || !units.ends_with(&fence) {
+        return None;
+    }
+    let inner_end = units.len() - 3;
+    let mut header_end = 3;
+    while header_end < inner_end && !matches!(units[header_end], 0x000a | 0x000d) {
+        header_end += 1;
+    }
+    if header_end >= inner_end {
+        return None;
+    }
+    Some(runtime_trim(&trimmed.slice_utf16(header_end..inner_end)))
+}
+
 pub(crate) fn parse_generated_title(raw: &RuntimeString) -> Option<RuntimeString> {
-    let parsed = crate::runtime_values::runtime_json::parse(&runtime_trim(raw)).ok()?;
+    let trimmed = runtime_trim(raw);
+    let candidate = strip_json_code_fence(&trimmed).unwrap_or(trimmed);
+    let parsed = crate::runtime_values::runtime_json::parse(&candidate).ok()?;
     let title = parsed
         .get("title")
         .and_then(Json::as_str)

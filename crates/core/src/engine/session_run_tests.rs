@@ -14620,6 +14620,15 @@ fn generated_title_parser_accepts_model_json_with_a_lone_surrogate() {
         .expect("title JSON should use the model JSON parser");
 
     assert_eq!(runtime_json::stringify(&Json::String(title)), r#""\ud800""#);
+
+    let fenced = parse_generated_title(&RuntimeString::from(
+        "```json\n{\"title\":\"\\ud800\"}\n```",
+    ))
+    .expect("fenced JSON should unwrap without losing UTF-16 units");
+    assert_eq!(
+        runtime_json::stringify(&Json::String(fenced)),
+        r#""\ud800""#
+    );
 }
 
 /// One recorded `turn_lifecycle` append: the turn it belongs to, the status, and

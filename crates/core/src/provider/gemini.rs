@@ -286,6 +286,9 @@ pub struct GeminiProviderOptions {
     pub thinking_dialect: Option<GeminiThinkingDialect>,
     /// Exact model-specific thinking wire dialects for mixed catalogs.
     pub thinking_dialects_by_model: Option<HashMap<String, GeminiThinkingDialect>>,
+    /// Lowest-reasoning sibling variant per model ID when a catalog encodes
+    /// reasoning effort as distinct model IDs within the same family.
+    pub minimal_reasoning_models: Option<HashMap<String, RuntimeString>>,
     /// Revalidate credential ownership before publishing each mapped event.
     pub stream_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub adapter_policy: GeminiAdapterPolicy,
@@ -309,6 +312,7 @@ pub struct GeminiProvider {
     /// The endpoint's thinking wire dialect.
     thinking_dialect: GeminiThinkingDialect,
     thinking_dialects_by_model: HashMap<String, GeminiThinkingDialect>,
+    minimal_reasoning_models: HashMap<String, RuntimeString>,
     stream_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     adapter_policy: GeminiAdapterPolicy,
 }
@@ -369,6 +373,7 @@ impl GeminiProvider {
             capabilities_by_model: opts.capabilities_by_model.unwrap_or_default(),
             thinking_dialect: opts.thinking_dialect.unwrap_or_default(),
             thinking_dialects_by_model: opts.thinking_dialects_by_model.unwrap_or_default(),
+            minimal_reasoning_models: opts.minimal_reasoning_models.unwrap_or_default(),
             stream_admission: opts.stream_admission,
             adapter_policy: opts.adapter_policy,
         }
@@ -399,6 +404,15 @@ impl ModelProvider for GeminiProvider {
 
     fn model_metadata(&self, model: &RuntimeString) -> ModelCapabilities {
         self.capabilities_for(model).clone()
+    }
+
+    fn minimal_reasoning_model(&self, model: &RuntimeString) -> RuntimeString {
+        model
+            .try_to_utf8()
+            .ok()
+            .and_then(|id| self.minimal_reasoning_models.get(&id))
+            .cloned()
+            .unwrap_or_else(|| model.clone())
     }
 
     fn offline_model_catalog(&self) -> Vec<(RuntimeString, ModelCapabilities)> {

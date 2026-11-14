@@ -2067,3 +2067,292 @@ async fn multi_account_usage_isolates_failures_and_native_media_search_rotate_on
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
+
+#[tokio::test]
+async fn title_generation_steps_down_high_thinking_variant_while_turns_keep_selected_variant() {
+    use klaus_agent_core::engine::agent::{Agent, AgentOptions, StartSessionOptions};
+    use klaus_agent_core::engine::deps::EngineDepsOverrides;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = recorded.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..index]);
+                        let len = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (index + 4, len);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let body: Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(json!({ "path": path, "body": body }));
+                if path.contains("streamGenerateContent") {
+                    let payload = format!(
+                        "data: {}\n\n",
+                        json!({
+                            "response": {
+                                "candidates": [{
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{"text": "{\"title\":\"同步新会话工作模式\"}"}]
+                                    },
+                                    "finishReason": "STOP"
+                                }],
+                                "usageMetadata": {
+                                    "promptTokenCount": 42,
+                                    "candidatesTokenCount": 8
+                                }
+                            }
+                        })
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    auth::adopt(auth::Credential {
+        access_token: "fixture-token".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("user@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let generation = auth::generation().unwrap();
+    std::fs::write(
+        root.path().join("antigravity-models.json"),
+        json!({
+            "generation": generation,
+            "clientIdentity": cloud_test_identity(),
+            "fetchedAt": chrono::Utc::now().timestamp_millis(),
+            "payload": {
+                "defaultAgentModelId": "gemini-4-carbon-high",
+                "models": {
+                    "gemini-4-carbon-high": {
+                        "displayName": "Gemini 4 Carbon (High)",
+                        "supportsThinking": true,
+                        "thinkingLevel": 3,
+                        "minThinkingBudget": 128,
+                        "maxTokens": 1048576,
+                        "maxOutputTokens": 65536,
+                        "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                    },
+                    "gemini-4-carbon-low": {
+                        "displayName": "Gemini 4 Carbon (Low)",
+                        "supportsThinking": true,
+                        "thinkingLevel": 1,
+                        "minThinkingBudget": 128,
+                        "maxTokens": 1048576,
+                        "maxOutputTokens": 65536,
+                        "modelProvider": "MODEL_PROVIDER_GOOGLE"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let resolved = resolve("gemini-4-carbon-high", &serde_json::Map::new())
+        .await
+        .unwrap();
+    let init: ProtocolSessionInit = runtime_codec::decode_text(&RuntimeString::from(
+        json!({
+            "provider": resolved.provider,
+            "capabilities": resolved.capabilities,
+            "capabilitiesByModel": resolved.capabilities_by_model,
+            "modelSource": { "source": "antigravity", "modelId": "gemini-4-carbon-high" }
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    let base: Arc<dyn ModelProvider> = Arc::new(GeminiProvider::new(GeminiProviderOptions {
+        default_model: Some("gemini-4-carbon-high".into()),
+        capabilities: Some(
+            runtime_codec::decode_text(&RuntimeString::from(resolved.capabilities.to_string()))
+                .unwrap(),
+        ),
+        ..Default::default()
+    }));
+    let provider = decorate(base, &init);
+
+    let turn_req: ModelRequest = runtime_codec::decode_text(&RuntimeString::from(
+        json!({
+            "model": "gemini-4-carbon-high",
+            "system": [],
+            "messages": [],
+            "tools": [],
+            "maxOutputTokens": 256,
+            "thinking": { "type": "adaptive" }
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    let turn_events: Vec<_> = provider
+        .stream(turn_req, AbortSignal::new())
+        .collect()
+        .await;
+    assert!(!turn_events
+        .iter()
+        .any(|ev| matches!(ev, ModelStreamEvent::Error { .. })));
+
+    let process = crate::test_process_context();
+    let root_str = root.path().to_string_lossy().into_owned();
+    let session = Agent::new(AgentOptions {
+        process_context: process,
+        provider: provider.clone(),
+        config: Some(json!({ "model": "gemini-4-carbon-high" })),
+        tools: Some(Vec::new()),
+        web_fetch_page: None,
+        browser_runtime: None,
+        capability_roots: Vec::new(),
+        cwd: Some(root_str.clone()),
+        deps: EngineDepsOverrides::default(),
+        compactor: None,
+        approval_handler: None,
+        approval_reviewer: None,
+        elicit_handler: None,
+        credential_store: None,
+        hooks: Vec::new(),
+        observer: Some(None),
+        logger: None,
+        pricing: None,
+        agents: None,
+        include_default_agents: None,
+        skills: None,
+        output_styles: None,
+        workflows: None,
+        mcp_catalog: None,
+        plugin_catalog: None,
+        lsp_servers: None,
+        agent_memory: None,
+        mcp_clients: None,
+        mcp_server_configs: Vec::new(),
+        mcp_tools: None,
+        refresh_tools: None,
+        system_prompt_provider: None,
+        plugins: Vec::new(),
+        plugin_load_report: None,
+    })
+    .start_session(StartSessionOptions {
+        cwd: Some(root_str.clone().into()),
+        user_config_dir: Some(root_str.into()),
+        config: Some(json!({
+            "model": "gemini-4-carbon-high",
+            "thinking": true,
+            "effort": "high"
+        })),
+        ..Default::default()
+    });
+
+    let title = session
+        .generate_title(
+            Some("Keep the title within 36 characters.".into()),
+            Some("同步后续新会话的编排模式与并行模式".into()),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(title.title, Some(RuntimeString::from("同步新会话工作模式")));
+
+    {
+        let streams: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("streamGenerateContent"))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            streams.len(),
+            2,
+            "one ordinary turn + one single-shot title request"
+        );
+        assert_eq!(streams[0]["body"]["model"], "gemini-4-carbon-high");
+        assert_eq!(
+            streams[0]["body"]["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+        assert_eq!(streams[1]["body"]["model"], "gemini-4-carbon-low");
+        assert_eq!(
+            streams[1]["body"]["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
+        );
+        let sys = streams[1]["body"]["request"]["systemInstruction"].to_string();
+        assert!(sys.contains("Keep the title within 36 characters."));
+        let user_msg = streams[1]["body"]["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(user_msg
+            .contains("<conversation>\n同步后续新会话的编排模式与并行模式\n</conversation>"));
+        assert!(!user_msg.contains("Keep the title within 36 characters."));
+    }
+
+    session.shutdown_and_wait().await.unwrap();
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
