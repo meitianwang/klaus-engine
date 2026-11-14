@@ -713,8 +713,12 @@ mod tests {
         assert_eq!(bases.len(), 1);
         assert_eq!(bases[0].text, RuntimeString::from(BASE_INSTRUCTIONS));
         assert!(bases[0].text.contains("# Task execution"));
-        assert!(bases[0].text.contains("any material risks or limitations"));
-        assert!(bases[0].text.contains("Summarize routine verification"));
+        assert!(bases[0]
+            .text
+            .contains("## Presenting your work and final message"));
+        assert!(bases[0]
+            .text
+            .contains("### Final answer structure and style guidelines"));
         assert!(bases[0].text.contains("# Using skills"));
         assert!(!bases[0].text.contains("functions.exec"));
         assert!(!bases[0].text.contains("First sentence is the conclusion"));
