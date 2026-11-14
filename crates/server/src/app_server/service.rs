@@ -4784,6 +4784,7 @@ async fn resolve_tier_target(
         return Ok(value);
     };
     if ![
+        "antigravity",
         "trae",
         "kiro",
         "subscription",

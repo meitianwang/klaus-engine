@@ -244,7 +244,7 @@ pub(super) fn account() -> Option<String> {
     read()?.credential.account
 }
 
-pub(super) async fn credential(expected: Option<&str>) -> Result<Credential, String> {
+pub(crate) async fn credential(expected: Option<&str>) -> Result<Credential, String> {
     let mut stored = {
         let _guard = credential_lock().lock().await;
         read().ok_or("antigravity_not_signed_in")?

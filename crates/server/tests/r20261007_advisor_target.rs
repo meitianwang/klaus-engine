@@ -7,6 +7,9 @@ use super::*;
 #[path = "../../core/tests/regressions/r20261018_claude_advisor_alias.rs"]
 mod claude_advisor_alias;
 
+#[path = "../../core/tests/regressions/r20261113_antigravity_model_targets.rs"]
+mod antigravity_model_targets;
+
 fn resolved_advisor(provider: &LoopbackProvider, model_id: &str) -> Value {
     json!({
         "type":"resolved","source":"local","modelId":model_id,

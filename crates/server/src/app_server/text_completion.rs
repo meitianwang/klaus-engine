@@ -46,6 +46,14 @@ fn source_pin(source: &str, root: &std::path::Path) -> Result<Option<Publication
             super::super::trae::auth::is_current(&expected)
         })));
     }
+    if source == "antigravity" {
+        super::super::antigravity::set_config_root(root);
+        let expected = super::super::antigravity::auth::generation()
+            .ok_or("text_completion_model_unavailable")?;
+        return Ok(Some(Arc::new(move || {
+            super::super::antigravity::auth::is_current(&expected)
+        })));
+    }
     use super::super::{qoder, qwenwork, subscription_speech, workbuddy};
     let read: Option<CredentialReader> = match source {
         "qoder" => Some(qoder::auth::credential),
@@ -75,6 +83,10 @@ async fn prepare_token(source: &str) -> Result<(), String> {
     }
     if source == "trae" {
         super::super::trae::auth::credential(None).await?;
+        return Ok(());
+    }
+    if source == "antigravity" {
+        super::super::antigravity::auth::credential(None).await?;
         return Ok(());
     }
     use super::super::{qoder, qwenwork};
@@ -218,6 +230,7 @@ async fn complete(
 ) -> Result<Response, String> {
     let root = model_sources::config_root_of(&state.config_path);
     match params.source.as_str() {
+        "antigravity" => super::super::antigravity::set_config_root(&root),
         "kiro" => super::super::kiro::set_config_root(&root),
         "trae" => super::super::trae::set_config_root(&root),
         "qoder" => super::super::qoder::set_config_root(&root),
