@@ -406,9 +406,9 @@ fn tool_event(painter: &Painter, event: &ToolDomainEvent) -> Rendered {
         ToolDomainEvent::Browser { .. } => Rendered::Nothing,
         // Desktop hosts project this state edge into their Spec control. The CLI
         // has no separate mode badge, so the tool result remains sufficient.
-        ToolDomainEvent::PlanModeChanged { .. } | ToolDomainEvent::PlanUpdated { .. } => {
-            Rendered::Nothing
-        }
+        ToolDomainEvent::PlanModeChanged { .. }
+        | ToolDomainEvent::PlanUpdated { .. }
+        | ToolDomainEvent::OrchestratorFallback { .. } => Rendered::Nothing,
     }
 }
 

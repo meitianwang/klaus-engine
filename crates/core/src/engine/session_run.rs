@@ -1030,24 +1030,30 @@ impl Session {
         let orchestration_enabled = is_main_role
             && initial_bundle.orchestration_mode
             && turn_collaboration_mode != crate::planning::CollaborationMode::Plan;
+        let turn_fallback_declined = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let build_orchestrate_tool = {
             let session = this.clone();
             let slot = inference_slot.clone();
             let initial = initial_bundle.clone();
+            let turn_declined = turn_fallback_declined.clone();
             move || {
                 let session = session.clone();
                 let slot = slot.clone();
                 let initial = initial.clone();
+                let turn_declined = turn_declined.clone();
                 crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(Arc::new(
                     move |request, ctx| {
                         let session = session.clone();
+                        let turn_declined = turn_declined.clone();
                         let mut captured = (*Session::bundle_from_slot(&slot, &initial)).clone();
                         captured.orchestrator_target = initial.orchestrator_target.clone();
                         captured.orchestration_mode = initial.orchestration_mode;
+                        captured.orchestrator_fallback_to_main =
+                            initial.orchestrator_fallback_to_main;
                         let captured = Arc::new(captured);
                         Box::pin(async move {
                             session
-                                .run_orchestrated_execution(captured, request, ctx)
+                                .run_orchestrated_execution(captured, request, ctx, turn_declined)
                                 .await
                         })
                     },
@@ -1085,8 +1091,10 @@ impl Session {
             let slot = inference_slot.clone();
             let initial = initial_bundle.clone();
             let model_override = opts.model.clone();
+            let turn_declined = turn_fallback_declined.clone();
             Some(Box::new(move || {
                 let this = this.clone();
+                let turn_declined = turn_declined.clone();
                 let bundle = Session::bundle_from_slot(&slot, &initial);
                 let turn_model = model_override
                     .clone()
@@ -1129,14 +1137,21 @@ impl Session {
                         );
                         let exec_session = this.clone();
                         let exec_initial = bundle.clone();
+                        let exec_declined = turn_declined.clone();
                         tools.push(
                             crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
                                 Arc::new(move |request, ctx| {
                                     let exec_session = exec_session.clone();
                                     let exec_initial = exec_initial.clone();
+                                    let exec_declined = exec_declined.clone();
                                     Box::pin(async move {
                                         exec_session
-                                            .run_orchestrated_execution(exec_initial, request, ctx)
+                                            .run_orchestrated_execution(
+                                                exec_initial,
+                                                request,
+                                                ctx,
+                                                exec_declined,
+                                            )
                                             .await
                                     })
                                 }),
@@ -2302,14 +2317,21 @@ impl Session {
                     );
                     let exec_session = this2.clone();
                     let exec_initial = initial_bundle.clone();
+                    let exec_declined = turn_fallback_declined.clone();
                     params.tools.push(
                         crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
                             Arc::new(move |request, ctx| {
                                 let exec_session = exec_session.clone();
                                 let exec_initial = exec_initial.clone();
+                                let exec_declined = exec_declined.clone();
                                 Box::pin(async move {
                                     exec_session
-                                        .run_orchestrated_execution(exec_initial, request, ctx)
+                                        .run_orchestrated_execution(
+                                            exec_initial,
+                                            request,
+                                            ctx,
+                                            exec_declined,
+                                        )
                                         .await
                                 })
                             }),

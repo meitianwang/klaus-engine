@@ -1301,6 +1301,8 @@ pub struct ProtocolSessionInit {
     pub orchestrator_target: Option<RuntimeJson>,
     /// Whether orchestration mode is active for this conversation.
     pub orchestration_mode: Option<bool>,
+    /// Whether orchestration mode automatically falls back to the chat model on execution-model failure.
+    pub orchestrator_fallback_to_main: Option<bool>,
     /// Independent per-feature auxiliary targets (title, prediction, memory
     /// maintenance); a missing/null slot follows the session's main model.
     pub feature_targets: Option<RuntimeJson>,

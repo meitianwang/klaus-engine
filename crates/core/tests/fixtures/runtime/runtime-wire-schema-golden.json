@@ -5761,6 +5761,58 @@
       }
     ]
   },
+  "crates/core/src/extensions/resource_references.rs::RawReferencedResource": {
+    "kind": "struct",
+    "shape": "named",
+    "canEncode": false,
+    "canDecode": true,
+    "denyUnknownFields": false,
+    "transparent": false,
+    "containerDefault": false,
+    "taggingKind": "external",
+    "fields": [
+      {
+        "rustName": "kind",
+        "rustType": "String",
+        "wireSerialize": "kind",
+        "wireDeserialize": "kind",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "name",
+        "rustType": "String",
+        "wireSerialize": "name",
+        "wireDeserialize": "name",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "id",
+        "rustType": "Option < String >",
+        "wireSerialize": "id",
+        "wireDeserialize": "id",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "path",
+        "rustType": "Option < String >",
+        "wireSerialize": "path",
+        "wireDeserialize": "path",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      }
+    ]
+  },
   "crates/core/src/fs/pdf.rs::PdfErrorReason": {
     "kind": "enum",
     "shape": "enum",

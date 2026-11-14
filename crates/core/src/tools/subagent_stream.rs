@@ -12,7 +12,7 @@
 use crate::runtime_values::{RuntimeJson, RuntimeString};
 use crate::schemas::content::{ContentBlock, OutputBlock};
 use crate::schemas::message::Message;
-use crate::types::errors::TerminalReason;
+use crate::types::errors::{ProviderErrorKind, TerminalReason};
 use crate::types::events::{
     EngineEvent, FileChangeKind, FileChangeStatus, ItemError, ItemStatus, ThreadItem,
     ToolDomainEvent,
@@ -27,6 +27,14 @@ use std::collections::HashMap;
 pub struct ForegroundSubAgentResult {
     pub final_text: RuntimeString,
     pub failure: Option<RuntimeString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetailedForegroundSubAgentResult {
+    pub final_text: RuntimeString,
+    pub failure: Option<RuntimeString>,
+    pub provider_kind: Option<ProviderErrorKind>,
+    pub terminal_reason: Option<TerminalReason>,
 }
 
 pub(crate) fn terminal_failure(reason: TerminalReason) -> Option<RuntimeString> {
@@ -159,9 +167,22 @@ pub async fn consume_foreground_sub_agent(
     ctx: &ToolContext,
     run: ForegroundSubAgentRun,
 ) -> ForegroundSubAgentResult {
+    let detailed = consume_foreground_sub_agent_detailed(ctx, run).await;
+    ForegroundSubAgentResult {
+        final_text: detailed.final_text,
+        failure: detailed.failure,
+    }
+}
+
+pub(crate) async fn consume_foreground_sub_agent_detailed(
+    ctx: &ToolContext,
+    run: ForegroundSubAgentRun,
+) -> DetailedForegroundSubAgentResult {
     let forward_text = ctx.forward_subagent_text.unwrap_or(false);
     let mut final_text = RuntimeString::default();
     let mut failure: Option<RuntimeString> = None;
+    let mut provider_kind: Option<ProviderErrorKind> = None;
+    let mut terminal_reason: Option<TerminalReason> = None;
     let mut terminal_seen = false;
     let ForegroundSubAgentRun {
         agent_id,
@@ -171,6 +192,7 @@ pub async fn consume_foreground_sub_agent(
         let e = tokio::select! {
             biased;
             _ = ctx.signal.cancelled() => {
+                terminal_reason = Some(TerminalReason::Aborted);
                 failure = terminal_failure(TerminalReason::Aborted);
                 break;
             }
@@ -189,6 +211,7 @@ pub async fn consume_foreground_sub_agent(
             } => final_text = text.clone(),
             EngineEvent::TurnFailed { error, .. } => {
                 terminal_seen = true;
+                provider_kind = error.provider_kind;
                 failure = Some(if error.message.is_empty() {
                     "Sub-agent failed without an error message.".into()
                 } else {
@@ -197,6 +220,7 @@ pub async fn consume_foreground_sub_agent(
             }
             EngineEvent::TurnCompleted { stop_reason, .. } => {
                 terminal_seen = true;
+                terminal_reason = Some(*stop_reason);
                 if let Some(reason) = terminal_failure(*stop_reason) {
                     failure = Some(reason);
                 }
@@ -214,9 +238,11 @@ pub async fn consume_foreground_sub_agent(
     if !terminal_seen && failure.is_none() {
         failure = Some("Sub-agent stream ended without a terminal event.".into());
     }
-    ForegroundSubAgentResult {
+    DetailedForegroundSubAgentResult {
         final_text,
         failure,
+        provider_kind,
+        terminal_reason,
     }
 }
 

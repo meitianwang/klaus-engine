@@ -709,6 +709,13 @@ pub enum ToolDomainEvent {
     PlanModeChanged {
         enabled: bool,
     },
+    /// Orchestration mode automatically switched execution to the chat's main
+    /// model because the configured execution model was unavailable or out of quota.
+    OrchestratorFallback {
+        failed_model: RuntimeString,
+        main_model: RuntimeString,
+        reason: RuntimeString,
+    },
 }
 
 impl RuntimeEncode for ToolDomainEvent {
@@ -760,6 +767,16 @@ impl RuntimeEncode for ToolDomainEvent {
                 object.field("enabled", enabled)?;
                 "plan_mode_changed"
             }
+            Self::OrchestratorFallback {
+                failed_model,
+                main_model,
+                reason,
+            } => {
+                object.field("failedModel", failed_model)?;
+                object.field("mainModel", main_model)?;
+                object.field("reason", reason)?;
+                "orchestrator_fallback"
+            }
         };
         encode_event_variant(out, tag, object)
     }
@@ -777,6 +794,7 @@ impl RuntimeDecode for ToolDomainEvent {
             RuntimeEnumVariant::new("web_search", &[]),
             RuntimeEnumVariant::new("plan_mode_changed", &[]),
             RuntimeEnumVariant::new("plan_updated", &[]),
+            RuntimeEnumVariant::new("orchestrator_fallback", &[]),
         ];
         runtime_codec::decode_internal(value, false, "type", &[], VARIANTS, |variant, object| {
             Ok(match variant {
@@ -809,6 +827,11 @@ impl RuntimeDecode for ToolDomainEvent {
                 },
                 8 => Self::PlanUpdated {
                     progress: object.required("progress", &[])?,
+                },
+                9 => Self::OrchestratorFallback {
+                    failed_model: object.required("failedModel", &[])?,
+                    main_model: object.required("mainModel", &[])?,
+                    reason: object.required("reason", &[])?,
                 },
                 _ => unreachable!("closed ToolDomainEvent variant table"),
             })

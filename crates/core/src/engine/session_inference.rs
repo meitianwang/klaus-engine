@@ -38,6 +38,7 @@ pub(crate) struct InferenceBundle {
     pub advisor_target: Option<InferenceTargetState>,
     pub orchestrator_target: Option<InferenceTargetState>,
     pub orchestration_mode: bool,
+    pub orchestrator_fallback_to_main: bool,
     pub feature_targets: FeatureTargets,
     pub source: Option<(String, String)>,
     /// Immutable rate table carried by the request that captured this bundle,
@@ -950,6 +951,9 @@ impl Session {
                 advisor_target: self.inference_snapshot().advisor_target.clone(),
                 orchestrator_target: self.inference_snapshot().orchestrator_target.clone(),
                 orchestration_mode: self.inference_snapshot().orchestration_mode,
+                orchestrator_fallback_to_main: self
+                    .inference_snapshot()
+                    .orchestrator_fallback_to_main,
                 feature_targets: self.inference_snapshot().feature_targets.clone(),
                 source: None,
                 rates: None,
@@ -1003,6 +1007,7 @@ impl Session {
             mut advisor_target,
             mut orchestrator_target,
             orchestration_mode,
+            orchestrator_fallback_to_main,
             mut feature_targets,
             source: publication_source,
             rates: publication_rates,
@@ -1107,6 +1112,9 @@ impl Session {
             None => "orchestrator=medium".to_string(),
         });
         target_ids.push(format!("orchestration_mode={orchestration_mode}"));
+        target_ids.push(format!(
+            "orchestrator_fallback_to_main={orchestrator_fallback_to_main}"
+        ));
         for (name, state) in feature_targets.slots() {
             target_ids.push(match state {
                 Some(InferenceTargetState::Ready(target)) => {
@@ -1187,6 +1195,7 @@ impl Session {
             advisor_target: advisor_target.clone(),
             orchestrator_target: orchestrator_target.clone(),
             orchestration_mode,
+            orchestrator_fallback_to_main,
             feature_targets: feature_targets.clone(),
             source: next_source.clone(),
             rates: rates.clone(),
@@ -1265,6 +1274,7 @@ impl Session {
             advisor_target,
             orchestrator_target,
             orchestration_mode,
+            orchestrator_fallback_to_main,
             feature_targets,
             source: next_source,
             rates,
@@ -1272,6 +1282,9 @@ impl Session {
         };
         next.context_downshift = previous.downshift_to(&next.config_for_model(&next.config.model));
         *current = Arc::new(next);
+        if !orchestration_mode {
+            self.clear_orchestration_fallback();
+        }
         if next_policy != previous_policy {
             next_policy.generation = previous_policy.generation.saturating_add(1);
             *policy = Arc::new(super::RuntimePolicySnapshot {
@@ -1501,6 +1514,7 @@ mod media_capture_tests {
             advisor_target: None,
             orchestrator_target: None,
             orchestration_mode: false,
+            orchestrator_fallback_to_main: false,
             feature_targets: Default::default(),
             source: None,
             rates: DEFAULT_PRICING.clone(),

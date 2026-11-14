@@ -1259,6 +1259,7 @@ pub struct Session {
     inference: RwLock<Arc<InferenceBundle>>,
     inference_admission: Arc<Mutex<InferenceAdmission>>,
     inference_changed: tokio::sync::Notify,
+    orchestration_fallback: Mutex<session_orchestrator_part::OrchestrationFallbackState>,
     deps: SessionIdentityDeps,
     /// Session-scoped background compaction precompute state. Lives as long as
     /// the session; dropping it cancels every in-flight background summary.

@@ -2340,7 +2340,7 @@ async fn submit_named_turn(state: Arc<AppServerState>, id: Value, params: wire::
                             &id,
                             serde_json::to_value(invalid(error.to_string())).unwrap(),
                         ))
-                        .await
+                        .await;
                 }
             }
         }
@@ -4586,6 +4586,7 @@ const INIT_RESOLVER_FIELDS: &[&str] = &[
     "advisorTarget",
     "orchestratorTarget",
     "orchestrationMode",
+    "orchestratorFallbackToMain",
     "featureTargets",
     "modelSource",
     "capabilities",
@@ -5362,7 +5363,7 @@ async fn dispatch_qoder_speech(state: Arc<AppServerState>, id: Value, method: &s
         Err(error) => {
             return state
                 .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
-                .await
+                .await;
         }
     };
     let root = super::model_sources::config_root_of(&state.config_path);
@@ -9365,6 +9366,7 @@ fn model_runtime_value(
         advisor_target,
         orchestrator_target,
         orchestration_mode,
+        orchestrator_fallback_to_main,
         feature_targets,
     ) = loop {
         let (revision, config, capabilities) = session.model_runtime();
@@ -9372,6 +9374,7 @@ fn model_runtime_value(
         let advisor_target = session.advisor_target_runtime();
         let orchestrator_target = session.orchestrator_target_runtime();
         let orchestration_mode = session.orchestration_mode_runtime();
+        let orchestrator_fallback_to_main = session.orchestrator_fallback_to_main_runtime();
         let feature_targets = session.feature_targets_runtime();
         if session.model_revision() == revision {
             break (
@@ -9384,6 +9387,7 @@ fn model_runtime_value(
                 advisor_target,
                 orchestrator_target,
                 orchestration_mode,
+                orchestrator_fallback_to_main,
                 feature_targets,
             );
         }
@@ -9404,6 +9408,7 @@ fn model_runtime_value(
         thinking: serde_json::to_value(config.thinking).map_err(|error| error.to_string())?,
         ultra_mode: config.ultra_mode,
         orchestration_mode,
+        orchestrator_fallback_to_main,
         fast_mode: config.fast_mode,
         context_window: config.context_window,
         max_output_tokens: config
@@ -9540,6 +9545,7 @@ fn validate_inference_init(init: &Value) -> Result<(), String> {
             "advisorTarget",
             "orchestratorTarget",
             "orchestrationMode",
+            "orchestratorFallbackToMain",
             "featureTargets",
             "modelSource",
             "capabilities",
@@ -9615,6 +9621,11 @@ fn validate_inference_init(init: &Value) -> Result<(), String> {
     if let Some(mode) = object.get("orchestrationMode") {
         if !mode.is_null() && !mode.is_boolean() {
             return Err("orchestrationMode must be a boolean or null".to_string());
+        }
+    }
+    if let Some(fallback) = object.get("orchestratorFallbackToMain") {
+        if !fallback.is_null() && !fallback.is_boolean() {
+            return Err("orchestratorFallbackToMain must be a boolean or null".to_string());
         }
     }
     if let Some(features) = object.get("featureTargets") {

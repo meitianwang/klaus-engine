@@ -943,6 +943,7 @@ impl_runtime_struct!(ProtocolSessionInit, deny_unknown: true, {
     advisor_target => "advisorTarget": optional,
     orchestrator_target => "orchestratorTarget": optional,
     orchestration_mode => "orchestrationMode": optional,
+    orchestrator_fallback_to_main => "orchestratorFallbackToMain": optional,
     feature_targets => "featureTargets": optional,
     model_source => "modelSource": optional,
 });

@@ -335,6 +335,7 @@ fn publication(revision: u64, target: Arc<Provider>) -> InferencePublication {
         advisor_target: None,
         orchestrator_target: None,
         orchestration_mode: false,
+        orchestrator_fallback_to_main: false,
         feature_targets: Default::default(),
         source: None,
         rates: None,

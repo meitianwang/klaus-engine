@@ -342,6 +342,8 @@ pub struct SessionModelRuntimeResult {
     #[serde(default)]
     pub orchestration_mode: bool,
     #[serde(default)]
+    pub orchestrator_fallback_to_main: bool,
+    #[serde(default)]
     pub fast_mode: bool,
     pub context_window: u64,
     pub max_output_tokens: u64,
@@ -1786,6 +1788,8 @@ pub struct SessionRoutingInitSchema {
     pub orchestrator_target: Option<ModelTierTarget>,
     /// Whether orchestration mode is active for this conversation.
     pub orchestration_mode: Option<bool>,
+    /// Whether orchestration mode automatically falls back to the chat model on execution-model failure.
+    pub orchestrator_fallback_to_main: Option<bool>,
     /// Independent targets for named auxiliary features (title generation,
     /// message prediction, memory maintenance); an omitted/null slot follows
     /// the session's main model on start and full reconfigure.

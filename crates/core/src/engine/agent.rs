@@ -6203,7 +6203,10 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer fixture-token"));
             let body = serde_json::json!({"requirements_toml":{"enterprise_managed":[{"id":"native-account-policy","name":"Administrator","contents":"allowed_approvals_reviewers = ['auto_review']\n[auto_review]\nrequired_on_models = ['blocked-model']"}]}}).to_string();
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             stream.write_all(head.as_bytes()).await.unwrap();
             stream.write_all(body.as_bytes()).await.unwrap();
         });
@@ -6354,12 +6357,18 @@ mod tests {
                 Default::default(),
             )
             .await;
-        assert!(refused.error.as_ref().is_some_and(|error| error
-            .message
-            .try_to_utf8()
-            .unwrap()
-            .contains("requires automatic approval review")));
-        assert_eq!(model_calls.load(Ordering::SeqCst), 3, "only the original model may enter its provider; the protected fallback must be refused during final preparation");
+        assert!(refused.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .try_to_utf8()
+                .unwrap()
+                .contains("requires automatic approval review")
+        }));
+        assert_eq!(
+            model_calls.load(Ordering::SeqCst),
+            3,
+            "only the original model may enter its provider; the protected fallback must be refused during final preparation"
+        );
         fallback.shutdown_and_wait().await.unwrap();
         let inference_revision = session.model_revision();
         let registration_revision = session.mcp_registration_revision();
@@ -6425,6 +6434,7 @@ mod tests {
             advisor_target: None,
             orchestrator_target: None,
             orchestration_mode: false,
+            orchestrator_fallback_to_main: false,
             feature_targets: Default::default(),
             source: None,
             rates: None,
@@ -9034,8 +9044,11 @@ mod tests {
             tokio::time::advance(std::time::Duration::from_millis(100)).await;
             tokio::task::yield_now().await;
         }
-        assert_eq!(rollout.shutdown_started.load(Ordering::SeqCst), 1,
-            "all producers must be fenced and raw shutdown entered within the virtual cleanup deadlines");
+        assert_eq!(
+            rollout.shutdown_started.load(Ordering::SeqCst),
+            1,
+            "all producers must be fenced and raw shutdown entered within the virtual cleanup deadlines"
+        );
         // Virtual timer advancement does not drive filesystem worker I/O.
         // Keep the checkpoint blocked and await the actual close receipt.
         tokio::time::resume();

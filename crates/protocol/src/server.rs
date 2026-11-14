@@ -1018,6 +1018,7 @@ struct SessionInitState {
     advisor_target: Option<klaus_agent_core::engine::session::InferenceTargetState>,
     orchestrator_target: Option<klaus_agent_core::engine::session::InferenceTargetState>,
     orchestration_mode: bool,
+    orchestrator_fallback_to_main: bool,
     feature_targets: klaus_agent_core::engine::session::FeatureTargets,
 }
 
@@ -1987,6 +1988,7 @@ impl ProtocolServer {
                 decorate_model_target(target, decorate);
             }
             let orchestration_mode = init.orchestration_mode.unwrap_or(false);
+            let orchestrator_fallback_to_main = init.orchestrator_fallback_to_main.unwrap_or(false);
             let mut feature_targets =
                 feature_targets_from_init(&init, self.inner.credential_store.clone()).await?;
             if let Some(decorate) = self.inner.provider_decorator.lock().unwrap().as_ref() {
@@ -2056,6 +2058,7 @@ impl ProtocolServer {
                     advisor_target,
                     orchestrator_target,
                     orchestration_mode,
+                    orchestrator_fallback_to_main,
                     feature_targets,
                     source: model_source_from_init(&init)?,
                     rates: None,
@@ -7769,6 +7772,7 @@ impl ServerInner {
             decorate_model_target(target, decorate);
         }
         let orchestration_mode = init.orchestration_mode.unwrap_or(false);
+        let orchestrator_fallback_to_main = init.orchestrator_fallback_to_main.unwrap_or(false);
         let mut feature_targets =
             match feature_targets_from_init(&init, self.credential_store.clone()).await {
                 Ok(targets) => targets,
@@ -7790,6 +7794,7 @@ impl ServerInner {
             advisor_target,
             orchestrator_target,
             orchestration_mode,
+            orchestrator_fallback_to_main,
             feature_targets,
             raw: init,
             provider,
@@ -9217,7 +9222,11 @@ impl ServerInner {
             prepared.pricing,
         )?;
         session.install_advisor_target(prepared.advisor_target)?;
-        session.install_orchestration(prepared.orchestration_mode, prepared.orchestrator_target)?;
+        session.install_orchestration(
+            prepared.orchestration_mode,
+            prepared.orchestrator_target,
+            prepared.orchestrator_fallback_to_main,
+        )?;
         session.install_feature_targets(prepared.feature_targets)?;
         {
             let mut inflight = self
@@ -11843,6 +11852,7 @@ fn canonical_inference_key(init: &ProtocolSessionInit) -> Result<String, String>
         advisor_target: init.advisor_target.clone(),
         orchestrator_target: init.orchestrator_target.clone(),
         orchestration_mode: init.orchestration_mode,
+        orchestrator_fallback_to_main: init.orchestrator_fallback_to_main,
         feature_targets: init.feature_targets.clone(),
         pricing: init.pricing.clone(),
         capabilities: init.capabilities.clone(),

@@ -207,14 +207,19 @@ fn task_reasoning_input_accepts_nullable_open_strings_and_rejects_empty_or_nonst
         ),
     ] {
         let expected = klaus_agent_core::runtime_values::runtime_json::parse(
-            &json!({"type":"string", "description":description}).to_string().into(),
+            &json!({"type":"string", "description":description})
+                .to_string()
+                .into(),
         )
         .unwrap();
         let actual = rendered[0]
             .input_schema
             .pointer(&format!("/properties/{field}"))
             .unwrap_or_else(|| panic!("Model-facing task schema must expose {field}"));
-        assert!(actual.semantic_eq_unordered(&expected), "{field}: {actual:?}");
+        assert!(
+            actual.semantic_eq_unordered(&expected),
+            "{field}: {actual:?}"
+        );
     }
     for effort in [
         json!(null),
@@ -416,6 +421,7 @@ async fn a_different_model_resets_effort_before_role_effort_fields_override() {
                         advisor_target: None,
                         orchestrator_target: None,
                         orchestration_mode: false,
+                        orchestrator_fallback_to_main: false,
                         feature_targets: Default::default(),
                         source: Some(("custom".into(), "test-model".into())),
                         rates: None,

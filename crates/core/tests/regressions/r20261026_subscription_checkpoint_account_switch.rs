@@ -69,7 +69,9 @@ fn initial_request() -> ModelRequest {
 }
 
 fn compact_response(opaque: &str) -> String {
-    format!("data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{opaque}\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"compaction-response\",\"status\":\"completed\"}}}}\n\n")
+    format!(
+        "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{opaque}\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"compaction-response\",\"status\":\"completed\"}}}}\n\n"
+    )
 }
 
 fn normal_response() -> String {
@@ -258,6 +260,7 @@ async fn restored_session_continues_after_account_replacement_without_summary_co
                         advisor_target: None,
                         orchestrator_target: None,
                         orchestration_mode: false,
+                        orchestrator_fallback_to_main: false,
                         feature_targets: Default::default(),
                         source: None,
                         rates: None,

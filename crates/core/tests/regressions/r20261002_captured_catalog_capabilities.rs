@@ -708,6 +708,7 @@ async fn held_a_spawns_its_captured_same_named_tier_after_b_publication_and_cata
                 advisor_target: None,
                 orchestrator_target: None,
                 orchestration_mode: false,
+                orchestrator_fallback_to_main: false,
                 feature_targets: Default::default(),
                 source: Some(("local".to_string(), MODEL.to_string())),
                 rates: None,

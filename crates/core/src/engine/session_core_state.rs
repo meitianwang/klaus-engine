@@ -1425,6 +1425,7 @@ impl Session {
                 advisor_target: None,
                 orchestrator_target: None,
                 orchestration_mode: false,
+                orchestrator_fallback_to_main: false,
                 feature_targets: Default::default(),
                 source: None,
                 rates: inference_rates,
@@ -1432,6 +1433,7 @@ impl Session {
             })),
             inference_admission: Arc::new(Mutex::new(super::InferenceAdmission::default())),
             inference_changed: tokio::sync::Notify::new(),
+            orchestration_fallback: Mutex::new(Default::default()),
             deps: super::SessionIdentityDeps {
                 uuid: deps.uuid.clone(),
                 now: deps.now.clone(),
