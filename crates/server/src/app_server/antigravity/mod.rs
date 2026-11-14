@@ -6,9 +6,12 @@ mod catalog;
 mod cloud;
 pub mod login;
 
+use futures::future::join_all;
 use klaus_agent_core::provider::gemini::{
     GeminiAdapterPolicy, GeminiProvider, GeminiProviderOptions, GeminiThinkingDialect,
 };
+use klaus_agent_core::provider::retry::RetryOptions;
+use klaus_agent_core::provider::rotation::RotateOutcome;
 use klaus_agent_core::runtime_values::RuntimeString;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::provider::ModelProvider;
@@ -34,8 +37,15 @@ pub fn set_config_root(root: &Path) {
         *current = Some(root.to_path_buf());
         drop(current);
         login::invalidate_pending();
-        *cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
-        *refresh_state().lock().unwrap_or_else(|p| p.into_inner()) = CatalogRefreshState::default();
+        cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
+        credit_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        refresh_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 }
 
@@ -57,15 +67,14 @@ fn config_root() -> PathBuf {
 
 #[derive(Clone)]
 struct CachedCatalog {
-    generation: String,
     payload: Value,
     fetched_at: i64,
     from_disk: bool,
 }
 
-fn cache() -> &'static Mutex<Option<CachedCatalog>> {
-    static CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+fn cache() -> &'static Mutex<HashMap<String, CachedCatalog>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedCatalog>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn refresh_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -74,20 +83,14 @@ fn refresh_lock() -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-#[derive(Default)]
-struct CatalogRefreshState {
-    generation: Option<String>,
-    retry_at: i64,
+fn refresh_state() -> &'static Mutex<HashMap<String, i64>> {
+    static STATE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn refresh_state() -> &'static Mutex<CatalogRefreshState> {
-    static STATE: OnceLock<Mutex<CatalogRefreshState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(CatalogRefreshState::default()))
-}
-
-fn credit_cache() -> &'static Mutex<Option<(String, Value)>> {
-    static CACHE: OnceLock<Mutex<Option<(String, Value)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+fn credit_cache() -> &'static Mutex<HashMap<String, Value>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(super) fn record_credits(generation: &str, payload: &Value) {
@@ -101,8 +104,89 @@ pub(super) fn record_credits(generation: &str, payload: &Value) {
         }
     }
     if !credits.is_empty() {
-        *credit_cache().lock().unwrap_or_else(|p| p.into_inner()) =
-            Some((generation.into(), Value::Object(credits)));
+        credit_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(generation.into(), Value::Object(credits));
+    }
+}
+
+pub(super) fn prune_generation(generation: &str) {
+    let _publish = CATALOG_PUBLISH_FENCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
+    refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
+    credit_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
+}
+
+pub(super) fn sync_head_catalog() {
+    let root = config_root();
+    let Some(head) = auth::generation() else {
+        forget_catalog();
+        return;
+    };
+    let should_notify = {
+        let _publish = CATALOG_PUBLISH_FENCE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let valid = auth::generations();
+        cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|gen, _| valid.contains(gen));
+        credit_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|gen, _| valid.contains(gen));
+        refresh_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|gen, _| valid.contains(gen));
+        let path = root.join("antigravity-models.json");
+        let existing_gen = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| {
+                value
+                    .get("generation")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if let Some(cached) = cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&head)
+            .cloned()
+        {
+            let snapshot = json!({
+                "generation": head,
+                "payload": cached.payload,
+                "fetchedAt": cached.fetched_at,
+                "clientIdentity": cloud::client_identity(),
+            });
+            if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+                let _ = std::fs::write(path, bytes);
+            }
+            existing_gen.as_deref() != Some(head.as_str())
+        } else {
+            if existing_gen.as_deref().is_some_and(|gen| gen != head) {
+                let _ = std::fs::remove_file(path);
+            }
+            existing_gen.as_deref().is_some_and(|gen| gen != head)
+        }
+    };
+    if should_notify {
+        super::model_sources::notify_catalog_changed(root, "antigravity");
     }
 }
 
@@ -110,9 +194,15 @@ fn forget_catalog() {
     let _publish = CATALOG_PUBLISH_FENCE
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    *cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
-    *refresh_state().lock().unwrap_or_else(|p| p.into_inner()) = CatalogRefreshState::default();
-    *credit_cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    credit_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     let _ = std::fs::remove_file(config_root().join("antigravity-models.json"));
 }
 
@@ -120,8 +210,7 @@ fn cached_payload(generation: &str) -> Option<CachedCatalog> {
     if let Some(cached) = cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .filter(|cached| cached.generation == generation)
+        .get(generation)
         .cloned()
     {
         return Some(cached);
@@ -137,7 +226,6 @@ fn cached_payload(generation: &str) -> Option<CachedCatalog> {
         return None;
     }
     Some(CachedCatalog {
-        generation: generation.to_string(),
         payload: snapshot.get("payload")?.clone(),
         fetched_at: snapshot.get("fetchedAt")?.as_i64()?,
         from_disk: true,
@@ -153,10 +241,15 @@ pub(super) async fn project(
     expected: Option<&str>,
     signal: &AbortSignal,
 ) -> Result<String, String> {
-    let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-    if expected.is_some_and(|expected| expected != generation) {
-        return Err("antigravity_credential_changed".into());
-    }
+    let generation = match expected {
+        Some(expected) => {
+            if !auth::is_current(expected) {
+                return Err("antigravity_credential_changed".into());
+            }
+            expected.to_string()
+        }
+        None => auth::generation().ok_or("antigravity_not_signed_in")?,
+    };
     let credential = auth::credential(Some(&generation)).await?;
     if let Some(project) = credential.project {
         return Ok(project);
@@ -226,21 +319,26 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
             .as_ref()
             != Some(&payload);
         let fetched_at = chrono::Utc::now().timestamp_millis();
-        *cache().lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedCatalog {
-            generation: generation.to_string(),
-            payload: payload.clone(),
-            fetched_at,
-            from_disk: false,
-        });
-        let snapshot = json!({
-            "generation":generation,"payload":payload,"fetchedAt":fetched_at,
-            "clientIdentity":cloud::client_identity(),
-        });
-        let path = root.join("antigravity-models.json");
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            let _ = std::fs::write(path, bytes);
+        cache().lock().unwrap_or_else(|p| p.into_inner()).insert(
+            generation.to_string(),
+            CachedCatalog {
+                payload: payload.clone(),
+                fetched_at,
+                from_disk: false,
+            },
+        );
+        let is_head = auth::is_head_generation(generation);
+        if is_head {
+            let snapshot = json!({
+                "generation":generation,"payload":payload,"fetchedAt":fetched_at,
+                "clientIdentity":cloud::client_identity(),
+            });
+            let path = root.join("antigravity-models.json");
+            if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+                let _ = std::fs::write(path, bytes);
+            }
         }
-        changed
+        changed && is_head
     };
     drop(_credential);
     if changed {
@@ -290,26 +388,28 @@ async fn fetch_available_models(
 }
 
 fn refresh_allowed(generation: &str, now: i64) -> bool {
-    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
-    if state.generation.as_deref() != Some(generation) {
-        state.generation = Some(generation.to_string());
-        state.retry_at = 0;
-    }
-    state.retry_at <= now
+    let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
+    state.get(generation).copied().unwrap_or(0) <= now
 }
 
 fn record_refresh_failure(generation: &str, now: i64) {
-    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
-    if state.generation.as_deref() == Some(generation) {
-        state.retry_at = now.saturating_add(CATALOG_RETRY_COOLDOWN_MS);
+    if !auth::is_current(generation) {
+        return;
     }
+    refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            generation.to_string(),
+            now.saturating_add(CATALOG_RETRY_COOLDOWN_MS),
+        );
 }
 
 fn record_refresh_success(generation: &str) {
-    let mut state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
-    if state.generation.as_deref() == Some(generation) {
-        state.retry_at = 0;
-    }
+    refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
 }
 
 /// Revalidate behind the caller. A catalog read never waits for this task, and
@@ -345,8 +445,9 @@ fn schedule_refresh(generation: String) {
 #[cfg(test)]
 pub(super) fn refresh_blocked(generation: &str) -> bool {
     let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
-    state.generation.as_deref() == Some(generation)
-        && state.retry_at > chrono::Utc::now().timestamp_millis()
+    state
+        .get(generation)
+        .is_some_and(|retry_at| *retry_at > chrono::Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
@@ -515,23 +616,44 @@ pub async fn transcribe_audio(
     Ok(response)
 }
 
-pub async fn usage() -> Result<Value, String> {
-    let Some(generation) = auth::generation() else {
-        return Ok(json!({"signedIn":false}));
-    };
+async fn account_usage(entry: &auth::StoredAccount) -> Result<Value, String> {
+    let generation = entry.generation.as_str();
     let signal = AbortSignal::new();
-    let project = project(Some(&generation), &signal).await?;
-    let quota = cloud::rpc(
+    let project = match project(Some(generation), &signal).await {
+        Ok(project) => project,
+        Err(error) if cloud::is_auth_refusal_message(&error) => {
+            if auth::force_refresh(generation).await.is_ok() {
+                project(Some(generation), &signal).await?
+            } else {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let mut quota = cloud::rpc(
         "retrieveUserQuota",
         json!({"project":project}),
-        Some(&generation),
+        Some(generation),
         &signal,
     )
     .await;
+    if quota
+        .as_ref()
+        .is_err_and(|err| cloud::is_auth_refusal_message(err))
+        && auth::force_refresh(generation).await.is_ok()
+    {
+        quota = cloud::rpc(
+            "retrieveUserQuota",
+            json!({"project":project}),
+            Some(generation),
+            &signal,
+        )
+        .await;
+    }
     let summary = cloud::rpc(
         "retrieveUserQuotaSummary",
         json!({"project":project}),
-        Some(&generation),
+        Some(generation),
         &signal,
     )
     .await;
@@ -540,10 +662,27 @@ pub async fn usage() -> Result<Value, String> {
             .err()
             .unwrap_or_else(|| "antigravity_usage_unavailable".into()));
     }
-    if !auth::is_current(&generation) {
+    if !auth::is_current(generation) {
         return Err("antigravity_credential_changed".into());
     }
-    let metadata=cloud::rpc("loadCodeAssist",json!({"cloudaicompanionProject":project,"metadata":{"ideType":"ANTIGRAVITY","pluginType":"GEMINI","ideName":"antigravity","platform":platform_id(),"ideVersion":"2.24.0","pluginVersion":"2.24.0"}}),Some(&generation),&signal).await.unwrap_or(Value::Null);
+    let metadata = cloud::rpc(
+        "loadCodeAssist",
+        json!({
+            "cloudaicompanionProject": project,
+            "metadata": {
+                "ideType": "ANTIGRAVITY",
+                "pluginType": "GEMINI",
+                "ideName": "antigravity",
+                "platform": platform_id(),
+                "ideVersion": "2.24.0",
+                "pluginVersion": "2.24.0"
+            }
+        }),
+        Some(generation),
+        &signal,
+    )
+    .await
+    .unwrap_or(Value::Null);
     let plan = metadata
         .get("paidTier")
         .or_else(|| metadata.get("currentTier"))
@@ -556,9 +695,8 @@ pub async fn usage() -> Result<Value, String> {
     let live_credits = credit_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .filter(|(owner, _)| owner == &generation)
-        .map(|(_, value)| value.clone());
+        .get(generation)
+        .cloned();
     let credits = live_credits
         .as_ref()
         .and_then(|value| value.get("remainingCredits"))
@@ -567,13 +705,13 @@ pub async fn usage() -> Result<Value, String> {
     if let Some(credits) = credits {
         summary["availableCredits"] = credits.clone();
     }
-    if !auth::is_current(&generation) {
+    if !auth::is_current(generation) {
         return Err("antigravity_credential_changed".into());
     }
     let mut usage = catalog::normalize_usage(
         &quota.unwrap_or(Value::Null),
         &summary,
-        auth::account().as_deref(),
+        entry.credential.account.as_deref(),
         plan,
     );
     if let Some(consumed) = live_credits
@@ -583,6 +721,62 @@ pub async fn usage() -> Result<Value, String> {
         usage["lastRequestConsumedCredits"] = consumed.clone();
     }
     Ok(usage)
+}
+
+pub async fn usage() -> Result<Value, String> {
+    let entries = auth::accounts();
+    if entries.is_empty() {
+        return Ok(json!({"signedIn":false,"accounts":[]}));
+    }
+    if entries.len() == 1 {
+        return account_usage(&entries[0]).await;
+    }
+    let rows = join_all(
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| async move {
+                let label = entry
+                    .credential
+                    .account
+                    .as_deref()
+                    .filter(|account| !account.is_empty())
+                    .unwrap_or("Antigravity")
+                    .to_string();
+                let outcome =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(&entry))
+                        .await
+                        .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
+                match outcome {
+                    Ok(mut row) => {
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert("id".into(), json!(entry.id));
+                            obj.insert("label".into(), json!(label));
+                            obj.insert("isCurrent".into(), json!(index == 0));
+                            obj.insert("state".into(), json!("ok"));
+                        }
+                        row
+                    }
+                    Err(error) => json!({
+                        "id": entry.id,
+                        "label": label,
+                        "isCurrent": index == 0,
+                        "state": "error",
+                        "error": error,
+                    }),
+                }
+            }),
+    )
+    .await;
+    let mut top = rows
+        .first()
+        .cloned()
+        .unwrap_or_else(|| json!({"signedIn": true}));
+    if let Some(obj) = top.as_object_mut() {
+        obj.insert("signedIn".into(), json!(true));
+        obj.insert("accounts".into(), json!(rows));
+    }
+    Ok(top)
 }
 
 pub async fn main_model(
@@ -616,7 +810,7 @@ pub async fn resolve(
     selection: &str,
     tiers: &serde_json::Map<String, Value>,
 ) -> Result<super::model_sources::Resolved, String> {
-    auth::credential(None).await?;
+    auth::active_or_rotated_credential().await?;
     let model = main_model(selection, tiers).await?;
     let rows = catalog::models_with_unavailable_paid(&catalog_payload(true).await?);
     let selected = rows
@@ -723,12 +917,22 @@ pub(super) fn decorate(
             )
         })
         .collect();
-    let generation = auth::generation().unwrap_or_default();
-    let admission_generation = generation.clone();
+    let admission_generations = auth::generations();
+    let multi_account = admission_generations.len() > 1;
     Arc::new(GeminiProvider::new(GeminiProviderOptions {
         default_model: model.try_to_utf8().ok(),
-        client: Some(Arc::new(cloud::CloudClient { generation })),
-        stream_admission: Some(Arc::new(move || auth::is_current(&admission_generation))),
+        client: Some(Arc::new(cloud::CloudClient {
+            generation: String::new(),
+        })),
+        retry: Some(RetryOptions {
+            yield_to_credential_rotation: multi_account,
+            ..Default::default()
+        }),
+        stream_admission: Some(Arc::new(move || {
+            admission_generations
+                .iter()
+                .any(|generation| auth::is_current(generation))
+        })),
         capabilities: Some(capabilities),
         capabilities_by_model: Some(by_model),
         thinking_dialect: Some(selected_dialect(&model, init)),
@@ -761,6 +965,67 @@ fn native_model(payload: &Value, field: &str, requested: Option<&str>) -> Result
     }
 }
 
+async fn generate_content_with_rotation(
+    model_field: &str,
+    requested_model: Option<&str>,
+    request_type: &str,
+    build_request: impl Fn(&str) -> Value,
+    signal: &AbortSignal,
+) -> Result<(String, String, Value), String> {
+    let mut attempted: Vec<String> = Vec::new();
+    loop {
+        let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
+        let payload = catalog_payload(true).await?;
+        let model = native_model(&payload, model_field, requested_model)?;
+        let mut renewed = false;
+        let outcome: Result<Value, String> = loop {
+            let project = match project(Some(&generation), signal).await {
+                Ok(project) => project,
+                Err(err) if !renewed && cloud::is_auth_refusal_message(&err) => {
+                    renewed = true;
+                    if auth::force_refresh(&generation).await.is_ok() {
+                        continue;
+                    }
+                    break Err(err);
+                }
+                Err(err) => break Err(err),
+            };
+            let body = cloud::envelope(&project, &model, build_request(&model), request_type);
+            match cloud::rpc("generateContent", body, Some(&generation), signal).await {
+                Ok(response) => break Ok(response),
+                Err(err) if !renewed && cloud::is_auth_refusal_message(&err) => {
+                    renewed = true;
+                    if auth::force_refresh(&generation).await.is_ok() {
+                        continue;
+                    }
+                    break Err(err);
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        match outcome {
+            Ok(response) => return Ok((generation, model, response)),
+            Err(err)
+                if !signal.is_cancelled()
+                    && cloud::is_rotatable_message(&err)
+                    && auth::account_count() > 1
+                    && !attempted.contains(&generation) =>
+            {
+                attempted.push(generation.clone());
+                match auth::rotate(&generation).await {
+                    RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
+                        if !attempted.contains(&next) =>
+                    {
+                        continue;
+                    }
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub async fn generate_image(
     params: super::wire::AntigravityImageParams,
     signal: AbortSignal,
@@ -769,10 +1034,6 @@ pub async fn generate_image(
     if params.prompt.trim().is_empty() || params.prompt.len() > 128 * 1024 {
         return Err("antigravity_image_prompt_invalid".into());
     }
-    let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-    let payload = catalog_payload(true).await?;
-    let model = native_model(&payload, "imageGenerationModelIds", params.model.as_deref())?;
-    let project = project(Some(&generation), &signal).await?;
     let mut parts = vec![json!({"text":params.prompt})];
     let mut total_bytes = 0usize;
     for image in &params.reference_images {
@@ -800,18 +1061,16 @@ pub async fn generate_image(
         Some("9:16") => "9:16",
         Some(_) => return Err("antigravity_image_size_unsupported".into()),
     };
-    let response = cloud::rpc(
-        "generateContent",
-        cloud::envelope(
-            &project,
-            &model,
+    let (generation, model, response) = generate_content_with_rotation(
+        "imageGenerationModelIds",
+        params.model.as_deref(),
+        "image_gen",
+        |_| {
             json!({
                 "contents":[{"role":"user","parts":parts}],
                 "generationConfig":{"candidateCount":1,"imageConfig":{"aspectRatio":aspect_ratio}},
-            }),
-            "image_gen",
-        ),
-        Some(&generation),
+            })
+        },
         &signal,
     )
     .await?;
@@ -849,22 +1108,17 @@ pub async fn search(
     {
         return Err("antigravity_search_filter_unsupported".into());
     }
-    let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-    let payload = catalog_payload(true).await?;
-    let model = native_model(&payload, "webSearchModelIds", params.model.as_deref())?;
-    let project = project(Some(&generation), &signal).await?;
-    let response = cloud::rpc(
-        "generateContent",
-        cloud::envelope(
-            &project,
-            &model,
+    let query_text = params.query.clone();
+    let (generation, model, response) = generate_content_with_rotation(
+        "webSearchModelIds",
+        params.model.as_deref(),
+        "web_search",
+        |_| {
             json!({
-                "contents":[{"role":"user","parts":[{"text":params.query}]}],
+                "contents":[{"role":"user","parts":[{"text":query_text}]}],
                 "tools":[{"googleSearch":{}}],
-            }),
-            "web_search",
-        ),
-        Some(&generation),
+            })
+        },
         &signal,
     )
     .await?;

@@ -3116,6 +3116,7 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
         | "antigravity/loginPoll"
         | "antigravity/loginCancel"
         | "antigravity/adoptCredential"
+        | "antigravity/switchAccount"
         | "antigravity/logout"
         | "antigravity/models"
         | "antigravity/usage"
@@ -6684,7 +6685,20 @@ async fn dispatch_antigravity(state: Arc<AppServerState>, id: Value, method: &st
                     Err(error) => Err(error),
                 }
             }
-            "antigravity/logout" => super::antigravity::auth::logout().await,
+            "antigravity/switchAccount" => {
+                match decode_qoder::<wire::AntigravitySwitchAccountParams>(&params) {
+                    Ok(params) => {
+                        super::antigravity::auth::switch_account(&params.account_id).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "antigravity/logout" => match decode_qoder::<wire::AntigravityLogoutParams>(&params) {
+                Ok(params) => {
+                    super::antigravity::auth::logout_account(params.account_id.as_deref()).await
+                }
+                Err(error) => Err(error),
+            },
             "antigravity/models" => match decode_qoder::<wire::QoderModelsParams>(&params) {
                 Ok(params) => {
                     super::antigravity::models(params.read == wire::QoderCatalogRead::Warm).await

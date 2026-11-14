@@ -723,6 +723,7 @@ fn facade_schemas_publish_secret_input_and_closed_native_shapes() {
     for method in [
         "status",
         "adoptCredential",
+        "switchAccount",
         "logout",
         "models",
         "usage",
@@ -1307,4 +1308,762 @@ fn recommended_sort_section_curates_the_menu_inventory() {
         "models": {"m-b-medium": {"displayName": "M B (Medium)"}}
     }));
     assert!(!flagged(&bare, "m-b-medium"));
+}
+
+#[tokio::test]
+async fn legacy_single_account_file_reads_as_queue_and_pool_mutations_preserve_order() {
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    let raw_legacy = json!({
+        "generation": "legacy-gen-1",
+        "credential": {
+            "accessToken": "tok-alice",
+            "refreshToken": "ref-alice",
+            "account": "alice@example.invalid",
+            "authMethod": "consumer",
+            "project": "proj-alice"
+        },
+        "needsLogin": false
+    })
+    .to_string();
+    std::fs::write(auth::path(), &raw_legacy).unwrap();
+
+    let initial = auth::status();
+    assert_eq!(initial["loggedIn"], true);
+    assert_eq!(initial["account"], "alice@example.invalid");
+    assert_eq!(initial["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(initial["accounts"][0]["id"], "legacy");
+    assert_eq!(initial["accounts"][0]["isCurrent"], true);
+    assert_eq!(
+        std::fs::read_to_string(auth::path()).unwrap(),
+        raw_legacy,
+        "reading a legacy file must not rewrite it"
+    );
+
+    let bob = auth::adopt(auth::Credential {
+        access_token: "tok-bob".into(),
+        refresh_token: Some("ref-bob".into()),
+        expires_at: None,
+        account: Some("bob@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-bob".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(bob["updatedExisting"], false);
+    assert_eq!(bob["previousCount"], 1);
+
+    let carol = auth::adopt(auth::Credential {
+        access_token: "tok-carol".into(),
+        refresh_token: Some("ref-carol".into()),
+        expires_at: None,
+        account: Some("carol@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-carol".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(carol["accounts"].as_array().unwrap().len(), 3);
+    let alice_id = carol["accounts"][0]["id"].as_str().unwrap().to_string();
+    let bob_id = carol["accounts"][1]["id"].as_str().unwrap().to_string();
+    let carol_id = carol["accounts"][2]["id"].as_str().unwrap().to_string();
+    assert_ne!(
+        alice_id, "legacy",
+        "legacy id upgrades when persisting a queue"
+    );
+
+    // Re-adopting Bob refreshes in place without duplicating or reordering.
+    let bob_refreshed = auth::adopt(auth::Credential {
+        access_token: "tok-bob-v2".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("BOB@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: None,
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(bob_refreshed["updatedExisting"], true);
+    assert_eq!(bob_refreshed["accountId"], bob_id);
+    let emails: Vec<&str> = bob_refreshed["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["email"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        emails,
+        vec![
+            "alice@example.invalid",
+            "BOB@example.invalid",
+            "carol@example.invalid"
+        ]
+    );
+
+    // Promote Carol to head; Alice and Bob keep their relative order behind her.
+    let switched = auth::switch_account(&carol_id).await.unwrap();
+    assert_eq!(switched["ok"], true);
+    assert_eq!(switched["account"], "carol@example.invalid");
+    assert_eq!(switched["project"], "proj-carol");
+    let ids: Vec<&str> = switched["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![carol_id.as_str(), alice_id.as_str(), bob_id.as_str()]
+    );
+    assert_eq!(switched["accounts"][0]["isCurrent"], true);
+    assert_eq!(switched["accounts"][1]["isCurrent"], false);
+
+    // Preserved Bob project & refresh token survive when Bob becomes head.
+    let bob_head = auth::switch_account(&bob_id).await.unwrap();
+    assert_eq!(bob_head["project"], "proj-bob");
+    assert_eq!(bob_head["canRefresh"], true);
+
+    assert_eq!(
+        auth::switch_account("missing-id").await.unwrap()["error"],
+        "antigravity_account_not_found"
+    );
+    assert_eq!(
+        auth::logout_account(Some("missing-id")).await.unwrap()["error"],
+        "antigravity_account_not_found"
+    );
+
+    let after_remove = auth::logout_account(Some(&bob_id)).await.unwrap();
+    assert_eq!(after_remove["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(after_remove["account"], "carol@example.invalid");
+
+    let signed_out = auth::logout_account(None).await.unwrap();
+    assert_eq!(signed_out["signedIn"], false);
+    assert!(!auth::path().exists());
+}
+
+#[tokio::test]
+async fn pooled_stream_rotates_across_accounts_with_isolated_projects_and_safe_parallel_streams() {
+    use klaus_agent_core::types::provider::{ModelProvider, ModelRequest, ModelStreamEvent};
+    use std::collections::VecDeque;
+
+    #[derive(Clone)]
+    enum StreamPlan {
+        Http429,
+        Sse429,
+        Http401,
+        Http403Disabled,
+        Success(&'static str),
+        HoldSuccess {
+            first: &'static str,
+            second: &'static str,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        },
+    }
+
+    let plans: Arc<Mutex<HashMap<String, VecDeque<StreamPlan>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let oauth_status: Arc<Mutex<HashMap<String, (u16, Value)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let trace: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let plans_srv = plans.clone();
+    let oauth_srv = oauth_status.clone();
+    let trace_srv = trace.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let plans = plans_srv.clone();
+            let oauth = oauth_srv.clone();
+            let trace = trace_srv.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..index]);
+                        let len = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (index + 4, len);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                if path == "/token" {
+                    let form: HashMap<String, String> =
+                        url::form_urlencoded::parse(&bytes[header_end..header_end + length])
+                            .into_owned()
+                            .collect();
+                    let rt = form.get("refresh_token").cloned().unwrap_or_default();
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(("oauth".into(), rt.clone(), String::new()));
+                    let (code, body) = oauth
+                        .lock()
+                        .unwrap()
+                        .get(&rt)
+                        .cloned()
+                        .unwrap_or((400, json!({"error": "invalid_grant"})));
+                    let text = body.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {code} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                let bearer = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("authorization: bearer ")
+                            .map(|_| {
+                                line.split_whitespace()
+                                    .nth(2)
+                                    .unwrap_or_default()
+                                    .to_string()
+                            })
+                    })
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes[header_end..header_end + length])
+                    .unwrap_or(Value::Null);
+                let project = body["project"].as_str().unwrap_or_default().to_string();
+                if path.contains(":streamGenerateContent") {
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(("stream".into(), bearer.clone(), project));
+                    let plan = plans
+                        .lock()
+                        .unwrap()
+                        .get_mut(&bearer)
+                        .and_then(|q| q.pop_front())
+                        .unwrap_or(StreamPlan::Http429);
+                    match plan {
+                        StreamPlan::Http429 => {
+                            let err = json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Rate limit exceeded"}}).to_string();
+                            let resp = format!("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}", err.len());
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                        StreamPlan::Sse429 => {
+                            let frame = format!(
+                                "data: {}\n\n",
+                                json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded for quota metric"}})
+                            );
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{frame}", frame.len());
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                        StreamPlan::Http401 => {
+                            let err = json!({"error":{"code":401,"status":"UNAUTHENTICATED","message":"Invalid Credentials"}}).to_string();
+                            let resp = format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}", err.len());
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                        StreamPlan::Http403Disabled => {
+                            let err = json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"This account has been disabled."}}).to_string();
+                            let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}", err.len());
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                        StreamPlan::Success(text) => {
+                            let sse = format!(
+                                "data: {}\n\n",
+                                json!({"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":text}]}}]}})
+                            );
+                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len());
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        }
+                        StreamPlan::HoldSuccess {
+                            first,
+                            second,
+                            entered,
+                            release,
+                        } => {
+                            let f1 = format!(
+                                "data: {}\n\n",
+                                json!({"response":{"candidates":[{"content":{"parts":[{"text":first}]}}]}})
+                            );
+                            let f2 = format!(
+                                "data: {}\n\n",
+                                json!({"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":second}]}}]}})
+                            );
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                                .await;
+                            let _ = socket.write_all(f1.as_bytes()).await;
+                            let _ = socket.flush().await;
+                            entered.notify_one();
+                            release.notified().await;
+                            let _ = socket.write_all(f2.as_bytes()).await;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL", format!("{endpoint}/token"));
+
+    for (email, tok, rf, proj) in [
+        ("a@example.invalid", "tok-a", "ref-a", "proj-a"),
+        ("b@example.invalid", "tok-b", "ref-b", "proj-b"),
+        ("c@example.invalid", "tok-c", "ref-c", "proj-c"),
+    ] {
+        auth::adopt(auth::Credential {
+            access_token: tok.into(),
+            refresh_token: Some(rf.into()),
+            expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            account: Some(email.into()),
+            auth_method: "consumer".into(),
+            project: Some(proj.into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let resolved = resolve("gemini-3.8-flash-medium", &serde_json::Map::new())
+        .await
+        .unwrap();
+    let init_json = json!({
+        "provider": resolved.provider,
+        "capabilities": resolved.capabilities,
+        "capabilitiesByModel": resolved.capabilities_by_model,
+        "modelSource": {"source": "antigravity"},
+    });
+    let proto_init: ProtocolSessionInit =
+        klaus_agent_core::runtime_values::runtime_codec::decode_text(&RuntimeString::from(
+            init_json.to_string(),
+        ))
+        .unwrap();
+    let base_provider: Arc<dyn ModelProvider> =
+        Arc::new(GeminiProvider::new(GeminiProviderOptions {
+            default_model: Some("gemini-3.8-flash-medium".into()),
+            ..Default::default()
+        }));
+    let provider = decorate(base_provider, &proto_init);
+
+    let run_request = |provider: Arc<dyn ModelProvider>| async move {
+        let req: ModelRequest = decode(json!({
+            "model": "gemini-3.8-flash-medium",
+            "system": [],
+            "messages": [],
+            "tools": [],
+            "maxOutputTokens": 256
+        }));
+        let events: Vec<ModelStreamEvent> =
+            provider.stream(req, AbortSignal::new()).collect().await;
+        events
+    };
+
+    // 1. HTTP 429 on A -> first-SSE-frame 429 on B -> HTTP 200 on C; persisted head becomes C.
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert("tok-a".into(), VecDeque::from([StreamPlan::Http429]));
+        p.insert("tok-b".into(), VecDeque::from([StreamPlan::Sse429]));
+        p.insert(
+            "tok-c".into(),
+            VecDeque::from([
+                StreamPlan::Success("from-c"),
+                StreamPlan::Success("next-turn-c"),
+            ]),
+        );
+    }
+    let events = run_request(provider.clone()).await;
+    let text: String = events
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "from-c", "{events:?}");
+    assert_eq!(
+        trace.lock().unwrap().clone(),
+        vec![
+            ("stream".into(), "tok-a".into(), "proj-a".into()),
+            ("stream".into(), "tok-b".into(), "proj-b".into()),
+            ("stream".into(), "tok-c".into(), "proj-c".into()),
+        ],
+        "each rotated account must authenticate with its own token and Cloud Code Assist project"
+    );
+    assert_eq!(auth::status()["account"], "c@example.invalid");
+
+    // Next turn immediately uses C without re-trying A or B.
+    trace.lock().unwrap().clear();
+    let events2 = run_request(provider.clone()).await;
+    let text2: String = events2
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text2, "next-turn-c");
+    assert_eq!(
+        trace.lock().unwrap().clone(),
+        vec![("stream".into(), "tok-c".into(), "proj-c".into())]
+    );
+
+    // 2. Premature 401 on C attempts one OAuth refresh; on invalid_grant marks only C needsLogin and rotates to A.
+    trace.lock().unwrap().clear();
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert("tok-c".into(), VecDeque::from([StreamPlan::Http401]));
+        p.insert(
+            "tok-a".into(),
+            VecDeque::from([StreamPlan::Success("recovered-on-a")]),
+        );
+    }
+    let events3 = run_request(provider.clone()).await;
+    let text3: String = events3
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text3, "recovered-on-a");
+    assert_eq!(
+        trace.lock().unwrap().clone(),
+        vec![
+            ("stream".into(), "tok-c".into(), "proj-c".into()),
+            ("oauth".into(), "ref-c".into(), String::new()),
+            ("stream".into(), "tok-a".into(), "proj-a".into()),
+        ]
+    );
+    let st = auth::status();
+    assert_eq!(st["account"], "a@example.invalid");
+    assert_eq!(st["needsLogin"], false);
+    assert_eq!(st["accounts"][2]["email"], "c@example.invalid");
+    assert_eq!(st["accounts"][2]["needsLogin"], true);
+
+    // 3. Account-disabled 403 is InvalidRequest and never rotates the queue.
+    trace.lock().unwrap().clear();
+    plans.lock().unwrap().insert(
+        "tok-a".into(),
+        VecDeque::from([StreamPlan::Http403Disabled]),
+    );
+    let disabled_events = run_request(provider.clone()).await;
+    assert!(disabled_events.iter().any(|ev| matches!(
+        ev,
+        ModelStreamEvent::Error { error } if error.code.as_ref().is_some_and(|code| code == "antigravity_account_disabled")
+    )));
+    assert_eq!(auth::status()["account"], "a@example.invalid");
+
+    // 4. Parallel subagent safety: Stream 1 streaming on A stays alive while Stream 2 rotates A -> B.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert(
+            "tok-a".into(),
+            VecDeque::from([
+                StreamPlan::HoldSuccess {
+                    first: "part1-",
+                    second: "part2",
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+                StreamPlan::Http429,
+            ]),
+        );
+        p.insert(
+            "tok-b".into(),
+            VecDeque::from([StreamPlan::Success("subagent-b")]),
+        );
+    }
+    let p1 = provider.clone();
+    let stream1 = tokio::spawn(async move { run_request(p1).await });
+    entered.notified().await;
+    let events_sub2 = run_request(provider.clone()).await;
+    let text_sub2: String = events_sub2
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text_sub2, "subagent-b");
+    assert_eq!(auth::status()["account"], "b@example.invalid");
+    release.notify_one();
+    let events_sub1 = stream1.await.unwrap();
+    let text_sub1: String = events_sub1
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_sub1, "part1-part2",
+        "rotation by a sibling stream must not kill an active stream on a still-stored account: {events_sub1:?}"
+    );
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL");
+}
+
+#[tokio::test]
+async fn multi_account_usage_isolates_failures_and_native_media_search_rotate_on_quota() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..index]);
+                        let len = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (index + 4, len);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let bearer = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("authorization: bearer ")
+                            .map(|_| {
+                                line.split_whitespace()
+                                    .nth(2)
+                                    .unwrap_or_default()
+                                    .to_string()
+                            })
+                    })
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes[header_end..header_end + length])
+                    .unwrap_or(Value::Null);
+                let (status, payload) = if bearer == "tok-broken" {
+                    (
+                        401,
+                        json!({"error":{"code":401,"status":"UNAUTHENTICATED","message":"Revoked"}}),
+                    )
+                } else if path.ends_with(":fetchAvailableModels") {
+                    (
+                        200,
+                        json!({
+                            "models":{"fixture-image":{},"fixture-search":{}},
+                            "imageGenerationModelIds":["fixture-image"],
+                            "webSearchModelIds":["fixture-search"]
+                        }),
+                    )
+                } else if path.ends_with(":retrieveUserQuota") {
+                    (200, json!({"buckets":[]}))
+                } else if path.ends_with(":retrieveUserQuotaSummary") {
+                    (
+                        200,
+                        json!({"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8,"window":"5h","description":"Resets every 5h"}]}]}),
+                    )
+                } else if path.ends_with(":loadCodeAssist") {
+                    (
+                        200,
+                        json!({"cloudaicompanionProject":"proj-ok","paidTier":{"name":"Google AI Ultra"}}),
+                    )
+                } else if path.ends_with(":generateContent") && bearer == "tok-limited" {
+                    (
+                        429,
+                        json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Rate limit"}}),
+                    )
+                } else if path.ends_with(":generateContent") && body["requestType"] == "image_gen" {
+                    (
+                        200,
+                        json!({"response":{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1hZ2U="}}]},"finishReason":"STOP"}]}}),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({"response":{"candidates":[{"content":{"parts":[{"text":"Search ok"}]},"groundingMetadata":{"groundingChunks":[{"web":{"uri":"https://example.com","title":"Example"}}]}} ]}}),
+                    )
+                };
+                let text = payload.to_string();
+                let resp = format!(
+                    "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+
+    auth::adopt(auth::Credential {
+        access_token: "tok-limited".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("limited@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-limited".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    auth::adopt(auth::Credential {
+        access_token: "tok-broken".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("broken@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-broken".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    auth::adopt(auth::Credential {
+        access_token: "tok-healthy".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("healthy@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-healthy".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+
+    // Multi-account usage isolates broken@'s 401 without blanking limited@ or healthy@, and never rotates.
+    let quota = usage().await.unwrap();
+    assert_eq!(quota["signedIn"], true);
+    let rows = quota["accounts"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["label"], "limited@example.invalid");
+    assert_eq!(rows[0]["isCurrent"], true);
+    assert_eq!(rows[0]["state"], "ok");
+    assert_eq!(rows[1]["label"], "broken@example.invalid");
+    assert_eq!(rows[1]["isCurrent"], false);
+    assert_eq!(rows[1]["state"], "error");
+    assert_eq!(rows[2]["label"], "healthy@example.invalid");
+    assert_eq!(rows[2]["state"], "ok");
+    assert_eq!(
+        auth::status()["account"],
+        "limited@example.invalid",
+        "usage queries must never advance the rotation queue"
+    );
+
+    // Seed catalog so generate_image and search can pick native models, then verify rotation past limited@ and broken@ to healthy@.
+    let head_gen = auth::generation().unwrap();
+    std::fs::write(
+        root.path().join("antigravity-models.json"),
+        json!({
+            "generation": head_gen,
+            "clientIdentity": cloud_test_identity(),
+            "fetchedAt": chrono::Utc::now().timestamp_millis(),
+            "payload": {
+                "models": {"fixture-image": {}, "fixture-search": {}},
+                "imageGenerationModelIds": ["fixture-image"],
+                "webSearchModelIds": ["fixture-search"]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let img = generate_image(
+        serde_json::from_value(json!({"prompt": "draw a circle"})).unwrap(),
+        AbortSignal::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(img["mimeType"], "image/png");
+    assert_eq!(auth::status()["account"], "healthy@example.invalid");
+
+    let srch = search(
+        serde_json::from_value(json!({"query": "example query"})).unwrap(),
+        AbortSignal::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(srch["results"][0]["url"], "https://example.com");
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }

@@ -36,7 +36,11 @@ const SCOPES: &[&str] = &[
 #[derive(Clone)]
 enum Outcome {
     Pending,
-    Complete(String),
+    Complete {
+        generation: String,
+        updated_existing: bool,
+        account_id: String,
+    },
     Failed(&'static str),
 }
 
@@ -204,7 +208,7 @@ async fn start_at(
         if closed.load(Ordering::Acquire) {
             return failure("antigravity_login_cancelled");
         }
-        expected = auth::generation();
+        expected = auth::store_fingerprint();
         let mut flows = flows().lock().unwrap_or_else(|p| p.into_inner());
         for flow in flows.iter_mut() {
             if matches!(flow.outcome, Outcome::Pending) {
@@ -212,7 +216,15 @@ async fn start_at(
             }
         }
         while flows.len() >= MAX_FLOWS {
-            let removable = flows.iter().position(|flow| !matches!(&flow.outcome, Outcome::Complete(generation) if auth::is_current(generation))).unwrap_or(0);
+            let removable = flows
+                .iter()
+                .position(|flow| {
+                    !matches!(
+                        &flow.outcome,
+                        Outcome::Complete { generation, .. } if auth::is_current(generation)
+                    )
+                })
+                .unwrap_or(0);
             if let Some(flow) = flows.remove(removable) {
                 flow.cancelled.send_replace(true);
             }
@@ -273,8 +285,17 @@ pub async fn poll(owner: usize, id: &str) -> Value {
     match &flow.outcome {
         Outcome::Pending => json!({"ok":false,"pending":true}),
         Outcome::Failed(error) => failure(error),
-        Outcome::Complete(generation) if auth::is_current(generation) => auth::status(),
-        Outcome::Complete(_) => failure("antigravity_login_credential_changed"),
+        Outcome::Complete {
+            generation,
+            updated_existing,
+            account_id,
+        } if auth::is_current(generation) => {
+            let mut reply = auth::status();
+            reply["updatedExisting"] = json!(*updated_existing);
+            reply["accountId"] = json!(account_id);
+            reply
+        }
+        Outcome::Complete { .. } => failure("antigravity_login_credential_changed"),
     }
 }
 
@@ -286,7 +307,7 @@ pub async fn cancel(owner: usize, id: &str) -> Value {
         .iter_mut()
         .find(|flow| flow.id == id && flow.owner == owner && flow.root == config_root())
     {
-        if let Outcome::Complete(generation) = &flow.outcome {
+        if let Outcome::Complete { generation, .. } = &flow.outcome {
             if let Err(error) = auth::remove_generation(generation) {
                 return failure(&error);
             }
@@ -299,7 +320,7 @@ pub async fn cancel(owner: usize, id: &str) -> Value {
 struct Authorization {
     id: String,
     root: PathBuf,
-    expected: Option<String>,
+    expected: Vec<(String, String)>,
     redirect: String,
     state: String,
     verifier: String,
@@ -585,12 +606,16 @@ async fn complete(
     }
     if flow.root != config_root()
         || flow.root != authorization.root
-        || auth::generation() != authorization.expected
+        || auth::store_fingerprint() != authorization.expected
     {
         return Err("antigravity_login_credential_changed");
     }
-    let generation = auth::store_login(credential).map_err(|_| "antigravity_login_store_failed")?;
-    flow.outcome = Outcome::Complete(generation);
+    let outcome = auth::store_login(credential).map_err(|_| "antigravity_login_store_failed")?;
+    flow.outcome = Outcome::Complete {
+        generation: outcome.generation,
+        updated_existing: outcome.updated_existing,
+        account_id: outcome.account_id,
+    };
     Ok(())
 }
 

@@ -7,6 +7,7 @@ use klaus_agent_core::provider::gemini::{
     generate_content_request, Candidate, Content, GeminiApiError, GeminiChunkStream, GeminiClient,
     GenerateContentParameters, GenerateContentResponse, UsageMetadata,
 };
+use klaus_agent_core::provider::rotation::RotateOutcome;
 use klaus_agent_core::runtime_values::{runtime_codec, runtime_json, RuntimeJson, RuntimeString};
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::provider::AuthHeaders;
@@ -1642,6 +1643,89 @@ fn adapt_model_request(request: &mut RuntimeJson, details: &Value) -> Result<(),
     Ok(())
 }
 
+fn has_tag_prefix(message: &str, tag: &str) -> bool {
+    message == tag
+        || message
+            .strip_prefix(tag)
+            .is_some_and(|suffix| suffix.starts_with(':') || suffix.starts_with(" ["))
+}
+
+pub(super) fn is_auth_refusal_message(message: &str) -> bool {
+    has_tag_prefix(message, "antigravity_auth_required")
+}
+
+pub(super) fn is_rotatable_message(message: &str) -> bool {
+    [
+        "antigravity_rate_limited",
+        "antigravity_quota_exhausted",
+        "antigravity_auth_required",
+        "antigravity_login_expired",
+    ]
+    .iter()
+    .any(|tag| has_tag_prefix(message, tag))
+}
+
+async fn establish_initial_leg_for_generation(
+    generation: &str,
+    params: &GenerateContentParameters,
+    model: &str,
+    user_prompt_id: &str,
+    signal: &AbortSignal,
+    extra_headers: &[(String, String)],
+) -> Result<(String, RuntimeJson, Option<u64>, reqwest::Response), GeminiApiError> {
+    let mut base_request = generate_content_request(params);
+    if let Some(details) = super::model_details(generation, model) {
+        adapt_model_request(&mut base_request, &details)?;
+    }
+    let initial_max_output_tokens = base_request
+        .get("generationConfig")
+        .and_then(|config| config.get("maxOutputTokens"))
+        .and_then(RuntimeJson::as_i64)
+        .filter(|value| *value > 0)
+        .map(|value| value as u64);
+
+    let mut renewed = false;
+    loop {
+        let mut project = match super::project(Some(generation), signal).await {
+            Ok(project) => project,
+            Err(err) if !renewed && is_auth_refusal_message(&err) && !signal.is_cancelled() => {
+                renewed = true;
+                if auth::force_refresh(generation).await.is_ok() {
+                    continue;
+                }
+                return Err(api_error(err));
+            }
+            Err(err) => return Err(api_error(err)),
+        };
+        match send_stream_leg(
+            generation,
+            model,
+            &mut project,
+            user_prompt_id,
+            &base_request,
+            None,
+            signal,
+            extra_headers,
+        )
+        .await
+        {
+            Ok(response) => {
+                return Ok((project, base_request, initial_max_output_tokens, response))
+            }
+            Err(err)
+                if !renewed && is_auth_refusal_message(&err.message) && !signal.is_cancelled() =>
+            {
+                renewed = true;
+                if auth::force_refresh(generation).await.is_ok() {
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl GeminiClient for CloudClient {
     fn error_details(&self, error: &GeminiApiError) -> RawProviderError {
@@ -1662,35 +1746,53 @@ impl GeminiClient for CloudClient {
             .model
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
-        let mut base_request = generate_content_request(&params);
-        if let Some(details) = super::model_details(&self.generation, &model) {
-            adapt_model_request(&mut base_request, &details)?;
-        }
-        let initial_max_output_tokens = base_request
-            .get("generationConfig")
-            .and_then(|config| config.get("maxOutputTokens"))
-            .and_then(RuntimeJson::as_i64)
-            .filter(|value| *value > 0)
-            .map(|value| value as u64);
         let user_prompt_id = uuid::Uuid::new_v4().to_string();
-        let mut project = super::project(Some(&self.generation), &signal)
+        let pooled = self.generation.is_empty();
+        let mut attempted: Vec<String> = Vec::new();
+        let (mut generation, mut project, mut base_request, initial_max_output_tokens, response) = loop {
+            let candidate_gen = if pooled {
+                auth::generation().ok_or_else(|| api_error("antigravity_not_signed_in"))?
+            } else {
+                self.generation.clone()
+            };
+            match establish_initial_leg_for_generation(
+                &candidate_gen,
+                &params,
+                &model,
+                &user_prompt_id,
+                &signal,
+                &extra_headers,
+            )
             .await
-            .map_err(api_error)?;
-        let response = send_stream_leg(
-            &self.generation,
-            &model,
-            &mut project,
-            &user_prompt_id,
-            &base_request,
-            None,
-            &signal,
-            &extra_headers,
-        )
-        .await?;
-        let generation = self.generation.clone();
+            {
+                Ok((project, base_request, max_tokens, response)) => {
+                    break (candidate_gen, project, base_request, max_tokens, response);
+                }
+                Err(err)
+                    if pooled
+                        && !signal.is_cancelled()
+                        && is_rotatable_message(&err.message)
+                        && auth::account_count() > 1
+                        && !attempted.contains(&candidate_gen) =>
+                {
+                    attempted.push(candidate_gen.clone());
+                    match auth::rotate(&candidate_gen).await {
+                        RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
+                            if !attempted.contains(&next) =>
+                        {
+                            continue;
+                        }
+                        _ => return Err(err),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
         Ok(Box::pin(async_stream::stream! {
             let mut tracker = StreamContinuationTracker::new(initial_max_output_tokens);
             let mut response = response;
+            let mut in_stream_auth_renewed = false;
             'leg: loop {
                 let mut stream = response.bytes_stream();
                 let mut buffered = Vec::new();
@@ -1806,6 +1908,84 @@ impl GeminiClient for CloudClient {
                 }
                 if signal.is_cancelled() {
                     return;
+                }
+                if !tracker.leg.saw_candidate
+                    && !tracker.has_prior_leg
+                    && leg_err.as_ref().is_some_and(|err| is_rotatable_message(&err.message))
+                {
+                    let first_err = leg_err.take().unwrap();
+                    if !in_stream_auth_renewed && is_auth_refusal_message(&first_err.message) {
+                        in_stream_auth_renewed = true;
+                        if auth::force_refresh(&generation).await.is_ok() {
+                            if let Ok((next_proj, next_base, _, next_resp)) =
+                                establish_initial_leg_for_generation(
+                                    &generation,
+                                    &params,
+                                    &model,
+                                    &user_prompt_id,
+                                    &signal,
+                                    &extra_headers,
+                                )
+                                .await
+                            {
+                                project = next_proj;
+                                base_request = next_base;
+                                response = next_resp;
+                                tracker = StreamContinuationTracker::new(initial_max_output_tokens);
+                                continue 'leg;
+                            }
+                        }
+                    }
+                    if pooled
+                        && auth::account_count() > 1
+                        && !attempted.contains(&generation)
+                    {
+                        attempted.push(generation.clone());
+                        let mut terminal_err = first_err;
+                        while let RotateOutcome::Rotated(next)
+                        | RotateOutcome::AlreadyAdvanced(next) =
+                            auth::rotate(&generation).await
+                        {
+                            if attempted.contains(&next) || signal.is_cancelled() {
+                                break;
+                            }
+                            generation = next.clone();
+                            in_stream_auth_renewed = false;
+                            match establish_initial_leg_for_generation(
+                                &generation,
+                                &params,
+                                &model,
+                                &user_prompt_id,
+                                &signal,
+                                &extra_headers,
+                            )
+                            .await
+                            {
+                                Ok((next_proj, next_base, _, next_resp)) => {
+                                    project = next_proj;
+                                    base_request = next_base;
+                                    response = next_resp;
+                                    tracker =
+                                        StreamContinuationTracker::new(initial_max_output_tokens);
+                                    continue 'leg;
+                                }
+                                Err(err)
+                                    if is_rotatable_message(&err.message)
+                                        && !attempted.contains(&generation) =>
+                                {
+                                    attempted.push(generation.clone());
+                                    terminal_err = err;
+                                }
+                                Err(err) => {
+                                    yield Err(err);
+                                    return;
+                                }
+                            }
+                        }
+                        leg_err = Some(terminal_err);
+                    } else {
+                        leg_err = Some(first_err);
+                    }
                 }
                 match tracker.evaluate_leg_end(leg_err) {
                     LegEndAction::FinishCleanly => return,
