@@ -1599,14 +1599,23 @@ fn build_gemini_request_with_policy(
         response_json_schema: req.output_schema.as_ref().map(sanitize_schema),
         thinking_config,
     };
+    let mut contents = to_contents_with_profile(
+        &req.messages,
+        &gemini_behavior_profile(&req.model),
+        &req.tools,
+        replay_signed_parts,
+    );
+    // Gemini and Cloud Code Assist reject requests ending on a model turn
+    // (`INVALID_ARGUMENT: Requests ending with a model turn are not supported.`).
+    // Ensure empty-input continuations after an interrupted or partial assistant
+    // message end on a user turn while leaving trailing `functionCall` turns
+    // untouched (`functionCall` requires a `functionResponse`, not plain text).
+    if contents.last().is_some_and(is_continuable_model_turn) {
+        contents.push(continuation_reminder_content());
+    }
     GenerateContentParameters {
         model: req.model.clone(),
-        contents: to_contents_with_profile(
-            &req.messages,
-            &gemini_behavior_profile(&req.model),
-            &req.tools,
-            replay_signed_parts,
-        ),
+        contents,
         config,
     }
 }
@@ -1809,15 +1818,30 @@ fn to_contents_with_profile(
     }
 
     let mut out: Vec<Content> = Vec::new();
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         match msg {
-            Message::User(u) => out.push(Content {
-                role: "user".into(),
-                parts: blocks_to_parts(&u.content, tools, replay_signed_parts),
-            }),
+            Message::User(u) => {
+                if is_superseded_empty_closing_nudge(u, &messages[index + 1..]) {
+                    continue;
+                }
+                let parts = blocks_to_parts(&u.content, tools, replay_signed_parts);
+                if !parts.is_empty() || messages.len() == 1 {
+                    out.push(Content {
+                        role: "user".into(),
+                        parts,
+                    });
+                }
+            }
             Message::Assistant(a) => {
                 let parts = blocks_to_parts(&a.content, tools, replay_signed_parts);
-                if !parts.is_empty() {
+                if has_visible_or_tool_part(&parts) {
+                    // Keep the synthetic continuation user turn between back-to-back
+                    // model turns produced across an empty-input continuation so later
+                    // tool-loop steps preserve the exact step-1 prefix and never merge
+                    // distinct signed thought blocks into a single model turn.
+                    if out.last().is_some_and(is_continuable_model_turn) {
+                        out.push(continuation_reminder_content());
+                    }
                     out.push(Content {
                         role: "model".into(),
                         parts,
@@ -1861,6 +1885,66 @@ fn to_contents_with_profile(
         }
     }
     merge_adjacent_same_role(out)
+}
+
+const EMPTY_CONTINUATION_REMINDER: &str = "<system-reminder>\nContinue from where you left off without repeating content already shown to the user.\n</system-reminder>";
+
+fn continuation_reminder_content() -> Content {
+    Content {
+        role: "user".into(),
+        parts: vec![Part {
+            text: Some(EMPTY_CONTINUATION_REMINDER.into()),
+            ..Part::default()
+        }],
+    }
+}
+
+/// True when a `model` turn carries visible text, inline media, or a function
+/// call/response. Turns containing only internal `thought` parts (or empty
+/// signature carriers) came from interrupted/empty reasoning attempts and must
+/// not survive as orphaned `model` turns.
+fn has_visible_or_tool_part(parts: &[Part]) -> bool {
+    parts.iter().any(|part| {
+        part.function_call.is_some()
+            || part.function_response.is_some()
+            || part.inline_data.is_some()
+            || (part.thought != Some(true)
+                && part.text.as_ref().is_some_and(|text| !text.is_empty()))
+    })
+}
+
+fn is_continuable_model_turn(content: &Content) -> bool {
+    content.role == "model"
+        && !content.parts.is_empty()
+        && !content
+            .parts
+            .iter()
+            .any(|part| part.function_call.is_some())
+}
+
+fn is_superseded_empty_closing_nudge(
+    user: &crate::schemas::message::UserMessage,
+    remaining: &[Message],
+) -> bool {
+    if user.is_meta != Some(true)
+        || !remaining
+            .iter()
+            .any(|message| !matches!(message, Message::System(_)))
+    {
+        return false;
+    }
+    user.content.len() == 1
+        && matches!(
+            &user.content[0],
+            ContentBlock::Text(text)
+                if text.text.try_to_utf8().ok().is_some_and(|body| {
+                    body.contains(
+                        "Your previous response contained only internal reasoning and no visible answer.",
+                    ) || body.contains(
+                        "Your previous response was empty. The work done so far is visible to the user",
+                    )
+                })
+        )
 }
 
 fn gemini_behavior_profile(model: &RuntimeString) -> ProviderBehaviorProfile {
@@ -5478,6 +5562,107 @@ mod tests {
         assert_eq!(
             config.config.thinking_config.unwrap().thinking_budget,
             Some(2000)
+        );
+    }
+
+    #[test]
+    fn empty_continuation_appends_user_reminder_and_drops_orphan_thought_turns() {
+        let mut mapper = ChunkMapper::new("gemini-2.5-pro".into());
+        let events = mapper.handle_chunk(&chunk(exact_json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "orphan thought", "thoughtSignature": "sig-orphan" }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })));
+        let orphan_sig = events
+            .into_iter()
+            .chain(mapper.finish())
+            .find_map(|event| match event {
+                ModelStreamEvent::ThinkingBlock {
+                    signature: Some(sig),
+                    ..
+                } => Some(sig),
+                _ => None,
+            })
+            .unwrap();
+
+        let mut req = base_req();
+        req.messages = vec![
+            Message::User(UserMessage {
+                question_answer: None,
+                uuid: "u1".into(),
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: "start work".into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })],
+                is_meta: None,
+            }),
+            Message::Assistant(AssistantMessage {
+                uuid: "a-orphan".into(),
+                model: "gemini-2.5-pro".into(),
+                usage: None,
+                content: vec![ContentBlock::Thinking(CThinkingBlock {
+                    message_id: None,
+                    text: "orphan thought".into(),
+                    signature: Some(orphan_sig),
+                    encrypted_content: None,
+                })],
+            }),
+            Message::User(UserMessage {
+                question_answer: None,
+                uuid: "u-stale-nudge".into(),
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: "<system-reminder>\nYour previous response contained only internal reasoning and no visible answer. Please respond directly to the user — do not respond empty again.\n</system-reminder>".into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })],
+                is_meta: Some(true),
+            }),
+            Message::Assistant(AssistantMessage {
+                uuid: "a-partial".into(),
+                model: "gemini-2.5-pro".into(),
+                usage: None,
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: "Phase 1 started.".into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                })],
+            }),
+        ];
+
+        let built = build_gemini_request_with_policy(
+            &req,
+            &ModelCapabilities::default(),
+            GeminiThinkingDialect::Level,
+            true,
+        );
+        assert_eq!(built.contents.len(), 3);
+        assert_eq!(built.contents[0].role, "user");
+        assert_eq!(built.contents[0].parts.len(), 1);
+        assert_eq!(
+            built.contents[0].parts[0].text.as_ref().unwrap(),
+            "start work"
+        );
+        assert_eq!(built.contents[1].role, "model");
+        assert_eq!(
+            built.contents[1].parts[0].text.as_ref().unwrap(),
+            "Phase 1 started."
+        );
+        assert_eq!(built.contents[2].role, "user");
+        assert_eq!(
+            built.contents[2].parts[0].text.as_ref().unwrap(),
+            EMPTY_CONTINUATION_REMINDER
         );
     }
 }

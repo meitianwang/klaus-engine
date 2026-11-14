@@ -778,3 +778,6 @@ mod r20261113_target_model_downshift_compaction;
 
 #[path = "regressions/r20261113_anthropic_model_switch_prefill_and_repair_boundary.rs"]
 mod r20261113_anthropic_model_switch_prefill_and_repair_boundary;
+
+#[path = "regressions/r20261114_gemini_empty_continuation_model_turn.rs"]
+mod r20261114_gemini_empty_continuation_model_turn;
