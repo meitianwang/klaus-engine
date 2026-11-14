@@ -7,12 +7,18 @@ use std::io::{self, BufRead, Read};
 pub(super) struct Header {
     #[serde(default)]
     pub kind: String,
+    pub meta: Option<Meta>,
     pub ctx: Option<Context>,
     pub message: Option<Message>,
     pub event: Option<String>,
     pub turn_id: Option<String>,
     pub payload: Option<Payload>,
     pub num_turns: Option<u32>,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Meta {
+    pub role: Option<String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,12 +244,14 @@ fn object(
         string(reader, Some(&mut key))?;
         let name: String = serde_json::from_slice(&key).map_err(|_| invalid())?;
         expect(reader, b':')?;
-        let nested = scope.is_empty() && matches!(name.as_str(), "ctx" | "message" | "payload");
+        let nested =
+            scope.is_empty() && matches!(name.as_str(), "meta" | "ctx" | "message" | "payload");
         let keep = match scope {
             "" => {
                 matches!(name.as_str(), "kind" | "event" | "turnId" | "numTurns")
                     || (summary && name == "summary")
             }
+            "meta" => name == "role",
             "ctx" => name == "turnId",
             "message" => matches!(
                 name.as_str(),

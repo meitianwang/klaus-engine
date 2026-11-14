@@ -153,6 +153,9 @@ impl CliSession {
             thread_id: thread_id.to_string(),
             new_thread_id: None,
             before_message_uuid: None,
+            after_message_uuid: None,
+            last_turn_id: None,
+            before_turn_id: None,
             submission_id: None,
         }
     }

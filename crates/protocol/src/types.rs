@@ -563,9 +563,18 @@ pub enum OpKind {
         /// the identity stays single-id end to end.
         new_thread_id: Option<RuntimeString>,
         /// Cut point: the branch inherits only history strictly BEFORE the
-        /// message with this uuid. Absent = full-transcript fork. The source
-        /// thread is never modified either way.
+        /// message with this uuid. Absent = full-transcript fork unless another
+        /// cut field is supplied. The source thread is never modified.
         before_message_uuid: Option<RuntimeString>,
+        /// Cut point: the branch inherits history through the exchange
+        /// containing this message uuid (inclusive).
+        after_message_uuid: Option<RuntimeString>,
+        /// Cut point: the branch inherits history through this turn id
+        /// (inclusive), omitting subsequent turns.
+        last_turn_id: Option<RuntimeString>,
+        /// Cut point: the branch inherits history strictly before this turn id,
+        /// omitting it and subsequent turns.
+        before_turn_id: Option<RuntimeString>,
         inherit_goal: Option<bool>,
     },
     ArchiveSession {
@@ -3506,9 +3515,15 @@ mod tests {
                 thread_id,
                 new_thread_id,
                 before_message_uuid,
+                after_message_uuid,
+                last_turn_id,
+                before_turn_id,
                 inherit_goal,
             } => {
                 assert!(inherit_goal.is_none());
+                assert!(after_message_uuid.is_none());
+                assert!(last_turn_id.is_none());
+                assert!(before_turn_id.is_none());
                 assert_eq!(thread_id, "thread-1");
                 assert_eq!(new_thread_id.as_ref().unwrap(), "branch-1");
                 assert_eq!(before_message_uuid.as_ref().unwrap(), "msg-7");

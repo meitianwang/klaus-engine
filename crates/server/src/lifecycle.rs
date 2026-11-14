@@ -601,7 +601,7 @@ fn protocol_lifecycle_with_config_root(
             move |handlers: ProtocolSessionHandlers,
                   thread_id: String,
                   _new_thread_id: Option<String>,
-                  _before_message_uuid: Option<String>| {
+                  _fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>| {
                 let agent = resume_agent.clone();
                 let store = resume_store.clone();
                 let user_config_dir = resume_config_root.clone();
@@ -619,7 +619,7 @@ fn protocol_lifecycle_with_config_root(
             move |handlers: ProtocolSessionHandlers,
                   thread_id: String,
                   new_thread_id: Option<String>,
-                  before_message_uuid: Option<String>| {
+                  fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>| {
                 let agent = fork_agent.clone();
                 let store = fork_store.clone();
                 let user_config_dir = fork_config_root.clone();
@@ -630,12 +630,7 @@ fn protocol_lifecycle_with_config_root(
                     // session key stays the single id end to end.
                     sopts.id = new_thread_id.map(Into::into);
                     agent
-                        .fork_session_before(
-                            store,
-                            &thread_id,
-                            before_message_uuid.as_deref(),
-                            sopts,
-                        )
+                        .fork_session_with_cut(store, &thread_id, fork_cut, sopts)
                         .await
                         .map_err(|e| Box::new(e) as BoxError)
                 }) as ProtocolCreateSessionFuture
@@ -645,7 +640,7 @@ fn protocol_lifecycle_with_config_root(
             move |handlers: ProtocolSessionHandlers,
                   thread_id: String,
                   new_thread_id: Option<String>,
-                  _before_message_uuid: Option<String>| {
+                  _fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>| {
                 let agent = side_agent.clone();
                 let store = side_store.clone();
                 let user_config_dir = side_config_root.clone();

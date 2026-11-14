@@ -482,10 +482,12 @@ pub(super) fn project(
         return Err("threadId must be nonempty and limit must be between 1 and 10".into());
     }
     let meta = exact_value(&snapshot.meta)?;
+    let visible_start =
+        klaus_agent_core::store::thread_history::side_task_visible_start_index(&snapshot.raw_items);
     let mut turns: Vec<TurnBuilder> = Vec::new();
     let mut seen = HashSet::new();
     let mut external_origin: Option<RuntimeJson> = None;
-    for (position, raw) in snapshot.raw_items.iter().enumerate() {
+    for (position, raw) in snapshot.raw_items.iter().enumerate().skip(visible_start) {
         let item = exact_value(raw)?;
         match scalar(field(&item, "kind"))?.as_deref().unwrap_or_default() {
             "turn_context" => {

@@ -8458,6 +8458,15 @@ async fn handle_acked_request(
                 if let Some(before_message_uuid) = p.before_message_uuid {
                     op["beforeMessageUuid"] = Value::String(before_message_uuid);
                 }
+                if let Some(after_message_uuid) = p.after_message_uuid {
+                    op["afterMessageUuid"] = Value::String(after_message_uuid);
+                }
+                if let Some(last_turn_id) = p.last_turn_id {
+                    op["lastTurnId"] = Value::String(last_turn_id);
+                }
+                if let Some(before_turn_id) = p.before_turn_id {
+                    op["beforeTurnId"] = Value::String(before_turn_id);
+                }
             }
             if op_type == "fork_session" && p.inherit_goal == Some(true) {
                 let source = state.sessions.lock().unwrap().values().find_map(|handle| {

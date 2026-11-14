@@ -234,9 +234,23 @@ impl Session {
                 .reserve_generation()
                 .ok_or_else(|| "turn admission counter is exhausted".to_string())?;
             let mut hist = self.conversation.history.lock_recover();
-            let before_turns = count_user_turns(&hist);
-            let new_hist = drop_last_n_user_turns(&hist, num_turns as f64);
-            let removed = &hist[new_hist.len()..];
+            let prefix_len = if self.conversation.hidden_message_ids.is_empty() {
+                0
+            } else {
+                hist.iter()
+                    .rposition(|message| {
+                        self.conversation
+                            .hidden_message_ids
+                            .contains(super::message_uuid(message))
+                    })
+                    .map_or(0, |index| index + 1)
+            };
+            let before_turns = count_user_turns(&hist[prefix_len..]);
+            let effective_num_turns = (num_turns as usize).min(before_turns) as u32;
+            let new_visible =
+                drop_last_n_user_turns(&hist[prefix_len..], effective_num_turns as f64);
+            let new_len = prefix_len + new_visible.len();
+            let removed = &hist[new_len..];
             let first_removed = removed.iter().find_map(|message| match message {
                 Message::User(user) if user.is_meta != Some(true) => Some(user.uuid.clone()),
                 _ => None,
@@ -269,23 +283,30 @@ impl Session {
                     .retain(|review| !removed_turns.contains(&review.turn_id));
                 self.approval_async.reset();
             }
-            *hist = new_hist;
+            let mut next_hist = Vec::with_capacity(new_len);
+            next_hist.extend_from_slice(&hist[..prefix_len]);
+            next_hist.extend(new_visible);
+            *hist = next_hist;
             self.update_prediction_source_checkpoint(generation, None);
-            let remaining_turns = count_user_turns(&hist);
-            let messages = hist.len();
+            let remaining_turns = count_user_turns(&hist[prefix_len..]);
+            let messages = hist.len().saturating_sub(prefix_len);
             drop(hist);
             let mut prediction = crate::runtime_values::RuntimeObject::new();
             prediction.insert("generation", RuntimeJson::from(generation.to_string()));
-            let mut records = vec![
-                crate::schemas::rollout::RolloutItem::Event(crate::schemas::rollout::EventItem {
+            let mut records = vec![crate::schemas::rollout::RolloutItem::Event(
+                crate::schemas::rollout::EventItem {
                     event: PREDICTION_SOURCE_ROLLOUT_EVENT.into(),
                     turn_id: None,
                     payload: Some(RuntimeJson::Object(prediction)),
-                }),
-                crate::schemas::rollout::RolloutItem::Rollback(
-                    crate::schemas::rollout::RollbackItem { num_turns },
-                ),
-            ];
+                },
+            )];
+            if effective_num_turns > 0 {
+                records.push(crate::schemas::rollout::RolloutItem::Rollback(
+                    crate::schemas::rollout::RollbackItem {
+                        num_turns: effective_num_turns,
+                    },
+                ));
+            }
             let active_tokens = estimate_context_tokens(&self.model_history());
             let window = {
                 let mut state = self.turn.context_window_usage.lock_recover();
@@ -3499,7 +3520,7 @@ impl Session {
         // view of the conversation (capped and framed) for the title model.
         let description = match prompt.and_then(nonempty_trimmed) {
             Some(host_prompt) => RuntimeString::from(host_prompt),
-            None => conversation_text_for_title(&self.history_snapshot()),
+            None => conversation_text_for_title(&self.visible_history()),
         };
         if runtime_trim(&description).is_empty() {
             return Ok(GenerateTitleResult {

@@ -2304,6 +2304,9 @@ impl RuntimeEncode for OpKind {
                 thread_id,
                 new_thread_id,
                 before_message_uuid,
+                after_message_uuid,
+                last_turn_id,
+                before_turn_id,
                 inherit_goal,
             } => {
                 fields.field("threadId", thread_id)?;
@@ -2315,6 +2318,15 @@ impl RuntimeEncode for OpKind {
                 }
                 if let Some(before_message_uuid) = before_message_uuid {
                     fields.field("beforeMessageUuid", before_message_uuid)?;
+                }
+                if let Some(after_message_uuid) = after_message_uuid {
+                    fields.field("afterMessageUuid", after_message_uuid)?;
+                }
+                if let Some(last_turn_id) = last_turn_id {
+                    fields.field("lastTurnId", last_turn_id)?;
+                }
+                if let Some(before_turn_id) = before_turn_id {
+                    fields.field("beforeTurnId", before_turn_id)?;
                 }
                 "fork_session"
             }
@@ -2818,6 +2830,9 @@ impl RuntimeDecode for OpKind {
                     thread_id: object.required("threadId", &[])?,
                     new_thread_id: object.optional("newThreadId", &[])?,
                     before_message_uuid: object.optional("beforeMessageUuid", &[])?,
+                    after_message_uuid: object.optional("afterMessageUuid", &[])?,
+                    last_turn_id: object.optional("lastTurnId", &[])?,
+                    before_turn_id: object.optional("beforeTurnId", &[])?,
                     inherit_goal: object.optional("inheritGoal", &[])?,
                 }),
                 42 => Ok(Self::ArchiveSession {

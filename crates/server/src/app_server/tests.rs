@@ -3387,3 +3387,172 @@ mod r20261019_sandbox_facade_contract;
 
 #[path = "../../tests/r20261019_windows_preparation_facade.rs"]
 mod r20261019_windows_preparation_facade;
+
+#[tokio::test]
+async fn side_task_reads_hide_parent_prefix_and_fork_session_cuts_by_turn_id() {
+    use klaus_agent_core::store::jsonl_store::{JsonlSessionStore, JsonlSessionStoreOptions};
+
+    let bundle = schema_bundle();
+    let fork_params = bundle["requests"]["session/forkSession"]["params"].to_string();
+    for field in [
+        "beforeMessageUuid",
+        "afterMessageUuid",
+        "lastTurnId",
+        "beforeTurnId",
+    ] {
+        assert!(
+            fork_params.contains(field),
+            "missing {field} in schema: {fork_params}"
+        );
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let sessions_dir = root.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let source_rows = [
+        json!({"kind":"session_meta","schemaVersion":3,"meta":{"id":"src-thread","createdAt":1700000000000_i64,"cwd":root.path(),"model":"fake","role":"main"}}),
+        json!({"kind":"turn_context","ctx":{"cwd":root.path(),"model":"fake","permissionMode":"default","turnId":"turn-1","startedAtMs":1700000000100_i64}}),
+        json!({"kind":"message","message":{"type":"user","uuid":"u1","content":[{"type":"text","text":"prompt one"}]}}),
+        json!({"kind":"message","message":{"type":"assistant","uuid":"a1","content":[{"type":"text","text":"reply one"}],"model":"fake"}}),
+        json!({"kind":"event","event":"turn_lifecycle","turnId":"turn-1","payload":{"status":"completed","finalMessageId":"a1","startedAtMs":1700000000100_i64,"finishedAtMs":1700000000200_i64,"durationMs":100}}),
+        json!({"kind":"turn_context","ctx":{"cwd":root.path(),"model":"fake","permissionMode":"default","turnId":"turn-2","startedAtMs":1700000000300_i64}}),
+        json!({"kind":"message","message":{"type":"user","uuid":"u2","content":[{"type":"text","text":"prompt two"}]}}),
+        json!({"kind":"message","message":{"type":"assistant","uuid":"a2","content":[{"type":"text","text":"reply two"}],"model":"fake"}}),
+        json!({"kind":"event","event":"turn_lifecycle","turnId":"turn-2","payload":{"status":"completed","finalMessageId":"a2","startedAtMs":1700000000300_i64,"finishedAtMs":1700000000400_i64,"durationMs":100}}),
+        json!({"kind":"turn_context","ctx":{"cwd":root.path(),"model":"fake","permissionMode":"default","turnId":"turn-3","startedAtMs":1700000000500_i64}}),
+        json!({"kind":"message","message":{"type":"user","uuid":"u3","content":[{"type":"text","text":"prompt three"}]}}),
+        json!({"kind":"message","message":{"type":"assistant","uuid":"a3","content":[{"type":"text","text":"reply three"}],"model":"fake"}}),
+        json!({"kind":"event","event":"turn_lifecycle","turnId":"turn-3","payload":{"status":"completed","finalMessageId":"a3","startedAtMs":1700000000500_i64,"finishedAtMs":1700000000600_i64,"durationMs":100}}),
+    ];
+    let payload = source_rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(sessions_dir.join("1700000000000-src-thread.jsonl"), payload).unwrap();
+
+    let store: Arc<dyn klaus_agent_core::store::session_store::SessionStore> =
+        Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+            dir: Some(sessions_dir.to_string_lossy().into_owned()),
+            archive_dir: None,
+        }));
+    let agent = make_agent_for_tests(vec![text_turn("side answer")]);
+    let create =
+        crate::lifecycle::engine_sessions(agent.clone(), Some(store.clone())).create_session;
+    let lifecycle = crate::lifecycle::protocol_lifecycle(agent, Some(store));
+    let mut client = TestClient::start_with(create, Some(lifecycle));
+    client.initialize().await;
+
+    // 1. Start a persisted side task off src-thread: both engine/readThread and
+    //    engine/readThreadHistory must report zero turns before any side turn runs.
+    client
+        .send(json!({
+            "id": 10,
+            "method": "session/startSideTask",
+            "params": {
+                "parentThreadId": "src-thread",
+                "init": { "threadId": "side-1", "cwd": root.path() }
+            }
+        }))
+        .await;
+    let (started_side, _) = client.response_for(10).await;
+    assert!(started_side.get("error").is_none(), "{started_side}");
+
+    client
+        .send(json!({
+            "id": 11,
+            "method": "engine/readThread",
+            "params": { "threadId": "side-1", "limit": 5 }
+        }))
+        .await;
+    let (side_read, _) = client.response_for(11).await;
+    assert_eq!(side_read["result"]["turns"], json!([]));
+
+    client
+        .send(json!({
+            "id": 12,
+            "method": "engine/readThreadHistory",
+            "params": { "threadId": "side-1", "limit": 25, "itemsView": "full", "sortDirection": "desc" }
+        }))
+        .await;
+    let (side_hist, _) = client.response_for(12).await;
+    assert_eq!(side_hist["result"]["turns"], json!([]));
+    assert_eq!(side_hist["result"]["history"], json!([]));
+
+    // 2. Fork src-thread through turn-2 via lastTurnId: turn-3 must be omitted.
+    client
+        .send(json!({
+            "id": 20,
+            "method": "session/start",
+            "params": { "init": { "threadId": "branch-t2", "cwd": root.path() } }
+        }))
+        .await;
+    let (started_branch, _) = client.response_for(20).await;
+    let branch_session_id = started_branch["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Conflicting cut parameters are rejected before mutating the destination.
+    client
+        .send(json!({
+            "id": 21,
+            "method": "session/forkSession",
+            "params": {
+                "sessionId": branch_session_id,
+                "threadId": "src-thread",
+                "newThreadId": "branch-t2",
+                "beforeMessageUuid": "u3",
+                "lastTurnId": "turn-2",
+                "submissionId": "conflict-fork"
+            }
+        }))
+        .await;
+    let (_, mut conflict_seen) = client.response_for(21).await;
+    while !conflict_seen.iter().any(|m| {
+        m["params"]["event"]["submissionId"] == "conflict-fork"
+            && m["params"]["event"]["error"].is_string()
+    }) {
+        conflict_seen.push(client.next_message().await);
+    }
+
+    client
+        .send(json!({
+            "id": 22,
+            "method": "session/forkSession",
+            "params": {
+                "sessionId": branch_session_id,
+                "threadId": "src-thread",
+                "newThreadId": "branch-t2",
+                "lastTurnId": "turn-2",
+                "submissionId": "valid-fork"
+            }
+        }))
+        .await;
+    let (_, mut fork_seen) = client.response_for(22).await;
+    while !fork_seen.iter().any(|m| {
+        m["params"]["event"]["submissionId"] == "valid-fork"
+            && m["params"]["event"]["session"]["threadId"] == "branch-t2"
+    }) {
+        fork_seen.push(client.next_message().await);
+    }
+
+    client
+        .send(json!({
+            "id": 23,
+            "method": "engine/readThreadHistory",
+            "params": { "threadId": "branch-t2", "limit": 25, "itemsView": "full", "sortDirection": "desc" }
+        }))
+        .await;
+    let (branch_hist, _) = client.response_for(23).await;
+    let uuids: Vec<&str> = branch_hist["result"]["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["uuid"].as_str())
+        .collect();
+    assert_eq!(uuids, vec!["u1", "a1", "u2", "a2"]);
+
+    client.close().await;
+}

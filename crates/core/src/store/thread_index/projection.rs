@@ -65,6 +65,9 @@ pub(super) fn create_schema(conn: &Connection) -> io::Result<()> {
          CREATE TABLE IF NOT EXISTS history_goal_projection (
             thread TEXT PRIMARY KEY, payload TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS history_side_task_state (
+            thread TEXT PRIMARY KEY, prefix_open INTEGER NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS history_projection_failures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             thread TEXT NOT NULL, at_ms INTEGER NOT NULL,
@@ -232,6 +235,7 @@ impl TurnIndexDb {
             "history_projection_state",
             "history_rollout_ordinals",
             "history_goal_projection",
+            "history_side_task_state",
             "history_control_projection",
             "history_message_turns",
             "history_items",

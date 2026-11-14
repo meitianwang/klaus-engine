@@ -361,6 +361,203 @@ pub struct StartSessionOptions {
     pub initial_agent_memory_snapshot_decisions: Option<Vec<AgentMemorySnapshotDecisionAudit>>,
 }
 
+/// Cut specification for [`Agent::fork_session_with_cut`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkCut {
+    /// Keep history strictly before the message with this UUID.
+    BeforeMessage(String),
+    /// Keep history through the exchange containing this message UUID (inclusive).
+    AfterMessage(String),
+    /// Keep history through this turn ID (inclusive), omitting all subsequent turns.
+    LastTurn(String),
+    /// Keep history strictly before this turn ID, omitting it and all subsequent turns.
+    BeforeTurn(String),
+}
+
+fn fold_retained_rollout_items<'a>(
+    items: &'a [crate::schemas::rollout::RolloutItem],
+    is_side_task: bool,
+) -> Vec<(usize, &'a crate::schemas::rollout::RolloutItem)> {
+    use crate::schemas::rollout::RolloutItem;
+    let protected_prefix = if is_side_task {
+        crate::store::thread_history::side_task_visible_start_index(items)
+    } else {
+        0
+    };
+    let mut retained: Vec<(usize, &'a RolloutItem)> = Vec::new();
+    let mut boundaries: Vec<usize> = Vec::new();
+    let mut pending_context = None;
+    for (raw_index, item) in items.iter().enumerate() {
+        if raw_index < protected_prefix {
+            retained.push((raw_index, item));
+            continue;
+        }
+        match item {
+            RolloutItem::Rollback(rollback) => {
+                let count = (rollback.num_turns as usize).min(boundaries.len());
+                if count > 0 {
+                    let keep = boundaries.len() - count;
+                    retained.truncate(boundaries[keep]);
+                    boundaries.truncate(keep);
+                    pending_context = None;
+                }
+            }
+            RolloutItem::TurnContext { .. } => {
+                pending_context = Some(retained.len());
+                retained.push((raw_index, item));
+            }
+            RolloutItem::Message {
+                message: Message::User(user),
+            } if user.is_meta != Some(true) => {
+                boundaries.push(pending_context.take().unwrap_or(retained.len()));
+                retained.push((raw_index, item));
+            }
+            _ => retained.push((raw_index, item)),
+        }
+    }
+    retained
+}
+
+fn resolve_fork_history(
+    resumed: &crate::store::session_store::ResumeResult,
+    cut: Option<&ForkCut>,
+    thread_id: &str,
+) -> std::io::Result<(Vec<Message>, usize, Vec<RuntimeString>)> {
+    use crate::schemas::rollout::RolloutItem;
+    let Some(cut) = cut else {
+        return Ok((
+            resumed.messages.clone(),
+            resumed.raw_items.len(),
+            Vec::new(),
+        ));
+    };
+    let retained = fold_retained_rollout_items(
+        &resumed.raw_items,
+        resumed.meta.role == Some(SessionRole::SideTask),
+    );
+    let mut item_turns: Vec<Option<RuntimeString>> = Vec::with_capacity(retained.len());
+    let mut active_turn: Option<RuntimeString> = None;
+    for &(_, item) in &retained {
+        match item {
+            RolloutItem::TurnContext { ctx } => {
+                active_turn = ctx.turn_id.clone();
+                item_turns.push(active_turn.clone());
+            }
+            RolloutItem::Message { message } => {
+                let mapped = active_turn.clone().or_else(|| {
+                    resumed
+                        .turn_index
+                        .message_turn
+                        .get(message_uuid(message))
+                        .cloned()
+                });
+                item_turns.push(mapped);
+            }
+            RolloutItem::Event(event) => {
+                let mapped = event.turn_id.clone().or_else(|| active_turn.clone());
+                item_turns.push(mapped);
+            }
+            RolloutItem::Compacted(_) => item_turns.push(None),
+            _ => item_turns.push(active_turn.clone()),
+        }
+    }
+
+    let retained_end: usize = match cut {
+        ForkCut::BeforeMessage(cut_uuid) => {
+            if let Some(pos) = retained.iter().position(|&(_, item)| {
+                matches!(item, RolloutItem::Message { message } if *message_uuid(message) == *cut_uuid)
+            }) {
+                if pos > 0
+                    && matches!(retained[pos - 1].1, RolloutItem::TurnContext { .. })
+                {
+                    pos - 1
+                } else {
+                    pos
+                }
+            } else if let Some(msg_pos) = resumed
+                .messages
+                .iter()
+                .position(|message| *message_uuid(message) == *cut_uuid)
+            {
+                let mut history = resumed.messages.clone();
+                history.truncate(msg_pos);
+                return Ok((history, resumed.raw_items.len(), Vec::new()));
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("fork cut point {cut_uuid} does not exist in thread {thread_id}"),
+                ));
+            }
+        }
+        ForkCut::AfterMessage(after_uuid) => {
+            let pos = retained
+                .iter()
+                .position(|&(_, item)| {
+                    matches!(item, RolloutItem::Message { message } if *message_uuid(message) == *after_uuid)
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("fork cut point {after_uuid} does not exist in thread {thread_id}"),
+                    )
+                })?;
+            let owner_turn = item_turns[pos].as_ref();
+            let mut end = pos + 1;
+            while end < retained.len() {
+                match retained[end].1 {
+                    RolloutItem::TurnContext { ctx }
+                        if owner_turn.is_none() || ctx.turn_id.as_ref() != owner_turn =>
+                    {
+                        break;
+                    }
+                    RolloutItem::Message {
+                        message: Message::User(user),
+                    } if user.is_meta != Some(true) => {
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            end
+        }
+        ForkCut::LastTurn(turn_id) => {
+            let last = item_turns
+                .iter()
+                .rposition(|turn| turn.as_ref().is_some_and(|t| *t == *turn_id))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("fork target turn {turn_id} does not exist in thread {thread_id}"),
+                    )
+                })?;
+            last + 1
+        }
+        ForkCut::BeforeTurn(turn_id) => {
+            let first = item_turns
+                .iter()
+                .position(|turn| turn.as_ref().is_some_and(|t| *t == *turn_id))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("fork target turn {turn_id} does not exist in thread {thread_id}"),
+                    )
+                })?;
+            first
+        }
+    };
+
+    if retained_end == 0 {
+        return Ok((Vec::new(), 1.min(resumed.raw_items.len()), Vec::new()));
+    }
+    let raw_cut_len = retained[retained_end - 1].0 + 1;
+    let history = crate::store::projection::project_for_prompt(&resumed.raw_items[..raw_cut_len]);
+    let retained_turns: Vec<RuntimeString> = item_turns[..retained_end]
+        .iter()
+        .filter_map(|turn| turn.clone())
+        .collect();
+    Ok((history, raw_cut_len, retained_turns))
+}
+
 /// A shareable model-call handle: the [`CallModel`] seam re-boxed per session.
 type SharedCallModel = Arc<dyn Fn(ModelRequest, AbortSignal) -> ModelStream + Send + Sync>;
 
@@ -3027,6 +3224,14 @@ impl Agent {
                 rollout.append_message(m.clone()).await;
             }
         }
+        if role == SessionRole::SideTask {
+            rollout
+                .append_event(
+                    crate::store::thread_history::SIDE_TASK_BOUNDARY_EVENT.into(),
+                    None,
+                )
+                .await;
+        }
         sopts.id = Some(id);
         sopts.cwd = Some(cwd);
         sopts.rollout = Some(rollout);
@@ -3269,31 +3474,28 @@ impl Agent {
         store: Arc<dyn SessionStore>,
         thread_id: &str,
         before_message_uuid: Option<&str>,
+        sopts: StartSessionOptions,
+    ) -> std::io::Result<Arc<Session>> {
+        self.fork_session_with_cut(
+            store,
+            thread_id,
+            before_message_uuid.map(|uuid| ForkCut::BeforeMessage(uuid.to_owned())),
+            sopts,
+        )
+        .await
+    }
+
+    /// Fork a persisted session with an optional message or turn boundary cut.
+    pub async fn fork_session_with_cut(
+        &self,
+        store: Arc<dyn SessionStore>,
+        thread_id: &str,
+        cut: Option<ForkCut>,
         mut sopts: StartSessionOptions,
     ) -> std::io::Result<Arc<Session>> {
         let resumed = store.resume(thread_id).await?;
-        let mut history = resumed.messages;
-        if let Some(cut_uuid) = before_message_uuid {
-            let cut = history
-                .iter()
-                .position(|message| {
-                    let uuid = match message {
-                        Message::User(user) => &user.uuid,
-                        Message::Assistant(assistant) => &assistant.uuid,
-                        Message::ToolResult(tool) => &tool.uuid,
-                        Message::System(system) => &system.uuid,
-                        Message::CompactBoundary(boundary) => &boundary.uuid,
-                    };
-                    *uuid == *cut_uuid
-                })
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("fork cut point {cut_uuid} does not exist in thread {thread_id}"),
-                    )
-                })?;
-            history.truncate(cut);
-        }
+        let (history, raw_cut_len, retained_turn_ids) =
+            resolve_fork_history(&resumed, cut.as_ref(), thread_id)?;
         let mut retained_planning_turns: std::collections::HashSet<RuntimeString> = history
             .iter()
             .filter_map(|message| {
@@ -3303,6 +3505,7 @@ impl Agent {
                     .get(message_uuid(message))
                     .cloned()
             })
+            .chain(retained_turn_ids)
             .collect();
         let planning_root = sopts
             .user_config_dir
@@ -3319,7 +3522,7 @@ impl Agent {
         )
         .snapshot()
         .map_err(|error| std::io::Error::other(crate::planning::runtime::host(&error)))?;
-        if before_message_uuid.is_none() {
+        if cut.is_none() {
             retained_planning_turns.extend(
                 planning_source
                     .plans
@@ -3333,15 +3536,20 @@ impl Agent {
                     .filter_map(|q| q.get("turnId").and_then(RuntimeJson::as_str).cloned()),
             );
         }
-        let parent_approval =
-            super::approval_capture::ReviewParentHistory::from_rollout(&resumed.raw_items)
-                .map_err(|error| {
-                    std::io::Error::other(
-                        String::from_utf8(error.to_node_utf8())
-                            .expect("Node UTF-8 projection is valid"),
-                    )
-                })?;
-        let parent_approval = if before_message_uuid.is_some() {
+        let approval_slice = if cut.is_some() {
+            &resumed.raw_items[..raw_cut_len.min(resumed.raw_items.len())]
+        } else {
+            &resumed.raw_items[..]
+        };
+        let parent_approval = super::approval_capture::ReviewParentHistory::from_rollout(
+            approval_slice,
+        )
+        .map_err(|error| {
+            std::io::Error::other(
+                String::from_utf8(error.to_node_utf8()).expect("Node UTF-8 projection is valid"),
+            )
+        })?;
+        let parent_approval = if cut.is_some() {
             parent_approval.prefix_for_messages(&history)
         } else {
             parent_approval
@@ -3355,6 +3563,9 @@ impl Agent {
         );
         sopts.initial_approval_reviews = Some(Vec::new());
         sopts.initial_history = Some(history);
+        sopts.hidden_context_message_ids = None;
+        sopts.session_role = Some(SessionRole::Main);
+        sopts.parent_thread_id = None;
         sopts.forked_from_id = Some(resumed.meta.id);
         sopts.initial_usage_ledger = Some(Vec::new());
         sopts.initial_subagent_lifecycle = Some(Vec::new());
@@ -3406,6 +3617,7 @@ impl Agent {
                     messages,
                     recovery_items: raw_items,
                     persisted_user_uuids,
+                    hidden_context_message_ids,
                     usage,
                     file_changes,
                     turn_index,
@@ -3413,10 +3625,8 @@ impl Agent {
                 },
             rollout,
         } = store.resume_runtime_for_write(thread_id).await?;
-        // Side tasks are ephemeral, so a persisted rollout carrying the side-task
-        // role can only be a leftover from an older build. It keeps its role (the
-        // turn loop still frames it as a side task) but has no lifecycle state, and
-        // the default listing hides it, so nothing surfaces it again.
+        // Persisted side tasks keep their role and hidden inherited-context prefix
+        // across restarts while staying out of the default main-session catalog.
         let effective_role = meta.role.unwrap_or(SessionRole::Main);
         let rollout_guard = ResumedRolloutInitGuard::new(Arc::from(rollout));
         let initial_queue =
@@ -3536,6 +3746,9 @@ impl Agent {
             initial_history.push(notice);
         }
         sopts.initial_history = Some(initial_history);
+        if sopts.hidden_context_message_ids.is_none() && !hidden_context_message_ids.is_empty() {
+            sopts.hidden_context_message_ids = Some(hidden_context_message_ids);
+        }
         sopts.initial_approval_context = Some(initial_approval_context);
         sopts.initial_approval_reviews = Some(initial_approval_reviews);
         // The budget's replacement bodies live only in the request view, so the

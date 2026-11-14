@@ -200,6 +200,7 @@ pub struct RuntimeResumeResult {
     pub turn_index: crate::engine::session::TurnIndex,
     pub file_changes: crate::engine::session::SessionFileChanges,
     pub persisted_user_uuids: std::collections::HashSet<RuntimeString>,
+    pub hidden_context_message_ids: Vec<RuntimeString>,
     pub usage: Vec<crate::store::runtime_resume::RuntimeUsage>,
 }
 
@@ -207,6 +208,8 @@ impl From<ResumeResult> for RuntimeResumeResult {
     fn from(resume: ResumeResult) -> Self {
         let (persisted_user_uuids, usage) =
             crate::store::runtime_resume::history_metadata(&resume.meta, &resume.raw_items);
+        let hidden_context_message_ids =
+            crate::store::thread_history::side_task_hidden_message_ids(&resume.raw_items);
         Self {
             meta: resume.meta,
             messages: resume.messages,
@@ -215,6 +218,7 @@ impl From<ResumeResult> for RuntimeResumeResult {
             turn_index: resume.turn_index,
             file_changes: resume.file_changes,
             persisted_user_uuids,
+            hidden_context_message_ids,
             usage,
         }
     }

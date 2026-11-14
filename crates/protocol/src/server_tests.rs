@@ -2118,7 +2118,7 @@ async fn pre_set_publication_panic_registers_cleanup_before_parent_completion() 
             submission_id: "pre-set-panic".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -2210,7 +2210,7 @@ async fn bound_flush_is_the_publication_boundary_and_all_four_sinks_survive_comm
             submission_id: "bind-publication".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -2338,7 +2338,7 @@ async fn closed_unsolicited_receiver_after_bound_flush_stops_published_endpoint(
             submission_id: "closed-publication-fifo".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -2632,7 +2632,7 @@ async fn acked_bind_commits_after_stop_and_shutdown_cleans_the_published_session
             submission_id: "acked-before-stop".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -2733,7 +2733,7 @@ async fn flushed_bind_commits_after_output_poison_and_is_then_torn_down() {
             submission_id: "flushed-before-poison".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -2821,7 +2821,7 @@ async fn failed_bound_flush_closes_old_memory_callback_before_barrier_discard() 
             submission_id: "bind-flush-failure".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session),
         });
     flush.wait_until_entered().await;
@@ -2941,7 +2941,7 @@ async fn disposed_unpublished_session_cannot_be_rebound_with_same_arc() {
             submission_id: "first-failed-bind".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     timeout(CROSS_TASK_LIVENESS_TIMEOUT, flush.wait_until_entered())
@@ -2978,7 +2978,7 @@ async fn disposed_unpublished_session_cannot_be_rebound_with_same_arc() {
             submission_id: "second-rejected-bind".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     let second_result = timeout(CROSS_TASK_LIVENESS_TIMEOUT, second_bind)
@@ -3044,7 +3044,7 @@ async fn disposed_session_between_bound_flush_and_commit_is_not_published() {
             submission_id: "disposed-before-commit".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     while !*commit_entered.borrow() {
@@ -3111,7 +3111,7 @@ async fn force_aborted_unpublished_adapter_cleanup_releases_protocol_owners_but_
             submission_id: "blocked-adapter-cleanup".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     timeout(CROSS_TASK_LIVENESS_TIMEOUT, flush.wait_until_entered())
@@ -3241,7 +3241,7 @@ async fn shutdown_during_fully_written_pending_bound_flush_never_late_publishes(
             submission_id: "bind-pending-flush".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session.clone()),
         });
     flush.wait_until_entered().await;
@@ -3452,7 +3452,7 @@ async fn init_ack_wins_publication_gate_and_bind_uses_committed_state() {
             submission_id: "bind-after-init".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind,
         });
     for _ in 0..8 {
@@ -3551,7 +3551,7 @@ async fn failed_init_ack_preserves_prior_state_for_later_bind() {
             submission_id: "bind-after-failed-init".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind,
         })
         .await;
@@ -3647,7 +3647,7 @@ async fn cancelled_init_write_preserves_prior_state_for_later_bind() {
             submission_id: "bind-after-cancelled-init".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind,
         })
         .await;
@@ -3955,7 +3955,7 @@ async fn partial_frame_poison_stops_writes_and_rejects_late_bind_publication() {
             submission_id: "late-bind".into(),
             thread_id: "persisted-thread".into(),
             new_thread_id: None,
-            before_message_uuid: None,
+            fork_cut: None,
             bind: bind_to_session(session),
         })
         .await;
@@ -4662,7 +4662,7 @@ fn protocol_lifecycle(agent: Arc<Agent>, store: Arc<dyn SessionStore>) -> Protoc
             move |args: CreateSessionArgs,
                   thread_id: String,
                   _new_thread_id: Option<String>,
-                  _before_message_uuid: Option<String>| {
+                  _fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>| {
                 let agent = resume_agent.clone();
                 let store = resume_store.clone();
                 Box::pin(async move {
@@ -4715,15 +4715,16 @@ fn protocol_lifecycle(agent: Arc<Agent>, store: Arc<dyn SessionStore>) -> Protoc
             move |args: CreateSessionArgs,
                   thread_id: String,
                   new_thread_id: Option<String>,
-                  _before_message_uuid: Option<String>| {
+                  fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>| {
                 let agent = fork_agent.clone();
                 let store = fork_store.clone();
                 Box::pin(async move {
                     let lsp_servers = args.init.lsp_servers.clone();
                     agent
-                        .fork_session(
+                        .fork_session_with_cut(
                             store,
                             &thread_id,
+                            fork_cut,
                             StartSessionOptions {
                                 id: new_thread_id.map(Into::into),
                                 approval_handler: Some(args.approval_handler),

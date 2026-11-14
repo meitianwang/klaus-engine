@@ -5,8 +5,60 @@ use crate::runtime_values::{
     runtime_codec, RuntimeCodecError, RuntimeEncode, RuntimeEncoder, RuntimeJson, RuntimeString,
 };
 use crate::schemas::message::{CompactBoundaryMessage, Message};
-use crate::schemas::rollout::RolloutItem;
+use crate::schemas::rollout::{RolloutItem, SessionRole};
 use std::collections::HashMap;
+
+/// Rollout event marking the end of a side task's inherited parent context prefix.
+pub const SIDE_TASK_BOUNDARY_EVENT: &str = "side_task_boundary";
+
+/// Return the rollout index where a side task's own visible history begins.
+/// Ordinary and forked main threads return `0` so inherited branch history stays visible.
+pub fn side_task_visible_start_index(items: &[RolloutItem]) -> usize {
+    let is_side_task = items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta { meta, .. } => Some(meta.role == Some(SessionRole::SideTask)),
+        _ => None,
+    });
+    if is_side_task != Some(true) {
+        return 0;
+    }
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            RolloutItem::SessionMeta { .. } => continue,
+            RolloutItem::Event(event)
+                if event.event == SIDE_TASK_BOUNDARY_EVENT
+                    || event.event == "approval_parent_history" =>
+            {
+                return index + 1;
+            }
+            RolloutItem::Checkpoint(_) | RolloutItem::TurnContext { .. } => return index,
+            RolloutItem::Event(event)
+                if event.event == "prediction_source" || event.event == "turn_goal_metadata" =>
+            {
+                return index;
+            }
+            _ => continue,
+        }
+    }
+    items.len()
+}
+
+/// Collect message UUIDs belonging to a side task's hidden inherited parent prefix.
+pub fn side_task_hidden_message_ids(items: &[RolloutItem]) -> Vec<RuntimeString> {
+    let end = side_task_visible_start_index(items);
+    items[..end]
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Message { message } => Some(match message {
+                Message::User(m) => m.uuid.clone(),
+                Message::Assistant(m) => m.uuid.clone(),
+                Message::ToolResult(m) => m.uuid.clone(),
+                Message::System(m) => m.uuid.clone(),
+                Message::CompactBoundary(m) => m.uuid.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
 
 #[derive(Debug)]
 pub(crate) struct SavedPathReference {
@@ -162,11 +214,13 @@ impl RuntimeEncode for ThreadHistory {
 /// Fold the complete saved conversation, applying only actual conversation rewinds.
 /// The input is a fixed file snapshot; this performs no I/O or provider initialization.
 pub fn project_thread_history(items: Vec<RolloutItem>) -> ThreadHistory {
-    let goal_completions = crate::goal::retained_context::completions_from_rollout(&items);
+    let visible_start = side_task_visible_start_index(&items);
+    let visible_items = &items[visible_start..];
+    let goal_completions = crate::goal::retained_context::completions_from_rollout(visible_items);
     let mut retained = Vec::new();
     let mut boundaries: Vec<usize> = Vec::new();
     let mut pending_context = None;
-    for item in items {
+    for item in items.into_iter().skip(visible_start) {
         match &item {
             RolloutItem::Rollback(rollback) => {
                 let count = (rollback.num_turns as usize).min(boundaries.len());

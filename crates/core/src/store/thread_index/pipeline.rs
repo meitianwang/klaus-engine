@@ -119,12 +119,28 @@ fn field(
     file.rewind()?;
     Ok(Payload::Staged(file))
 }
+pub(super) fn is_side_task_prefix_end_before(header: &scan::Header) -> bool {
+    matches!(header.kind.as_str(), "checkpoint" | "turn_context")
+        || matches!(
+            header.event.as_deref(),
+            Some("prediction_source" | "turn_goal_metadata")
+        )
+}
+
+pub(super) fn is_side_task_prefix_end_inclusive(header: &scan::Header) -> bool {
+    matches!(
+        header.event.as_deref(),
+        Some("side_task_boundary" | "approval_parent_history")
+    )
+}
+
 fn prepare(
     source: &mut std::fs::File,
     offset: u64,
     len: u64,
     ordinal: i64,
     header: Option<scan::Header>,
+    skip_prefix: &mut bool,
     cancelled: &Arc<AtomicBool>,
 ) -> io::Result<Step> {
     let mut step = Step {
@@ -140,6 +156,23 @@ fn prepare(
     let Some(header) = step.header.as_ref() else {
         return Ok(step);
     };
+    if header.kind == "session_meta" {
+        *skip_prefix =
+            header.meta.as_ref().and_then(|meta| meta.role.as_deref()) == Some("side_task");
+        return Ok(step);
+    }
+    if *skip_prefix {
+        if is_side_task_prefix_end_inclusive(header) {
+            *skip_prefix = false;
+            return Ok(step);
+        }
+        if is_side_task_prefix_end_before(header) {
+            *skip_prefix = false;
+        } else {
+            step.skip_item = true;
+            return Ok(step);
+        }
+    }
     if header.kind == "message"
         && header
             .message
@@ -251,6 +284,7 @@ fn produce(
     from: u64,
     end: u64,
     initial_ordinal: i64,
+    mut skip_prefix: bool,
     sender: &SyncSender<ProjectionMessage>,
     cancelled: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -293,7 +327,15 @@ fn produce(
         }
         batch.source_read_us += read_started.elapsed().as_micros() as u64;
         let normalize_started = std::time::Instant::now();
-        let step = prepare(source, offset, len, ordinal, header, cancelled)?;
+        let step = prepare(
+            source,
+            offset,
+            len,
+            ordinal,
+            header,
+            &mut skip_prefix,
+            cancelled,
+        )?;
         batch.normalize_us += normalize_started.elapsed().as_micros() as u64;
         offset = offset
             .checked_add(len)
@@ -344,10 +386,19 @@ pub(super) fn producer(
     from: u64,
     end: u64,
     initial_ordinal: i64,
+    initial_skip_prefix: bool,
     sender: SyncSender<ProjectionMessage>,
     cancelled: Arc<AtomicBool>,
 ) {
-    if let Err(error) = produce(&mut source, from, end, initial_ordinal, &sender, &cancelled) {
+    if let Err(error) = produce(
+        &mut source,
+        from,
+        end,
+        initial_ordinal,
+        initial_skip_prefix,
+        &sender,
+        &cancelled,
+    ) {
         if !cancelled.load(Ordering::Acquire) {
             let _ = sender.send(ProjectionMessage::Failed(error));
         }

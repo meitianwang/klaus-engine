@@ -3075,6 +3075,21 @@ pub struct SessionThreadParams {
     /// `fork_session.beforeMessageUuid`). Other lifecycle methods ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_message_uuid: Option<String>,
+    /// `session/forkSession` only: cut point — the branch inherits history
+    /// through the exchange containing this message uuid, inclusive (mirrors
+    /// `fork_session.afterMessageUuid`). Other lifecycle methods ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_message_uuid: Option<String>,
+    /// `session/forkSession` only: cut point — the branch inherits history
+    /// through this turn id, inclusive (mirrors `fork_session.lastTurnId`).
+    /// Other lifecycle methods ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+    /// `session/forkSession` only: cut point — the branch inherits history
+    /// strictly BEFORE this turn id (mirrors `fork_session.beforeTurnId`).
+    /// Other lifecycle methods ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<String>,
 }

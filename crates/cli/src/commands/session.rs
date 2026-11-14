@@ -99,6 +99,9 @@ pub async fn run(
                         thread_id: thread_id.clone(),
                         new_thread_id: new_thread_id.clone(),
                         before_message_uuid: before_message.clone(),
+                        after_message_uuid: None,
+                        last_turn_id: None,
+                        before_turn_id: None,
                         submission_id: None,
                     },
                     |event| event.session.is_some(),
@@ -299,6 +302,9 @@ fn thread_params(session: &CliSession, thread_id: &str) -> wire::SessionThreadPa
         // Fork's two extra fields, which the others are documented to ignore.
         new_thread_id: None,
         before_message_uuid: None,
+        after_message_uuid: None,
+        last_turn_id: None,
+        before_turn_id: None,
         submission_id: None,
     }
 }

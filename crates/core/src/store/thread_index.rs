@@ -154,6 +154,35 @@ impl TurnIndexDb {
         if version < 6 {
             conn.execute_batch("CREATE INDEX IF NOT EXISTS history_turn_order ON history_turn_projection(thread,ordinal); PRAGMA user_version=6;").map_err(sql_error)?;
         }
+        if version < 7 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS history_side_task_state (
+                    thread TEXT PRIMARY KEY, prefix_open INTEGER NOT NULL
+                 );
+                 CREATE TEMP TABLE IF NOT EXISTS _stale_preamble_threads AS
+                    SELECT DISTINCT thread FROM page_turns_v2 WHERE id LIKE '%-preamble';
+                 DELETE FROM history_item_chunks WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_turn_projection WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_projection_state WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_rollout_ordinals WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_goal_projection WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_control_projection WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_message_turns WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_items WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_user_presentations WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_presentation_backfill WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM history_legacy_imports WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM page_records_v2 WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM page_turns_v2 WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM page_threads_v2 WHERE id IN (SELECT thread FROM _stale_preamble_threads);
+                 DELETE FROM page_epochs_v1 WHERE thread IN (SELECT thread FROM _stale_preamble_threads);
+                 DROP TABLE _stale_preamble_threads;
+                 PRAGMA user_version=7;
+                 COMMIT;",
+            )
+            .map_err(sql_error)?;
+        }
         Ok(Self { conn, _lock: lock })
     }
 
@@ -665,6 +694,17 @@ impl TurnIndexDb {
                 )
                 .map_err(sql_error)?
         };
+        let initial_skip_prefix = if rebuild {
+            false
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT COALESCE((SELECT prefix_open FROM history_side_task_state WHERE thread=?1),0)!=0",
+                    params![thread],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?
+        };
         let source = source.try_clone()?;
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::scope(|scope| {
@@ -676,6 +716,7 @@ impl TurnIndexDb {
                     from,
                     len,
                     initial_ordinal,
+                    initial_skip_prefix,
                     sender,
                     producer_cancelled,
                 )
@@ -988,12 +1029,68 @@ impl TurnIndexDb {
              ORDER BY c.offset DESC LIMIT 1",
             params![thread],|row|row.get::<_,i64>(0)).optional().map_err(sql_error)?;
         let mut active_context = self.active_context(thread)?;
+        let mut is_side_task_thread: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM history_side_task_state WHERE thread=?1)",
+                params![thread],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let mut skip_prefix: bool = self
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT prefix_open FROM history_side_task_state WHERE thread=?1),0)!=0",
+                params![thread],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
         let mut affected = std::collections::BTreeSet::new();
         for step in &mut batch.steps {
             let offset = step.offset;
             let len = step.len;
             self.conn.execute("INSERT INTO history_rollout_ordinals(thread,byte_offset,ordinal) VALUES(?1,?2,?3)",params![thread,offset as i64,step.ordinal]).map_err(sql_error)?;
             if let Some(header) = step.header.as_ref() {
+                if header.kind == "session_meta" {
+                    let is_side_task = header.meta.as_ref().and_then(|meta| meta.role.as_deref())
+                        == Some("side_task");
+                    is_side_task_thread = is_side_task;
+                    skip_prefix = is_side_task;
+                    if is_side_task {
+                        self.conn
+                            .execute(
+                                "INSERT INTO history_side_task_state(thread,prefix_open) VALUES(?1,1) ON CONFLICT(thread) DO UPDATE SET prefix_open=1",
+                                params![thread],
+                            )
+                            .map_err(sql_error)?;
+                        position += 1;
+                        continue;
+                    }
+                } else if skip_prefix {
+                    if pipeline::is_side_task_prefix_end_inclusive(header) {
+                        skip_prefix = false;
+                        self.conn
+                            .execute(
+                                "INSERT INTO history_side_task_state(thread,prefix_open) VALUES(?1,0) ON CONFLICT(thread) DO UPDATE SET prefix_open=0",
+                                params![thread],
+                            )
+                            .map_err(sql_error)?;
+                        position += 1;
+                        continue;
+                    }
+                    if pipeline::is_side_task_prefix_end_before(header) {
+                        skip_prefix = false;
+                        self.conn
+                            .execute(
+                                "INSERT INTO history_side_task_state(thread,prefix_open) VALUES(?1,0) ON CONFLICT(thread) DO UPDATE SET prefix_open=0",
+                                params![thread],
+                            )
+                            .map_err(sql_error)?;
+                    } else {
+                        position += 1;
+                        continue;
+                    }
+                }
                 goals_changed |= header.event.as_deref() == Some("goal_completed");
                 if header.kind == "rollback" {
                     rewound = true;
@@ -1044,13 +1141,18 @@ impl TurnIndexDb {
                     }
                     pending = Some(offset as i64);
                 }
-                turn_delta += self
-                    .conn
-                    .execute(
-                        "INSERT OR IGNORE INTO page_turns_v2(thread,id,offset) VALUES(?1,?2,?3)",
-                        params![thread, turn, offset as i64],
-                    )
-                    .map_err(sql_error)? as i64;
+                let creates_turn = !is_side_task_thread
+                    || !turn.ends_with("-preamble")
+                    || (!step.skip_item && matches!(header.kind.as_str(), "message" | "compacted"));
+                if creates_turn {
+                    turn_delta += self
+                        .conn
+                        .execute(
+                            "INSERT OR IGNORE INTO page_turns_v2(thread,id,offset) VALUES(?1,?2,?3)",
+                            params![thread, turn, offset as i64],
+                        )
+                        .map_err(sql_error)? as i64;
+                }
                 // An undecodable message keeps its byte range and ordinal but
                 // contributes no display item. Advancing the checkpoint past it
                 // is what keeps one bad record from hiding every later turn.

@@ -554,7 +554,12 @@ pub type ImportExternalSession = Arc<
 >;
 pub type ListSessions = Arc<dyn Fn(ListOptions) -> ListSessionsFuture + Send + Sync>;
 pub type BindSession = Arc<
-    dyn Fn(CreateSessionArgs, String, Option<String>, Option<String>) -> CreateSessionFuture
+    dyn Fn(
+            CreateSessionArgs,
+            String,
+            Option<String>,
+            Option<klaus_agent_core::engine::agent::ForkCut>,
+        ) -> CreateSessionFuture
         + Send
         + Sync,
 >;
@@ -1078,7 +1083,7 @@ enum SessionPublicationRequest {
         submission_id: String,
         thread_id: String,
         new_thread_id: Option<String>,
-        before_message_uuid: Option<String>,
+        fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>,
         bind: BindSession,
     },
 }
@@ -5149,6 +5154,9 @@ impl ServerInner {
                 thread_id,
                 new_thread_id,
                 before_message_uuid,
+                after_message_uuid,
+                last_turn_id,
+                before_turn_id,
                 inherit_goal,
             } => {
                 Box::pin(self.dispatch_fork_session(
@@ -5156,6 +5164,9 @@ impl ServerInner {
                     thread_id,
                     new_thread_id,
                     before_message_uuid,
+                    after_message_uuid,
+                    last_turn_id,
+                    before_turn_id,
                     inherit_goal,
                 ))
                 .await;
@@ -8277,12 +8288,16 @@ impl ServerInner {
     }
 
     /// `ForkSession`: bind a forked persisted session through the host fork hook.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_fork_session(
         self: &Arc<Self>,
         submission_id: String,
         thread_id: RuntimeString,
         new_thread_id: Option<RuntimeString>,
         before_message_uuid: Option<RuntimeString>,
+        after_message_uuid: Option<RuntimeString>,
+        last_turn_id: Option<RuntimeString>,
+        before_turn_id: Option<RuntimeString>,
         inherit_goal: Option<bool>,
     ) {
         macro_rules! scalar {
@@ -8312,13 +8327,57 @@ impl ServerInner {
                     return;
                 }
             };
+        let after_message_uuid =
+            match optional_scalar_runtime_string(after_message_uuid, "afterMessageUuid") {
+                Ok(value) => value,
+                Err(error) => {
+                    self.report_op_error(&submission_id, error.into()).await;
+                    return;
+                }
+            };
+        let last_turn_id = match optional_scalar_runtime_string(last_turn_id, "lastTurnId") {
+            Ok(value) => value,
+            Err(error) => {
+                self.report_op_error(&submission_id, error.into()).await;
+                return;
+            }
+        };
+        let before_turn_id = match optional_scalar_runtime_string(before_turn_id, "beforeTurnId") {
+            Ok(value) => value,
+            Err(error) => {
+                self.report_op_error(&submission_id, error.into()).await;
+                return;
+            }
+        };
+        let mut cuts = Vec::new();
+        if let Some(id) = before_message_uuid {
+            cuts.push(klaus_agent_core::engine::agent::ForkCut::BeforeMessage(id));
+        }
+        if let Some(id) = after_message_uuid {
+            cuts.push(klaus_agent_core::engine::agent::ForkCut::AfterMessage(id));
+        }
+        if let Some(id) = last_turn_id {
+            cuts.push(klaus_agent_core::engine::agent::ForkCut::LastTurn(id));
+        }
+        if let Some(id) = before_turn_id {
+            cuts.push(klaus_agent_core::engine::agent::ForkCut::BeforeTurn(id));
+        }
+        if cuts.len() > 1 {
+            self.report_op_error(
+                &submission_id,
+                "at most one fork cut point may be specified".into(),
+            )
+            .await;
+            return;
+        }
+        let fork_cut = cuts.pop();
         let bind = if inherit_goal == Some(true) {
             self.lifecycle.fork_session.clone().map(|fork| {
                 Arc::new(
                     move |handlers,
                           source: String,
                           new_thread_id,
-                          before_message_uuid|
+                          fork_cut|
                           -> CreateSessionFuture {
                         let fork = fork.clone();
                         Box::pin(async move {
@@ -8326,8 +8385,7 @@ impl ServerInner {
                                 klaus_agent_core::goal::store::capture_goal_fork_snapshot(&source)
                                     .await?;
                             let session =
-                                fork(handlers, source.clone(), new_thread_id, before_message_uuid)
-                                    .await?;
+                                fork(handlers, source.clone(), new_thread_id, fork_cut).await?;
                             if session.meta.role
                                 == Some(klaus_agent_core::schemas::rollout::SessionRole::SideTask)
                             {
@@ -8362,7 +8420,7 @@ impl ServerInner {
             submission_id,
             thread_id,
             new_thread_id,
-            before_message_uuid,
+            fork_cut,
             bind,
             "fork_session requires a session store",
         )
@@ -9179,14 +9237,14 @@ impl ServerInner {
                 submission_id,
                 thread_id,
                 new_thread_id,
-                before_message_uuid,
+                fork_cut,
                 bind,
             } => (
                 bind(
                     self.create_session_args(),
                     thread_id,
                     new_thread_id,
-                    before_message_uuid,
+                    fork_cut,
                 )
                 .await
                 .map_err(|error| error.to_string())?,
@@ -10288,7 +10346,7 @@ impl ServerInner {
         submission_id: String,
         thread_id: String,
         new_thread_id: Option<String>,
-        before_message_uuid: Option<String>,
+        fork_cut: Option<klaus_agent_core::engine::agent::ForkCut>,
         bind: Option<BindSession>,
         missing_message: &'static str,
     ) {
@@ -10302,7 +10360,7 @@ impl ServerInner {
                 submission_id: submission_id.clone(),
                 thread_id,
                 new_thread_id,
-                before_message_uuid,
+                fork_cut,
                 bind,
             })
             .await;

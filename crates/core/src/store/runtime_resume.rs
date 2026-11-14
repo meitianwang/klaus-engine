@@ -31,7 +31,8 @@ pub(crate) fn history_metadata(
 ) -> (HashSet<RuntimeString>, Vec<RuntimeUsage>) {
     let mut users = HashSet::new();
     let mut usage = Vec::new();
-    let mut billable = meta.forked_from_id.is_none();
+    let mut billable = meta.forked_from_id.is_none()
+        && meta.role != Some(crate::schemas::rollout::SessionRole::SideTask);
     for item in items {
         collect_history_metadata(item, &mut billable, &mut users, &mut usage);
     }
@@ -524,7 +525,8 @@ pub(crate) fn load(
         };
         if !billing_meta_seen {
             if let RolloutItem::SessionMeta { meta, .. } = &item {
-                billable = meta.forked_from_id.is_none();
+                billable = meta.forked_from_id.is_none()
+                    && meta.role != Some(crate::schemas::rollout::SessionRole::SideTask);
                 billing_meta_seen = true;
             }
         }
@@ -572,6 +574,30 @@ pub(crate) fn load(
         )));
     }
     check(cancelled)?;
+    let mut hidden_context_message_ids = Vec::new();
+    if meta.role == Some(crate::schemas::rollout::SessionRole::SideTask) {
+        for row in &rows {
+            if row.kind == "session_meta" {
+                continue;
+            }
+            if matches!(
+                row.event.as_deref(),
+                Some("side_task_boundary" | "approval_parent_history")
+            ) || matches!(row.kind.as_str(), "checkpoint" | "turn_context")
+                || matches!(
+                    row.event.as_deref(),
+                    Some("prediction_source" | "turn_goal_metadata")
+                )
+            {
+                break;
+            }
+            if row.kind == "message" {
+                if let Some(id) = &row.message_id {
+                    hidden_context_message_ids.push(id.clone());
+                }
+            }
+        }
+    }
     let messages = project_for_prompt(&model_items);
     check(cancelled)?;
     Ok(RuntimeResumeResult {
@@ -582,6 +608,7 @@ pub(crate) fn load(
         turn_index,
         file_changes,
         persisted_user_uuids: users,
+        hidden_context_message_ids,
         usage,
     })
 }
