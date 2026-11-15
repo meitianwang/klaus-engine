@@ -178,6 +178,12 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    fn bind_capabilities_provider(
+        &self,
+        _provider: Arc<dyn crate::types::provider::ModelProvider>,
+    ) {
+    }
+
     /// Compact when the pre-turn estimate crosses the trigger. `custom_instructions`
     /// carries a PreCompact hook's additional context, folded into the summary
     /// prompt.

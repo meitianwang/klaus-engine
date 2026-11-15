@@ -64,14 +64,14 @@ pub fn to_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
     tools.iter().map(|t| to_tool_spec(t.as_ref())).collect()
 }
 
-/// Look a tool up by its name or one of its aliases. Exact matches win; a
-/// mis-cased name resolves only when exactly one tool matches
-/// case-insensitively, so an ambiguous name stays unknown.
+/// Look a tool up by its name or one of its aliases. Exact primary names win,
+/// followed by exact aliases; a mis-cased name resolves only when exactly one
+/// tool matches case-insensitively, so an ambiguous name stays unknown.
 pub fn find_tool(tools: &[Arc<dyn Tool>], name: &str) -> Option<Arc<dyn Tool>> {
-    if let Some(tool) = tools
-        .iter()
-        .find(|t| t.name() == name || t.aliases().iter().any(|a| a == name))
-    {
+    if let Some(tool) = tools.iter().find(|t| t.name() == name) {
+        return Some(tool.clone());
+    }
+    if let Some(tool) = tools.iter().find(|t| t.aliases().iter().any(|a| a == name)) {
         return Some(tool.clone());
     }
     let mut matches = tools.iter().filter(|t| {
@@ -425,5 +425,19 @@ mod tests {
         ];
         assert_eq!(find_tool(&ambiguous, "READ").unwrap().name(), "READ");
         assert!(find_tool(&ambiguous, "ReAd").is_none());
+
+        // Exact primary name beats an earlier tool's exact alias.
+        let alias_vs_primary: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool {
+                name: "legacy_reader".into(),
+                aliases: vec!["read".into()],
+                enabled: true,
+                schema: JsonSchema::new(),
+                input_kind: ToolInputKind::JsonSchema,
+                description: String::new(),
+            }),
+            mk("read", true),
+        ];
+        assert_eq!(find_tool(&alias_vs_primary, "read").unwrap().name(), "read");
     }
 }

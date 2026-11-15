@@ -912,7 +912,28 @@ impl<'a> Turn<'a> {
             text::text(message)
         ));
 
+        let is_url = matches!(&event.request, McpElicitationRequest::Url { .. });
         let response = match self.policy {
+            ApprovalPolicy::Ask if is_url => {
+                match self
+                    .ask("Confirm after completing in browser (y/N): ")
+                    .await?
+                {
+                    Some(answer)
+                        if matches!(
+                            answer.trim().to_ascii_lowercase().as_str(),
+                            "y" | "yes" | "done" | "ok"
+                        ) =>
+                    {
+                        McpElicitationResponse {
+                            action: McpElicitationAction::Accept,
+                            content: None,
+                            meta: None,
+                        }
+                    }
+                    _ => McpElicitationResponse::decline(),
+                }
+            }
             ApprovalPolicy::Ask => match self.ask("JSON answer (empty to decline): ").await? {
                 Some(answer) if !answer.trim().is_empty() => McpElicitationResponse {
                     action: McpElicitationAction::Accept,

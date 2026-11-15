@@ -9,7 +9,6 @@ use super::concat_runtime_strings;
 use super::dispatch_tool_calls;
 use super::error_result as truncated_call_result;
 use super::execute_tool_call_after_started;
-use super::find_runtime_tool;
 use super::provider_metadata;
 use super::push_tool_call_started;
 use super::record_tool_lifecycle_parts;
@@ -1057,9 +1056,9 @@ async fn stream_and_dispatch_inner(
                 }
                 if let Some(p) = partial.get_mut(&id) {
                     p.finalize_input();
-                    let call = ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
+                    let mut call = ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                     let tools = shared.tools.lock_recover().clone();
-                    let tool = find_runtime_tool(&tools, &call.internal_name);
+                    let tool = call.bind_resolved_tool(&tools);
                     let source = tool
                         .as_ref()
                         .map(|found| tool_lifecycle_source_for_tool(found.as_ref()));
@@ -1334,9 +1333,10 @@ async fn stream_and_dispatch_inner(
             Assembly::Tool { id } => {
                 if let Some(p) = partial.get(&id) {
                     if !resolved_calls.contains_key(&id) {
-                        let call = ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
+                        let mut call =
+                            ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                         let tools = shared.tools.lock_recover().clone();
-                        let tool = find_runtime_tool(&tools, &call.internal_name);
+                        let tool = call.bind_resolved_tool(&tools);
                         let source = tool
                             .as_ref()
                             .map(|tool| tool_lifecycle_source_for_tool(tool.as_ref()));
@@ -1586,9 +1586,13 @@ async fn stream_and_dispatch_inner(
                     .and_then(|p| p.salvage_truncated_input())
                     .is_some();
             if salvaged {
-                let rebuilt = partial
-                    .get(&id)
-                    .map(|p| ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone()));
+                let tools = shared.tools.lock_recover().clone();
+                let rebuilt = partial.get(&id).map(|p| {
+                    let mut rebuilt =
+                        ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
+                    rebuilt.bind_resolved_tool(&tools);
+                    rebuilt
+                });
                 let path = rebuilt.as_ref().and_then(|call| {
                     call.initial_internal_input
                         .get("path")

@@ -119,6 +119,7 @@ pub struct FullCompactor {
     request: Mutex<Option<ModelRequest>>,
     signal: Mutex<AbortSignal>,
     provider: Mutex<Option<Arc<dyn ModelProvider>>>,
+    capabilities_provider: Mutex<Option<Arc<dyn ModelProvider>>>,
     precompute_context: Mutex<Option<crate::types::provider::NativeCompactionContext>>,
     output: Mutex<Option<CompactionOutputSink>>,
     session_memory: Mutex<Option<Arc<dyn SessionMemoryCompactProvider>>>,
@@ -141,6 +142,7 @@ pub fn create_full_compactor(options: FullCompactorOptions) -> FullCompactor {
         request: Mutex::new(None),
         signal: Mutex::new(AbortSignal::new()),
         provider: Mutex::new(None),
+        capabilities_provider: Mutex::new(None),
         precompute_context: Mutex::new(None),
         output: Mutex::new(None),
         session_memory: Mutex::new(None),
@@ -162,6 +164,7 @@ impl FullCompactor {
             request: Mutex::new(None),
             signal: Mutex::new(AbortSignal::new()),
             provider: Mutex::new(None),
+            capabilities_provider: Mutex::new(self.capabilities_provider.lock().unwrap().clone()),
             precompute_context: Mutex::new(None),
             output: Mutex::new(None),
             session_memory: Mutex::new(None),
@@ -207,7 +210,12 @@ impl FullCompactor {
     }
 
     pub fn bind_native_provider(&self, provider: Arc<dyn ModelProvider>) {
+        *self.capabilities_provider.lock().unwrap() = Some(provider.clone());
         *self.provider.lock().unwrap() = Some(provider);
+    }
+
+    pub fn bind_capabilities_provider(&self, provider: Arc<dyn ModelProvider>) {
+        *self.capabilities_provider.lock().unwrap() = Some(provider);
     }
 
     /// True when a summary would run through the provider's native remote
@@ -518,6 +526,24 @@ impl FullCompactor {
             !crate::context::instruction_policy::is_workspace_instruction_projection(message)
                 && !matches!(message, Message::System(system) if system.subtype == crate::schemas::message::SystemSubtype::UserDisplay)
         }).cloned());
+        if let Some(provider) = self
+            .capabilities_provider
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.provider.lock().unwrap().clone())
+        {
+            let capabilities = provider.capabilities(&self.model);
+            if !capabilities.vision {
+                crate::engine::query::request::omit_request_images(&mut request.messages);
+            }
+            if !capabilities.native_pdf {
+                crate::engine::query::request::omit_historical_request_documents(
+                    &mut request.messages,
+                    false,
+                );
+            }
+        }
         let mut prompt = config
             .compact_prompt
             .clone()
@@ -1151,5 +1177,107 @@ mod tests {
             assert!(!result.compacted);
             assert!(output.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn blind_summary_model_omits_stored_tool_images_from_compaction_requests() {
+        use crate::schemas::content::{ImageBlock, OutputBlock};
+        use crate::schemas::message::ToolResultMessage;
+        use crate::types::provider::{ModelStream, ProviderCapabilities, ProviderInfo};
+
+        struct BlindProvider(ProviderInfo);
+        impl ModelProvider for BlindProvider {
+            fn info(&self) -> &ProviderInfo {
+                &self.0
+            }
+            fn capabilities(&self, _model: &RuntimeString) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_image_detail_original: false,
+                    streaming: true,
+                    tools: true,
+                    thinking: false,
+                    structured_output: false,
+                    web_search: false,
+                    prompt_cache_control: false,
+                    context_window: 128_000,
+                    max_output_tokens: 4_096,
+                    native_pdf: false,
+                    vision: false,
+                    image_limits: None,
+                    max_media_blocks: None,
+                }
+            }
+            fn stream(&self, _req: ModelRequest, _signal: AbortSignal) -> ModelStream {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<ModelRequest>::new()));
+        let seen = captured.clone();
+        let compactor = create_full_compactor(FullCompactorOptions {
+            call_model: Box::new(move |request, _| {
+                seen.lock().unwrap().push(request);
+                Box::pin(futures::stream::iter(vec![
+                    ModelStreamEvent::TextMessageCompleted {
+                        id: "summary".into(),
+                        phase: Some("final_answer".into()),
+                        text: "Checkpoint summary".into(),
+                    },
+                    stop(),
+                ]))
+            }),
+            model: "blind-model".into(),
+            max_output_tokens: Some(1_024),
+            uuid: Box::new(|| "summary-id".to_owned()),
+        });
+        compactor.bind_capabilities_provider(Arc::new(BlindProvider(ProviderInfo {
+            name: "blind".into(),
+            base_url: None,
+            env_key: None,
+            default_model: "blind-model".into(),
+        })));
+
+        let history = vec![
+            Message::User(UserMessage {
+                uuid: "u1".into(),
+                content: vec![ContentBlock::Text(text_block("Read shot.png".into()))],
+                is_meta: None,
+                question_answer: None,
+            }),
+            Message::ToolResult(ToolResultMessage {
+                uuid: "tr1".into(),
+                tool_use_id: "call-1".into(),
+                content: vec![OutputBlock::Image(ImageBlock {
+                    mime_type: "image/png".into(),
+                    base64: "iVBORw0KGgo=".into(),
+                    detail: None,
+                    source_path: None,
+                })],
+                is_error: false,
+                tool_kind: None,
+                native_tool_output: None,
+                output: None,
+                extra_user_blocks: None,
+            }),
+        ];
+        let result = compactor
+            .manual_compact(history, &crate::schemas::config::default_config(), None)
+            .await;
+        assert!(result.compacted);
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let Message::ToolResult(tool_result) = &requests[0].messages[1] else {
+            panic!("expected compacted request to carry projected tool result");
+        };
+        assert!(
+            tool_result
+                .content
+                .iter()
+                .all(|block| !matches!(block, OutputBlock::Image(_))),
+            "blind compaction request must strip raw image blocks"
+        );
+        assert!(tool_result.content.iter().any(
+            |block| matches!(block, OutputBlock::Text(text) if text.text.contains("omitted"))
+        ));
     }
 }

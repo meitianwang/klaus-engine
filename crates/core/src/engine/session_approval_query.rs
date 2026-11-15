@@ -340,7 +340,10 @@ impl Session {
             .compactor
             .fork_isolated(summary_call, &config)
         {
-            Ok(compactor) => compactor,
+            Ok(compactor) => {
+                compactor.bind_capabilities_provider(provider.clone());
+                compactor
+            }
             Err(error) => {
                 return query_result(
                     &history,

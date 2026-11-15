@@ -64,7 +64,7 @@ mod compaction;
 mod orchestration;
 mod precompute;
 pub(crate) use precompute::PrecomputeRegistry;
-pub(super) mod request;
+pub(crate) mod request;
 mod result_trim;
 mod streaming;
 mod support;
@@ -1037,6 +1037,16 @@ impl ResolvedToolCall {
 
     fn replace_effective_input(&mut self, input: Json) {
         self.effective_internal_input = input;
+    }
+
+    /// Resolve against the live runtime tool inventory and canonicalize
+    /// `internal_name` to the matched tool's primary name so downstream policy,
+    /// hook, spill-limit, and special-tool checks see the canonical identity
+    /// while `visible.name` keeps the wire spelling emitted by the model.
+    fn bind_resolved_tool(&mut self, tools: &[Arc<dyn Tool>]) -> Option<Arc<dyn Tool>> {
+        let tool = find_runtime_tool(tools, &self.internal_name)?;
+        self.internal_name = tool.name();
+        Some(tool)
     }
 }
 

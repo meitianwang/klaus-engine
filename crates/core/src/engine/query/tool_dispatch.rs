@@ -685,7 +685,7 @@ fn execute_tool_call_body(
         };
         let arguments_json = call.initial_internal_input.clone();
         let tools = shared.tools.lock_recover().clone();
-        let tool = find_runtime_tool(&tools, &call.internal_name);
+        let tool = call.bind_resolved_tool(&tools);
         if !tool_call_authorized(
             &shared,
             &call,
@@ -970,6 +970,12 @@ fn execute_tool_call_body(
                             Err(ToolError::new(format!("Unknown tool: {name_host}")))
                         }
                         Some(inner) => {
+                            if inner.name() == owner {
+                                let name_host = invoked_tool_name_to_registry_host(&inner.name());
+                                return Err(ToolError::new(format!(
+                                    "Tool {name_host} cannot invoke itself"
+                                )));
+                            }
                             let inner_block = ToolUseBlock {
                                 id: (s.deps.uuid)().into(),
                                 name: inner.name(),
@@ -1604,13 +1610,14 @@ pub(super) async fn push_tool_call_started(
     call: &ResolvedToolCall,
 ) -> Result<(), ToolError> {
     let tools = shared.tools.lock_recover().clone();
-    let tool = find_runtime_tool(&tools, &call.internal_name);
-    if !tool_call_authorized(shared, call, tool.as_deref(), &call.initial_internal_input) {
+    let mut call = call.clone();
+    let tool = call.bind_resolved_tool(&tools);
+    if !tool_call_authorized(shared, &call, tool.as_deref(), &call.initial_internal_input) {
         return Ok(());
     }
     record_tool_lifecycle(
         shared,
-        call,
+        &call,
         ToolLifecyclePhase::Started,
         Some(call.initial_internal_input.clone()),
         None,
@@ -2025,7 +2032,7 @@ async fn request_network_access(
     };
     if let Some(reviewer) = &shared.params.approval_reviewer {
         let tools = shared.tools.lock_recover();
-        if let Some(tool) = tools.iter().find(|tool| tool.name() == call.internal_name) {
+        if let Some(tool) = find_runtime_tool(&tools, &call.internal_name) {
             if let Ok(mut metadata) = crate::engine::approval_action::metadata_for_tool(
                 tool.as_ref(),
                 &call.effective_internal_input,

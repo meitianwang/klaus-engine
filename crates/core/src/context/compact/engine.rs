@@ -146,6 +146,8 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    fn bind_capabilities_provider(&self, _provider: Arc<dyn ModelProvider>) {}
+
     /// Supply the live request prefix for a cache-preserving summary fork.
     fn prepare_request(
         &self,
@@ -232,6 +234,10 @@ impl Compactor for RealCompactor {
     }
     fn bind_native_provider(&self, provider: Arc<dyn ModelProvider>) {
         self.full.bind_native_provider(provider);
+    }
+
+    fn bind_capabilities_provider(&self, provider: Arc<dyn ModelProvider>) {
+        self.full.bind_capabilities_provider(provider);
     }
 
     fn native_summary_active(&self) -> bool {

@@ -935,11 +935,22 @@ pub trait McpElicitationPresenter: Send + Sync {
     /// it presented for `request_id`; the default keeps presenters that predate
     /// the callback working.
     async fn cancelled(&self, _request_id: RuntimeString) {}
+
+    /// A pending elicitation settled on the engine side without a host
+    /// `resolve_mcp_elicitation` call (for example, `notifications/elicitation/complete`
+    /// from the MCP server on a URL flow, or turn/connection cancellation).
+    async fn resolved(&self, request_id: RuntimeString, action: McpElicitationAction) {
+        if action == McpElicitationAction::Cancel {
+            self.cancelled(request_id).await;
+        }
+    }
 }
 
 struct PendingElicitation {
     owner: u64,
     generation: Option<u64>,
+    is_url: bool,
+    url_completion: Option<(RuntimeString, RuntimeString)>,
     sender: oneshot::Sender<McpElicitationResponse>,
 }
 
@@ -1267,15 +1278,58 @@ impl McpElicitationRouter {
         response: McpElicitationResponse,
     ) -> Result<(), String> {
         let request_id_fragment = exact_error_fragment(request_id);
-        self.inner
+        let pending = self
+            .inner
             .pending
             .lock()
             .unwrap()
             .remove(request_id)
-            .ok_or_else(|| format!("request_not_found: MCP elicitation '{request_id_fragment}'"))?
+            .ok_or_else(|| format!("request_not_found: MCP elicitation '{request_id_fragment}'"))?;
+        let mut response = response.normalized();
+        if pending.is_url {
+            response.content = None;
+        }
+        pending
             .sender
-            .send(response.normalized())
+            .send(response)
             .map_err(|_| format!("request_not_found: MCP elicitation '{request_id_fragment}'"))
+    }
+
+    /// Settle a pending URL-mode elicitation when the MCP server confirms
+    /// out-of-band completion via `notifications/elicitation/complete`.
+    pub fn complete_url_elicitation(
+        &self,
+        server_name: &RuntimeString,
+        elicitation_id: &RuntimeString,
+    ) -> bool {
+        let matched = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let found_id = pending.iter().find_map(|(id, entry)| {
+                entry
+                    .url_completion
+                    .as_ref()
+                    .is_some_and(|(server, candidate)| {
+                        server == server_name && candidate == elicitation_id
+                    })
+                    .then(|| id.clone())
+            });
+            found_id.and_then(|id| pending.remove(&id).map(|entry| (id, entry)))
+        };
+        let Some((request_id, entry)) = matched else {
+            return false;
+        };
+        let sent = entry
+            .sender
+            .send(McpElicitationResponse {
+                action: McpElicitationAction::Accept,
+                content: None,
+                meta: None,
+            })
+            .is_ok();
+        if sent {
+            self.notify_resolved(request_id, McpElicitationAction::Accept);
+        }
+        sent
     }
 
     pub fn cancel_all(&self) {
@@ -1295,10 +1349,14 @@ impl McpElicitationRouter {
     /// Tell the host that a presented card will never receive a user answer,
     /// so it closes instead of staying clickable forever.
     fn notify_cancelled(&self, request_id: RuntimeString) {
+        self.notify_resolved(request_id, McpElicitationAction::Cancel);
+    }
+
+    fn notify_resolved(&self, request_id: RuntimeString, action: McpElicitationAction) {
         let Some(presenter) = self.inner.presenter.clone() else {
             return;
         };
-        tokio::spawn(async move { presenter.cancelled(request_id).await });
+        tokio::spawn(async move { presenter.resolved(request_id, action).await });
     }
 
     pub(crate) async fn route(
@@ -1351,6 +1409,13 @@ impl McpElicitationRouter {
         let request_id =
             RuntimeString::from(format!("mcp-elicit-{}-{sequence}", (self.inner.uuid)()));
         let (tx, rx) = oneshot::channel();
+        let is_url = matches!(&request, McpElicitationRequest::Url { .. });
+        let url_completion = match &request {
+            McpElicitationRequest::Url { elicitation_id, .. } => {
+                Some((server_name.clone(), elicitation_id.clone()))
+            }
+            _ => None,
+        };
         // Register under the same owner lock used when a query ends. A prompt
         // cannot enter that ended generation between capture and insertion.
         let query = {
@@ -1361,6 +1426,8 @@ impl McpElicitationRouter {
                 PendingElicitation {
                     owner: self.owner.id,
                     generation: query.as_ref().map(|query| query.generation),
+                    is_url,
+                    url_completion,
                     sender: tx,
                 },
             );
@@ -1414,7 +1481,11 @@ impl McpElicitationRouter {
         {
             return McpElicitationResponse::decline();
         }
-        response.normalized()
+        let mut response = response.normalized();
+        if is_url {
+            response.content = None;
+        }
+        response
     }
 }
 
@@ -2229,6 +2300,106 @@ mod approval_policy_tests {
             )
             .unwrap();
         assert_eq!(waiting.await.unwrap().action, McpElicitationAction::Decline);
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn url_elicitation_strips_content_and_settles_on_server_completion_notification() {
+        struct ResolutionPresenter {
+            events: tokio::sync::mpsc::UnboundedSender<McpElicitationEvent>,
+            resolved: tokio::sync::mpsc::UnboundedSender<(RuntimeString, McpElicitationAction)>,
+        }
+        #[async_trait]
+        impl McpElicitationPresenter for ResolutionPresenter {
+            async fn present(&self, event: McpElicitationEvent) {
+                self.events.send(event).unwrap();
+            }
+            async fn resolved(&self, request_id: RuntimeString, action: McpElicitationAction) {
+                self.resolved.send((request_id, action)).unwrap();
+            }
+        }
+
+        let (events, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let (resolved_tx, mut resolved_rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = McpElicitationRouter::new(
+            Some(Arc::new(ResolutionPresenter {
+                events,
+                resolved: resolved_tx,
+            })),
+            Arc::new(|| "url-complete".to_owned()),
+        );
+        let _query = router.begin_query(AbortSignal::new());
+
+        // 1. Explicit resolve on a URL elicitation omits any spurious content object.
+        let manual_router = router.clone();
+        let manual = tokio::spawn(async move {
+            manual_router
+                .route(
+                    "calendar".into(),
+                    McpElicitationRequest::Url {
+                        meta: None,
+                        message: "Authorize calendar".into(),
+                        url: "https://example.invalid/oauth".into(),
+                        elicitation_id: "el-manual".into(),
+                    },
+                    AbortSignal::new(),
+                    AbortSignal::new(),
+                )
+                .await
+        });
+        let manual_event = tokio::time::timeout(std::time::Duration::from_secs(2), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        router
+            .resolve(
+                &manual_event.request_id,
+                McpElicitationResponse {
+                    action: McpElicitationAction::Accept,
+                    content: Some(RuntimeJson::Object(Default::default())),
+                    meta: None,
+                },
+            )
+            .unwrap();
+        let manual_response = manual.await.unwrap();
+        assert_eq!(manual_response.action, McpElicitationAction::Accept);
+        assert_eq!(manual_response.content, None);
+
+        // 2. Server-sent notifications/elicitation/complete settles the matching pending URL flow.
+        let notified_router = router.clone();
+        let notified = tokio::spawn(async move {
+            notified_router
+                .route(
+                    "calendar".into(),
+                    McpElicitationRequest::Url {
+                        meta: None,
+                        message: "Authorize calendar".into(),
+                        url: "https://example.invalid/oauth".into(),
+                        elicitation_id: "el-notify".into(),
+                    },
+                    AbortSignal::new(),
+                    AbortSignal::new(),
+                )
+                .await
+        });
+        let notified_event =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receive.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!router.complete_url_elicitation(&"other".into(), &"el-notify".into()));
+        assert!(!router.complete_url_elicitation(&"calendar".into(), &"wrong-id".into()));
+        assert!(router.complete_url_elicitation(&"calendar".into(), &"el-notify".into()));
+
+        let notified_response = notified.await.unwrap();
+        assert_eq!(notified_response.action, McpElicitationAction::Accept);
+        assert_eq!(notified_response.content, None);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), resolved_rx.recv())
+                .await
+                .unwrap(),
+            Some((notified_event.request_id, McpElicitationAction::Accept))
+        );
         assert_eq!(router.pending_count(), 0);
     }
 }

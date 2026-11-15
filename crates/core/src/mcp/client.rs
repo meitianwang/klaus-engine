@@ -546,6 +546,24 @@ impl Client {
                 }),
             );
         }
+        {
+            let router = elicitation_router.clone();
+            let server_name = RuntimeString::from(server_name.clone());
+            inner.notif_handlers.lock().unwrap().insert(
+                "notifications/elicitation/complete".to_string(),
+                Arc::new(move |params| {
+                    let router = router.clone();
+                    let server_name = server_name.clone();
+                    Box::pin(async move {
+                        if let Some(elicitation_id) =
+                            params.get("elicitationId").and_then(Value::as_str)
+                        {
+                            router.complete_url_elicitation(&server_name, elicitation_id);
+                        }
+                    }) as BoxFuture<'static, ()>
+                }),
+            );
+        }
         Client { inner }
     }
 

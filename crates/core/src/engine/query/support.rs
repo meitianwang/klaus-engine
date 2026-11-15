@@ -353,6 +353,12 @@ pub(super) fn find_runtime_tool(
     if let Some(tool) = tools.iter().find(|tool| tool.name() == *name) {
         return Some(Arc::clone(tool));
     }
+    if let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.aliases().iter().any(|alias| alias == name))
+    {
+        return Some(Arc::clone(tool));
+    }
     // Models occasionally mis-case a tool name (capitalized builtin names
     // have been observed on subscription channels). Fall back to a
     // case-insensitive match only when it resolves to exactly one tool, so
@@ -364,6 +370,11 @@ pub(super) fn find_runtime_tool(
         tool.name()
             .try_to_utf8()
             .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(&folded))
+            || tool.aliases().iter().any(|alias| {
+                alias
+                    .try_to_utf8()
+                    .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(&folded))
+            })
     });
     let first = matches.next()?;
     if matches.next().is_some() {

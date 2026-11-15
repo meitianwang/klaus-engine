@@ -664,6 +664,9 @@ impl Compactor for RealCompactorBridge {
     fn prepare_request(&self, request: &ModelRequest, signal: &AbortSignal) {
         self.0.prepare_request(request, signal);
     }
+    fn bind_capabilities_provider(&self, provider: Arc<dyn ModelProvider>) {
+        self.0.bind_capabilities_provider(provider);
+    }
     fn reactive_enabled(&self) -> bool {
         self.0.reactive_enabled()
     }
@@ -4090,8 +4093,9 @@ impl Agent {
             // The compactor's model-call + uuid closures are reconstructed from the
             // provider (matching production_deps' own construction), since the base
             // deps' closures are not shareable.
-            let provider = provider.clone();
-            let call_model: CallModel = Box::new(move |req, signal| provider.stream(req, signal));
+            let stream_provider = provider.clone();
+            let call_model: CallModel =
+                Box::new(move |req, signal| stream_provider.stream(req, signal));
             let uuid: crate::context::compact::full_compact::UuidFn = Box::new(new_uuid);
             let real: Arc<dyn crate::context::compact::engine::Compactor> =
                 Arc::new(create_compactor(CompactorOptions {
@@ -4103,6 +4107,7 @@ impl Agent {
                     max_output_tokens: config.max_output_tokens,
                     uuid,
                 }));
+            real.bind_capabilities_provider(provider);
             let built: Arc<dyn Compactor> = Arc::new(RealCompactorBridge(real));
             built
         });

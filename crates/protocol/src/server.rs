@@ -11758,17 +11758,19 @@ impl McpElicitationPresenter for McpElicitationAdapter {
     }
 
     async fn cancelled(&self, request_id: RuntimeString) {
-        // The card the host presented for this request will never receive a
-        // user answer (turn ended or the connection dropped), so settle it as
-        // cancelled instead of leaving the host's card clickable forever.
+        self.resolved(request_id, McpElicitationAction::Cancel)
+            .await;
+    }
+
+    async fn resolved(&self, request_id: RuntimeString, action: McpElicitationAction) {
+        // Settle the host's parked card when the engine resolves the elicitation
+        // on its own (turn ended, connection dropped, or server-sent URL
+        // completion notification).
         let submission_id = self.inner.current_submission_id.lock().unwrap().clone();
         self.inner
             .write(ProtocolEvent {
                 submission_id: submission_id.into(),
-                mcp_elicitation_resolved: Some(McpElicitationResolvedWire {
-                    request_id,
-                    action: McpElicitationAction::Cancel,
-                }),
+                mcp_elicitation_resolved: Some(McpElicitationResolvedWire { request_id, action }),
                 ..Default::default()
             })
             .await;

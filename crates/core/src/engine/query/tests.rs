@@ -8403,7 +8403,7 @@ async fn root_agent_definition_policy_survives_refresh_and_native_search() {
 
 #[tokio::test]
 async fn root_agent_definition_policy_blocks_direct_and_nested_tool_execution() {
-    for name in ["echo", "nested_invoke"] {
+    for name in ["echo", "ECHO", "nested_invoke"] {
         let mut first = vec![ev::message_start(None)];
         first.extend(exact_tool_use_events(
             "blocked-call",
@@ -8455,6 +8455,121 @@ async fn root_agent_definition_policy_blocks_direct_and_nested_tool_execution() 
             "{name}: {records:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn mis_cased_tool_call_canonicalizes_identity_for_allowlists_events_and_self_recursion() {
+    struct SelfInvokeCaseTool {
+        schema: JsonSchema,
+    }
+    #[async_trait]
+    impl Tool for SelfInvokeCaseTool {
+        fn static_name(&self) -> &str {
+            "self_invoke_probe"
+        }
+        fn static_description(&self) -> &str {
+            "attempts case-folded self invocation"
+        }
+        fn static_input_schema(&self) -> &JsonSchema {
+            &self.schema
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn is_concurrency_safe(&self, _input: &Json) -> bool {
+            false
+        }
+        fn is_read_only(&self, _input: &Json) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _input: Json,
+            ctx: &ToolContext,
+            _on_progress: Option<ToolProgress>,
+        ) -> Result<ToolResult, ToolError> {
+            let invoke_tool = ctx.invoke_tool.as_ref().unwrap();
+            let err = invoke_tool("SELF_INVOKE_PROBE".into(), runtime_json!({}))
+                .await
+                .expect_err("case-folded self invocation must be rejected");
+            Ok(text_result(
+                Json::String(err.message.clone()),
+                err.message,
+                false,
+            ))
+        }
+    }
+
+    let mut first = vec![ev::message_start(None)];
+    first.extend(exact_tool_use_events(
+        "allowed-upper",
+        "ECHO",
+        &runtime_json!({ "ok": true }),
+    ));
+    first.extend(exact_tool_use_events(
+        "self-upper",
+        "Self_Invoke_Probe",
+        &runtime_json!({}),
+    ));
+    first.push(ev::stop(Some(ModelStopReason::ToolUse), None));
+    let mut params = mk_params(
+        vec![user_msg("run mis-cased tools")],
+        vec![
+            Arc::new(EchoTool {
+                schema: JsonSchema::new(),
+            }),
+            Arc::new(SelfInvokeCaseTool {
+                schema: JsonSchema::new(),
+            }),
+        ],
+    );
+    params.agent_tool_policy = Some(crate::engine::agent_definitions::AgentDefinition {
+        tools: Some(vec!["echo".into(), "self_invoke_probe".into()]),
+        ..Default::default()
+    });
+    let events = query(
+        params,
+        deps_with(scripted_call_model(vec![
+            first,
+            vec![
+                ev::message_start(None),
+                ev::text("done"),
+                ev::stop(None, None),
+            ],
+        ])),
+    )
+    .collect::<Vec<_>>()
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ItemStarted {
+            item: ThreadItem::ToolCall { id, tool_name, .. },
+            ..
+        } if id == "allowed-upper" && tool_name == "echo"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ItemCompleted {
+            item: ThreadItem::ToolCall { id, tool_name, status: ItemStatus::Completed, .. },
+            ..
+        } if id == "allowed-upper" && tool_name == "echo"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ItemCompleted {
+            item: ThreadItem::ToolCall {
+                id,
+                tool_name,
+                result: Some(result),
+                status: ItemStatus::Completed,
+                ..
+            },
+            ..
+        } if id == "self-upper"
+            && tool_name == "self_invoke_probe"
+            && result.as_str().is_some_and(|text| text.contains("cannot invoke itself"))
+    )));
 }
 
 #[tokio::test]
