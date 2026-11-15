@@ -43,7 +43,110 @@ pub(super) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn client_identity() -> String {
+/// Hub build claimed by the protocol identity when no installed application
+/// can be inspected. Bump these alongside any re-captured wire baseline.
+const FALLBACK_HUB_VERSION: &str = "2.32.1";
+const FALLBACK_HUB_CL: &str = "1021296516";
+
+/// Identity tokens end up inside request headers, so values read from the
+/// environment or from disk are accepted only when they fit a conservative
+/// header-safe character set.
+fn safe_identity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+/// Read the (version, changelist) pair of the installed hub application: the
+/// marketing version from the bundle's Info.plist and the source changelist
+/// from the language server's build stamp — the same two sources the hub
+/// itself combines into its protocol identity. Both must come from the same
+/// install, or the pair is not trustworthy and the fallback is used instead.
+#[cfg(target_os = "macos")]
+fn installed_hub_build() -> Option<(String, String)> {
+    let home = std::env::var_os("HOME")?;
+    let app = [
+        std::path::PathBuf::from("/Applications/Antigravity.app"),
+        std::path::Path::new(&home).join("Applications/Antigravity.app"),
+    ]
+    .into_iter()
+    .find(|path| path.is_dir())?;
+    let version = std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw"])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| safe_identity_token(value))?;
+    let stamp = std::process::Command::new(app.join("Contents/Resources/bin/language_server"))
+        .arg("--stamp")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())?;
+    let cl = stamp
+        .lines()
+        .find_map(|line| line.strip_prefix("Built at CL: "))
+        .map(|value| value.trim().to_string())
+        .filter(|value| safe_identity_token(value))?;
+    Some((version, cl))
+}
+
+/// Install inspection is only implemented where the hub's on-disk layout is
+/// known; other platforms fall back to the captured build pair.
+#[cfg(not(target_os = "macos"))]
+fn installed_hub_build() -> Option<(String, String)> {
+    None
+}
+
+/// Identity pair pinned via the environment as "version:changelist". Tests
+/// use it to stay deterministic without inspecting the installed app; it
+/// also serves as an explicit override where that inspection is unwanted.
+fn env_hub_build() -> Option<(String, String)> {
+    let raw = std::env::var("KLAUS_ANTIGRAVITY_HUB_IDENTITY").ok()?;
+    let (version, cl) = raw.split_once(':')?;
+    let (version, cl) = (version.trim(), cl.trim());
+    if safe_identity_token(version) && safe_identity_token(cl) {
+        Some((version.to_string(), cl.to_string()))
+    } else {
+        None
+    }
+}
+
+static HUB_BUILD: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The (version, changelist) pair the protocol identity claims, resolved at
+/// most once per process.
+fn hub_build() -> &'static (String, String) {
+    HUB_BUILD.get_or_init(|| {
+        env_hub_build()
+            .or_else(installed_hub_build)
+            .unwrap_or_else(|| {
+                (
+                    FALLBACK_HUB_VERSION.to_string(),
+                    FALLBACK_HUB_CL.to_string(),
+                )
+            })
+    })
+}
+
+/// The first resolution may spawn helper processes to inspect the installed
+/// application, which must not block an async worker; park that work on the
+/// blocking pool ahead of any identity consumer.
+pub(super) async fn ensure_identity() {
+    if HUB_BUILD.get().is_some() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(hub_build).await;
+}
+
+/// User-Agent claimed by every hub protocol request: product line and
+/// version, client class, platform, architecture and source changelist.
+pub(super) fn identity_ua(version: &str, cl: &str) -> String {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         other => other,
@@ -53,7 +156,12 @@ pub(super) fn client_identity() -> String {
         "x86_64" => "amd64",
         other => other,
     };
-    format!("antigravity/hub/2.24.0 (aidev_client; os_type={os}; arch={arch})")
+    format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch}; cl={cl})")
+}
+
+pub(super) fn client_identity() -> String {
+    let (version, cl) = hub_build();
+    identity_ua(version, cl)
 }
 
 pub(super) fn http_client() -> Result<reqwest::Client, String> {
@@ -530,6 +638,7 @@ async fn send_once(
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
 ) -> Result<reqwest::Response, GeminiApiError> {
+    ensure_identity().await;
     let credential = auth::credential(generation).await.map_err(api_error)?;
     let base = api_base().map_err(api_error)?;
     let suffix = if method == "streamGenerateContent" {

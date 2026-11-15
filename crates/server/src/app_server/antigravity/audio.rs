@@ -13,6 +13,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 const HOST: &str = "aicode.googleapis.com";
 const PATH: &str = "/google.gca.aicode.v1alpha.PredictionService/BidiGenerateContent";
+/// Client identity the realtime speech endpoint expects: the Go gRPC stack
+/// announcement the hub's audio pipeline presents on this connection.
+const GRPC_USER_AGENT: &str = "grpc-go/1.86.0-dev";
 const MAX_AUDIO: usize = 12 * 1024 * 1024;
 const MAX_PCM: usize = 16_000 * 2 * 300;
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -276,7 +279,7 @@ where
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .header("grpc-timeout", "450000m")
-        .header("user-agent", "klaus")
+        .header("user-agent", GRPC_USER_AGENT)
         .header("authorization", authorization)
         .body(())
         .map_err(|_| error("configuration_invalid"))?;

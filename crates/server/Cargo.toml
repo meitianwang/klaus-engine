@@ -53,7 +53,9 @@ rustls-native-certs = "0.8"
 # `rustls-tls-native-roots` for the reason spelled out on the workspace reqwest
 # entry: baked webpki roots cannot see an inspecting proxy's root, so the model
 # provider leg fails at certificate validation.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls-native-roots"] }
+# `gzip` so outgoing requests advertise the same Accept-Encoding the hub
+# protocol's Go transport always sends; responses decode transparently.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "gzip", "rustls-tls-native-roots"] }
 sha2 = "0.10"
 hmac = "0.12"
 url = "2"

@@ -254,15 +254,12 @@ pub(super) async fn project(
     if let Some(project) = credential.project {
         return Ok(project);
     }
+    // The account is resolved from the bearer token alone; the hub's own
+    // probe carries nothing but the client class, so richer metadata would
+    // only deviate from the expected request shape.
     let result = cloud::rpc(
         "loadCodeAssist",
-        json!({
-            "metadata":{
-                "ideType":"ANTIGRAVITY", "ideName":"antigravity", "pluginType":"GEMINI",
-                "ideVersion":"2.24.0", "pluginVersion":"2.24.0", "platform":platform_id(),
-            },
-            "mode":"HEALTH_CHECK",
-        }),
+        json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
         Some(&generation),
         signal,
     )
@@ -278,17 +275,6 @@ pub(super) async fn project(
         .ok_or("antigravity_project_unavailable")?;
     auth::set_project(&generation, project).await?;
     Ok(project.to_string())
-}
-
-fn platform_id() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "DARWIN_ARM64",
-        ("macos", _) => "DARWIN_AMD64",
-        ("windows", "aarch64") => "WINDOWS_ARM64",
-        ("windows", _) => "WINDOWS_AMD64",
-        ("linux", "aarch64") => "LINUX_ARM64",
-        _ => "LINUX_AMD64",
-    }
 }
 
 async fn refresh_catalog(generation: &str) -> Result<Value, String> {
@@ -365,9 +351,7 @@ async fn fetch_available_models(
     project: &str,
     signal: &AbortSignal,
 ) -> Result<Value, String> {
-    let body = json!({
-        "project":project,"requestId":uuid::Uuid::new_v4().to_string(),
-    });
+    let body = json!({ "project": project });
     match cloud::rpc("fetchAvailableModels", body, Some(generation), signal).await {
         // A dead cached project would pin the catalog to its last good snapshot
         // forever; resolve a fresh project and ask once more.
@@ -375,9 +359,7 @@ async fn fetch_available_models(
             let healed = heal_project(generation, signal).await?;
             cloud::rpc(
                 "fetchAvailableModels",
-                json!({
-                    "project":healed,"requestId":uuid::Uuid::new_v4().to_string(),
-                }),
+                json!({ "project": healed }),
                 Some(generation),
                 signal,
             )
@@ -487,6 +469,9 @@ async fn catalog_payload(_warm: bool) -> Result<Value, String> {
 }
 
 pub async fn models(warm: bool) -> Result<Value, String> {
+    // Snapshot staleness compares the recorded client identity synchronously;
+    // resolve it off the async worker pool before any catalog read.
+    cloud::ensure_identity().await;
     let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
     let payload = catalog_payload(warm).await?;
     if !auth::is_current(&generation) {
@@ -669,14 +654,7 @@ async fn account_usage(entry: &auth::StoredAccount) -> Result<Value, String> {
         "loadCodeAssist",
         json!({
             "cloudaicompanionProject": project,
-            "metadata": {
-                "ideType": "ANTIGRAVITY",
-                "pluginType": "GEMINI",
-                "ideName": "antigravity",
-                "platform": platform_id(),
-                "ideVersion": "2.24.0",
-                "pluginVersion": "2.24.0"
-            }
+            "metadata": { "ideType": "ANTIGRAVITY" }
         }),
         Some(generation),
         &signal,

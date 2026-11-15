@@ -109,12 +109,16 @@ impl Environment {
     fn set(endpoint: &str) -> Self {
         let previous = std::env::var_os("KLAUS_ANTIGRAVITY_API_URL");
         set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", endpoint);
+        // Pin the protocol identity so catalog reads never spawn the
+        // installed app's helper processes mid-test.
+        set_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456");
         Self(previous)
     }
 }
 
 impl Drop for Environment {
     fn drop(&mut self) {
+        remove_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY");
         if let Some(previous) = self.0.take() {
             set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", previous);
         } else {

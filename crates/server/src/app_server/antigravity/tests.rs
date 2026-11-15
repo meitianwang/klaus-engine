@@ -22,6 +22,9 @@ impl Drop for Fixture {
 }
 
 async fn fixture() -> Fixture {
+    // Pin the protocol identity so fixture-backed tests never spawn the
+    // installed app's helper processes and see a deterministic value.
+    set_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -993,6 +996,16 @@ async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_mo
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
 
+#[test]
+fn identity_ua_carries_the_full_hub_shape() {
+    let ua = cloud::identity_ua("9.9.9", "123456");
+    assert!(ua.starts_with("antigravity/hub/9.9.9 (aidev_client; os_type="));
+    assert!(ua.ends_with("; cl=123456)"));
+    set_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456");
+    assert_eq!(cloud::client_identity(), ua);
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY");
+}
+
 #[tokio::test]
 async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selection() {
     let fixture = fixture().await;
@@ -1046,12 +1059,13 @@ async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selectio
     let requests = fixture.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     for request in requests.iter() {
+        let ua = request["userAgent"].as_str().unwrap();
         assert!(
-            request["userAgent"]
-                .as_str()
-                .unwrap()
-                .starts_with("antigravity/hub/2.24.0 (aidev_client; "),
-            "the service catalog is scoped to the hub protocol"
+            ua.starts_with("antigravity/hub/")
+                && ua.contains(" (aidev_client; os_type=")
+                && ua.contains("; cl=")
+                && ua.ends_with(')'),
+            "the service catalog is scoped to the hub protocol: {ua}"
         );
     }
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
