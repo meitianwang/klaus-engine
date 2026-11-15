@@ -2513,3 +2513,450 @@ async fn title_generation_steps_down_high_thinking_variant_while_turns_keep_sele
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
 }
+
+#[tokio::test]
+async fn premature_401_deduplicates_refresh_preserves_oauth_verdicts_and_retries_hop_drops() {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    enum ReplyPlan {
+        InvalidAuth401,
+        MissingCred401,
+        SseMissingCred401,
+        MidStream401ThenResume {
+            checkpoint_text: &'static str,
+            continuation: &'static str,
+        },
+        OkText(&'static str),
+    }
+
+    #[derive(Clone)]
+    enum OAuthPlan {
+        Success {
+            access: &'static str,
+            refresh: &'static str,
+        },
+        InvalidGrant400,
+        Unavailable503,
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stream_plans: Arc<Mutex<VecDeque<ReplyPlan>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let oauth_plans: Arc<Mutex<VecDeque<OAuthPlan>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let oauth_calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+
+    let sp = stream_plans.clone();
+    let op = oauth_plans.clone();
+    let oc = oauth_calls.clone();
+    let sc = stream_calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let sp = sp.clone();
+            let op = op.clone();
+            let oc = oc.clone();
+            let sc = sc.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..index]);
+                        let len = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (index + 4, len);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let bearer = header
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().strip_prefix("Bearer ").unwrap_or("").to_string())
+                    })
+                    .unwrap_or_default();
+
+                if path == "/token" {
+                    oc.fetch_add(1, Ordering::SeqCst);
+                    let plan = op
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(OAuthPlan::Success {
+                            access: "tok-renewed",
+                            refresh: "ref-renewed",
+                        });
+                    let (status, body) = match plan {
+                        OAuthPlan::Success { access, refresh } => (
+                            200,
+                            json!({"access_token": access, "refresh_token": refresh, "expires_in": 3600})
+                                .to_string(),
+                        ),
+                        OAuthPlan::InvalidGrant400 => (
+                            400,
+                            json!({"error": "invalid_grant"}).to_string(),
+                        ),
+                        OAuthPlan::Unavailable503 => (
+                            503,
+                            json!({"error": "temporarily_unavailable"}).to_string(),
+                        ),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+
+                if !path.contains(":streamGenerateContent") {
+                    let body = json!({
+                        "cloudaicompanionProject": "proj-1",
+                        "models": {
+                            "gemini-3.8-flash-medium": {
+                                "displayName": "Gemini 3.8 Flash Medium",
+                                "maxTokens": 100000,
+                                "maxOutputTokens": 8192
+                            }
+                        }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                        status = 200
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+
+                sc.fetch_add(1, Ordering::SeqCst);
+                if bearer.starts_with("stale-") {
+                    let err = json!({
+                        "error": {
+                            "code": 401,
+                            "status": "UNAUTHENTICATED",
+                            "message": "Request had invalid authentication credentials."
+                        }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                        err.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+
+                let plan = sp
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ReplyPlan::OkText("ok"));
+                match plan {
+                    ReplyPlan::InvalidAuth401 => {
+                        let err = json!({
+                            "error": {
+                                "code": 401,
+                                "status": "UNAUTHENTICATED",
+                                "message": "Request had invalid authentication credentials."
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                    ReplyPlan::MissingCred401 => {
+                        let err = json!({
+                            "error": {
+                                "code": 401,
+                                "status": "UNAUTHENTICATED",
+                                "message": "Request is missing required authentication credential. Expected OAuth 2 access token, login cookie or other valid authentication credential."
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                    ReplyPlan::SseMissingCred401 => {
+                        let sse = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "error": {
+                                    "code": 401,
+                                    "status": "UNAUTHENTICATED",
+                                    "message": "Request is missing required authentication credential."
+                                }
+                            })
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                    ReplyPlan::MidStream401ThenResume {
+                        checkpoint_text,
+                        continuation,
+                    } => {
+                        let f1 = json!({
+                            "response": {
+                                "candidates": [{
+                                    "continuationToken": continuation,
+                                    "content": { "parts": [{ "text": checkpoint_text }] }
+                                }]
+                            }
+                        });
+                        let f2 = json!({
+                            "error": {
+                                "code": 401,
+                                "status": "UNAUTHENTICATED",
+                                "message": "Request had invalid authentication credentials."
+                            }
+                        });
+                        let sse = format!("data: {f1}\n\ndata: {f2}\n\n");
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                    ReplyPlan::OkText(text) => {
+                        let sse = format!(
+                            "data: {}\n\n",
+                            json!({"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":text}]}}]}})
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL", format!("{endpoint}/token"));
+
+    auth::adopt(auth::Credential {
+        access_token: "stale-initial".into(),
+        refresh_token: Some("ref-1".into()),
+        expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+        account: Some("user@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-1".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+
+    let resolved = resolve("gemini-3.8-flash-medium", &serde_json::Map::new())
+        .await
+        .unwrap();
+    let init_json = json!({
+        "provider": resolved.provider,
+        "capabilities": resolved.capabilities,
+        "capabilitiesByModel": resolved.capabilities_by_model,
+        "modelSource": {"source": "antigravity"},
+    });
+    let proto_init: ProtocolSessionInit =
+        runtime_codec::decode_text(&RuntimeString::from(init_json.to_string())).unwrap();
+    let base_provider: Arc<dyn ModelProvider> =
+        Arc::new(GeminiProvider::new(GeminiProviderOptions {
+            default_model: Some("gemini-3.8-flash-medium".into()),
+            ..Default::default()
+        }));
+    let provider = decorate(base_provider, &proto_init);
+
+    let run = |provider: Arc<dyn ModelProvider>| async move {
+        let req: ModelRequest = decode(json!({
+            "model": "gemini-3.8-flash-medium",
+            "system": [],
+            "messages": [],
+            "tools": [],
+            "maxOutputTokens": 256
+        }));
+        provider
+            .stream(req, AbortSignal::new())
+            .collect::<Vec<_>>()
+            .await
+    };
+
+    // 1. Concurrent premature 401s share one OAuth refresh; even a staggered
+    // caller that rejected the same stale token reuses the renewed credential.
+    oauth_plans.lock().unwrap().push_back(OAuthPlan::Success {
+        access: "fresh-1",
+        refresh: "ref-2",
+    });
+    for _ in 0..4 {
+        stream_plans
+            .lock()
+            .unwrap()
+            .push_back(ReplyPlan::OkText("healed"));
+    }
+    let batch = futures::future::join_all((0..4).map(|_| run(provider.clone()))).await;
+    for events in &batch {
+        let text: String = events
+            .iter()
+            .filter_map(|ev| match ev {
+                ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "healed", "{events:?}");
+    }
+    let reused = auth::force_refresh(&auth::generation().unwrap(), Some("stale-initial"))
+        .await
+        .unwrap();
+    assert_eq!(reused.access_token, "fresh-1");
+    assert_eq!(oauth_calls.load(Ordering::SeqCst), 1);
+
+    // 2. Upstream hop missing-credential 401 (HTTP and SSE) retries as service overload
+    // without touching /token or asking the user to sign in again.
+    oauth_calls.store(0, Ordering::SeqCst);
+    {
+        let mut sp_guard = stream_plans.lock().unwrap();
+        sp_guard.push_back(ReplyPlan::MissingCred401);
+        sp_guard.push_back(ReplyPlan::SseMissingCred401);
+        sp_guard.push_back(ReplyPlan::OkText("after-hop-drop"));
+    }
+    let hop_events = run(provider.clone()).await;
+    let hop_text: String = hop_events
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hop_text, "after-hop-drop", "{hop_events:?}");
+    assert_eq!(oauth_calls.load(Ordering::SeqCst), 0);
+
+    // 3. Mid-stream in-band 401 after checkpointed output renews the token and resumes cleanly.
+    oauth_plans.lock().unwrap().push_back(OAuthPlan::Success {
+        access: "fresh-2",
+        refresh: "ref-3",
+    });
+    {
+        let mut sp_guard = stream_plans.lock().unwrap();
+        sp_guard.push_back(ReplyPlan::MidStream401ThenResume {
+            checkpoint_text: "hello-",
+            continuation: "cont-1",
+        });
+        sp_guard.push_back(ReplyPlan::OkText("world"));
+    }
+    let mid_events = run(provider.clone()).await;
+    let mid_text: String = mid_events
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mid_text, "hello-world", "{mid_events:?}");
+    assert_eq!(oauth_calls.load(Ordering::SeqCst), 1);
+
+    // 4. Transient OAuth 503 during reactive renewal surfaces `antigravity_refresh_unavailable`
+    // (preserving the saved login) and recovers when the next bounded attempt succeeds.
+    oauth_calls.store(0, Ordering::SeqCst);
+    {
+        let mut op_guard = oauth_plans.lock().unwrap();
+        op_guard.push_back(OAuthPlan::Unavailable503);
+        op_guard.push_back(OAuthPlan::Success {
+            access: "fresh-3",
+            refresh: "ref-4",
+        });
+    }
+    {
+        let mut sp_guard = stream_plans.lock().unwrap();
+        sp_guard.push_back(ReplyPlan::InvalidAuth401);
+        sp_guard.push_back(ReplyPlan::InvalidAuth401);
+        sp_guard.push_back(ReplyPlan::OkText("recovered-after-oauth-503"));
+    }
+    let transient_oauth_events = run(provider.clone()).await;
+    let transient_oauth_text: String = transient_oauth_events
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        transient_oauth_text, "recovered-after-oauth-503",
+        "{transient_oauth_events:?}"
+    );
+    assert_eq!(auth::status()["needsLogin"], false);
+
+    // 5. Terminal OAuth `invalid_grant` on reactive 401 surfaces `antigravity_login_expired`.
+    oauth_plans
+        .lock()
+        .unwrap()
+        .push_back(OAuthPlan::InvalidGrant400);
+    stream_plans
+        .lock()
+        .unwrap()
+        .push_back(ReplyPlan::InvalidAuth401);
+    let expired_events = run(provider.clone()).await;
+    assert!(
+        expired_events.iter().any(|ev| matches!(
+            ev,
+            ModelStreamEvent::Error { error }
+                if error.code.as_ref().is_some_and(|code| code == "antigravity_login_expired")
+                    && error.kind == klaus_agent_core::types::errors::ProviderErrorKind::Auth
+        )),
+        "{expired_events:?}"
+    );
+    assert_eq!(auth::status()["needsLogin"], true);
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL");
+}

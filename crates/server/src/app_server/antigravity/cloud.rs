@@ -218,7 +218,7 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 13] = [
+const ERROR_TAGS: [&str; 17] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
     "antigravity_model_unlisted",
@@ -227,8 +227,12 @@ const ERROR_TAGS: [&str; 13] = [
     "antigravity_region_unsupported",
     "antigravity_account_disabled",
     "antigravity_account_restricted",
+    "antigravity_verification_required",
     "antigravity_permission_denied",
     "antigravity_auth_required",
+    "antigravity_login_expired",
+    "antigravity_refresh_unavailable",
+    "antigravity_not_signed_in",
     "antigravity_rate_limited",
     "antigravity_service_unavailable",
     "model_context_window_exceeded",
@@ -294,29 +298,34 @@ fn service_error(
         .iter()
         .any(|word| lower.contains(word));
     let explicit_quota = !explicit_rate
-        && (reasons.iter().any(|reason| {
-            matches!(
-                *reason,
-                "QUOTA_EXCEEDED"
-                    | "QUOTA_EXHAUSTED"
-                    | "CREDIT_BALANCE_EXHAUSTED"
-                    | "INSUFFICIENT_CREDITS"
-            )
-        }) || (!rate_wording
-            && ["quota", "allowance", "credit balance", "credits"]
-                .iter()
-                .any(|word| {
-                    lower.contains(word)
-                        && (lower.contains("exhaust")
-                            || lower.contains("exceed")
-                            || lower.contains("insufficient"))
-                })));
+        && (status == Some(402)
+            || reasons.iter().any(|reason| {
+                matches!(
+                    *reason,
+                    "QUOTA_EXCEEDED"
+                        | "QUOTA_EXHAUSTED"
+                        | "CREDIT_BALANCE_EXHAUSTED"
+                        | "INSUFFICIENT_CREDITS"
+                        | "INSUFFICIENT_G1_CREDITS_BALANCE"
+                        | "MONETIZATION_DENIED"
+                )
+            })
+            || (!rate_wording
+                && ["quota", "allowance", "credit balance", "credits"]
+                    .iter()
+                    .any(|word| {
+                        lower.contains(word)
+                            && (lower.contains("exhaust")
+                                || lower.contains("exceed")
+                                || lower.contains("insufficient")
+                                || lower.contains("reached")
+                                || lower.contains("too low"))
+                    })));
     let auth_reason = reasons.iter().any(|reason| {
         matches!(
             *reason,
             "ACCESS_TOKEN_EXPIRED"
                 | "ACCESS_TOKEN_INVALID"
-                | "CREDENTIALS_MISSING"
                 | "UNAUTHENTICATED"
                 | "INSUFFICIENT_AUTHENTICATION_SCOPES"
         )
@@ -392,36 +401,60 @@ fn service_error(
     ]
     .iter()
     .any(|phrase| lower.contains(phrase));
+    let validation_required = reasons.contains(&"VALIDATION_REQUIRED")
+        || lower.contains("verify your account")
+        || lower.contains("verification required");
+    // Every outbound cloud request carries a non-empty Bearer token (an absent
+    // local credential fails before the socket opens). A 401/UNAUTHENTICATED
+    // response reporting that credentials are missing — or an internal stub
+    // authentication drop after a multi-minute prefill — is an upstream proxy
+    // hop failure rather than a rejected user sign-in, so it belongs with the
+    // other retryable service capacity/routing faults.
+    let upstream_hop_credential_drop = (status == Some(401)
+        || service_code == Some("UNAUTHENTICATED"))
+        && (lower.contains("missing required authentication credential")
+            || reasons.contains(&"CREDENTIALS_MISSING")
+            || lower.contains("extensible_stubs"));
     // Upstream capacity verdicts arrive shaped like ordinary refusals but clear
     // on their own, so the retry schedule can wait them out instead of failing
     // the turn fast. HTTP 408 is the service's own request-timeout verdict.
     let transient_overload = status == Some(408)
+        || upstream_hop_credential_drop
         || matches!(
             service_code,
             Some(
                 "PREFILL_QUEUE_OVERLOADED"
+                    | "PREFILL_QUEUE_PREEMPTED"
                     | "DECODE_PREEMPTED"
                     | "TPU_EXECUTE_ERROR"
                     | "MODEL_CAPACITY_EXHAUSTED"
                     | "THROTTLED_TASK_LIMIT"
+                    | "OVERLOADED_TOO_MANY_RETRIES_PER_REQUEST"
+                    | "OVERLOADED_TOO_MANY_RETRIES_PER_STUB"
             )
         )
         || reasons.iter().any(|reason| {
             matches!(
                 *reason,
                 "PREFILL_QUEUE_OVERLOADED"
+                    | "PREFILL_QUEUE_PREEMPTED"
                     | "DECODE_PREEMPTED"
                     | "TPU_EXECUTE_ERROR"
                     | "MODEL_CAPACITY_EXHAUSTED"
                     | "THROTTLED_TASK_LIMIT"
+                    | "OVERLOADED_TOO_MANY_RETRIES_PER_REQUEST"
+                    | "OVERLOADED_TOO_MANY_RETRIES_PER_STUB"
             )
         })
         || (!explicit_quota
             && [
                 "overloaded prefill queue",
+                "overloaded local recovery queue",
                 "thread is cancelled before we get prefill results",
                 "preempted out of decode queue",
                 "tpu device returned error",
+                "pony address resolution failed",
+                "incomplete envelope: unexpected eof",
             ]
             .iter()
             .any(|phrase| lower.contains(phrase)));
@@ -431,7 +464,11 @@ fn service_error(
         "antigravity_account_disabled"
     } else if region_unsupported {
         "antigravity_region_unsupported"
-    } else if status == Some(401) || service_code == Some("UNAUTHENTICATED") || auth_reason {
+    } else if validation_required {
+        "antigravity_verification_required"
+    } else if !transient_overload
+        && (status == Some(401) || service_code == Some("UNAUTHENTICATED") || auth_reason)
+    {
         "antigravity_auth_required"
     } else if explicit_quota {
         "antigravity_quota_exhausted"
@@ -601,10 +638,22 @@ fn transport_error(stage: TransportStage) -> GeminiApiError {
     ))
 }
 
-/// Replays the request once, and only for a connect-stage transport failure —
-/// the one stage that proves the request bytes never reached the service.
-/// Post-upload failures surface immediately so an inference request is never
-/// duplicated, and the stage stays in the error message as a URL-free
+fn map_refresh_failure(refresh_err: String, original: GeminiApiError) -> GeminiApiError {
+    match refresh_err.as_str() {
+        "antigravity_login_expired"
+        | "antigravity_refresh_unavailable"
+        | "antigravity_credential_changed"
+        | "antigravity_not_signed_in" => api_error(refresh_err),
+        _ => original,
+    }
+}
+
+/// Replays the request once on a connect-stage transport failure — the one
+/// stage that proves the request bytes never reached the service — and renews
+/// the OAuth access token once on a service authentication refusal when the
+/// stored credential was invalidated ahead of its local expiry timestamp.
+/// Post-upload transport failures surface immediately so an inference request
+/// is never duplicated, and the stage stays in the error message as a URL-free
 /// diagnostic so callers can classify the network verdict correctly.
 async fn send(
     method: &str,
@@ -621,18 +670,34 @@ async fn send(
         extra_headers.clone(),
     )
     .await;
-    let Err(error) = first else { return first };
+    let Err((error, used_token)) = first else {
+        return first.map(|(response, _)| response).map_err(|(err, _)| err);
+    };
     let replayable =
         error.status.is_none() && error.message == transport_error(TransportStage::Connect).message;
-    if !replayable {
-        return Err(error);
+    if replayable {
+        return tokio::select! {
+            _ = signal.cancelled() => Err(api_error("antigravity_request_cancelled")),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {
+                send_once(method, body, generation, signal, extra_headers)
+                    .await
+                    .map(|(response, _)| response)
+                    .map_err(|(err, _)| err)
+            }
+        };
     }
-    tokio::select! {
-        _ = signal.cancelled() => Err(api_error("antigravity_request_cancelled")),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {
-            send_once(method, body, generation, signal, extra_headers).await
+    if let Some(generation) = generation {
+        if is_auth_refusal_message(&error.message) && !signal.is_cancelled() {
+            return match auth::force_refresh(generation, used_token.as_deref()).await {
+                Ok(_) => send_once(method, body, Some(generation), signal, extra_headers)
+                    .await
+                    .map(|(response, _)| response)
+                    .map_err(|(err, _)| err),
+                Err(refresh_err) => Err(map_refresh_failure(refresh_err, error)),
+            };
         }
     }
+    Err(error)
 }
 
 async fn send_once(
@@ -641,10 +706,13 @@ async fn send_once(
     generation: Option<&str>,
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
-) -> Result<reqwest::Response, GeminiApiError> {
+) -> Result<(reqwest::Response, String), (GeminiApiError, Option<String>)> {
     ensure_identity().await;
-    let credential = auth::credential(generation).await.map_err(api_error)?;
-    let base = api_base().map_err(api_error)?;
+    let credential = auth::credential(generation)
+        .await
+        .map_err(|err| (api_error(err), None))?;
+    let used_token = credential.access_token;
+    let base = api_base().map_err(|err| (api_error(err), Some(used_token.clone())))?;
     let suffix = if method == "streamGenerateContent" {
         "?alt=sse"
     } else {
@@ -652,7 +720,7 @@ async fn send_once(
     };
     let url = format!("{base}/v1internal:{method}{suffix}");
     let (url, egress_headers) = super::egress::route(&url);
-    let http = http_client().map_err(api_error)?;
+    let http = http_client().map_err(|err| (api_error(err), Some(used_token.clone())))?;
     let mut request = match &body {
         Some(bytes) => http
             .post(url)
@@ -672,9 +740,9 @@ async fn send_once(
         }
         request = request.header(name, value);
     }
-    request = request.bearer_auth(&credential.access_token);
+    request = request.bearer_auth(&used_token);
     let response = tokio::select! {
-        _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
+        _ = signal.cancelled() => return Err((api_error("antigravity_request_cancelled"), Some(used_token))),
         response = request.send() => match response {
             Ok(response) => response,
             // A connect error is the only reqwest stage that proves the
@@ -686,12 +754,15 @@ async fn send_once(
                 } else {
                     TransportStage::Sent
                 };
-                return Err(transport_error(stage));
+                return Err((transport_error(stage), Some(used_token)));
             }
         },
     };
     if generation.is_some_and(|generation| !auth::is_current(generation)) {
-        return Err(api_error("antigravity_credential_changed"));
+        return Err((
+            api_error("antigravity_credential_changed"),
+            Some(used_token),
+        ));
     }
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -705,10 +776,15 @@ async fn send_once(
                     .map(|value| (name.to_string(), value.to_string()))
             })
             .collect();
-        let bytes = read_refusal_body(response, generation, signal).await?;
-        return Err(service_error(Some(status), &bytes, headers));
+        let bytes = read_refusal_body(response, generation, signal)
+            .await
+            .map_err(|err| (err, Some(used_token.clone())))?;
+        return Err((
+            service_error(Some(status), &bytes, headers),
+            Some(used_token),
+        ));
     }
-    Ok(response)
+    Ok((response, used_token))
 }
 
 pub(super) async fn rpc(
@@ -1822,46 +1898,21 @@ async fn establish_initial_leg_for_generation(
         .filter(|value| *value > 0)
         .map(|value| value as u64);
 
-    let mut renewed = false;
-    loop {
-        let mut project = match super::project(Some(generation), signal).await {
-            Ok(project) => project,
-            Err(err) if !renewed && is_auth_refusal_message(&err) && !signal.is_cancelled() => {
-                renewed = true;
-                if auth::force_refresh(generation).await.is_ok() {
-                    continue;
-                }
-                return Err(api_error(err));
-            }
-            Err(err) => return Err(api_error(err)),
-        };
-        match send_stream_leg(
-            generation,
-            model,
-            &mut project,
-            user_prompt_id,
-            &base_request,
-            None,
-            signal,
-            extra_headers,
-        )
+    let mut project = super::project(Some(generation), signal)
         .await
-        {
-            Ok(response) => {
-                return Ok((project, base_request, initial_max_output_tokens, response))
-            }
-            Err(err)
-                if !renewed && is_auth_refusal_message(&err.message) && !signal.is_cancelled() =>
-            {
-                renewed = true;
-                if auth::force_refresh(generation).await.is_ok() {
-                    continue;
-                }
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
+        .map_err(api_error)?;
+    let response = send_stream_leg(
+        generation,
+        model,
+        &mut project,
+        user_prompt_id,
+        &base_request,
+        None,
+        signal,
+        extra_headers,
+    )
+    .await?;
+    Ok((project, base_request, initial_max_output_tokens, response))
 }
 
 #[async_trait::async_trait]
@@ -1930,7 +1981,9 @@ impl GeminiClient for CloudClient {
         Ok(Box::pin(async_stream::stream! {
             let mut tracker = StreamContinuationTracker::new(initial_max_output_tokens);
             let mut response = response;
+            let mut leg_token = auth::peek_access_token(&generation);
             let mut in_stream_auth_renewed = false;
+            let mut pre_candidate_overload_retries = 0usize;
             'leg: loop {
                 let mut stream = response.bytes_stream();
                 let mut buffered = Vec::new();
@@ -2051,12 +2104,15 @@ impl GeminiClient for CloudClient {
                     && !tracker.has_prior_leg
                     && leg_err.as_ref().is_some_and(|err| is_rotatable_message(&err.message))
                 {
-                    let first_err = leg_err.take().unwrap();
-                    if !in_stream_auth_renewed && is_auth_refusal_message(&first_err.message) {
+                    let mut first_err = leg_err.take().unwrap();
+                    if !in_stream_auth_renewed
+                        && is_auth_refusal_message(&first_err.message)
+                        && !signal.is_cancelled()
+                    {
                         in_stream_auth_renewed = true;
-                        if auth::force_refresh(&generation).await.is_ok() {
-                            if let Ok((next_proj, next_base, _, next_resp)) =
-                                establish_initial_leg_for_generation(
+                        match auth::force_refresh(&generation, leg_token.as_deref()).await {
+                            Ok(_) => {
+                                match establish_initial_leg_for_generation(
                                     &generation,
                                     &params,
                                     &model,
@@ -2065,16 +2121,28 @@ impl GeminiClient for CloudClient {
                                     &extra_headers,
                                 )
                                 .await
-                            {
-                                project = next_proj;
-                                base_request = next_base;
-                                response = next_resp;
-                                tracker = StreamContinuationTracker::new(initial_max_output_tokens);
-                                continue 'leg;
+                                {
+                                    Ok((next_proj, next_base, _, next_resp)) => {
+                                        project = next_proj;
+                                        base_request = next_base;
+                                        response = next_resp;
+                                        leg_token = auth::peek_access_token(&generation);
+                                        tracker =
+                                            StreamContinuationTracker::new(initial_max_output_tokens);
+                                        continue 'leg;
+                                    }
+                                    Err(retry_err) => {
+                                        first_err = retry_err;
+                                    }
+                                }
+                            }
+                            Err(refresh_err) => {
+                                first_err = map_refresh_failure(refresh_err, first_err);
                             }
                         }
                     }
                     if pooled
+                        && is_rotatable_message(&first_err.message)
                         && auth::account_count() > 1
                         && !attempted.contains(&generation)
                     {
@@ -2103,6 +2171,7 @@ impl GeminiClient for CloudClient {
                                     project = next_proj;
                                     base_request = next_base;
                                     response = next_resp;
+                                    leg_token = auth::peek_access_token(&generation);
                                     tracker =
                                         StreamContinuationTracker::new(initial_max_output_tokens);
                                     continue 'leg;
@@ -2124,6 +2193,70 @@ impl GeminiClient for CloudClient {
                     } else {
                         leg_err = Some(first_err);
                     }
+                } else if !tracker.leg.saw_candidate
+                    && !tracker.has_prior_leg
+                    && pre_candidate_overload_retries < 2
+                    && leg_err
+                        .as_ref()
+                        .is_some_and(|err| has_tag_prefix(&err.message, "antigravity_service_unavailable"))
+                    && !signal.is_cancelled()
+                {
+                    let backoff_ms = MID_STREAM_RETRY_BASE_BACKOFF_MS
+                        .saturating_mul(1u64 << pre_candidate_overload_retries);
+                    pre_candidate_overload_retries += 1;
+                    let _ = leg_err.take();
+                    if let Err(error) =
+                        sleep_for_mid_stream_retry(backoff_ms, &generation, &signal).await
+                    {
+                        if !signal.is_cancelled() {
+                            yield Err(error);
+                        }
+                        return;
+                    }
+                    match establish_initial_leg_for_generation(
+                        &generation,
+                        &params,
+                        &model,
+                        &user_prompt_id,
+                        &signal,
+                        &extra_headers,
+                    )
+                    .await
+                    {
+                        Ok((next_proj, next_base, _, next_resp)) => {
+                            project = next_proj;
+                            base_request = next_base;
+                            response = next_resp;
+                            leg_token = auth::peek_access_token(&generation);
+                            tracker = StreamContinuationTracker::new(initial_max_output_tokens);
+                            continue 'leg;
+                        }
+                        Err(retry_err) => {
+                            yield Err(retry_err);
+                            return;
+                        }
+                    }
+                } else if (tracker.leg.saw_candidate || tracker.has_prior_leg)
+                    && leg_err.as_ref().is_some_and(|err| is_auth_refusal_message(&err.message))
+                    && !signal.is_cancelled()
+                {
+                    // An in-band SSE error after HTTP 200 and emitted chunks is a
+                    // mid-stream interruption unless OAuth renewal proves the saved
+                    // refresh token itself was revoked.
+                    let _ = leg_err.take();
+                    leg_err = match auth::force_refresh(&generation, leg_token.as_deref()).await {
+                        Err(refresh_err)
+                            if matches!(
+                                refresh_err.as_str(),
+                                "antigravity_login_expired"
+                                    | "antigravity_credential_changed"
+                                    | "antigravity_not_signed_in"
+                            ) =>
+                        {
+                            Some(api_error(refresh_err))
+                        }
+                        _ => Some(api_error("antigravity_stream_interrupted")),
+                    };
                 }
                 match tracker.evaluate_leg_end(leg_err) {
                     LegEndAction::FinishCleanly => return,
@@ -2173,6 +2306,7 @@ impl GeminiClient for CloudClient {
                             {
                                 Ok(next_response) => {
                                     response = next_response;
+                                    leg_token = auth::peek_access_token(&generation);
                                     continue 'leg;
                                 }
                                 Err(dial_err) => match tracker.evaluate_dial_error(dial_err) {
@@ -2260,9 +2394,12 @@ mod tests {
 
         for service_status in [
             "PREFILL_QUEUE_OVERLOADED",
+            "PREFILL_QUEUE_PREEMPTED",
             "DECODE_PREEMPTED",
             "TPU_EXECUTE_ERROR",
             "MODEL_CAPACITY_EXHAUSTED",
+            "OVERLOADED_TOO_MANY_RETRIES_PER_REQUEST",
+            "OVERLOADED_TOO_MANY_RETRIES_PER_STUB",
         ] {
             let bytes = serde_json::to_vec(&json!({
                 "error": {
@@ -2300,6 +2437,64 @@ mod tests {
             "antigravity_service_unavailable"
         );
         assert!(is_retryable(&classified));
+
+        for (http_status, payload) in [
+            (
+                Some(401),
+                json!({
+                    "error": {
+                        "code": 401,
+                        "status": "UNAUTHENTICATED",
+                        "message": "Request is missing required authentication credential. Expected OAuth 2 access token, login cookie or other valid authentication credential."
+                    }
+                }),
+            ),
+            (
+                Some(401),
+                json!({
+                    "error": {
+                        "code": 401,
+                        "status": "UNAUTHENTICATED",
+                        "message": "Upstream credential missing.",
+                        "details": [{"reason": "CREDENTIALS_MISSING"}]
+                    }
+                }),
+            ),
+            (
+                Some(400),
+                json!({
+                    "error": {
+                        "code": 400,
+                        "status": "INVALID_ARGUMENT",
+                        "message": "Pony address resolution failed for upstream target."
+                    }
+                }),
+            ),
+            (
+                Some(500),
+                json!({
+                    "error": {
+                        "code": 500,
+                        "status": "UNKNOWN",
+                        "message": "incomplete envelope: unexpected EOF"
+                    }
+                }),
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            for error in [
+                service_error(http_status, &bytes, Default::default()),
+                decode_frame(&bytes, None).unwrap_err(),
+            ] {
+                let classified = classify_error(&error_details(&error));
+                assert_eq!(classified.kind, ProviderErrorKind::Overloaded, "{payload}");
+                assert_eq!(
+                    classified.code.as_ref().unwrap(),
+                    "antigravity_service_unavailable"
+                );
+                assert!(is_retryable(&classified), "{payload}");
+            }
+        }
     }
 
     #[test]
@@ -2326,6 +2521,11 @@ mod tests {
                 "You are not eligible to use Antigravity.",
                 None,
                 "antigravity_account_restricted",
+            ),
+            (
+                "Verify your account to continue.",
+                Some("VALIDATION_REQUIRED"),
+                "antigravity_verification_required",
             ),
             (
                 "Access has been disabled.",
@@ -2402,7 +2602,14 @@ mod tests {
             (
                 429,
                 "RESOURCE_EXHAUSTED",
-                "Quota is exhausted.",
+                "Individual quota reached. Please upgrade your subscription.",
+                "antigravity_quota_exhausted",
+                ProviderErrorKind::Quota,
+            ),
+            (
+                402,
+                "FAILED_PRECONDITION",
+                "Your credits balance is too low to continue.",
                 "antigravity_quota_exhausted",
                 ProviderErrorKind::Quota,
             ),
@@ -2455,6 +2662,27 @@ mod tests {
                 assert!(classified.message.contains(message));
                 assert!(!classified.message.contains("not-public"));
             }
+        }
+        for reason in ["INSUFFICIENT_G1_CREDITS_BALANCE", "MONETIZATION_DENIED"] {
+            let payload = json!({
+                "error": {
+                    "code": 403,
+                    "status": "PERMISSION_DENIED",
+                    "message": "Action denied.",
+                    "details": [{"reason": reason}]
+                }
+            })
+            .to_string();
+            let classified = classify_error(&error_details(&service_error(
+                Some(403),
+                payload.as_bytes(),
+                Default::default(),
+            )));
+            assert_eq!(classified.kind, ProviderErrorKind::Quota, "{reason}");
+            assert_eq!(
+                classified.code.as_ref().unwrap(),
+                "antigravity_quota_exhausted"
+            );
         }
         let iam=json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied on projects/fixture/publishers/google/models/fixture.","details":[{"reason":"IAM_PERMISSION_DENIED"}]}}).to_string();
         let classified = classify_error(&error_details(&service_error(

@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261114_antigravity_auth_and_error_classification.rs"]
+mod r20261114_antigravity_auth_and_error_classification;
+
 #[path = "regressions/r20261114_side_task_prefix_and_fork_cuts.rs"]
 mod r20261114_side_task_prefix_and_fork_cuts;
 

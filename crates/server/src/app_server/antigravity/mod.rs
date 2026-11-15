@@ -703,7 +703,7 @@ pub async fn transcribe_audio(
     let payload = catalog_payload(true).await?;
     let model = native_model(&payload, "audioTranscriptionModelIds", None)?;
     let credential = auth::credential(Some(&generation)).await?;
-    let response = audio::transcribe(
+    let response = match audio::transcribe(
         audio::AudioInput {
             audio_base64: &params.audio_base64,
             mime_type: Some(&params.mime_type),
@@ -713,9 +713,39 @@ pub async fn transcribe_audio(
             access_token: &credential.access_token,
             model: &model,
         },
-        signal,
+        signal.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error)
+            if error == "antigravity_transcription_authentication_required"
+                && !signal.is_cancelled() =>
+        {
+            match auth::force_refresh(&generation, Some(&credential.access_token)).await {
+                Ok(renewed) => {
+                    audio::transcribe(
+                        audio::AudioInput {
+                            audio_base64: &params.audio_base64,
+                            mime_type: Some(&params.mime_type),
+                            language: params.language.as_deref(),
+                        },
+                        audio::Credentials {
+                            access_token: &renewed.access_token,
+                            model: &model,
+                        },
+                        signal,
+                    )
+                    .await?
+                }
+                Err(refresh_err) if refresh_err == "antigravity_credential_changed" => {
+                    return Err(refresh_err);
+                }
+                Err(_) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     if !auth::is_current(&generation) {
         return Err("antigravity_credential_changed".into());
     }
@@ -725,37 +755,14 @@ pub async fn transcribe_audio(
 async fn account_usage(entry: &auth::StoredAccount) -> Result<Value, String> {
     let generation = entry.generation.as_str();
     let signal = AbortSignal::new();
-    let project = match project(Some(generation), &signal).await {
-        Ok(project) => project,
-        Err(error) if cloud::is_auth_refusal_message(&error) => {
-            if auth::force_refresh(generation).await.is_ok() {
-                project(Some(generation), &signal).await?
-            } else {
-                return Err(error);
-            }
-        }
-        Err(error) => return Err(error),
-    };
-    let mut quota = cloud::rpc(
+    let project = project(Some(generation), &signal).await?;
+    let quota = cloud::rpc(
         "retrieveUserQuota",
         json!({"project":project}),
         Some(generation),
         &signal,
     )
     .await;
-    if quota
-        .as_ref()
-        .is_err_and(|err| cloud::is_auth_refusal_message(err))
-        && auth::force_refresh(generation).await.is_ok()
-    {
-        quota = cloud::rpc(
-            "retrieveUserQuota",
-            json!({"project":project}),
-            Some(generation),
-            &signal,
-        )
-        .await;
-    }
     let summary = cloud::rpc(
         "retrieveUserQuotaSummary",
         json!({"project":project}),
@@ -1108,32 +1115,12 @@ async fn generate_content_with_rotation(
         let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
         let payload = catalog_payload(true).await?;
         let model = native_model(&payload, model_field, requested_model)?;
-        let mut renewed = false;
-        let outcome: Result<Value, String> = loop {
-            let project = match project(Some(&generation), signal).await {
-                Ok(project) => project,
-                Err(err) if !renewed && cloud::is_auth_refusal_message(&err) => {
-                    renewed = true;
-                    if auth::force_refresh(&generation).await.is_ok() {
-                        continue;
-                    }
-                    break Err(err);
-                }
-                Err(err) => break Err(err),
-            };
+        let outcome: Result<Value, String> = async {
+            let project = project(Some(&generation), signal).await?;
             let body = cloud::envelope(&project, &model, build_request(&model), request_type);
-            match cloud::rpc("generateContent", body, Some(&generation), signal).await {
-                Ok(response) => break Ok(response),
-                Err(err) if !renewed && cloud::is_auth_refusal_message(&err) => {
-                    renewed = true;
-                    if auth::force_refresh(&generation).await.is_ok() {
-                        continue;
-                    }
-                    break Err(err);
-                }
-                Err(err) => break Err(err),
-            }
-        };
+            cloud::rpc("generateContent", body, Some(&generation), signal).await
+        }
+        .await;
         match outcome {
             Ok(response) => return Ok((generation, model, response)),
             Err(err)

@@ -623,12 +623,23 @@ pub(super) fn is_head_generation(generation: &str) -> bool {
         .is_some_and(|head| head.generation == generation)
 }
 
-pub(crate) async fn credential(expected: Option<&str>) -> Result<Credential, String> {
-    credential_inner(expected, false).await
+/// Read the current stored access token for `generation` without refreshing.
+pub(super) fn peek_access_token(generation: &str) -> Option<String> {
+    accounts()
+        .into_iter()
+        .find(|entry| entry.generation == generation)
+        .map(|entry| entry.credential.access_token)
 }
 
-pub(super) async fn force_refresh(generation: &str) -> Result<Credential, String> {
-    credential_inner(Some(generation), true).await
+pub(crate) async fn credential(expected: Option<&str>) -> Result<Credential, String> {
+    credential_inner(expected, None, false).await
+}
+
+pub(super) async fn force_refresh(
+    generation: &str,
+    rejected_access_token: Option<&str>,
+) -> Result<Credential, String> {
+    credential_inner(Some(generation), rejected_access_token, true).await
 }
 
 /// Resolve the active head's credential, advancing past expired queued heads when
@@ -658,7 +669,11 @@ pub(super) async fn active_or_rotated_credential() -> Result<Credential, String>
     }
 }
 
-async fn credential_inner(expected: Option<&str>, force: bool) -> Result<Credential, String> {
+async fn credential_inner(
+    expected: Option<&str>,
+    rejected_access_token: Option<&str>,
+    force: bool,
+) -> Result<Credential, String> {
     let mut target = {
         let _guard = credential_lock().lock().await;
         let entries = accounts();
@@ -677,11 +692,14 @@ async fn credential_inner(expected: Option<&str>, force: bool) -> Result<Credent
         return Err("antigravity_login_expired".into());
     }
     let now = chrono::Utc::now().timestamp_millis();
-    if !force
-        && target
-            .credential
-            .expires_at
-            .is_none_or(|expiry| expiry > now + REFRESH_SKEW_MS)
+    let fresh_window = target
+        .credential
+        .expires_at
+        .is_none_or(|expiry| expiry > now + REFRESH_SKEW_MS);
+    if fresh_window
+        && (!force
+            || rejected_access_token
+                .is_some_and(|rejected| target.credential.access_token != rejected))
     {
         return Ok(target.credential);
     }
@@ -699,13 +717,12 @@ async fn credential_inner(expected: Option<&str>, force: bool) -> Result<Credent
     if target.needs_login {
         return Err("antigravity_login_expired".into());
     }
-    if (!force
-        && target
-            .credential
-            .expires_at
-            .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp_millis() + REFRESH_SKEW_MS))
-        || (force && target.credential.access_token != pre_refresh_access)
-    {
+    let still_fresh = target
+        .credential
+        .expires_at
+        .is_none_or(|expiry| expiry > chrono::Utc::now().timestamp_millis() + REFRESH_SKEW_MS);
+    let stale_access = rejected_access_token.unwrap_or(pre_refresh_access.as_str());
+    if still_fresh && (!force || target.credential.access_token != stale_access) {
         return Ok(target.credential);
     }
     let refresh_token = target

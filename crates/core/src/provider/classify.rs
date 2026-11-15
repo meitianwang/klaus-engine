@@ -338,10 +338,14 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
             | "antigravity_region_unsupported"
             | "antigravity_account_disabled"
             | "antigravity_account_restricted"
+            | "antigravity_verification_required"
             | "antigravity_permission_denied"
             | "image_preprocessing_failed",
         ) => Some(ProviderErrorKind::InvalidRequest),
-        Some("antigravity_auth_required") => Some(ProviderErrorKind::Auth),
+        Some(
+            "antigravity_auth_required" | "antigravity_login_expired" | "antigravity_not_signed_in",
+        ) => Some(ProviderErrorKind::Auth),
+        Some("antigravity_refresh_unavailable") => Some(ProviderErrorKind::Timeout),
         Some("antigravity_quota_exhausted") => Some(ProviderErrorKind::Quota),
         Some("antigravity_rate_limited") => Some(ProviderErrorKind::RateLimit),
         Some("antigravity_service_unavailable") => Some(ProviderErrorKind::Overloaded),
