@@ -1007,6 +1007,137 @@ fn identity_ua_carries_the_full_hub_shape() {
 }
 
 #[tokio::test]
+async fn startup_surfaces_mirror_the_hub_control_plane_calls() {
+    let fixture = fixture().await;
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    auth::adopt(auth::Credential {
+        access_token: "fixture".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: None,
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let result = models(true).await.unwrap();
+    assert!(result["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == "gemini-4-argon-medium"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let done = fixture.requests.lock().unwrap().iter().any(|request| {
+                request["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(":buildWithGooglePlugins?page_size=1000")
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the one-shot startup surfaces must complete");
+    let (experiments_body, scoped_body) = {
+        let requests = fixture.requests.lock().unwrap();
+        let path_of = |request: &Value| request["path"].as_str().unwrap_or_default().to_string();
+        let experiments = requests
+            .iter()
+            .find(|request| path_of(request).ends_with(":listExperiments"))
+            .expect("listExperiments fires once per generation");
+        let scoped = requests
+            .iter()
+            .find(|request| {
+                path_of(request).ends_with(":loadCodeAssist")
+                    && request["body"]["cloudaicompanionProject"] == "fixture-project"
+            })
+            .expect("the project-scoped loadCodeAssist fires");
+        (experiments["body"].clone(), scoped["body"].clone())
+    };
+    assert_eq!(
+        experiments_body,
+        json!({"project":"fixture-project","metadata":{"updateChannel":"stable"}})
+    );
+    assert_eq!(
+        scoped_body,
+        json!({"cloudaicompanionProject":"fixture-project","metadata":{"ideType":"ANTIGRAVITY"}})
+    );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
+async fn heartbeat_repeats_the_paired_control_plane_poll() {
+    let fixture = fixture().await;
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS", "1");
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    auth::adopt(auth::Credential {
+        access_token: "fixture".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: None,
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let _ = models(true).await.unwrap();
+    let fetches = || {
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(":fetchAvailableModels")
+            })
+            .count()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while fetches() < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the heartbeat must keep the paired poll alive");
+    let minimal = fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["path"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with(":loadCodeAssist")
+                && request["body"] == json!({"metadata":{"ideType":"ANTIGRAVITY"}})
+        })
+        .count();
+    assert!(
+        minimal >= 2,
+        "each heartbeat tick revalidates the account: {minimal}"
+    );
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
 async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selection() {
     let fixture = fixture().await;
     set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &fixture.endpoint);
@@ -1057,7 +1188,19 @@ async fn catalog_identity_changes_discard_legacy_snapshots_before_model_selectio
         auth::logout().await.unwrap();
     }
     let requests = fixture.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    let fetches = requests
+        .iter()
+        .filter(|request| {
+            request["path"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with(":fetchAvailableModels")
+        })
+        .count();
+    assert_eq!(
+        fetches, 2,
+        "each identity generation refreshes the catalog exactly once"
+    );
     for request in requests.iter() {
         let ua = request["userAgent"].as_str().unwrap();
         assert!(

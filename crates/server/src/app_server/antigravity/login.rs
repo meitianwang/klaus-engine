@@ -513,10 +513,16 @@ async fn exchange(
 ) -> Result<auth::Credential, &'static str> {
     let (client_id, client_secret) = auth::oauth_client()?;
     let client = cloud::http_client().map_err(|_| "antigravity_login_network_error")?;
+    let (endpoint, egress_headers) = super::egress::route(&authorization.endpoints.token);
     let started = chrono::Utc::now().timestamp_millis();
-    let response = client
-        .post(&authorization.endpoints.token)
-        .timeout(Duration::from_secs(30))
+    let mut request = client
+        .post(endpoint)
+        .header("user-agent", cloud::TOKEN_ENDPOINT_USER_AGENT)
+        .timeout(Duration::from_secs(30));
+    for (name, value) in egress_headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .form(&[
             ("client_id", client_id),
             ("client_secret", client_secret),

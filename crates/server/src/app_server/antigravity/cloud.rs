@@ -48,6 +48,10 @@ pub(super) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
 const FALLBACK_HUB_VERSION: &str = "2.32.1";
 const FALLBACK_HUB_CL: &str = "1021296516";
 
+/// The token endpoint sees the Go HTTP stack's default client identity rather
+/// than the hub protocol user agent that every v1internal call carries.
+pub(super) const TOKEN_ENDPOINT_USER_AGENT: &str = "Go-http-client/2.0";
+
 /// Identity tokens end up inside request headers, so values read from the
 /// environment or from disk are accepted only when they fit a conservative
 /// header-safe character set.
@@ -604,7 +608,7 @@ fn transport_error(stage: TransportStage) -> GeminiApiError {
 /// diagnostic so callers can classify the network verdict correctly.
 async fn send(
     method: &str,
-    body: Vec<u8>,
+    body: Option<Vec<u8>>,
     generation: Option<&str>,
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
@@ -633,7 +637,7 @@ async fn send(
 
 async fn send_once(
     method: &str,
-    body: Vec<u8>,
+    body: Option<Vec<u8>>,
     generation: Option<&str>,
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
@@ -647,16 +651,22 @@ async fn send_once(
         ""
     };
     let url = format!("{base}/v1internal:{method}{suffix}");
+    let (url, egress_headers) = super::egress::route(&url);
     let http = http_client().map_err(api_error)?;
-    let mut request = http.post(url).header("content-type", "application/json");
+    let mut request = match &body {
+        Some(bytes) => http
+            .post(url)
+            .header("content-type", "application/json")
+            .body(bytes.clone()),
+        None => http.get(url),
+    };
     if method != "streamGenerateContent" {
         // Control-plane RPCs stay bounded. The inference stream carries no
         // adapter-side total deadline: engine-level idle/total stream budgets
         // own it, and a long prefill or generation must not be cut short here.
         request = request.timeout(std::time::Duration::from_secs(180));
     }
-    let mut request = request.body(body);
-    for (name, value) in extra_headers {
+    for (name, value) in extra_headers.into_iter().chain(egress_headers) {
         if name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("host") {
             continue;
         }
@@ -708,7 +718,26 @@ pub(super) async fn rpc(
     signal: &AbortSignal,
 ) -> Result<Value, String> {
     let bytes = serde_json::to_vec(&body).map_err(|_| "antigravity_request_invalid")?;
-    let response = send(method, bytes, generation, signal, Vec::new())
+    send_json(method, Some(bytes), generation, signal).await
+}
+
+/// Body-less GET variant for the catalog-adjacent surfaces the hub client
+/// reads without a request payload.
+pub(super) async fn rpc_get(
+    method: &str,
+    generation: Option<&str>,
+    signal: &AbortSignal,
+) -> Result<Value, String> {
+    send_json(method, None, generation, signal).await
+}
+
+async fn send_json(
+    method: &str,
+    body: Option<Vec<u8>>,
+    generation: Option<&str>,
+    signal: &AbortSignal,
+) -> Result<Value, String> {
+    let response = send(method, body, generation, signal, Vec::new())
         .await
         .map_err(|e| e.message)?;
     let bytes = tokio::select! {
@@ -1463,7 +1492,7 @@ async fn send_stream_leg(
     )?;
     match send(
         "streamGenerateContent",
-        body,
+        Some(body),
         Some(generation),
         signal,
         extra_headers.to_vec(),
@@ -1487,7 +1516,7 @@ async fn send_stream_leg(
             )?;
             match send(
                 "streamGenerateContent",
-                retry_body,
+                Some(retry_body),
                 Some(generation),
                 signal,
                 extra_headers.to_vec(),

@@ -723,10 +723,16 @@ async fn credential_inner(expected: Option<&str>, force: bool) -> Result<Credent
     let endpoint = std::env::var("KLAUS_ANTIGRAVITY_OAUTH_URL")
         .unwrap_or_else(|_| "https://oauth2.googleapis.com/token".into());
     cloud::validate_endpoint(&endpoint)?;
+    let (endpoint, egress_headers) = super::egress::route(&endpoint);
     let started = chrono::Utc::now().timestamp_millis();
-    let response = cloud::http_client()?
+    let mut request = cloud::http_client()?
         .post(endpoint)
-        .timeout(Duration::from_secs(30))
+        .header("user-agent", cloud::TOKEN_ENDPOINT_USER_AGENT)
+        .timeout(Duration::from_secs(30));
+    for (name, value) in egress_headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),

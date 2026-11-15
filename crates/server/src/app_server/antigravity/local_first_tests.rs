@@ -101,6 +101,15 @@ impl CloudFixture {
     fn requests(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
+
+    fn requests_to(&self, suffix: &str) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|target| target.ends_with(suffix))
+            .count()
+    }
 }
 
 struct Environment(Option<OsString>);
@@ -223,7 +232,7 @@ async fn cold_and_inflight_reads_answer_from_the_baseline_with_one_refresh() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        server.requests(),
+        server.requests_to(":fetchAvailableModels"),
         1,
         "all readers share the in-flight background refresh"
     );
@@ -279,7 +288,7 @@ async fn a_stale_credential_snapshot_paints_first_and_revalidates_behind_the_cal
     let rows = response["result"]["models"].as_array().unwrap();
     assert!(rows.iter().any(|row| row["id"] == "live-model"));
     assert!(!rows.iter().any(|row| row["id"] == "stale-only"));
-    assert_eq!(server.requests(), 1);
+    assert_eq!(server.requests_to(":fetchAvailableModels"), 1);
 
     // An unchanged revalidation keeps the client quiet instead of pulsing UI caches.
     antigravity::set_config_root(&root.path().join("other"));
@@ -299,7 +308,7 @@ async fn a_stale_credential_snapshot_paints_first_and_revalidates_behind_the_cal
         .await,
         "disk snapshot revalidation must settle"
     );
-    assert_eq!(server.requests(), 2);
+    assert_eq!(server.requests_to(":fetchAvailableModels"), 2);
     client
         .send(json!({"id":104,"method":"antigravity/models","params":{"read":"cached"}}))
         .await;
@@ -338,12 +347,12 @@ async fn a_failed_refresh_observes_its_cooldown_and_a_new_account_is_not_blocked
         .await,
         "the failed refresh must enter its cooldown"
     );
-    let requests = server.requests();
+    let requests = server.requests_to(":fetchAvailableModels");
     let response = catalog_request(&mut client, 112).await;
     assert!(response["result"]["models"].is_array());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        server.requests(),
+        server.requests_to(":fetchAvailableModels"),
         requests,
         "a failed refresh is not restarted by every catalog read"
     );
@@ -375,7 +384,11 @@ async fn a_late_refresh_cannot_publish_for_a_replaced_account() {
     let response = catalog_request(&mut client, 121).await;
     assert!(response["result"]["models"].is_array());
     assert!(
-        wait_until(|| server.requests() == 1, Duration::from_secs(2)).await,
+        wait_until(
+            || server.requests_to(":fetchAvailableModels") == 1,
+            Duration::from_secs(2)
+        )
+        .await,
         "the background request must be in flight"
     );
     antigravity::auth::adopt(credential()).await.unwrap();

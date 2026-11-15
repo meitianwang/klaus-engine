@@ -4,6 +4,7 @@ mod audio;
 pub mod auth;
 mod catalog;
 mod cloud;
+mod egress;
 pub mod login;
 
 use futures::future::join_all;
@@ -330,7 +331,127 @@ async fn refresh_catalog(generation: &str) -> Result<Value, String> {
     if changed {
         super::model_sources::notify_catalog_changed(root, "antigravity");
     }
+    spawn_bootstrap_surfaces(generation, &project);
+    spawn_heartbeat(generation);
     Ok(payload)
+}
+
+/// One-shot side calls the hub client makes alongside its catalog fetch.
+/// Surface fidelity only: responses are discarded, failures never reach model
+/// availability, and the calls run detached so the catalog refresh completes
+/// (and releases its shared permit) exactly as fast as the bare fetch would.
+fn spawn_bootstrap_surfaces(generation: &str, project: &str) {
+    if !mark_once(&SURFACE_BOOTSTRAPPED, generation) {
+        return;
+    }
+    let generation = generation.to_string();
+    let project = project.to_string();
+    tokio::spawn(async move {
+        let signal = AbortSignal::new();
+        let (scoped, experiments) = tokio::join!(
+            cloud::rpc(
+                "loadCodeAssist",
+                json!({
+                    "cloudaicompanionProject": project,
+                    "metadata": { "ideType": "ANTIGRAVITY" }
+                }),
+                Some(&generation),
+                &signal
+            ),
+            cloud::rpc(
+                "listExperiments",
+                json!({
+                    "project": project,
+                    "metadata": { "updateChannel": "stable" }
+                }),
+                Some(&generation),
+                &signal
+            ),
+        );
+        let _ = (scoped, experiments);
+        let _ = cloud::rpc_get(
+            "buildWithGooglePlugins?page_size=1000",
+            Some(&generation),
+            &signal,
+        )
+        .await;
+    });
+}
+
+fn mark_once(
+    set: &std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>,
+    generation: &str,
+) -> bool {
+    set.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(generation.to_string())
+}
+
+static SURFACE_BOOTSTRAPPED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+static HEARTBEAT_SPAWNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Periodic control-plane keepalive. The hub client revalidates its account
+/// and catalog with paired loadCodeAssist + fetchAvailableModels calls roughly
+/// every six minutes while it runs; this task mirrors that cadence for as long
+/// as the credential generation stays current.
+fn spawn_heartbeat(generation: &str) {
+    if !mark_once(&HEARTBEAT_SPAWNED, generation) {
+        return;
+    }
+    let generation = generation.to_string();
+    tokio::spawn(async move {
+        let base = std::env::var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(360);
+        loop {
+            let spread = (base / 4).max(1);
+            let jitter = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| u64::from(elapsed.subsec_nanos()) % spread)
+                .unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_secs(base + jitter)).await;
+            if !auth::is_current(&generation) {
+                break;
+            }
+            let signal = AbortSignal::new();
+            let project = match project(Some(&generation), &signal).await {
+                Ok(project) => project,
+                Err(_) => {
+                    if !auth::is_current(&generation) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let _ = cloud::rpc(
+                "loadCodeAssist",
+                json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
+                Some(&generation),
+                &signal,
+            )
+            .await;
+            let _ = cloud::rpc(
+                "loadCodeAssist",
+                json!({
+                    "cloudaicompanionProject": project,
+                    "metadata": { "ideType": "ANTIGRAVITY" }
+                }),
+                Some(&generation),
+                &signal,
+            )
+            .await;
+            if !auth::is_current(&generation) {
+                break;
+            }
+            let _ = refresh_catalog(&generation).await;
+        }
+    });
 }
 
 /// A NOT_FOUND refusal names an entity the service no longer resolves. The cached
