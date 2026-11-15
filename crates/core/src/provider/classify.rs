@@ -284,7 +284,11 @@ static GATEWAY_PACK_TIMEOUT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)network|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|error sending request|error decoding response body|connection reset|connection timeout|connect timeout|dns|tls handshake").unwrap()
+    // Bare socket error codes are matched with word boundaries so a code
+    // inside a longer identifier keeps its own classification; transports
+    // that report only the code ("read ECONNRESET", "write EPIPE",
+    // "connect ETIMEDOUT 1.2.3.4:443") must stay retryable.
+    Regex::new(r"(?i)network|fetch failed|\b(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)\b|socket hang up|error sending request|error decoding response body|connection reset|connection timeout|connect timeout|dns|tls handshake").unwrap()
 });
 
 /// A rate-limit delay hint like "Please try again in 11.054s" / "try again in
@@ -681,6 +685,14 @@ mod tests {
             ("the server is overloaded", ProviderErrorKind::Overloaded),
             ("fetch failed: ECONNRESET", ProviderErrorKind::Network),
             ("socket hang up", ProviderErrorKind::Network),
+            // Transports that surface only the raw socket code stay retryable;
+            // a code inside a longer identifier is not a socket error.
+            ("read ECONNRESET", ProviderErrorKind::Network),
+            ("write EPIPE", ProviderErrorKind::Network),
+            ("connect ETIMEDOUT 1.2.3.4:443", ProviderErrorKind::Network),
+            ("connect ECONNREFUSED 127.0.0.1:443", ProviderErrorKind::Network),
+            ("connect ECONNABORTED", ProviderErrorKind::Network),
+            ("EPIPELINE telemetry", ProviderErrorKind::Unknown),
             // reqwest's opaque transport wording must classify as Network so a
             // dead connection retries instead of failing the turn outright.
             (
