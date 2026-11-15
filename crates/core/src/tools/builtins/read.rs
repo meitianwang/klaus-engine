@@ -305,16 +305,10 @@ impl Tool for ReadTool {
         let ext = ascii_lower_runtime(&extname_runtime(abs.as_runtime_string()));
 
         // Image path: recognized extension → return a base64 image block.
+        // A blind ACTIVE model does not refuse the read: the image is stored
+        // and the request layer swaps in a per-request omission note, so
+        // switching to a vision model restores the image without a re-read.
         if let Some(mime_type) = image_mime(&ext) {
-            if ctx.vision == Some(false) {
-                return Ok(text_result(
-                    read_output(&abs, true, Some("image"), []),
-                    RuntimeString::from(
-                        "This model cannot understand images, so the image was not loaded. Tell the user to switch to a model with vision support and try again.",
-                    ),
-                    true,
-                ));
-            }
             if size > self.max_image_bytes {
                 return Ok(text_result(
                     read_output(
@@ -338,16 +332,28 @@ impl Tool for ReadTool {
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
             let b64 = BASE64_STANDARD.encode(&buf);
-            return Ok(image_result(
+            // The envelope flag is UI-only: the transcript can tell the user
+            // that the ACTIVE model cannot see this image, while the stored
+            // result itself stays correct across a model switch.
+            let output = if ctx.vision == Some(false) {
+                read_output(
+                    &abs,
+                    true,
+                    Some("image"),
+                    [
+                        ("mimeType", RuntimeJson::from(mime_type)),
+                        ("imageUnsupportedByModel", RuntimeJson::Bool(true)),
+                    ],
+                )
+            } else {
                 read_output(
                     &abs,
                     true,
                     Some("image"),
                     [("mimeType", RuntimeJson::from(mime_type))],
-                ),
-                mime_type,
-                b64,
-            ));
+                )
+            };
+            return Ok(image_result(output, mime_type, b64));
         }
 
         // PDF path. A PDF is binary, so it MUST be handled before the
@@ -1858,7 +1864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_an_image_when_the_model_lacks_vision() {
+    async fn stores_the_image_when_the_model_lacks_vision() {
         let dir = temp_dir();
         let cwd = dir.to_string_lossy().into_owned();
         let p = dir.join("shot.png");
@@ -1873,13 +1879,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(res.serializable.is_error, Some(true));
-        let text = text_of(&res);
-        assert!(
-            text.starts_with("This model cannot understand images"),
-            "text: {text:?}"
+        // A blind active model no longer refuses the read: the image is
+        // stored and the request layer degrades it per request, so switching
+        // to a vision model sees the original image without a re-read. The
+        // envelope flag is UI-only.
+        assert_eq!(res.serializable.is_error, Some(false));
+        assert_eq!(
+            res.serializable.output,
+            runtime(
+                json!({ "path": posix_rendered(&abs), "found": true, "kind": "image", "mimeType": "image/png", "imageUnsupportedByModel": true })
+            )
         );
-        assert!(text.contains("vision support"), "text: {text:?}");
+        match &res.serializable.model_content[0] {
+            OutputBlock::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                assert_eq!(
+                    img.base64,
+                    RuntimeString::from(BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\n"))
+                );
+            }
+            _ => panic!("expected an image block"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
