@@ -350,10 +350,26 @@ pub(super) fn find_runtime_tool(
     tools: &[Arc<dyn Tool>],
     name: &RuntimeString,
 ) -> Option<Arc<dyn Tool>> {
-    tools
-        .iter()
-        .find(|tool| tool.name() == *name)
-        .map(Arc::clone)
+    if let Some(tool) = tools.iter().find(|tool| tool.name() == *name) {
+        return Some(Arc::clone(tool));
+    }
+    // Models occasionally mis-case a tool name (capitalized builtin names
+    // have been observed on subscription channels). Fall back to a
+    // case-insensitive match only when it resolves to exactly one tool, so
+    // an ambiguous name stays unknown.
+    let Ok(folded) = name.try_to_utf8() else {
+        return None;
+    };
+    let mut matches = tools.iter().filter(|tool| {
+        tool.name()
+            .try_to_utf8()
+            .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(&folded))
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(Arc::clone(first))
 }
 
 pub(super) fn query_path_dialect() -> NodePathDialect {
@@ -590,5 +606,80 @@ mod repair_truncated_json_tests {
     /// The repaired document, as text, for asserting the exact cut point.
     fn repaired_text(input: &str) -> Option<String> {
         parse(input).map(|repaired| String::from_utf8_lossy(&repaired.to_node_utf8()).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod find_runtime_tool_tests {
+    use super::*;
+    use crate::types::errors::ToolError;
+    use crate::types::tool::{ToolContext, ToolProgress, ToolResult};
+    use async_trait::async_trait;
+
+    struct NamedTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> RuntimeString {
+            RuntimeString::from(self.name)
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn is_concurrency_safe(&self, _input: &Json) -> bool {
+            false
+        }
+        fn is_read_only(&self, _input: &Json) -> bool {
+            false
+        }
+        async fn call(
+            &self,
+            _input: Json,
+            _ctx: &ToolContext,
+            _on_progress: Option<ToolProgress>,
+        ) -> Result<ToolResult, ToolError> {
+            unimplemented!("lookup-only test tool")
+        }
+    }
+
+    fn tool(name: &'static str) -> Arc<dyn Tool> {
+        Arc::new(NamedTool { name })
+    }
+
+    #[test]
+    fn exact_match_wins_over_a_case_folded_one() {
+        let tools = vec![tool("read"), tool("Read")];
+        assert_eq!(
+            find_runtime_tool(&tools, &RuntimeString::from("Read"))
+                .unwrap()
+                .name(),
+            "Read"
+        );
+        assert_eq!(
+            find_runtime_tool(&tools, &RuntimeString::from("read"))
+                .unwrap()
+                .name(),
+            "read"
+        );
+    }
+
+    #[test]
+    fn mis_cased_name_resolves_to_the_unique_tool() {
+        let tools = vec![tool("read"), tool("bash")];
+        assert_eq!(
+            find_runtime_tool(&tools, &RuntimeString::from("READ"))
+                .unwrap()
+                .name(),
+            "read"
+        );
+        assert!(find_runtime_tool(&tools, &RuntimeString::from("nope")).is_none());
+    }
+
+    #[test]
+    fn ambiguous_case_folded_name_stays_unknown() {
+        let tools = vec![tool("read"), tool("READ")];
+        assert!(find_runtime_tool(&tools, &RuntimeString::from("ReAd")).is_none());
     }
 }

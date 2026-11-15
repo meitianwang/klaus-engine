@@ -64,12 +64,33 @@ pub fn to_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
     tools.iter().map(|t| to_tool_spec(t.as_ref())).collect()
 }
 
-/// Look a tool up by its name or one of its aliases.
+/// Look a tool up by its name or one of its aliases. Exact matches win; a
+/// mis-cased name resolves only when exactly one tool matches
+/// case-insensitively, so an ambiguous name stays unknown.
 pub fn find_tool(tools: &[Arc<dyn Tool>], name: &str) -> Option<Arc<dyn Tool>> {
-    tools
+    if let Some(tool) = tools
         .iter()
         .find(|t| t.name() == name || t.aliases().iter().any(|a| a == name))
-        .cloned()
+    {
+        return Some(tool.clone());
+    }
+    let mut matches = tools.iter().filter(|t| {
+        runtime_eq_ignore_ascii_case(&t.name(), name)
+            || t.aliases()
+                .iter()
+                .any(|a| runtime_eq_ignore_ascii_case(a, name))
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.clone())
+}
+
+fn runtime_eq_ignore_ascii_case(candidate: &RuntimeString, name: &str) -> bool {
+    candidate
+        .try_to_utf8()
+        .is_ok_and(|value| value.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
@@ -362,5 +383,47 @@ mod tests {
         assert_eq!(find_tool(&tools, "cat").unwrap().name(), "read");
         assert_eq!(find_tool(&tools, "bash").unwrap().name(), "bash");
         assert!(find_tool(&tools, "nope").is_none());
+    }
+
+    #[test]
+    fn find_tool_falls_back_to_a_unique_case_insensitive_match() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool {
+                name: "read".into(),
+                aliases: vec!["view".into()],
+                enabled: true,
+                schema: JsonSchema::new(),
+                input_kind: ToolInputKind::JsonSchema,
+                description: String::new(),
+            }),
+            mk("bash", true),
+        ];
+        // A mis-cased name or alias resolves to the unique tool.
+        assert_eq!(find_tool(&tools, "Read").unwrap().name(), "read");
+        assert_eq!(find_tool(&tools, "VIEW").unwrap().name(), "read");
+        assert!(find_tool(&tools, "nope").is_none());
+
+        // An exact match wins; a case-folded name matching two tools is
+        // ambiguous and stays unknown.
+        let ambiguous: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool {
+                name: "read".into(),
+                aliases: vec![],
+                enabled: true,
+                schema: JsonSchema::new(),
+                input_kind: ToolInputKind::JsonSchema,
+                description: String::new(),
+            }),
+            Arc::new(MockTool {
+                name: "READ".into(),
+                aliases: vec![],
+                enabled: true,
+                schema: JsonSchema::new(),
+                input_kind: ToolInputKind::JsonSchema,
+                description: String::new(),
+            }),
+        ];
+        assert_eq!(find_tool(&ambiguous, "READ").unwrap().name(), "READ");
+        assert!(find_tool(&ambiguous, "ReAd").is_none());
     }
 }
