@@ -3634,10 +3634,12 @@ impl Agent {
                 Ok(queue) => queue,
                 Err(error) => return Err(rollout_guard.fail(error).await),
             };
-        let initial_prediction_source = match prediction_source_from_rollout(&raw_items) {
-            Ok(source) => source,
-            Err(error) => return Err(rollout_guard.fail(error).await),
-        };
+        let visible_start = crate::store::thread_history::side_task_visible_start_index(&raw_items);
+        let initial_prediction_source =
+            match prediction_source_from_rollout(&raw_items[visible_start..]) {
+                Ok(source) => source,
+                Err(error) => return Err(rollout_guard.fail(error).await),
+            };
         let initial_approval_context = match sopts.initial_approval_context.clone() {
             Some(checkpoint) => checkpoint,
             None => match super::approval_capture::ReviewParentHistory::from_rollout(&raw_items) {
@@ -3832,7 +3834,7 @@ impl Agent {
         } else {
             // Legacy traces have no admission watermark. Preserve their retained context fallback.
             session.restore_prediction_source_turn(
-                raw_items
+                raw_items[visible_start..]
                     .iter()
                     .rev()
                     .find_map(|item| match item {

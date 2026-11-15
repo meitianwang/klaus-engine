@@ -3469,6 +3469,7 @@ impl Session {
                 model_tier: None,
                 feature: None,
                 include_history: true,
+                exclude_hidden_history: false,
                 bare_system_prompt: false,
                 inherit_session_reasoning: true,
                 effort: None,
@@ -3554,6 +3555,7 @@ impl Session {
                 // The host prompt already carries the capped seed text; the
                 // raw transcript would only add latency and reasoning spend.
                 include_history: false,
+                exclude_hidden_history: false,
                 bare_system_prompt: true,
                 inherit_session_reasoning: false,
                 effort: None,
@@ -3653,6 +3655,8 @@ impl Session {
             // unavailable target follows the session's main model.
             feature: Some(FeatureSlot::Prediction),
             include_history: true,
+            exclude_hidden_history: self.meta.role.as_ref()
+                == Some(&crate::schemas::rollout::SessionRole::SideTask),
             bare_system_prompt: false,
             inherit_session_reasoning: true,
             effort,
@@ -3763,11 +3767,30 @@ impl Session {
         *self.turn.latest_prediction_source.lock_recover() = turn_id.map(|id| (0, Some(id)));
     }
 
+    fn has_own_human_work(&self, history: &[Message]) -> bool {
+        history.iter().any(|message| {
+            !self
+                .conversation
+                .hidden_message_ids
+                .contains(super::message_uuid(message))
+                && match message {
+                    Message::User(user) => user.is_meta != Some(true),
+                    Message::CompactBoundary(_) => true,
+                    _ => crate::context::compact::full_compact::is_compaction_output(message),
+                }
+        })
+    }
+
     fn latest_prediction_turn(
         &self,
         history: &[Message],
         index: &super::TurnIndex,
     ) -> Option<RuntimeString> {
+        if self.meta.role.as_ref() == Some(&crate::schemas::rollout::SessionRole::SideTask)
+            && !self.has_own_human_work(history)
+        {
+            return None;
+        }
         self.turn
             .latest_prediction_source
             .lock_recover()
@@ -3775,6 +3798,13 @@ impl Session {
             .and_then(|(_, id)| id.clone())
             .or_else(|| {
                 history.iter().rev().find_map(|message| {
+                    if self
+                        .conversation
+                        .hidden_message_ids
+                        .contains(super::message_uuid(message))
+                    {
+                        return None;
+                    }
                     index
                         .message_turn
                         .get(super::message_uuid(message))
@@ -3898,7 +3928,20 @@ impl Session {
         let abort = opts.signal;
         let user_uuid = (self.deps.uuid)();
         let mut messages = if opts.include_history {
-            self.model_history()
+            let history = self.model_history();
+            if opts.exclude_hidden_history {
+                history
+                    .into_iter()
+                    .filter(|message| {
+                        !self
+                            .conversation
+                            .hidden_message_ids
+                            .contains(super::message_uuid(message))
+                    })
+                    .collect()
+            } else {
+                history
+            }
         } else {
             Vec::new()
         };
@@ -4066,7 +4109,8 @@ impl Session {
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),
-            context_edit_state: Some(self.context_edit_state.clone()),
+            context_edit_state: (!opts.exclude_hidden_history)
+                .then(|| self.context_edit_state.clone()),
             padded_countdown_spend: self.turn.padded_countdown_spend(),
             task_countdown_anchor: None,
             live_model_override: None,

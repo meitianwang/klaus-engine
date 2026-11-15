@@ -632,3 +632,126 @@ async fn prediction_generation_exhaustion_cannot_wrap_or_mutate_history() {
     assert_eq!(session.history_snapshot(), before);
     session.shutdown_and_wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn side_task_predictions_ignore_inherited_prefix_until_side_task_has_own_human_work() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut config = default_config();
+    config.memory.enabled = false;
+    config.model = "main-model".into();
+    let parent = mk_session_with_deps(
+        recording_deps(requests.clone(), vec![text_turn("parent reply")]),
+        config.clone(),
+        Vec::new(),
+    );
+    parent
+        .run(
+            Input::Text("parent unfinished task".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    let parent_turn = source_turn(&parent);
+    let snapshot = parent.side_task_snapshot().unwrap();
+    parent.shutdown_and_wait().await.unwrap();
+
+    let hidden_ids = snapshot
+        .history
+        .iter()
+        .map(super::message_uuid)
+        .cloned()
+        .collect();
+    let mut side_deps = recording_deps(
+        requests.clone(),
+        vec![
+            text_turn("side reply"),
+            text_turn(r#"{"suggestion":"Ask a follow-up on the side answer"}"#),
+        ],
+    );
+    let side_uuid = Arc::new(AtomicUsize::new(0));
+    side_deps.uuid =
+        Arc::new(move || format!("side-uuid-{}", side_uuid.fetch_add(1, Ordering::SeqCst)));
+    let mut side_init = session_init_with_provider_memory_store_agents_and_snapshot_decisions(
+        Arc::new(fake_provider()),
+        side_deps,
+        config,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Some(snapshot.history),
+        None,
+        None,
+    );
+    side_init.id = Some("side-1".into());
+    side_init.session_role = Some(crate::schemas::rollout::SessionRole::SideTask);
+    side_init.parent_thread_id = Some("s1".into());
+    side_init.hidden_context_message_ids = Some(hidden_ids);
+    side_init.initial_approval_context = Some(
+        crate::engine::approval_capture::ReviewParentHistory::inherit_snapshot(
+            &crate::engine::approval_capture::ReviewParentHistory::restore(
+                &snapshot.approval_context,
+            )
+            .snapshot(),
+            false,
+        )
+        .checkpoint(),
+    );
+    side_init.initial_approval_reviews = Some(Vec::new());
+    let side = Session::new(side_init);
+
+    // A brand-new side task has zero own human work: no source turn, no provider call.
+    assert_eq!(side.prediction_context().await.unwrap().turn_id, None);
+    assert_eq!(
+        side.predict_message_with_signal(
+            "dynamic prompt".into(),
+            parent_turn,
+            None,
+            AbortSignal::new(),
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    // After the user sends a message in the side task, prediction sees ONLY the side task's own turn.
+    side.run(
+        Input::Text("what does message flow mean here?".into()),
+        TurnOptions::default(),
+    )
+    .await;
+    let side_turn = side
+        .prediction_context()
+        .await
+        .unwrap()
+        .turn_id
+        .expect("side task own turn becomes prediction source")
+        .try_to_utf8()
+        .unwrap();
+    let suggestion = side
+        .predict_message_with_signal("dynamic prompt".into(), side_turn, None, AbortSignal::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        suggestion,
+        Some("Ask a follow-up on the side answer".into())
+    );
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        let prediction_req = &recorded[2];
+        // Inherited parent messages ("parent unfinished task" / "parent reply") must be excluded.
+        let visible = side.visible_history();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(
+            &prediction_req.messages[..visible.len()],
+            visible.as_slice()
+        );
+        assert_eq!(prediction_req.messages.len(), visible.len() + 1);
+    }
+
+    // Rolling back the side task's only turn returns prediction eligibility to empty.
+    side.rollback(1).await.unwrap();
+    assert_eq!(side.prediction_context().await.unwrap().turn_id, None);
+    side.shutdown_and_wait().await.unwrap();
+}

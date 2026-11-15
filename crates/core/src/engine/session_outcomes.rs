@@ -541,6 +541,10 @@ pub(crate) struct ReadonlyQueryOptions {
     /// is self-contained, and carrying the raw transcript only adds latency
     /// and reasoning spend ahead of a small output budget.
     pub(crate) include_history: bool,
+    /// Strip hidden inherited-context messages (such as a side task's parent
+    /// prefix) when `include_history` is enabled so suggestions reflect only
+    /// the conversation's own visible work.
+    pub(crate) exclude_hidden_history: bool,
     /// Whether the query carries the session's own system prompt (project
     /// rules, skills, memory index). Title generation only needs its
     /// instruction append; the project context adds latency and reasoning
