@@ -507,13 +507,36 @@ fn text(value: &Value, key: &str) -> Result<String, &'static str> {
         .ok_or("antigravity_login_invalid_response")
 }
 
+fn email_from_id_token(token_response: &Value) -> Option<String> {
+    let raw = token_response.get("id_token")?.as_str()?;
+    if raw.is_empty() || raw.len() > 64 * 1024 {
+        return None;
+    }
+    let payload_segment = raw.split('.').nth(1)?.trim_end_matches('=');
+    if payload_segment.is_empty() {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(payload_segment.as_bytes()).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let email = claims.get("email")?.as_str()?;
+    (!email.is_empty()
+        && email.len() <= 320
+        && email.contains('@')
+        && email.trim() == email
+        && !email
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control()))
+    .then(|| email.to_string())
+}
+
 async fn exchange(
     code: &str,
     authorization: &Authorization,
 ) -> Result<auth::Credential, &'static str> {
     let (client_id, client_secret) = auth::oauth_client()?;
     let client = cloud::http_client().map_err(|_| "antigravity_login_network_error")?;
-    let (endpoint, egress_headers) = super::egress::route(&authorization.endpoints.token);
+    let (endpoint, egress_headers) =
+        super::egress::route(&authorization.endpoints.token, Some("oauth-login"))?;
     let started = chrono::Utc::now().timestamp_millis();
     let mut request = client
         .post(endpoint)
@@ -522,7 +545,7 @@ async fn exchange(
     for (name, value) in egress_headers {
         request = request.header(name, value);
     }
-    let response = request
+    let response = match request
         .form(&[
             ("client_id", client_id),
             ("client_secret", client_secret),
@@ -533,7 +556,15 @@ async fn exchange(
         ])
         .send()
         .await
-        .map_err(|_| "antigravity_login_network_error")?;
+    {
+        Ok(response) => response,
+        Err(err) => {
+            if err.is_connect() {
+                super::egress::invalidate();
+            }
+            return Err("antigravity_login_network_error");
+        }
+    };
     let status = response.status();
     let bytes = cloud::read_body(response, MAX_RESPONSE)
         .await
@@ -561,25 +592,46 @@ async fn exchange(
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
         .filter(|seconds| *seconds > 0 && *seconds <= 365 * 24 * 60 * 60)
         .ok_or("antigravity_login_invalid_response")?;
-    let response = client
-        .get(&authorization.endpoints.userinfo)
-        .timeout(Duration::from_secs(15))
-        .bearer_auth(&access_token)
-        .send()
-        .await
-        .map_err(|_| "antigravity_login_network_error")?;
-    if !response.status().is_success() {
-        return Err("antigravity_login_failed");
-    }
-    let bytes = cloud::read_body(response, MAX_RESPONSE)
-        .await
-        .map_err(|_| "antigravity_login_invalid_response")?;
-    let profile: Value =
-        serde_json::from_slice(&bytes).map_err(|_| "antigravity_login_invalid_response")?;
-    let email = text(&profile, "email")?;
-    if email.len() > 320 {
-        return Err("antigravity_login_invalid_response");
-    }
+    // Prefer the OIDC `id_token` email claim returned directly by `/token` so
+    // sign-in completes without an extra userinfo call. Fall back to the
+    // configured userinfo endpoint (via the egress relay and Go HTTP UA) only
+    // when no `id_token` email claim is present.
+    let email = if let Some(claimed) = email_from_id_token(&value) {
+        claimed
+    } else {
+        let (userinfo_url, userinfo_headers) =
+            super::egress::route(&authorization.endpoints.userinfo, Some("oauth-login"))?;
+        let mut profile_req = client
+            .get(userinfo_url)
+            .header("user-agent", cloud::TOKEN_ENDPOINT_USER_AGENT)
+            .timeout(Duration::from_secs(15))
+            .bearer_auth(&access_token);
+        for (name, header_val) in userinfo_headers {
+            profile_req = profile_req.header(name, header_val);
+        }
+        let response = match profile_req.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                if err.is_connect() {
+                    super::egress::invalidate();
+                }
+                return Err("antigravity_login_network_error");
+            }
+        };
+        if !response.status().is_success() {
+            return Err("antigravity_login_failed");
+        }
+        let bytes = cloud::read_body(response, MAX_RESPONSE)
+            .await
+            .map_err(|_| "antigravity_login_invalid_response")?;
+        let profile: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "antigravity_login_invalid_response")?;
+        let fetched = text(&profile, "email")?;
+        if fetched.len() > 320 {
+            return Err("antigravity_login_invalid_response");
+        }
+        fetched
+    };
     Ok(auth::Credential {
         access_token,
         refresh_token,

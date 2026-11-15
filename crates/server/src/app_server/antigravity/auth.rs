@@ -447,8 +447,11 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
         if !found {
             return Ok(json!({"ok":false,"error":"antigravity_account_not_found"}));
         }
-        if let Some(generation) = removed_generation {
-            super::prune_generation(&generation);
+        if let Some(ref generation) = removed_generation {
+            super::prune_generation(generation);
+        }
+        if let Some(ref generation) = removed_generation {
+            super::egress::reset_pool(Some(generation)).await;
         }
         if accounts().is_empty() {
             super::forget_catalog();
@@ -460,6 +463,7 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
     super::login::invalidate_pending();
     with_store_file_lock(|| write_accounts_unlocked(&[]))?;
     super::forget_catalog();
+    super::egress::reset_pool(None).await;
     Ok(json!({"ok":true,"signedIn":false,"loggedIn":false,"accounts":[]}))
 }
 
@@ -521,6 +525,7 @@ pub(super) async fn rotate(failed_generation: &str) -> RotateOutcome {
         Ok(outcome) => {
             if matches!(outcome, RotateOutcome::Rotated(_)) {
                 super::sync_head_catalog();
+                super::egress::reset_pool(Some(failed_generation)).await;
             }
             outcome
         }
@@ -740,7 +745,8 @@ async fn credential_inner(
     let endpoint = std::env::var("KLAUS_ANTIGRAVITY_OAUTH_URL")
         .unwrap_or_else(|_| "https://oauth2.googleapis.com/token".into());
     cloud::validate_endpoint(&endpoint)?;
-    let (endpoint, egress_headers) = super::egress::route(&endpoint);
+    let (endpoint, egress_headers) =
+        super::egress::route(&endpoint, Some(&original_generation)).map_err(str::to_string)?;
     let started = chrono::Utc::now().timestamp_millis();
     let mut request = cloud::http_client()?
         .post(endpoint)
@@ -749,7 +755,7 @@ async fn credential_inner(
     for (name, value) in egress_headers {
         request = request.header(name, value);
     }
-    let response = request
+    let response = match request
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -758,7 +764,15 @@ async fn credential_inner(
         ])
         .send()
         .await
-        .map_err(|_| "antigravity_refresh_unavailable")?;
+    {
+        Ok(response) => response,
+        Err(err) => {
+            if err.is_connect() {
+                super::egress::invalidate();
+            }
+            return Err("antigravity_refresh_unavailable".into());
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         let oauth_error = cloud::read_body(response, 64 * 1024)

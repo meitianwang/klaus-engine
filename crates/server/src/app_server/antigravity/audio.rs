@@ -35,6 +35,7 @@ pub(super) struct AudioInput<'a> {
 pub(super) struct Credentials<'a> {
     pub access_token: &'a str,
     pub model: &'a str,
+    pub pool_key: Option<&'a str>,
 }
 
 /// Only PCM16 mono 16 kHz WAV is accepted, avoiding implicit lossy conversion.
@@ -63,10 +64,23 @@ pub(super) async fn transcribe(
         return Err(error("configuration_invalid"));
     }
     let work = async {
-        let io = connect().await?;
-        transcribe_io(io, pcm, credentials, Duration::from_millis(100))
-            .await
-            .map(|text| json!({ "text": text }))
+        let (io, uri, extra_headers) = connect(credentials.pool_key).await?;
+        let mut timer = tokio::time::interval(Duration::from_millis(100));
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        transcribe_feed(
+            io,
+            AudioFeed::Buffered {
+                pcm,
+                offset: 0,
+                timer,
+            },
+            credentials,
+            &uri,
+            &extra_headers,
+            StreamCallbacks::default(),
+        )
+        .await
+        .map(|text| json!({ "text": text }))
     };
     tokio::select! {
         biased;
@@ -142,7 +156,95 @@ fn pcm_from_wav(bytes: &[u8]) -> Result<&[u8], String> {
     pcm.ok_or_else(|| error("audio_invalid"))
 }
 
-async fn connect() -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+enum AudioTransport {
+    Relay(TcpStream),
+    Direct(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for AudioTransport {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Relay(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Direct(stream) => std::pin::Pin::new(&mut **stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for AudioTransport {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Relay(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Direct(stream) => std::pin::Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Relay(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Direct(stream) => std::pin::Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Relay(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Direct(stream) => std::pin::Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect_relay_once(
+    endpoint: &super::egress::Endpoint,
+    pool_key: Option<&str>,
+) -> Result<(AudioTransport, String, Vec<(String, String)>), String> {
+    let tcp = tokio::time::timeout(
+        SETUP_BUDGET,
+        TcpStream::connect(("127.0.0.1", endpoint.port)),
+    )
+    .await
+    .map_err(|_| error("timeout"))?
+    .map_err(|_| error("network_error"))?;
+    let uri = format!("http://127.0.0.1:{}{PATH}", endpoint.port);
+    let mut headers = vec![
+        ("x-egress-target".to_string(), HOST.to_string()),
+        ("x-egress-token".to_string(), endpoint.token.clone()),
+    ];
+    if let Some(key) = pool_key.filter(|k| !k.is_empty()) {
+        headers.push(("x-egress-pool".to_string(), super::egress::pool_tag(key)));
+    }
+    Ok((AudioTransport::Relay(tcp), uri, headers))
+}
+
+async fn connect(
+    pool_key: Option<&str>,
+) -> Result<(AudioTransport, String, Vec<(String, String)>), String> {
+    if let Some(endpoint) = super::egress::ensure_endpoint() {
+        match connect_relay_once(&endpoint, pool_key).await {
+            Ok(connected) => return Ok(connected),
+            Err(_) => {
+                super::egress::invalidate();
+                let respawned = super::egress::require_endpoint().map_err(str::to_string)?;
+                return connect_relay_once(&respawned, pool_key).await;
+            }
+        }
+    }
+    if !super::egress::allow_direct() {
+        return Err("antigravity_egress_unavailable".into());
+    }
     let mut roots = rustls::RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -153,7 +255,7 @@ async fn connect() -> Result<tokio_rustls::client::TlsStream<TcpStream>, String>
     .with_root_certificates(roots)
     .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec()];
-    tokio::time::timeout(SETUP_BUDGET, async {
+    let stream = tokio::time::timeout(SETUP_BUDGET, async {
         let tcp = TcpStream::connect((HOST, 443))
             .await
             .map_err(|_| error("network_error"))?;
@@ -169,7 +271,12 @@ async fn connect() -> Result<tokio_rustls::client::TlsStream<TcpStream>, String>
         Ok(stream)
     })
     .await
-    .map_err(|_| error("timeout"))?
+    .map_err(|_| error("timeout"))??;
+    Ok((
+        AudioTransport::Direct(Box::new(stream)),
+        format!("https://{HOST}{PATH}"),
+        Vec::new(),
+    ))
 }
 
 /// Cancelling the outer future must close the transport's background driver.
@@ -219,8 +326,16 @@ pub(super) async fn transcribe_stream(
     signal: AbortSignal,
 ) -> Result<String, String> {
     let work = async {
-        let io = connect().await?;
-        transcribe_feed(io, AudioFeed::Live(input), credentials, callbacks).await
+        let (io, uri, extra_headers) = connect(credentials.pool_key).await?;
+        transcribe_feed(
+            io,
+            AudioFeed::Live(input),
+            credentials,
+            &uri,
+            &extra_headers,
+            callbacks,
+        )
+        .await
     };
     tokio::select! {
         biased;
@@ -229,6 +344,7 @@ pub(super) async fn transcribe_stream(
     }
 }
 
+#[cfg(test)]
 async fn transcribe_io<T>(
     io: T,
     pcm: &[u8],
@@ -240,6 +356,7 @@ where
 {
     let mut timer = tokio::time::interval(pacing);
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let uri = format!("https://{HOST}{PATH}");
     transcribe_feed(
         io,
         AudioFeed::Buffered {
@@ -248,6 +365,8 @@ where
             timer,
         },
         credentials,
+        &uri,
+        &[],
         StreamCallbacks::default(),
     )
     .await
@@ -257,6 +376,8 @@ async fn transcribe_feed<T>(
     io: T,
     mut feed: AudioFeed<'_>,
     credentials: Credentials<'_>,
+    uri: &str,
+    extra_headers: &[(String, String)],
     mut callbacks: StreamCallbacks,
 ) -> Result<String, String>
 where
@@ -273,14 +394,18 @@ where
         http::HeaderValue::from_str(&format!("Bearer {}", credentials.access_token))
             .map_err(|_| error("configuration_invalid"))?;
     authorization.set_sensitive(true);
-    let request = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method("POST")
-        .uri(format!("https://{HOST}{PATH}"))
+        .uri(uri)
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .header("grpc-timeout", "450000m")
         .header("user-agent", GRPC_USER_AGENT)
-        .header("authorization", authorization)
+        .header("authorization", authorization);
+    for (name, value) in extra_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let request = builder
         .body(())
         .map_err(|_| error("configuration_invalid"))?;
     let (response, mut send) = client
@@ -822,6 +947,7 @@ mod tests {
         let credentials = || Credentials {
             access_token: "token",
             model: "model",
+            pool_key: None,
         };
         let result = transcribe(
             AudioInput {
@@ -963,24 +1089,31 @@ mod tests {
         let (input, receiver) = tokio::sync::mpsc::channel(4);
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let (text_tx, mut texts) = tokio::sync::mpsc::unbounded_channel();
-        let work = tokio::spawn(transcribe_feed(
-            io,
-            AudioFeed::Live(receiver),
-            Credentials {
-                access_token: "fixture-token",
-                model: "fixture-model",
-            },
-            StreamCallbacks {
-                ready: Some(Box::new(move || {
-                    let _ = ready_tx.send(());
-                })),
-                partial: Some(Arc::new(move |text| {
-                    let _ = text_tx.send(text);
-                    Box::pin(std::future::ready(()))
-                })),
-                valid: None,
-            },
-        ));
+        let uri = format!("https://{HOST}{PATH}");
+        let work = tokio::spawn(async move {
+            transcribe_feed(
+                io,
+                AudioFeed::Live(receiver),
+                Credentials {
+                    access_token: "fixture-token",
+                    model: "fixture-model",
+                    pool_key: None,
+                },
+                &uri,
+                &[],
+                StreamCallbacks {
+                    ready: Some(Box::new(move || {
+                        let _ = ready_tx.send(());
+                    })),
+                    partial: Some(Arc::new(move |text| {
+                        let _ = text_tx.send(text);
+                        Box::pin(std::future::ready(()))
+                    })),
+                    valid: None,
+                },
+            )
+            .await
+        });
         tokio::time::timeout(Duration::from_secs(1), ready)
             .await
             .unwrap()
@@ -1027,23 +1160,30 @@ mod tests {
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let check = valid.clone();
-        let work = tokio::spawn(transcribe_feed(
-            io,
-            AudioFeed::Live(receiver),
-            Credentials {
-                access_token: "fixture-token",
-                model: "fixture-model",
-            },
-            StreamCallbacks {
-                ready: Some(Box::new(move || {
-                    let _ = ready_tx.send(());
-                })),
-                partial: None,
-                valid: Some(Arc::new(move || {
-                    check.load(std::sync::atomic::Ordering::SeqCst)
-                })),
-            },
-        ));
+        let uri = format!("https://{HOST}{PATH}");
+        let work = tokio::spawn(async move {
+            transcribe_feed(
+                io,
+                AudioFeed::Live(receiver),
+                Credentials {
+                    access_token: "fixture-token",
+                    model: "fixture-model",
+                    pool_key: None,
+                },
+                &uri,
+                &[],
+                StreamCallbacks {
+                    ready: Some(Box::new(move || {
+                        let _ = ready_tx.send(());
+                    })),
+                    partial: None,
+                    valid: Some(Arc::new(move || {
+                        check.load(std::sync::atomic::Ordering::SeqCst)
+                    })),
+                },
+            )
+            .await
+        });
         ready.await.unwrap();
         valid.store(false, std::sync::atomic::Ordering::SeqCst);
         input.send(vec![1, 0]).await.unwrap();
@@ -1067,20 +1207,27 @@ mod tests {
         let (io, _received, driver) = fixture("0", false);
         let (_input, receiver) = tokio::sync::mpsc::channel(4);
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
-        let work = tokio::spawn(transcribe_feed(
-            io,
-            AudioFeed::Live(receiver),
-            Credentials {
-                access_token: "fixture-token",
-                model: "fixture-model",
-            },
-            StreamCallbacks {
-                ready: Some(Box::new(move || {
-                    let _ = ready_tx.send(());
-                })),
-                ..StreamCallbacks::default()
-            },
-        ));
+        let uri = format!("https://{HOST}{PATH}");
+        let work = tokio::spawn(async move {
+            transcribe_feed(
+                io,
+                AudioFeed::Live(receiver),
+                Credentials {
+                    access_token: "fixture-token",
+                    model: "fixture-model",
+                    pool_key: None,
+                },
+                &uri,
+                &[],
+                StreamCallbacks {
+                    ready: Some(Box::new(move || {
+                        let _ = ready_tx.send(());
+                    })),
+                    ..StreamCallbacks::default()
+                },
+            )
+            .await
+        });
         ready.await.unwrap();
         work.abort();
         assert!(work.await.unwrap_err().is_cancelled());
@@ -1146,6 +1293,7 @@ mod tests {
                 Credentials {
                     access_token: "fixture-token",
                     model: "fixture-model",
+                    pool_key: None,
                 },
                 Duration::from_millis(1),
             ),
@@ -1178,6 +1326,7 @@ mod tests {
                 Credentials {
                     access_token: "fixture-token",
                     model: "fixture-model",
+                    pool_key: None,
                 },
                 Duration::from_millis(1),
             ),
@@ -1202,6 +1351,7 @@ mod tests {
                     Credentials {
                         access_token: "fixture-token",
                         model: "fixture-model",
+                        pool_key: None,
                     },
                     Duration::from_secs(60),
                 ),
@@ -1219,5 +1369,36 @@ mod tests {
             );
             driver.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn transcription_fails_closed_without_egress_relay() {
+        klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_ANTIGRAVITY_EGRESS",
+            "/definitely/missing/antigravity-egress",
+        );
+        klaus_agent_core::runtime_process::remove_process_environment_var(
+            "KLAUS_ANTIGRAVITY_ALLOW_DIRECT",
+        );
+        super::super::egress::invalidate();
+        let audio = base64::engine::general_purpose::STANDARD.encode(wav(&[0, 0]));
+        let result = transcribe(
+            AudioInput {
+                audio_base64: &audio,
+                mime_type: Some("audio/wav"),
+                language: None,
+            },
+            Credentials {
+                access_token: "fixture-token",
+                model: "fixture-model",
+                pool_key: Some("gen-a"),
+            },
+            AbortSignal::new(),
+        )
+        .await;
+        klaus_agent_core::runtime_process::remove_process_environment_var(
+            "KLAUS_ANTIGRAVITY_EGRESS",
+        );
+        assert_eq!(result.unwrap_err(), "antigravity_egress_unavailable");
     }
 }

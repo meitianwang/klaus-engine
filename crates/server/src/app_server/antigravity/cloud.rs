@@ -218,7 +218,7 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 17] = [
+const ERROR_TAGS: [&str; 18] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
     "antigravity_model_unlisted",
@@ -229,6 +229,7 @@ const ERROR_TAGS: [&str; 17] = [
     "antigravity_account_restricted",
     "antigravity_verification_required",
     "antigravity_permission_denied",
+    "antigravity_egress_unavailable",
     "antigravity_auth_required",
     "antigravity_login_expired",
     "antigravity_refresh_unavailable",
@@ -719,7 +720,8 @@ async fn send_once(
         ""
     };
     let url = format!("{base}/v1internal:{method}{suffix}");
-    let (url, egress_headers) = super::egress::route(&url);
+    let (url, egress_headers) = super::egress::route(&url, generation)
+        .map_err(|err| (api_error(err), Some(used_token.clone())))?;
     let http = http_client().map_err(|err| (api_error(err), Some(used_token.clone())))?;
     let mut request = match &body {
         Some(bytes) => http
@@ -750,6 +752,7 @@ async fn send_once(
             // treated as possibly delivered and must not be replayed.
             Err(error) => {
                 let stage = if error.is_connect() {
+                    super::egress::invalidate();
                     TransportStage::Connect
                 } else {
                     TransportStage::Sent
@@ -828,15 +831,52 @@ async fn send_json(
     Ok(result)
 }
 
-pub(super) fn envelope(project: &str, model: &str, request: Value, request_type: &str) -> Value {
+/// Derive the stable 64-bit signed FNV-1a decimal session identifier stamped on
+/// every `GenerateContent` inner request for a conversation.
+pub(super) fn compute_session_id(conversation_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in conversation_id.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    (hash as i64).to_string()
+}
+
+/// Format the scoped request identifier carried by the outer protocol envelope.
+pub(super) fn compute_request_id(
+    request_type: &str,
+    conversation_id: Option<&str>,
+    step: Option<usize>,
+) -> String {
+    let kind = if request_type.trim().is_empty() {
+        "agent"
+    } else {
+        request_type.trim()
+    };
+    if let Some(conv_id) = conversation_id.filter(|id| !id.trim().is_empty()) {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0);
+        let step_idx = step.unwrap_or(0);
+        format!("{kind}/{now_ms}/{conv_id}/{step_idx}")
+    } else {
+        format!("{kind}/{}", uuid::Uuid::new_v4())
+    }
+}
+
+pub(super) fn envelope_with_context(
+    project: &str,
+    model: &str,
+    request: Value,
+    request_type: &str,
+    conversation_id: Option<&str>,
+    step: Option<usize>,
+) -> Value {
     json!({
-        "project":project,
-        "model":model,
-        "requestId":uuid::Uuid::new_v4().to_string(),
-        "userPromptId":uuid::Uuid::new_v4().to_string(),
-        "userAgent":"antigravity",
-        "requestType":request_type,
-        "request":request,
+        "project": project,
+        "model": model,
+        "requestId": compute_request_id(request_type, conversation_id, step),
+        "userAgent": "antigravity",
+        "requestType": request_type,
+        "request": request,
     })
 }
 
@@ -901,9 +941,139 @@ async fn not_offered_or_original(
     )
 }
 
+const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 2;
+const DEFAULT_ROTATION_COOLDOWN_MS: u64 = 1_200;
+const MIN_STREAM_LAUNCH_SPACING_MS: u64 = 80;
+
+struct AccountStreamLimiter {
+    capacity: usize,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    last_launch: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+fn configured_max_concurrent_streams() -> usize {
+    std::env::var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| (1..=32).contains(v))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_STREAMS)
+}
+
+fn stream_limiters() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<AccountStreamLimiter>>,
+> {
+    static LIMITERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<AccountStreamLimiter>>>,
+    > = std::sync::OnceLock::new();
+    LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(super) fn prune_stream_limiter(generation: &str) {
+    stream_limiters()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
+}
+
+async fn acquire_stream_permit(
+    generation: &str,
+    signal: &AbortSignal,
+) -> Result<tokio::sync::OwnedSemaphorePermit, GeminiApiError> {
+    let desired = configured_max_concurrent_streams();
+    let limiter = {
+        let mut guard = stream_limiters().lock().unwrap_or_else(|p| p.into_inner());
+        match guard.get(generation) {
+            Some(existing) if existing.capacity == desired => existing.clone(),
+            _ => {
+                let created = std::sync::Arc::new(AccountStreamLimiter {
+                    capacity: desired,
+                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(desired)),
+                    last_launch: tokio::sync::Mutex::new(None),
+                });
+                guard.insert(generation.to_string(), created.clone());
+                created
+            }
+        }
+    };
+    let permit = tokio::select! {
+        _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
+        acquired = limiter.semaphore.clone().acquire_owned() => {
+            acquired.map_err(|_| api_error("antigravity_transport_unavailable"))?
+        }
+    };
+    let mut launch_guard = tokio::select! {
+        _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
+        guard = limiter.last_launch.lock() => guard,
+    };
+    if let Some(prev) = *launch_guard {
+        let min_gap = std::time::Duration::from_millis(MIN_STREAM_LAUNCH_SPACING_MS);
+        let elapsed = prev.elapsed();
+        if elapsed < min_gap {
+            tokio::select! {
+                _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
+                _ = tokio::time::sleep(min_gap - elapsed) => {}
+            }
+        }
+    }
+    *launch_guard = Some(tokio::time::Instant::now());
+    Ok(permit)
+}
+
+pub(super) async fn wait_rotation_cooldown(signal: &AbortSignal) -> Result<(), &'static str> {
+    let base_ms = std::env::var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ROTATION_COOLDOWN_MS);
+    if base_ms == 0 {
+        return if signal.is_cancelled() {
+            Err("antigravity_request_cancelled")
+        } else {
+            Ok(())
+        };
+    }
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % (base_ms / 3).max(1))
+        .unwrap_or(0);
+    tokio::select! {
+        _ = signal.cancelled() => Err("antigravity_request_cancelled"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)) => Ok(()),
+    }
+}
+
 #[derive(Clone)]
+pub(super) struct CloudSessionContext {
+    pub conversation_id: String,
+    pub step_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct CloudClient {
     pub generation: String,
+    pub session: Option<CloudSessionContext>,
+}
+
+impl CloudClient {
+    pub(super) fn pooled(conversation_id: String) -> Self {
+        Self {
+            generation: String::new(),
+            session: Some(CloudSessionContext {
+                conversation_id,
+                step_counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        }
+    }
+
+    fn next_conversation_step(&self) -> (String, usize) {
+        if let Some(ctx) = &self.session {
+            let step = ctx
+                .step_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (ctx.conversation_id.clone(), step)
+        } else {
+            (uuid::Uuid::new_v4().to_string(), 0)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1521,7 +1691,8 @@ impl StreamContinuationTracker {
 fn build_leg_body(
     project: &str,
     model: &str,
-    user_prompt_id: &str,
+    conversation_id: &str,
+    step: usize,
     base_request: &RuntimeJson,
     continuation_token: Option<&RuntimeString>,
 ) -> Result<Vec<u8>, GeminiApiError> {
@@ -1532,10 +1703,14 @@ fn build_leg_body(
             .ok_or_else(|| api_error("antigravity_request_invalid"))?
             .insert("continuationToken", RuntimeJson::String(token.clone()));
     }
-    let mut envelope_value = envelope(project, model, Value::Null, "agent");
-    if let Some(obj) = envelope_value.as_object_mut() {
-        obj.insert("userPromptId".into(), Value::String(user_prompt_id.into()));
-    }
+    let envelope_value = envelope_with_context(
+        project,
+        model,
+        Value::Null,
+        "agent",
+        Some(conversation_id),
+        Some(step),
+    );
     let mut body: RuntimeJson =
         runtime_codec::decode_text(&RuntimeString::from(envelope_value.to_string()))
             .map_err(|_| api_error("antigravity_request_invalid"))?;
@@ -1553,7 +1728,8 @@ async fn send_stream_leg(
     generation: &str,
     model: &str,
     project: &mut String,
-    user_prompt_id: &str,
+    conversation_id: &str,
+    step: usize,
     base_request: &RuntimeJson,
     continuation_token: Option<&RuntimeString>,
     signal: &AbortSignal,
@@ -1562,7 +1738,8 @@ async fn send_stream_leg(
     let body = build_leg_body(
         project,
         model,
-        user_prompt_id,
+        conversation_id,
+        step,
         base_request,
         continuation_token,
     )?;
@@ -1586,7 +1763,8 @@ async fn send_stream_leg(
             let retry_body = build_leg_body(
                 &healed,
                 model,
-                user_prompt_id,
+                conversation_id,
+                step,
                 base_request,
                 continuation_token,
             )?;
@@ -1879,15 +2057,33 @@ pub(super) fn is_rotatable_message(message: &str) -> bool {
     .any(|tag| has_tag_prefix(message, tag))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_initial_leg_for_generation(
     generation: &str,
     params: &GenerateContentParameters,
     model: &str,
-    user_prompt_id: &str,
+    conversation_id: &str,
+    step: usize,
     signal: &AbortSignal,
     extra_headers: &[(String, String)],
-) -> Result<(String, RuntimeJson, Option<u64>, reqwest::Response), GeminiApiError> {
+) -> Result<
+    (
+        String,
+        RuntimeJson,
+        super::sanitize::ToolProjection,
+        Option<u64>,
+        reqwest::Response,
+    ),
+    GeminiApiError,
+> {
     let mut base_request = generate_content_request(params);
+    if let Some(req_obj) = base_request.as_object_mut() {
+        req_obj.insert(
+            "sessionId",
+            RuntimeJson::String(RuntimeString::from(compute_session_id(conversation_id))),
+        );
+    }
+    let tool_projection = super::sanitize::sanitize_outbound_request(&mut base_request);
     if let Some(details) = super::model_details(generation, model) {
         adapt_model_request(&mut base_request, &details)?;
     }
@@ -1905,14 +2101,36 @@ async fn establish_initial_leg_for_generation(
         generation,
         model,
         &mut project,
-        user_prompt_id,
+        conversation_id,
+        step,
         &base_request,
         None,
         signal,
         extra_headers,
     )
     .await?;
-    Ok((project, base_request, initial_max_output_tokens, response))
+    Ok((
+        project,
+        base_request,
+        tool_projection,
+        initial_max_output_tokens,
+        response,
+    ))
+}
+
+fn finalize_recorded_frame(
+    mut mapped: GenerateContentResponse,
+    projection: &super::sanitize::ToolProjection,
+    restorer: &mut super::sanitize::TextRestorer,
+) -> GenerateContentResponse {
+    let is_terminal = mapped
+        .candidates
+        .as_ref()
+        .and_then(|c| c.first())
+        .and_then(|c| c.finish_reason.as_ref())
+        .is_some();
+    projection.restore_response(&mut mapped, restorer, is_terminal);
+    mapped
 }
 
 #[async_trait::async_trait]
@@ -1935,27 +2153,45 @@ impl GeminiClient for CloudClient {
             .model
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
-        let user_prompt_id = uuid::Uuid::new_v4().to_string();
+        let (conversation_id, step) = self.next_conversation_step();
         let pooled = self.generation.is_empty();
         let mut attempted: Vec<String> = Vec::new();
-        let (mut generation, mut project, mut base_request, initial_max_output_tokens, response) = loop {
+        let (
+            mut generation,
+            mut stream_permit,
+            mut project,
+            mut base_request,
+            mut tool_projection,
+            initial_max_output_tokens,
+            response,
+        ) = loop {
             let candidate_gen = if pooled {
                 auth::generation().ok_or_else(|| api_error("antigravity_not_signed_in"))?
             } else {
                 self.generation.clone()
             };
+            let permit = acquire_stream_permit(&candidate_gen, &signal).await?;
             match establish_initial_leg_for_generation(
                 &candidate_gen,
                 &params,
                 &model,
-                &user_prompt_id,
+                &conversation_id,
+                step,
                 &signal,
                 &extra_headers,
             )
             .await
             {
-                Ok((project, base_request, max_tokens, response)) => {
-                    break (candidate_gen, project, base_request, max_tokens, response);
+                Ok((project, base_request, projection, max_tokens, response)) => {
+                    break (
+                        candidate_gen,
+                        permit,
+                        project,
+                        base_request,
+                        projection,
+                        max_tokens,
+                        response,
+                    );
                 }
                 Err(err)
                     if pooled
@@ -1964,11 +2200,14 @@ impl GeminiClient for CloudClient {
                         && auth::account_count() > 1
                         && !attempted.contains(&candidate_gen) =>
                 {
+                    drop(permit);
                     attempted.push(candidate_gen.clone());
                     match auth::rotate(&candidate_gen).await {
-                        RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
-                            if !attempted.contains(&next) =>
-                        {
+                        RotateOutcome::Rotated(next) if !attempted.contains(&next) => {
+                            wait_rotation_cooldown(&signal).await.map_err(api_error)?;
+                            continue;
+                        }
+                        RotateOutcome::AlreadyAdvanced(next) if !attempted.contains(&next) => {
                             continue;
                         }
                         _ => return Err(err),
@@ -1979,7 +2218,9 @@ impl GeminiClient for CloudClient {
         };
 
         Ok(Box::pin(async_stream::stream! {
+            let _active_permit = &mut stream_permit;
             let mut tracker = StreamContinuationTracker::new(initial_max_output_tokens);
+            let mut text_restorer = super::sanitize::TextRestorer::default();
             let mut response = response;
             let mut leg_token = auth::peek_access_token(&generation);
             let mut in_stream_auth_renewed = false;
@@ -2039,7 +2280,11 @@ impl GeminiClient for CloudClient {
                                     }
                                     match decode_raw_frame(&data, Some(&generation)) {
                                         Ok(decoded) => {
-                                            yield Ok(tracker.record_frame(decoded));
+                                            yield Ok(finalize_recorded_frame(
+                                                tracker.record_frame(decoded),
+                                                &tool_projection,
+                                                &mut text_restorer,
+                                            ));
                                         }
                                         Err(error) => {
                                             leg_err = Some(error);
@@ -2085,7 +2330,11 @@ impl GeminiClient for CloudClient {
                         }
                         match decode_raw_frame(&data, Some(&generation)) {
                             Ok(decoded) => {
-                                yield Ok(tracker.record_frame(decoded));
+                                yield Ok(finalize_recorded_frame(
+                                    tracker.record_frame(decoded),
+                                    &tool_projection,
+                                    &mut text_restorer,
+                                ));
                             }
                             Err(error) => {
                                 leg_err = Some(error);
@@ -2116,19 +2365,22 @@ impl GeminiClient for CloudClient {
                                     &generation,
                                     &params,
                                     &model,
-                                    &user_prompt_id,
+                                    &conversation_id,
+                                    step,
                                     &signal,
                                     &extra_headers,
                                 )
                                 .await
                                 {
-                                    Ok((next_proj, next_base, _, next_resp)) => {
+                                    Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
                                         project = next_proj;
                                         base_request = next_base;
+                                        tool_projection = next_proj_map;
                                         response = next_resp;
                                         leg_token = auth::peek_access_token(&generation);
                                         tracker =
                                             StreamContinuationTracker::new(initial_max_output_tokens);
+                                        text_restorer = Default::default();
                                         continue 'leg;
                                     }
                                     Err(retry_err) => {
@@ -2148,32 +2400,56 @@ impl GeminiClient for CloudClient {
                     {
                         attempted.push(generation.clone());
                         let mut terminal_err = first_err;
-                        while let RotateOutcome::Rotated(next)
-                        | RotateOutcome::AlreadyAdvanced(next) =
-                            auth::rotate(&generation).await
-                        {
+                        loop {
+                            let rotated = auth::rotate(&generation).await;
+                            let (next, was_rotated) = match rotated {
+                                RotateOutcome::Rotated(next) => (next, true),
+                                RotateOutcome::AlreadyAdvanced(next) => (next, false),
+                                RotateOutcome::Exhausted => break,
+                            };
                             if attempted.contains(&next) || signal.is_cancelled() {
                                 break;
                             }
+                            if was_rotated {
+                                if let Err(cancel_err) = wait_rotation_cooldown(&signal).await {
+                                    if !signal.is_cancelled() {
+                                        yield Err(api_error(cancel_err));
+                                    }
+                                    return;
+                                }
+                            }
+                            let next_permit = match acquire_stream_permit(&next, &signal).await {
+                                Ok(permit) => permit,
+                                Err(err) => {
+                                    if !signal.is_cancelled() {
+                                        yield Err(err);
+                                    }
+                                    return;
+                                }
+                            };
                             generation = next.clone();
+                            *_active_permit = next_permit;
                             in_stream_auth_renewed = false;
                             match establish_initial_leg_for_generation(
                                 &generation,
                                 &params,
                                 &model,
-                                &user_prompt_id,
+                                &conversation_id,
+                                step,
                                 &signal,
                                 &extra_headers,
                             )
                             .await
                             {
-                                Ok((next_proj, next_base, _, next_resp)) => {
+                                Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
                                     project = next_proj;
                                     base_request = next_base;
+                                    tool_projection = next_proj_map;
                                     response = next_resp;
                                     leg_token = auth::peek_access_token(&generation);
                                     tracker =
                                         StreamContinuationTracker::new(initial_max_output_tokens);
+                                    text_restorer = Default::default();
                                     continue 'leg;
                                 }
                                 Err(err)
@@ -2217,18 +2493,21 @@ impl GeminiClient for CloudClient {
                         &generation,
                         &params,
                         &model,
-                        &user_prompt_id,
+                        &conversation_id,
+                        step,
                         &signal,
                         &extra_headers,
                     )
                     .await
                     {
-                        Ok((next_proj, next_base, _, next_resp)) => {
+                        Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
                             project = next_proj;
                             base_request = next_base;
+                            tool_projection = next_proj_map;
                             response = next_resp;
                             leg_token = auth::peek_access_token(&generation);
                             tracker = StreamContinuationTracker::new(initial_max_output_tokens);
+                            text_restorer = Default::default();
                             continue 'leg;
                         }
                         Err(retry_err) => {
@@ -2259,8 +2538,46 @@ impl GeminiClient for CloudClient {
                     };
                 }
                 match tracker.evaluate_leg_end(leg_err) {
-                    LegEndAction::FinishCleanly => return,
+                    LegEndAction::FinishCleanly => {
+                        let leftover = text_restorer.flush();
+                        if !leftover.is_empty() {
+                            yield Ok(GenerateContentResponse {
+                                model_version: tracker.last_model_version.clone(),
+                                candidates: Some(vec![Candidate {
+                                    content: Some(Content {
+                                        role: "model".into(),
+                                        parts: vec![klaus_agent_core::provider::gemini::Part {
+                                            text: Some(RuntimeString::from(leftover)),
+                                            ..Default::default()
+                                        }],
+                                    }),
+                                    finish_reason: None,
+                                    grounding_metadata: None,
+                                }]),
+                                usage_metadata: None,
+                            });
+                        }
+                        return;
+                    }
                     LegEndAction::EmitSyntheticMaxTokens => {
+                        let leftover = text_restorer.flush();
+                        if !leftover.is_empty() {
+                            yield Ok(GenerateContentResponse {
+                                model_version: tracker.last_model_version.clone(),
+                                candidates: Some(vec![Candidate {
+                                    content: Some(Content {
+                                        role: "model".into(),
+                                        parts: vec![klaus_agent_core::provider::gemini::Part {
+                                            text: Some(RuntimeString::from(leftover)),
+                                            ..Default::default()
+                                        }],
+                                    }),
+                                    finish_reason: None,
+                                    grounding_metadata: None,
+                                }]),
+                                usage_metadata: None,
+                            });
+                        }
                         yield Ok(tracker.new_synthetic_max_tokens_response());
                         return;
                     }
@@ -2296,7 +2613,8 @@ impl GeminiClient for CloudClient {
                                 &generation,
                                 &model,
                                 &mut project,
-                                &user_prompt_id,
+                                &conversation_id,
+                                step,
                                 &base_request,
                                 token.as_ref(),
                                 &signal,
@@ -2311,6 +2629,28 @@ impl GeminiClient for CloudClient {
                                 }
                                 Err(dial_err) => match tracker.evaluate_dial_error(dial_err) {
                                     DialErrorAction::EmitSyntheticMaxTokens => {
+                                        let leftover = text_restorer.flush();
+                                        if !leftover.is_empty() {
+                                            yield Ok(GenerateContentResponse {
+                                                model_version: tracker.last_model_version.clone(),
+                                                candidates: Some(vec![Candidate {
+                                                    content: Some(Content {
+                                                        role: "model".into(),
+                                                        parts: vec![
+                                                            klaus_agent_core::provider::gemini::Part {
+                                                                text: Some(RuntimeString::from(
+                                                                    leftover,
+                                                                )),
+                                                                ..Default::default()
+                                                            },
+                                                        ],
+                                                    }),
+                                                    finish_reason: None,
+                                                    grounding_metadata: None,
+                                                }]),
+                                                usage_metadata: None,
+                                            });
+                                        }
                                         yield Ok(tracker.new_synthetic_max_tokens_response());
                                         return;
                                     }
@@ -3099,13 +3439,33 @@ mod tests {
     }
 
     #[test]
-    fn direct_envelope_has_camel_case_identity_without_paid_credit_opt_in() {
-        let body = envelope("project", "fixture-model", json!({"contents":[]}), "agent");
+    fn direct_envelope_has_scoped_request_id_and_omits_user_prompt_id() {
+        let body = envelope_with_context(
+            "project",
+            "fixture-model",
+            json!({"contents":[],"sessionId":compute_session_id("conv-123")}),
+            "agent",
+            Some("conv-123"),
+            Some(4),
+        );
         assert_eq!(body["requestType"], "agent");
-        assert!(body["requestId"].as_str().is_some());
-        assert!(body["userPromptId"].as_str().is_some());
+        let req_id = body["requestId"].as_str().unwrap();
+        assert!(
+            req_id.starts_with("agent/"),
+            "unexpected requestId: {req_id}"
+        );
+        assert!(
+            req_id.ends_with("/conv-123/4"),
+            "unexpected requestId: {req_id}"
+        );
+        assert!(body.get("userPromptId").is_none());
         assert!(body.get("enabledCreditTypes").is_none());
         assert!(body.get("session_id").is_none());
+        let session_id = body["request"]["sessionId"].as_str().unwrap();
+        assert!(
+            session_id.parse::<i64>().is_ok(),
+            "sessionId must be signed 64-bit decimal: {session_id}"
+        );
     }
 
     #[test]

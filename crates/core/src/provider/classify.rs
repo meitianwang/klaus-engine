@@ -340,6 +340,7 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
             | "antigravity_account_restricted"
             | "antigravity_verification_required"
             | "antigravity_permission_denied"
+            | "antigravity_egress_unavailable"
             | "image_preprocessing_failed",
         ) => Some(ProviderErrorKind::InvalidRequest),
         Some(

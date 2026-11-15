@@ -504,7 +504,15 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         for request in streams {
             assert_eq!(request["body"]["userAgent"], "antigravity");
             assert_eq!(request["body"]["requestType"], "agent");
-            assert!(request["body"].get("userPromptId").is_some());
+            let req_id = request["body"]["requestId"].as_str().unwrap();
+            assert!(
+                req_id.starts_with("agent/"),
+                "expected scoped requestId, got {req_id}"
+            );
+            assert!(request["body"].get("userPromptId").is_none());
+            assert!(request["body"]["request"]["sessionId"]
+                .as_str()
+                .is_some_and(|sid| sid.parse::<i64>().is_ok()));
             assert!(request["body"].get("enabledCreditTypes").is_none());
         }
         assert_eq!(
@@ -766,6 +774,7 @@ async fn buffered_cloud_frames_respect_credentials_and_clean_eof_preserves_outpu
     .unwrap();
     let client = cloud::CloudClient {
         generation: auth::generation().unwrap(),
+        session: None,
     };
     let params =
         |model: &str| decode(json!({"model":model,"contents":[],"config":{"maxOutputTokens":100}}));
@@ -797,6 +806,7 @@ async fn buffered_cloud_frames_respect_credentials_and_clean_eof_preserves_outpu
     .unwrap();
     let client = cloud::CloudClient {
         generation: auth::generation().unwrap(),
+        session: None,
     };
     let events: Vec<_> = client
         .generate_content_stream(
@@ -885,6 +895,7 @@ async fn a_stale_cached_project_heals_before_a_not_found_refusal_is_trusted() {
     .unwrap();
     let client = cloud::CloudClient {
         generation: auth::generation().unwrap(),
+        session: None,
     };
     let events: Vec<_> = client
         .generate_content_stream(
@@ -946,6 +957,7 @@ async fn a_persistent_not_found_reports_the_account_verdict_only_for_unlisted_mo
     .unwrap();
     let client = cloud::CloudClient {
         generation: auth::generation().unwrap(),
+        session: None,
     };
     let params =
         |model: &str| decode(json!({"model":model,"contents":[],"config":{"maxOutputTokens":100}}));
@@ -1245,7 +1257,10 @@ async fn a_model_the_live_catalog_dropped_reports_the_account_verdict() {
         snapshot.to_string(),
     )
     .unwrap();
-    let client = cloud::CloudClient { generation };
+    let client = cloud::CloudClient {
+        generation,
+        session: None,
+    };
     let error = client
         .generate_content_stream(
             decode(
@@ -1332,6 +1347,7 @@ async fn a_post_upload_transport_failure_is_never_replayed() {
             use klaus_agent_core::provider::gemini::GeminiClient;
             let client = cloud::CloudClient {
                 generation: generation.clone(),
+                session: None,
             };
             client
                 .generate_content_stream(
@@ -1405,6 +1421,7 @@ async fn a_connect_stage_failure_replays_once_and_reports_the_stage() {
             use klaus_agent_core::provider::gemini::GeminiClient;
             let client = cloud::CloudClient {
                 generation: generation.clone(),
+                session: None,
             };
             client
                 .generate_content_stream(
@@ -2959,4 +2976,428 @@ async fn premature_401_deduplicates_refresh_preserves_oauth_verdicts_and_retries
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
     remove_process_environment_var("KLAUS_ANTIGRAVITY_OAUTH_URL");
+}
+
+#[tokio::test]
+async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigravity_and_restores_calls(
+) {
+    use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+    use klaus_agent_core::types::provider::{ModelProvider, ModelRequest, ModelStreamEvent};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let captured_clone = captured_bodies.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = captured_clone.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while raw.len() < header_end + content_len {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                if let Ok(parsed) =
+                    serde_json::from_slice::<Value>(&raw[header_end..header_end + content_len])
+                {
+                    if path.contains("streamGenerateContent") || path.contains("generateContent") {
+                        captured.lock().unwrap().push(parsed);
+                    }
+                }
+                if path.contains("streamGenerateContent") {
+                    let sse = concat!(
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Chart:\\n::inline-\"}]}}]}}\n\n",
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"vis-frame{path=\\\"/tmp/x.html\\\"}\"},{\"functionCall\":{\"name\":\"app_state_query\",\"args\":{\"key\":\"docs\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}}\n\n"
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else {
+                    let body = json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{ "text": "plain-gemini-ok" }]
+                            },
+                            "finishReason": "STOP"
+                        }]
+                    })
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    auth::adopt(auth::Credential {
+        access_token: "tok-sanitize".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("sanitize@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-sanitize".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+
+    let proto_init = ProtocolSessionInit {
+        thread_id: Some(RuntimeString::from("thread-fixed-42")),
+        ..Default::default()
+    };
+    let base_provider: Arc<dyn ModelProvider> =
+        Arc::new(GeminiProvider::new(GeminiProviderOptions {
+            api_key: Some("dummy-key".into()),
+            base_url: Some(endpoint.clone()),
+            default_model: Some("gemini-3.8-flash-medium".into()),
+            capabilities: Some(decode(json!({ "supportsTools": true }))),
+            ..Default::default()
+        }));
+    let agy_provider = decorate(base_provider.clone(), &proto_init);
+
+    let make_req = || -> ModelRequest {
+        let mut req: ModelRequest = decode(json!({
+            "model": "gemini-3.8-flash-medium",
+            "system": [{
+                "name": "base",
+                "text": "You are Klaus. You and the user share one workspace, and your job is to collaborate with them until their intended goal is completely handled.\nUse `klaus_query` in /Users/dev/workspace/klaus."
+            }],
+            "messages": [],
+            "tools": [{
+                "name": "klaus_query",
+                "description": "Read Klaus documentation and live state.",
+                "inputSchema": { "type": "object", "properties": { "key": { "type": "string" } } }
+            }],
+            "maxOutputTokens": 256
+        }));
+        req.messages
+            .push(klaus_agent_core::schemas::message::Message::User(
+                klaus_agent_core::schemas::message::UserMessage {
+                    uuid: "u-1".into(),
+                    is_meta: None,
+                    question_answer: None,
+                    content: vec![klaus_agent_core::schemas::content::ContentBlock::Text(
+                        klaus_agent_core::schemas::content::TextBlock {
+                            text: "<!-- klaus-steered-message -->\nInspect status".into(),
+                            citations: None,
+                            harness_envelope: None,
+                            message_id: None,
+                            phase: None,
+                        },
+                    )],
+                },
+            ));
+        req
+    };
+
+    let events: Vec<_> = agy_provider
+        .stream(make_req(), AbortSignal::new())
+        .collect()
+        .await;
+    let combined_text: String = events
+        .iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        combined_text, "Chart:\n::klaus-inline-vis{path=\"/tmp/x.html\"}",
+        "split inline-vis marker must be restored across chunks: {events:?}"
+    );
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            ModelStreamEvent::ToolUseStart { name, .. } if name == "klaus_query"
+        )),
+        "wire tool call `app_state_query` must restore to `klaus_query`: {events:?}"
+    );
+
+    let sent = captured_bodies.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    let wire_body = &sent[0];
+    assert!(wire_body.get("userPromptId").is_none());
+    let req_id = wire_body["requestId"].as_str().unwrap();
+    assert!(req_id.starts_with("agent/") && req_id.ends_with("/thread-fixed-42/0"));
+    assert_eq!(
+        wire_body["request"]["sessionId"].as_str().unwrap(),
+        cloud::compute_session_id("thread-fixed-42")
+    );
+    let wire_sys = wire_body["request"]["systemInstruction"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!wire_sys.contains("You are Klaus"));
+    assert!(wire_sys.contains("/Users/dev/workspace/klaus"));
+    assert_eq!(
+        wire_body["request"]["tools"][0]["functionDeclarations"][0]["name"],
+        "app_state_query"
+    );
+
+    // Non-Antigravity GeminiProvider preserves original system prompt and tool names verbatim.
+    captured_bodies.lock().unwrap().clear();
+    let _plain_events: Vec<_> = base_provider
+        .stream(make_req(), AbortSignal::new())
+        .collect()
+        .await;
+    let plain_sent = captured_bodies.lock().unwrap().clone();
+    assert_eq!(plain_sent.len(), 1);
+    let plain_sys = plain_sent[0]["systemInstruction"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(plain_sys.starts_with("You are Klaus."));
+    assert_eq!(
+        plain_sent[0]["tools"][0]["functionDeclarations"][0]["name"],
+        "klaus_query"
+    );
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+}
+
+#[tokio::test]
+async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_excess_streams() {
+    use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+    use klaus_agent_core::types::provider::{ModelProvider, ModelRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let active_in_flight = Arc::new(AtomicUsize::new(0));
+    let peak_in_flight = Arc::new(AtomicUsize::new(0));
+    let heartbeat_tokens: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+    let two_entered = Arc::new(tokio::sync::Notify::new());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let active_clone = active_in_flight.clone();
+    let peak_clone = peak_in_flight.clone();
+    let hb_clone = heartbeat_tokens.clone();
+    let release_clone = release_gate.clone();
+    let two_entered_clone = two_entered.clone();
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let active = active_clone.clone();
+            let peak = peak_clone.clone();
+            let hb = hb_clone.clone();
+            let release = release_clone.clone();
+            let two_in = two_entered_clone.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let bearer = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+
+                if path.contains("streamGenerateContent") {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    if now == 2 {
+                        two_in.notify_one();
+                    }
+                    release.notified().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n";
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else {
+                    if path.contains("loadCodeAssist") || path.contains("fetchAvailableModels") {
+                        hb.lock().unwrap().push(format!("{bearer}:{path}"));
+                    }
+                    let body = if path.contains("fetchAvailableModels") {
+                        json!({"models":{"gemini-3.8-flash-medium":{"displayName":"Flash"}}})
+                            .to_string()
+                    } else {
+                        json!({"cloudaicompanionProject":"proj-pool"}).to_string()
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS", "1");
+    set_process_environment_var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS", "2");
+
+    auth::adopt(auth::Credential {
+        access_token: "head-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("head@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-head".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let head_gen = auth::generation().unwrap();
+
+    auth::adopt(auth::Credential {
+        access_token: "standby-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("standby@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-standby".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let standby_gen = auth::generations()
+        .into_iter()
+        .find(|g| g != &head_gen)
+        .unwrap();
+
+    spawn_heartbeat(&standby_gen);
+    refresh_catalog(&head_gen).await.unwrap();
+    heartbeat_tokens.lock().unwrap().clear();
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let recorded_hb = heartbeat_tokens.lock().unwrap().clone();
+    assert!(
+        recorded_hb
+            .iter()
+            .any(|entry| entry.starts_with("Bearer head-tok:")),
+        "expected active head heartbeat RPCs, got {recorded_hb:?}"
+    );
+    assert!(
+        !recorded_hb
+            .iter()
+            .any(|entry| entry.starts_with("Bearer standby-tok:")),
+        "standby account must never emit background heartbeat RPCs: {recorded_hb:?}"
+    );
+
+    let proto_init = ProtocolSessionInit::default();
+    let base_provider: Arc<dyn ModelProvider> =
+        Arc::new(GeminiProvider::new(GeminiProviderOptions {
+            default_model: Some("gemini-3.8-flash-medium".into()),
+            ..Default::default()
+        }));
+    let provider = decorate(base_provider, &proto_init);
+    let launch_one = |p: Arc<dyn ModelProvider>| {
+        tokio::spawn(async move {
+            let req: ModelRequest = decode(json!({
+                "model": "gemini-3.8-flash-medium",
+                "system": [],
+                "messages": [],
+                "tools": [],
+                "maxOutputTokens": 64
+            }));
+            p.stream(req, AbortSignal::new()).collect::<Vec<_>>().await
+        })
+    };
+    let tasks: Vec<_> = (0..4).map(|_| launch_one(provider.clone())).collect();
+    tokio::time::timeout(std::time::Duration::from_secs(5), two_entered.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(active_in_flight.load(Ordering::SeqCst), 2);
+    assert_eq!(peak_in_flight.load(Ordering::SeqCst), 2);
+    for _ in 0..8 {
+        release_gate.notify_waiters();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+    for task in tasks {
+        let evs = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!evs.is_empty());
+    }
+    assert!(
+        peak_in_flight.load(Ordering::SeqCst) <= 2,
+        "peak concurrent streams exceeded cap of 2: {}",
+        peak_in_flight.load(Ordering::SeqCst)
+    );
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS");
 }

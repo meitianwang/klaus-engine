@@ -622,3 +622,41 @@ fn browser_sign_in_requires_a_complete_build_time_client() {
         Ok(("id", "secret"))
     );
 }
+
+#[tokio::test]
+async fn id_token_email_claim_completes_sign_in_without_calling_userinfo() {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload =
+        URL_SAFE_NO_PAD.encode(br#"{"email":"idtoken@example.invalid","email_verified":true}"#);
+    let id_token = format!("{header}.{payload}.sig");
+    let f = LoginFixture::new(
+        Behavior {
+            token_status: 200,
+            token_body: json!({
+                "access_token": "fixture-access",
+                "refresh_token": "fixture-refresh",
+                "id_token": id_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })
+            .to_string(),
+            profile_status: 500,
+            profile_body: "userinfo must not be called".into(),
+            blocked: false,
+        },
+        LOGIN_WINDOW,
+        None,
+    )
+    .await;
+    assert_eq!(f.callback().await.status(), 200);
+    let terminal = f.terminal().await;
+    assert_eq!(terminal["ok"], true);
+    assert_eq!(terminal["account"], "idtoken@example.invalid");
+    let requests = f.mock.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected only /token request, got {requests:?}"
+    );
+    assert_eq!(requests[0]["path"], "/token");
+}

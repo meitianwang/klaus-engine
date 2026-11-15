@@ -6,8 +6,8 @@ mod catalog;
 mod cloud;
 mod egress;
 pub mod login;
+mod sanitize;
 
-use futures::future::join_all;
 use klaus_agent_core::provider::gemini::{
     GeminiAdapterPolicy, GeminiProvider, GeminiProviderOptions, GeminiThinkingDialect,
 };
@@ -128,6 +128,9 @@ pub(super) fn prune_generation(generation: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(generation);
+    unmark(&HEARTBEAT_SPAWNED, generation);
+    unmark(&SURFACE_BOOTSTRAPPED, generation);
+    cloud::prune_stream_limiter(generation);
 }
 
 pub(super) fn sync_head_catalog() {
@@ -188,6 +191,14 @@ pub(super) fn sync_head_catalog() {
     };
     if should_notify {
         super::model_sources::notify_catalog_changed(root, "antigravity");
+    }
+    if tokio::runtime::Handle::try_current().is_ok()
+        && cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&head)
+    {
+        spawn_heartbeat(&head);
     }
 }
 
@@ -388,18 +399,28 @@ fn mark_once(
         .insert(generation.to_string())
 }
 
+fn unmark(
+    set: &std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>,
+    generation: &str,
+) {
+    if let Some(guard) = set.get() {
+        guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(generation);
+    }
+}
+
 static SURFACE_BOOTSTRAPPED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 static HEARTBEAT_SPAWNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
-/// Periodic control-plane keepalive. The hub client revalidates its account
-/// and catalog with paired loadCodeAssist + fetchAvailableModels calls roughly
-/// every six minutes while it runs; this task mirrors that cadence for as long
-/// as the credential generation stays current.
+/// Periodic control-plane keepalive for the single active head account only.
+/// Standby accounts in the pool stay silent until promoted to the head slot.
 fn spawn_heartbeat(generation: &str) {
-    if !mark_once(&HEARTBEAT_SPAWNED, generation) {
+    if !auth::is_head_generation(generation) || !mark_once(&HEARTBEAT_SPAWNED, generation) {
         return;
     }
     let generation = generation.to_string();
@@ -416,14 +437,16 @@ fn spawn_heartbeat(generation: &str) {
                 .map(|elapsed| u64::from(elapsed.subsec_nanos()) % spread)
                 .unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_secs(base + jitter)).await;
-            if !auth::is_current(&generation) {
+            if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
+                unmark(&HEARTBEAT_SPAWNED, &generation);
                 break;
             }
             let signal = AbortSignal::new();
             let project = match project(Some(&generation), &signal).await {
                 Ok(project) => project,
                 Err(_) => {
-                    if !auth::is_current(&generation) {
+                    if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
+                        unmark(&HEARTBEAT_SPAWNED, &generation);
                         break;
                     }
                     continue;
@@ -446,7 +469,8 @@ fn spawn_heartbeat(generation: &str) {
                 &signal,
             )
             .await;
-            if !auth::is_current(&generation) {
+            if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
+                unmark(&HEARTBEAT_SPAWNED, &generation);
                 break;
             }
             let _ = refresh_catalog(&generation).await;
@@ -646,6 +670,7 @@ pub(crate) async fn stream_dictation(
         audio::Credentials {
             access_token: &credential.access_token,
             model: &model,
+            pool_key: Some(&generation),
         },
         audio::StreamCallbacks {
             ready: Some(Box::new(move || {
@@ -712,6 +737,7 @@ pub async fn transcribe_audio(
         audio::Credentials {
             access_token: &credential.access_token,
             model: &model,
+            pool_key: Some(&generation),
         },
         signal.clone(),
     )
@@ -733,6 +759,7 @@ pub async fn transcribe_audio(
                         audio::Credentials {
                             access_token: &renewed.access_token,
                             model: &model,
+                            pool_key: Some(&generation),
                         },
                         signal,
                     )
@@ -837,43 +864,42 @@ pub async fn usage() -> Result<Value, String> {
     if entries.len() == 1 {
         return account_usage(&entries[0]).await;
     }
-    let rows = join_all(
-        entries
-            .into_iter()
-            .enumerate()
-            .map(|(index, entry)| async move {
-                let label = entry
-                    .credential
-                    .account
-                    .as_deref()
-                    .filter(|account| !account.is_empty())
-                    .unwrap_or("Antigravity")
-                    .to_string();
-                let outcome =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(&entry))
-                        .await
-                        .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
-                match outcome {
-                    Ok(mut row) => {
-                        if let Some(obj) = row.as_object_mut() {
-                            obj.insert("id".into(), json!(entry.id));
-                            obj.insert("label".into(), json!(label));
-                            obj.insert("isCurrent".into(), json!(index == 0));
-                            obj.insert("state".into(), json!("ok"));
-                        }
-                        row
-                    }
-                    Err(error) => json!({
-                        "id": entry.id,
-                        "label": label,
-                        "isCurrent": index == 0,
-                        "state": "error",
-                        "error": error,
-                    }),
+    let mut rows = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+        let label = entry
+            .credential
+            .account
+            .as_deref()
+            .filter(|account| !account.is_empty())
+            .unwrap_or("Antigravity")
+            .to_string();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(&entry))
+                .await
+                .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
+        let row = match outcome {
+            Ok(mut row) => {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("id".into(), json!(entry.id));
+                    obj.insert("label".into(), json!(label));
+                    obj.insert("isCurrent".into(), json!(index == 0));
+                    obj.insert("state".into(), json!("ok"));
                 }
+                row
+            }
+            Err(error) => json!({
+                "id": entry.id,
+                "label": label,
+                "isCurrent": index == 0,
+                "state": "error",
+                "error": error,
             }),
-    )
-    .await;
+        };
+        rows.push(row);
+    }
     let mut top = rows
         .first()
         .cloned()
@@ -1054,13 +1080,17 @@ pub(super) fn decorate(
             )
         })
         .collect();
+    let conversation_id = init
+        .thread_id
+        .as_ref()
+        .and_then(|id| id.try_to_utf8().ok())
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let admission_generations = auth::generations();
     let multi_account = admission_generations.len() > 1;
     Arc::new(GeminiProvider::new(GeminiProviderOptions {
         default_model: model.try_to_utf8().ok(),
-        client: Some(Arc::new(cloud::CloudClient {
-            generation: String::new(),
-        })),
+        client: Some(Arc::new(cloud::CloudClient::pooled(conversation_id))),
         retry: Some(RetryOptions {
             yield_to_credential_rotation: multi_account,
             ..Default::default()
@@ -1107,9 +1137,14 @@ async fn generate_content_with_rotation(
     model_field: &str,
     requested_model: Option<&str>,
     request_type: &str,
+    session_id: Option<&str>,
     build_request: impl Fn(&str) -> Value,
     signal: &AbortSignal,
 ) -> Result<(String, String, Value), String> {
+    let conversation_id = session_id
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut attempted: Vec<String> = Vec::new();
     loop {
         let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
@@ -1117,7 +1152,21 @@ async fn generate_content_with_rotation(
         let model = native_model(&payload, model_field, requested_model)?;
         let outcome: Result<Value, String> = async {
             let project = project(Some(&generation), signal).await?;
-            let body = cloud::envelope(&project, &model, build_request(&model), request_type);
+            let mut inner_request = build_request(&model);
+            if let Some(obj) = inner_request.as_object_mut() {
+                obj.insert(
+                    "sessionId".into(),
+                    Value::String(cloud::compute_session_id(&conversation_id)),
+                );
+            }
+            let body = cloud::envelope_with_context(
+                &project,
+                &model,
+                inner_request,
+                request_type,
+                Some(&conversation_id),
+                Some(0),
+            );
             cloud::rpc("generateContent", body, Some(&generation), signal).await
         }
         .await;
@@ -1131,9 +1180,13 @@ async fn generate_content_with_rotation(
             {
                 attempted.push(generation.clone());
                 match auth::rotate(&generation).await {
-                    RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
-                        if !attempted.contains(&next) =>
-                    {
+                    RotateOutcome::Rotated(next) if !attempted.contains(&next) => {
+                        cloud::wait_rotation_cooldown(signal)
+                            .await
+                            .map_err(str::to_string)?;
+                        continue;
+                    }
+                    RotateOutcome::AlreadyAdvanced(next) if !attempted.contains(&next) => {
                         continue;
                     }
                     _ => return Err(err),
@@ -1183,6 +1236,7 @@ pub async fn generate_image(
         "imageGenerationModelIds",
         params.model.as_deref(),
         "image_gen",
+        params.session_id.as_deref(),
         |_| {
             json!({
                 "contents":[{"role":"user","parts":parts}],
@@ -1231,6 +1285,7 @@ pub async fn search(
         "webSearchModelIds",
         params.model.as_deref(),
         "web_search",
+        params.session_id.as_deref(),
         |_| {
             json!({
                 "contents":[{"role":"user","parts":[{"text":query_text}]}],
