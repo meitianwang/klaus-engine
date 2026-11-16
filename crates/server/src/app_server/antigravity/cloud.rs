@@ -2012,7 +2012,7 @@ fn adapt_model_request(request: &mut RuntimeJson, details: &Value) -> Result<(),
             2 => "MEDIUM",
             3 => "HIGH",
             4 => "MINIMAL",
-            5 => "EXTRA_HIGH",
+            5 | 100 => "EXTRA_HIGH",
             6 | 200 => "MAX",
             _ => return Err(api_error("antigravity_thinking_level_unsupported")),
         };
@@ -3216,6 +3216,10 @@ mod tests {
             (
                 json!({"thinkingLevel":3,"thinkingBudget":0,"supportsAdaptiveThinking":false}),
                 "HIGH",
+            ),
+            (
+                json!({"thinkingLevel":100,"thinkingBudget":0,"supportsAdaptiveThinking":false}),
+                "EXTRA_HIGH",
             ),
             (
                 json!({"thinkingLevel":200,"thinkingBudget":0,"supportsAdaptiveThinking":true}),
