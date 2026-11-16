@@ -645,6 +645,16 @@ facade_methods! {
     AntigravityTranscribeAudio => "antigravity/transcribeAudio" (wire::AntigravityTranscribeParams) -> Value;
     AntigravityCancelOperation => "antigravity/cancelOperation" (wire::WorkBuddyCancelParams) -> Value;
 
+    /// The public Gemini chat lineup served through the shared direct-cloud
+    /// account: the same login and backend as the Antigravity source, with its
+    /// own catalog projection, usage pool and error vocabulary.
+    GeminiStatus => "gemini/status" (wire::QoderParams) -> Value;
+    GeminiAdoptCredential => "gemini/adoptCredential" (wire::AntigravityAdoptParams) -> Value;
+    GeminiSwitchAccount => "gemini/switchAccount" (wire::AntigravitySwitchAccountParams) -> Value;
+    GeminiLogout => "gemini/logout" (wire::AntigravityLogoutParams) -> Value;
+    GeminiModels => "gemini/models" (wire::QoderModelsParams) -> Value;
+    GeminiUsage => "gemini/usage" (wire::QoderParams) -> Value;
+
     /// The Claude subscription lineup, for the third time the same reason: which
     /// models the subscription serves and what effort ladder each one honours is
     /// knowledge this engine already holds to declare a session's capability set.

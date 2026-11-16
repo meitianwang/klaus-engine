@@ -140,6 +140,13 @@ fn dedicated_identity(source: &str, key: &str) -> bool {
     }
     match source {
         "kiro" => key == "auto" || key.starts_with("auto::effort="),
+        "gemini" => {
+            key.ends_with("-image")
+                || key.starts_with("tab_")
+                || key.starts_with("chat_")
+                || key.contains("orchestrator")
+                || key.contains("worker")
+        }
         "bailian" => {
             key == "decision-model-preview"
                 || (key.starts_with("qwen-audio-")

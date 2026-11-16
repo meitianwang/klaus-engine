@@ -51,6 +51,10 @@ pub(super) async fn resolve(
             super::antigravity::set_config_root(&model_sources::config_root_of(config_path));
             super::antigravity::main_model(value, &params.model_tier_selections).await?
         }
+        "gemini" => {
+            super::gemini::set_config_root(&model_sources::config_root_of(config_path));
+            super::gemini::main_model(value, &params.model_tier_selections).await?
+        }
         "custom" => {
             let document = config_store::load(config_path)
                 .await
