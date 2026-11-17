@@ -3128,15 +3128,6 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
             let params = scalar_params!();
             dispatch_antigravity(state, id, &method, params).await;
         }
-        "gemini/status"
-        | "gemini/adoptCredential"
-        | "gemini/switchAccount"
-        | "gemini/logout"
-        | "gemini/models"
-        | "gemini/usage" => {
-            let params = scalar_params!();
-            dispatch_gemini(state, id, &method, params).await;
-        }
         // Kimi's coding gateway is the ordinary Anthropic wire with a plain
         // credential, so there is no `setThinkingLevel` side channel either: the
         // engine sends the effort itself, from the ladder the cloud catalog
@@ -6717,47 +6708,6 @@ async fn dispatch_antigravity(state: Arc<AppServerState>, id: Value, method: &st
             "antigravity/usage" => super::antigravity::usage().await,
             "antigravity/capabilities" => super::antigravity::capabilities().await,
             _ => Err("antigravity_method_unavailable".into()),
-        };
-        match outcome {
-            Ok(value) => state.send(wire::response(&id, value)).await,
-            Err(error) => {
-                state
-                    .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
-                    .await
-            }
-        }
-    });
-}
-
-async fn dispatch_gemini(state: Arc<AppServerState>, id: Value, method: &str, params: Value) {
-    super::gemini::set_config_root(&super::model_sources::config_root_of(&state.config_path));
-    let method = method.to_string();
-    tokio::spawn(async move {
-        let outcome: Result<Value, String> = match method.as_str() {
-            "gemini/status" => Ok(super::gemini::status()),
-            "gemini/adoptCredential" => match decode_qoder::<wire::AntigravityAdoptParams>(&params)
-            {
-                Ok(params) => super::gemini::adopt(params.credential).await,
-                Err(error) => Err(error),
-            },
-            "gemini/switchAccount" => {
-                match decode_qoder::<wire::AntigravitySwitchAccountParams>(&params) {
-                    Ok(params) => super::gemini::switch_account(&params.account_id).await,
-                    Err(error) => Err(error),
-                }
-            }
-            "gemini/logout" => match decode_qoder::<wire::AntigravityLogoutParams>(&params) {
-                Ok(params) => super::gemini::logout_account(params.account_id.as_deref()).await,
-                Err(error) => Err(error),
-            },
-            "gemini/models" => match decode_qoder::<wire::QoderModelsParams>(&params) {
-                Ok(params) => {
-                    super::gemini::models(params.read == wire::QoderCatalogRead::Warm).await
-                }
-                Err(error) => Err(error),
-            },
-            "gemini/usage" => super::gemini::usage().await,
-            _ => Err("gemini_method_unavailable".into()),
         };
         match outcome {
             Ok(value) => state.send(wire::response(&id, value)).await,

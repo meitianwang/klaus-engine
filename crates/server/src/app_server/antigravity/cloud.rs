@@ -141,7 +141,7 @@ fn hub_build() -> &'static (String, String) {
 /// The first resolution may spawn helper processes to inspect the installed
 /// application, which must not block an async worker; park that work on the
 /// blocking pool ahead of any identity consumer.
-pub(crate) async fn ensure_identity() {
+pub(super) async fn ensure_identity() {
     if HUB_BUILD.get().is_some() {
         return;
     }
@@ -163,7 +163,7 @@ pub(super) fn identity_ua(version: &str, cl: &str) -> String {
     format!("antigravity/hub/{version} (aidev_client; os_type={os}; arch={arch}; cl={cl})")
 }
 
-pub(crate) fn client_identity() -> String {
+pub(super) fn client_identity() -> String {
     let (version, cl) = hub_build();
     identity_ua(version, cl)
 }
@@ -790,7 +790,7 @@ async fn send_once(
     Ok((response, used_token))
 }
 
-pub(crate) async fn rpc(
+pub(super) async fn rpc(
     method: &str,
     body: Value,
     generation: Option<&str>,
@@ -802,7 +802,7 @@ pub(crate) async fn rpc(
 
 /// Body-less GET variant for the catalog-adjacent surfaces the hub client
 /// reads without a request payload.
-pub(crate) async fn rpc_get(
+pub(super) async fn rpc_get(
     method: &str,
     generation: Option<&str>,
     signal: &AbortSignal,
@@ -1042,19 +1042,19 @@ pub(super) async fn wait_rotation_cooldown(signal: &AbortSignal) -> Result<(), &
 }
 
 #[derive(Clone)]
-pub(crate) struct CloudSessionContext {
+pub(super) struct CloudSessionContext {
     pub conversation_id: String,
     pub step_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct CloudClient {
+pub(super) struct CloudClient {
     pub generation: String,
     pub session: Option<CloudSessionContext>,
 }
 
 impl CloudClient {
-    pub(crate) fn pooled(conversation_id: String) -> Self {
+    pub(super) fn pooled(conversation_id: String) -> Self {
         Self {
             generation: String::new(),
             session: Some(CloudSessionContext {

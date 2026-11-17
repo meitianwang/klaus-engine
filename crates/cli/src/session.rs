@@ -730,7 +730,6 @@ mod tests {
             "codex:gpt-5.6-sol",
             "qoder:auto",
             "antigravity:gemini-4-carbon-high",
-            "gemini:gemini-3-flash",
         ] {
             let globals = with_model(Some(selection));
             assert_eq!(

@@ -341,36 +341,15 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
             | "antigravity_verification_required"
             | "antigravity_permission_denied"
             | "antigravity_egress_unavailable"
-            | "gemini_model_access_denied"
-            | "gemini_model_not_offered"
-            | "gemini_model_unlisted"
-            | "gemini_request_rejected"
-            | "gemini_region_unsupported"
-            | "gemini_account_disabled"
-            | "gemini_account_restricted"
-            | "gemini_verification_required"
-            | "gemini_permission_denied"
-            | "gemini_egress_unavailable"
             | "image_preprocessing_failed",
         ) => Some(ProviderErrorKind::InvalidRequest),
         Some(
             "antigravity_auth_required" | "antigravity_login_expired" | "antigravity_not_signed_in",
         ) => Some(ProviderErrorKind::Auth),
-        Some("gemini_auth_required" | "gemini_login_expired" | "gemini_not_signed_in") => {
-            Some(ProviderErrorKind::Auth)
-        }
-        Some("antigravity_refresh_unavailable" | "gemini_refresh_unavailable") => {
-            Some(ProviderErrorKind::Timeout)
-        }
-        Some("antigravity_quota_exhausted" | "gemini_quota_exhausted") => {
-            Some(ProviderErrorKind::Quota)
-        }
-        Some("antigravity_rate_limited" | "gemini_rate_limited") => {
-            Some(ProviderErrorKind::RateLimit)
-        }
-        Some("antigravity_service_unavailable" | "gemini_service_unavailable") => {
-            Some(ProviderErrorKind::Overloaded)
-        }
+        Some("antigravity_refresh_unavailable") => Some(ProviderErrorKind::Timeout),
+        Some("antigravity_quota_exhausted") => Some(ProviderErrorKind::Quota),
+        Some("antigravity_rate_limited") => Some(ProviderErrorKind::RateLimit),
+        Some("antigravity_service_unavailable") => Some(ProviderErrorKind::Overloaded),
         Some("rate_limit_exceeded") | Some("rate_limit_error") => {
             Some(ProviderErrorKind::RateLimit)
         }

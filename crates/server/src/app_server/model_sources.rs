@@ -292,16 +292,6 @@ pub(crate) fn provider_decorator(
             .as_ref()
             .and_then(|value| value.get("source"))
             .and_then(|value| value.as_string())
-            .is_some_and(|source| source == "gemini")
-        {
-            super::gemini::set_config_root(&root);
-            return super::gemini::decorate(provider, init);
-        }
-        if init
-            .model_source
-            .as_ref()
-            .and_then(|value| value.get("source"))
-            .and_then(|value| value.as_string())
             .is_some_and(|source| source == "antigravity")
         {
             super::antigravity::set_config_root(&root);
@@ -647,10 +637,6 @@ pub async fn resolve(
     if let Some(model) = selection.strip_prefix("antigravity:") {
         super::antigravity::set_config_root(config_root);
         return super::antigravity::resolve(model, tiers).await.map(Some);
-    }
-    if let Some(model) = selection.strip_prefix("gemini:") {
-        super::gemini::set_config_root(config_root);
-        return super::gemini::resolve(model, tiers).await.map(Some);
     }
     if let Some(alias) = selection.strip_prefix("subscription:") {
         return claude(alias, config_root, tiers).await.map(Some);

@@ -17,7 +17,6 @@ mod codex_dictation;
 mod conversation_catalog;
 pub mod cursor;
 mod external_import;
-pub mod gemini;
 pub mod kimi;
 pub mod kiro;
 mod maintenance;

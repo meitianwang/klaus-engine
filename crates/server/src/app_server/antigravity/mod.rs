@@ -2,8 +2,8 @@
 
 mod audio;
 pub mod auth;
-pub(crate) mod catalog;
-pub(crate) mod cloud;
+mod catalog;
+mod cloud;
 mod egress;
 pub mod login;
 mod sanitize;
@@ -249,7 +249,7 @@ pub(super) fn cloud_test_identity() -> String {
     cloud::client_identity()
 }
 
-pub(crate) async fn project(
+pub(super) async fn project(
     expected: Option<&str>,
     signal: &AbortSignal,
 ) -> Result<String, String> {
@@ -481,12 +481,12 @@ fn spawn_heartbeat(generation: &str) {
 /// A NOT_FOUND refusal names an entity the service no longer resolves. The cached
 /// project is the only identity kept without revalidation, so it is the first
 /// suspect whenever an otherwise authenticated request hits that verdict.
-pub(crate) fn is_not_found_message(message: &str) -> bool {
+pub(super) fn is_not_found_message(message: &str) -> bool {
     message.contains("[NOT_FOUND]")
 }
 
 /// Drop the cached project and resolve a fresh one from the service.
-pub(crate) async fn heal_project(generation: &str, signal: &AbortSignal) -> Result<String, String> {
+pub(super) async fn heal_project(generation: &str, signal: &AbortSignal) -> Result<String, String> {
     auth::clear_project(generation).await?;
     project(Some(generation), signal).await
 }

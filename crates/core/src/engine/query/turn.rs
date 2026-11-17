@@ -1438,31 +1438,26 @@ async fn run_turn(
                     continue;
                 }
                 if e.kind == ProviderErrorKind::Auth {
-                    // The direct-cloud sources stamp a stable tag on the
-                    // refusal. Replacing it with the generic auth sentence
-                    // makes a network failure or an account ban read as
-                    // "credentials rejected".
-                    let hub_verdict = e
+                    // Antigravity stamps a stable tag on the refusal. Replacing it
+                    // with the generic auth sentence makes a network failure or an
+                    // account ban read as "credentials rejected".
+                    let antigravity_verdict = e
                         .code
                         .as_ref()
                         .and_then(|code| code.try_to_utf8().ok())
-                        .is_some_and(|code| {
-                            code.starts_with("antigravity_") || code.starts_with("gemini_")
-                        })
+                        .is_some_and(|code| code.starts_with("antigravity_"))
                         || e.message
                             .try_to_utf8()
                             .ok()
-                            .is_some_and(|message| {
-                                message.contains("antigravity_") || message.contains("gemini_")
-                            });
-                    if hub_verdict
+                            .is_some_and(|message| message.contains("antigravity_"));
+                    if antigravity_verdict
                         && shared
                             .params
                             .agent_type
                             .as_ref()
                             .is_none_or(|kind| kind != "approval-review")
                     {
-                        emit_provider_failure(&shared, e, "auth: hub verdict");
+                        emit_provider_failure(&shared, e, "auth: antigravity verdict");
                         return;
                     }
                     // The turn ends with a fixed sentence, so this record is the

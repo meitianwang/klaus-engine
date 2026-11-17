@@ -65,7 +65,7 @@ pub(super) struct LoginWriteOutcome {
     pub previous_count: usize,
 }
 
-pub(crate) fn credential_lock() -> &'static Mutex<()> {
+pub(super) fn credential_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -537,7 +537,7 @@ pub(crate) fn generation() -> Option<String> {
     accounts().into_iter().next().map(|entry| entry.generation)
 }
 
-pub(crate) fn generations() -> Vec<String> {
+pub(super) fn generations() -> Vec<String> {
     accounts()
         .into_iter()
         .map(|entry| entry.generation)
@@ -622,7 +622,7 @@ pub(crate) fn is_current(generation: &str) -> bool {
 }
 
 /// Whether `generation` is currently the active head of the pool.
-pub(crate) fn is_head_generation(generation: &str) -> bool {
+pub(super) fn is_head_generation(generation: &str) -> bool {
     accounts()
         .first()
         .is_some_and(|head| head.generation == generation)
@@ -649,7 +649,7 @@ pub(super) async fn force_refresh(
 
 /// Resolve the active head's credential, advancing past expired queued heads when
 /// spare accounts remain in the pool.
-pub(crate) async fn active_or_rotated_credential() -> Result<Credential, String> {
+pub(super) async fn active_or_rotated_credential() -> Result<Credential, String> {
     let mut attempted = Vec::new();
     loop {
         let head = generation().ok_or("antigravity_not_signed_in")?;

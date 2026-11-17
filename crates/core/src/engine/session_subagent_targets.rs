@@ -18,7 +18,6 @@ pub type SubagentTargetResolver = Arc<
 /// auxiliary/orchestration targets, sub-agent admission, and CLI `--model` parsing.
 pub const MODEL_TARGET_SOURCES: &[&str] = &[
     "antigravity",
-    "gemini",
     "trae",
     "kiro",
     "subscription",
