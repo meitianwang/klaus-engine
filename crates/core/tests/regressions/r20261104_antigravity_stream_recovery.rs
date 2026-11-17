@@ -580,8 +580,15 @@ async fn multi_leg_continuation_and_mid_stream_checkpoint_resume_preserve_stream
         "all three legs must be concatenated without loss: {text}"
     );
     let usage = result.usage.as_ref().unwrap();
+    // Deliberate accounting change: the input side stays pinned to the first
+    // leg's uncached prompt (1000 - 800 = 200), while cache coverage reports
+    // the best leg seen this turn (1000 on the final leg) instead of the
+    // first leg's 800. Continuation legs are dispatched back to back and
+    // usually hit the implicit cache better than the first leg, which
+    // follows the idle gap since the previous turn; pinning the first leg's
+    // coverage systematically understated the reported cache hit rate.
     assert_eq!(usage.input_tokens, 200);
-    assert_eq!(usage.cache_read_input_tokens, 800);
+    assert_eq!(usage.cache_read_input_tokens, 1000);
     assert_eq!(usage.output_tokens, 600);
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");

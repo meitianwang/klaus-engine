@@ -1271,7 +1271,7 @@ enum DialErrorAction {
 struct StreamContinuationTracker {
     latest_continuation_token: Option<RuntimeString>,
     initial_input_tokens: u64,
-    initial_cache_read_tokens: u64,
+    max_cache_read_tokens: u64,
     prior_legs_thinking_tokens: u64,
     prior_legs_response_tokens: u64,
     leg: LegState,
@@ -1297,7 +1297,7 @@ impl StreamContinuationTracker {
         Self {
             latest_continuation_token: None,
             initial_input_tokens: 0,
-            initial_cache_read_tokens: 0,
+            max_cache_read_tokens: 0,
             prior_legs_thinking_tokens: 0,
             prior_legs_response_tokens: 0,
             leg: LegState::default(),
@@ -1392,17 +1392,23 @@ impl StreamContinuationTracker {
             let prompt = usage.prompt_token_count.unwrap_or(0);
             let cached = usage.cached_content_token_count.unwrap_or(0).min(prompt);
             let uncached_input = prompt.saturating_sub(cached);
+            // Continuation legs are dispatched back to back, so their cache
+            // coverage is usually better than the first leg's, which follows
+            // the idle gap since the previous turn. Track the best coverage
+            // seen this turn for reporting, while the input side stays pinned
+            // to the first leg's uncached prompt so one multi-leg turn is
+            // still accounted as a single request.
+            self.max_cache_read_tokens = self.max_cache_read_tokens.max(cached);
             let (pinned_input, pinned_cached) = if self.has_prior_leg {
                 if self.has_initial_input_tokens {
-                    (self.initial_input_tokens, self.initial_cache_read_tokens)
+                    (self.initial_input_tokens, self.max_cache_read_tokens)
                 } else {
-                    (uncached_input, cached)
+                    (uncached_input, self.max_cache_read_tokens)
                 }
             } else {
                 self.initial_input_tokens = uncached_input;
-                self.initial_cache_read_tokens = cached;
                 self.has_initial_input_tokens = true;
-                (uncached_input, cached)
+                (uncached_input, self.max_cache_read_tokens)
             };
             let pinned_prompt = pinned_input.saturating_add(pinned_cached);
             let total_thinking = self
@@ -3523,15 +3529,49 @@ mod tests {
             "STOP"
         );
         let usage = mapped2.usage_metadata.unwrap();
-        assert_eq!(usage.prompt_token_count, Some(1000));
-        assert_eq!(usage.cached_content_token_count, Some(800));
+        // The input side stays pinned to leg 1 (1000 - 800 = 200 uncached)
+        // while cache coverage reports the best leg (1200), so the pinned
+        // prompt total is 200 + 1200 = 1400 and the turn total is 2400.
+        assert_eq!(usage.prompt_token_count, Some(1400));
+        assert_eq!(usage.cached_content_token_count, Some(1200));
         assert_eq!(usage.thoughts_token_count, Some(400));
         assert_eq!(usage.candidates_token_count, Some(600));
-        assert_eq!(usage.total_token_count, Some(2000));
+        assert_eq!(usage.total_token_count, Some(2400));
         assert!(matches!(
             tracker.evaluate_leg_end(None),
             LegEndAction::FinishCleanly
         ));
+    }
+
+    #[test]
+    fn continuation_tracker_keeps_best_cache_coverage_when_a_later_leg_regresses() {
+        let mut tracker = StreamContinuationTracker::new(Some(10_000));
+        let leg1 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"part one "}]},"finishReason":"FINISH_REASON_CONTINUATION","continuationToken":"tok-leg-1"}],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":800,"thoughtsTokenCount":300,"candidatesTokenCount":200}}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = tracker.record_frame(leg1);
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::Continue {
+                is_mid_stream_retry: false,
+                ..
+            }
+        ));
+        // A later leg whose cache coverage regressed (for example the implicit
+        // cache was evicted mid-turn) must not drag the reported coverage
+        // below the best seen this turn: cached stays 800 and the uncached
+        // input stays pinned to leg 1's 200.
+        let leg2 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"part two"}]},"finishReason":"STOP","continuationToken":"tok-leg-2"}],"usageMetadata":{"promptTokenCount":1500,"cachedContentTokenCount":300,"thoughtsTokenCount":100,"candidatesTokenCount":400}}}"#,
+            None,
+        )
+        .unwrap();
+        let mapped2 = tracker.record_frame(leg2);
+        let usage = mapped2.usage_metadata.unwrap();
+        assert_eq!(usage.cached_content_token_count, Some(800));
+        assert_eq!(usage.prompt_token_count, Some(1000));
     }
 
     #[test]
