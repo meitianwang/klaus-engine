@@ -1,6 +1,6 @@
 //! Defect: turn reminders and hook context still changed the system prefix.
 //! Root cause: the source-scoped snapshot selector omitted those volatile slots.
-//! Work item: preserve Gemini history across turn-context updates and clearing.
+//! Fixing commit: d180b669ce8f810baf878493030403fd2d9f062d.
 
 use std::sync::{Arc, Mutex};
 
