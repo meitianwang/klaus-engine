@@ -419,7 +419,16 @@ async fn persisted_steps_survive_resume_and_fork_clear_once_and_stay_private_to_
     run(&resumed, "The external edit is resolved.").await;
     let cleared = steps(&resumed.history());
     assert_eq!(cleared.len(), 2);
-    assert!(step_text(&cleared[1]).contains("No runtime reminder entries are currently active."));
+    let cleared_text = step_text(&cleared[1]);
+    assert!(
+        !cleared_text.contains("The fixture was edited externally.")
+            && !cleared_text.contains("[reminder]"),
+        "resolved reminder must drop out of the superseding snapshot: {cleared_text:?}"
+    );
+    assert!(
+        cleared_text.contains("[collaboration-mode]") && cleared_text.contains("[permissions]"),
+        "active non-cacheable turn-context slots stay projected in the superseding snapshot: {cleared_text:?}"
+    );
     select(&resumed, provider.clone(), "gemini", false);
     run(&resumed, "Continue through the regular Gemini source.").await;
     assert!(steps(&provider.requests.lock().unwrap().last().unwrap().messages).is_empty());

@@ -1461,6 +1461,12 @@ pub struct AntigravitySwitchAccountParams {
 
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AntigravitySetAccountShardingParams {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KiroAdoptParams {
     pub credential: super::kiro::auth::Credential,
     #[serde(default)]

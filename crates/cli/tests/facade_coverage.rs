@@ -72,6 +72,8 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("AntigravityLoginPoll", Reach::Withheld("Browser authorization is managed through the named account facade")),
     ("AntigravityLoginCancel", Reach::Withheld("Browser authorization is managed through the named account facade")),
     ("AntigravityAdoptCredential", Reach::Withheld("The desktop imports the signed-in account")),
+    ("AntigravitySwitchAccount", Reach::Withheld("The CLI has no account-management command")),
+    ("AntigravitySetAccountSharding", Reach::Withheld("The CLI has no account-management command")),
     ("AntigravityLogout", Reach::Withheld("The CLI has no account-management command")),
     ("AntigravityModels", Reach::Withheld("The CLI accepts concrete source-qualified model ids")),
     ("AntigravityUsage", Reach::Withheld("The CLI draws no account quota gauge")),

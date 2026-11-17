@@ -3117,6 +3117,7 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
         | "antigravity/loginCancel"
         | "antigravity/adoptCredential"
         | "antigravity/switchAccount"
+        | "antigravity/setAccountSharding"
         | "antigravity/logout"
         | "antigravity/models"
         | "antigravity/usage"
@@ -6689,6 +6690,14 @@ async fn dispatch_antigravity(state: Arc<AppServerState>, id: Value, method: &st
                 match decode_qoder::<wire::AntigravitySwitchAccountParams>(&params) {
                     Ok(params) => {
                         super::antigravity::auth::switch_account(&params.account_id).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "antigravity/setAccountSharding" => {
+                match decode_qoder::<wire::AntigravitySetAccountShardingParams>(&params) {
+                    Ok(params) => {
+                        super::antigravity::auth::set_account_sharding(params.enabled).await
                     }
                     Err(error) => Err(error),
                 }

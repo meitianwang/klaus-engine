@@ -261,6 +261,7 @@ pub(super) struct RequestInference<'a> {
     pub config: &'a crate::schemas::config::ResolvedConfig,
     pub provider_info: Option<&'a ProviderInfo>,
     pub thinking: Option<ThinkingConfig>,
+    pub model_messages: Option<&'a crate::runtime_values::RuntimeJson>,
 }
 
 pub(super) fn render_query_owned_system_parts(
@@ -345,6 +346,7 @@ pub(super) fn prepare_model_request(
             config: &params.config,
             provider_info: params.provider_info.as_ref(),
             thinking: params.thinking,
+            model_messages: None,
         },
         canonical_system_prompt,
         max_output_tokens,
@@ -366,6 +368,7 @@ pub(super) fn prepare_with_inference(
         config,
         provider_info,
         thinking,
+        model_messages,
     } = inference;
     let model = turn_override
         .map(|turn_override| turn_override.model.clone())
@@ -403,7 +406,7 @@ pub(super) fn prepare_with_inference(
         internal_visible_tool_specs,
         params.agent_id.as_ref(),
         params.multi_agent_instructions,
-        None,
+        model_messages,
         config.multi_agent_mode_hint_text.as_ref(),
     );
     let tools = render_tool_specs_for_behavior(internal_visible_tool_specs, &profile);
@@ -434,6 +437,18 @@ pub(super) fn prepare_with_inference(
     } else {
         None
     };
+    let isolate_gemini_session =
+        crate::context::runtime_reminders::enabled(config) && profile.family == Some("gemini");
+    let (cache_key, cache_domain) = if isolate_gemini_session {
+        (
+            (!params.thread_id.is_empty())
+                .then(|| params.thread_id.clone())
+                .or_else(|| params.cache_key.clone()),
+            None,
+        )
+    } else {
+        (params.cache_key.clone(), params.cache_domain.clone())
+    };
     let mut request = ModelRequest {
         model,
         image_limits: None,
@@ -461,8 +476,8 @@ pub(super) fn prepare_with_inference(
             None
         },
         cache_ttl: params.cache_ttl,
-        cache_key: params.cache_key.clone(),
-        cache_domain: params.cache_domain.clone(),
+        cache_key,
+        cache_domain,
         context_management: adaptive_context_management(
             config.context_management.as_ref(),
             params.context_edit_state.as_deref(),
@@ -582,6 +597,8 @@ impl Shared {
         } else {
             self.params.thinking
         };
+        let capabilities = bundle.provider.capabilities(&turn_override.model);
+        let metadata = bundle.provider.model_metadata(&turn_override.model);
         let mut prepared = prepare_with_inference(
             messages,
             &self.params,
@@ -589,22 +606,12 @@ impl Shared {
                 config: &config,
                 provider_info: Some(bundle.provider.info()),
                 thinking,
+                model_messages: metadata.model_messages.as_ref(),
             },
             canonical_system_prompt,
             max_output_tokens,
             internal_visible_tool_specs,
             Some(&turn_override),
-        );
-        let capabilities = bundle.provider.capabilities(&prepared.request.model);
-        let metadata = bundle.provider.model_metadata(&prepared.request.model);
-        prepared.request.system = super::orchestration::request_policy_with_model_messages(
-            &prepared.request.system,
-            turn_override.ultra_mode,
-            internal_visible_tool_specs,
-            self.params.agent_id.as_ref(),
-            self.params.multi_agent_instructions,
-            metadata.model_messages.as_ref(),
-            config.multi_agent_mode_hint_text.as_ref(),
         );
         prepared.request.effort =
             super::orchestration::resolve_effort(turn_override.effort.clone(), &metadata);
@@ -721,6 +728,32 @@ impl Shared {
         window.saturating_sub(request.max_output_tokens)
     }
 
+    pub(super) fn uses_eager_tool_inventory(&self) -> bool {
+        if self
+            .oversized_inventory_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        let config = self.config();
+        let model = self.turn_context.lock_recover().model.clone();
+        let provider_info = self
+            .bundle()
+            .map(|bundle| bundle.provider.info().clone())
+            .or_else(|| self.params.provider_info.clone());
+        antigravity_gemini_eager_tools(&config, provider_info.as_ref(), &model)
+    }
+
+    pub(super) fn visible_tool_specs_for_step(&self) -> Vec<ToolSpec> {
+        let tools = self.tools.lock_recover().clone();
+        if self.uses_eager_tool_inventory() {
+            return eager_visible_tool_specs(&tools);
+        }
+        let precomp = self.tool_specs.lock_recover().clone();
+        let surfaced = self.surfaced.lock_recover();
+        visible_tool_specs(&tools, &surfaced, &precomp)
+    }
+
     /// Deferred-exposure specs that have not been surfaced yet, rendered for
     /// the request's provider profile. Providers with native deferred-loading
     /// wire support send these alongside the immediate tools; every other
@@ -729,6 +762,9 @@ impl Shared {
         &self,
         profile: &ProviderBehaviorProfile,
     ) -> Vec<ToolSpec> {
+        if self.uses_eager_tool_inventory() {
+            return Vec::new();
+        }
         let tools = self.tools.lock_recover().clone();
         let surfaced = self.surfaced.lock_recover();
         let internal = deferred_tool_specs(&tools, &surfaced);
@@ -778,6 +814,8 @@ impl Shared {
         if render_tool_specs_for_behavior(&specs, &prepared.profile) == request.tools {
             return None;
         }
+        self.oversized_inventory_deferred
+            .store(true, std::sync::atomic::Ordering::Release);
         *self.tools.lock_recover() = Arc::new(deferred);
         Some(specs)
     }
@@ -1040,6 +1078,27 @@ pub fn build_model_request(
 /// a `HashSet` has no stable iteration order, and reading it would let two
 /// requests that surfaced the same tools emit them in a different order. That
 /// is the same prefix invalidation as a mid-array insert, with no visible cause.
+pub(crate) fn antigravity_gemini_eager_tools(
+    config: &crate::schemas::config::ResolvedConfig,
+    provider_info: Option<&ProviderInfo>,
+    model: &RuntimeString,
+) -> bool {
+    crate::context::runtime_reminders::enabled(config)
+        && resolve_provider_behavior_profile(provider_info, model).family == Some("gemini")
+}
+
+/// Static name-sorted tool declarations for Antigravity Gemini when inventory
+/// fits within the model's input window. Exposing both `Direct` and `Deferred`
+/// tools up front in pool order keeps the leading `tools` prefix invariant even
+/// if `tool_search` is invoked mid-conversation.
+pub(crate) fn eager_visible_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .filter(|tool| tool.exposure() != ToolExposure::Hidden)
+        .map(|tool| to_tool_spec(tool.as_ref()))
+        .collect()
+}
+
 pub(crate) fn visible_tool_specs(
     tools: &[Arc<dyn Tool>],
     surfaced: &HashSet<RuntimeString>,

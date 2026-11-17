@@ -1,6 +1,10 @@
-//! Defect: turn reminders and hook context still changed the system prefix.
-//! Root cause: the source-scoped snapshot selector omitted those volatile slots.
-//! Fixing commit: d180b669ce8f810baf878493030403fd2d9f062d.
+//! Defect: turn reminders, hook context, collaboration-mode, permissions, and
+//! other non-cacheable (`cacheable == Some(false)`) system blocks still mutated
+//! the leading `systemInstruction` prefix on Antigravity Gemini.
+//! Root cause: the source-scoped snapshot selector only captured `reminder` and
+//! `hook-context`, leaving other `cacheable == Some(false)` parts in system.
+//! Fixing commit: d180b669ce8f810baf878493030403fd2d9f062d (expanded to all
+//! `cacheable == Some(false)` parts for Antigravity Gemini).
 
 use std::sync::{Arc, Mutex};
 
@@ -62,12 +66,14 @@ fn part(name: &str, text: &str, cacheable: bool) -> SystemPromptPart {
 fn context(version: Option<&str>, volatile: bool) -> Vec<SystemPromptPart> {
     let mut parts = vec![
         part("base", "Stable base instructions.", true),
-        part("permissions", "Fixed authority must remain system.", false),
-        part(
-            "custom",
-            "Unknown custom context must remain system.",
-            false,
-        ),
+        SystemPromptPart {
+            name: "invariant".into(),
+            text: "Unspecified cacheability remains system.".into(),
+            cacheable: None,
+            cache_scope: None,
+        },
+        part("permissions", "Dynamic permission policy.", false),
+        part("collaboration-mode", "Dynamic collaboration mode.", false),
     ];
     if let Some(version) = version {
         parts.push(part("reminder", &format!("TURN-{version}"), !volatile));
@@ -188,12 +194,19 @@ async fn public_gemini_turn_context_updates_and_clear_preserve_wire_history_pref
         let system = wires[0]["systemInstruction"].to_string();
         assert!(!system.contains("TURN-ONE"));
         assert!(!system.contains("HOOK-ONE"));
-        assert!(system.contains("Fixed authority"));
-        assert!(system.contains("Unknown custom"));
+        assert!(!system.contains("Dynamic permission policy."));
+        assert!(!system.contains("# Collaboration Mode:"));
+        assert!(system.contains("Stable base instructions."));
+        assert!(system.contains("Unspecified cacheability remains system."));
         let last = wires[3]["contents"].to_string();
         assert!(last.contains("TURN-ONE") && last.contains("TURN-TWO"));
         assert!(last.contains("HOOK-ONE") && last.contains("HOOK-TWO"));
-        assert!(last.contains("No runtime reminder entries are currently active."));
+        assert!(last.contains("Dynamic permission policy."));
+        assert!(last.contains("[collaboration-mode]") && last.contains("# Collaboration Mode:"));
+        assert!(
+            !last.contains("No runtime reminder entries are currently active."),
+            "remaining non-cacheable slots keep the latest snapshot populated when turn reminders clear"
+        );
     }
     let steps = fixture
         .session
@@ -215,33 +228,45 @@ async fn public_gemini_turn_context_updates_and_clear_preserve_wire_history_pref
 
 #[tokio::test]
 async fn public_turn_context_stays_system_outside_antigravity_gemini() {
-    for (source, model) in [
-        ("gemini", GEMINI),
-        ("antigravity", "claude-turn-context-fixture"),
-    ] {
-        let fixture = fixture(source, model, true);
-        run(&fixture, "Begin the fixture.").await;
-        *fixture.parts.lock().unwrap() = context(Some("TWO"), true);
-        run(&fixture, "Continue the fixture.").await;
-        {
-            let wires = fixture.client.0.lock().unwrap();
-            assert_eq!(wires.len(), 2);
-            assert!(wires[0]["systemInstruction"]
-                .to_string()
-                .contains("TURN-ONE"));
-            assert!(wires[0]["systemInstruction"]
-                .to_string()
-                .contains("HOOK-ONE"));
-            assert!(wires[1]["systemInstruction"]
-                .to_string()
-                .contains("TURN-TWO"));
-            assert!(wires[1]["systemInstruction"]
-                .to_string()
-                .contains("HOOK-TWO"));
-            assert_eq!(wires.iter().map(snapshots).collect::<Vec<_>>(), [0, 0]);
-        }
-        fixture.session.dispose().await;
+    // 1. Non-antigravity Gemini keeps all turn context in `systemInstruction`.
+    let gemini_fixture = fixture("gemini", GEMINI, true);
+    run(&gemini_fixture, "Begin the fixture.").await;
+    *gemini_fixture.parts.lock().unwrap() = context(Some("TWO"), true);
+    run(&gemini_fixture, "Continue the fixture.").await;
+    {
+        let wires = gemini_fixture.client.0.lock().unwrap();
+        assert_eq!(wires.len(), 2);
+        assert!(wires[0]["systemInstruction"]
+            .to_string()
+            .contains("TURN-ONE"));
+        assert!(wires[0]["systemInstruction"]
+            .to_string()
+            .contains("HOOK-ONE"));
+        assert!(wires[1]["systemInstruction"]
+            .to_string()
+            .contains("TURN-TWO"));
+        assert!(wires[1]["systemInstruction"]
+            .to_string()
+            .contains("HOOK-TWO"));
+        assert_eq!(wires.iter().map(snapshots).collect::<Vec<_>>(), [0, 0]);
     }
+    gemini_fixture.session.dispose().await;
+
+    // 2. Non-Gemini models on `antigravity` project `reminder`/`hook-context`
+    //    snapshots while keeping non-Gemini `permissions` slots in `systemInstruction`.
+    let claude_fixture = fixture("antigravity", "claude-turn-context-fixture", true);
+    run(&claude_fixture, "Begin the fixture.").await;
+    *claude_fixture.parts.lock().unwrap() = context(Some("TWO"), true);
+    run(&claude_fixture, "Continue the fixture.").await;
+    {
+        let wires = claude_fixture.client.0.lock().unwrap();
+        assert_eq!(wires.len(), 2);
+        let sys = wires[0]["systemInstruction"].to_string();
+        assert!(!sys.contains("TURN-ONE") && !sys.contains("HOOK-ONE"));
+        assert!(sys.contains("Dynamic permission policy."));
+        assert_eq!(wires.iter().map(snapshots).collect::<Vec<_>>(), [1, 2]);
+    }
+    claude_fixture.session.dispose().await;
 }
 
 #[tokio::test]
@@ -253,7 +278,8 @@ async fn public_cacheable_turn_slots_retain_their_system_authority() {
         assert_eq!(wires.len(), 1);
         let system = wires[0]["systemInstruction"].to_string();
         assert!(system.contains("TURN-ONE") && system.contains("HOOK-ONE"));
-        assert_eq!(snapshots(&wires[0]), 0);
+        let contents = wires[0]["contents"].to_string();
+        assert!(!contents.contains("TURN-ONE") && !contents.contains("HOOK-ONE"));
     }
     fixture.session.dispose().await;
 }

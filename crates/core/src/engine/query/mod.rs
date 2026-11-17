@@ -688,6 +688,9 @@ struct Shared {
     tool_specs: Mutex<Arc<Vec<ToolSpec>>>,
     /// Deferred tools surfaced via `tool_search` this session.
     surfaced: Mutex<HashSet<RuntimeString>>,
+    /// Latched when an oversized tool inventory exceeds the model's input window
+    /// and must fall back from eager exposure to `tool_search` deferral.
+    oversized_inventory_deferred: std::sync::atomic::AtomicBool,
     turn_context: Mutex<TurnContext>,
     /// Runtime values read directly by the loop (probed once from the base factory).
     cwd: RuntimePath,

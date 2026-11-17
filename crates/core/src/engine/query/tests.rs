@@ -3365,6 +3365,7 @@ fn captured_request_planning_uses_captured_provider_config_and_explicit_effort()
             config: &captured_config,
             provider_info: Some(&provider),
             thinking: Some(ThinkingConfig::Adaptive),
+            model_messages: None,
         },
         &[],
         2048,

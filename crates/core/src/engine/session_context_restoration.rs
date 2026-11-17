@@ -168,13 +168,22 @@ impl Session {
         self.refresh_workspace_instruction_cache();
         let provider = self.system_prompt_provider.read_recover().clone();
         let mut parts = provider().await;
+        let bundle = self.inference_snapshot();
         let tools = self.current_tools();
-        let surfaced = self.surfaced_tools.lock_recover().clone();
-        let tools = crate::engine::query::visible_tool_specs(
-            &tools,
-            &surfaced,
-            &crate::tools::pool::to_tool_specs(&tools),
-        );
+        let tools = if crate::engine::query::request::antigravity_gemini_eager_tools(
+            config,
+            Some(bundle.provider.info()),
+            &config.model,
+        ) {
+            crate::engine::query::request::eager_visible_tool_specs(&tools)
+        } else {
+            let surfaced = self.surfaced_tools.lock_recover().clone();
+            crate::engine::query::visible_tool_specs(
+                &tools,
+                &surfaced,
+                &crate::tools::pool::to_tool_specs(&tools),
+            )
+        };
         if tools.iter().any(|tool| tool.name == "advisor") {
             let boundary = parts
                 .iter()
@@ -284,7 +293,6 @@ impl Session {
         policy.apply_to_context(&mut context);
         context.planning_read_only =
             self.collaboration_mode() == crate::planning::CollaborationMode::Plan;
-        let bundle = self.inference_snapshot();
         let profile = crate::provider::behavior::resolve_provider_behavior_profile(
             Some(bundle.provider.info()),
             &config.model,

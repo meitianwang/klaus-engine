@@ -4,6 +4,7 @@
 //! cuts and compaction own their lifetime. Request preparation only projects a
 //! possible next snapshot; the turn owner admits it before calling the model.
 
+use crate::provider::behavior::resolve_provider_behavior_profile;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::config::ResolvedConfig;
 use crate::schemas::content::{ContentBlock, TextBlock};
@@ -24,14 +25,15 @@ pub(crate) fn enabled(config: &ResolvedConfig) -> bool {
         == Some("antigravity")
 }
 
-fn is_dynamic(part: &SystemPromptPart, include_turn_context: bool) -> bool {
+fn is_dynamic(part: &SystemPromptPart, include_all_non_cacheable: bool) -> bool {
     part.name == "task-plan-reminder"
         || part.name == "edited-files"
         || part.name == "loop-recovery"
         || part.name == "total-tokens"
-        || (include_turn_context
-            && part.cacheable == Some(false)
-            && (part.name == "reminder" || part.name == "hook-context"))
+        || (part.cacheable == Some(false)
+            && (include_all_non_cacheable
+                || part.name == "reminder"
+                || part.name == "hook-context"))
 }
 
 pub(crate) fn is_step(message: &Message) -> bool {
@@ -54,10 +56,10 @@ pub(crate) fn without_steps(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-fn snapshot(parts: &[SystemPromptPart], include_turn_context: bool) -> RuntimeString {
+fn snapshot(parts: &[SystemPromptPart], include_all_non_cacheable: bool) -> RuntimeString {
     let mut parts: Vec<_> = parts
         .iter()
-        .filter(|part| is_dynamic(part, include_turn_context))
+        .filter(|part| is_dynamic(part, include_all_non_cacheable))
         .collect();
     parts.sort_by(|a, b| a.name.cmp(&b.name));
     let mut text = RuntimeString::from(SNAPSHOT_PREFIX);
@@ -87,9 +89,13 @@ pub(crate) fn project(request: &mut ModelRequest, active: bool) {
     }
     // Every model routed through this source concatenates `request.system` into
     // a single leading instruction field ahead of conversation history, so
-    // non-cacheable per-turn context (`reminder`, `hook-context`) must also
-    // project into the append-only snapshot tail regardless of model family.
-    let include_turn_context = true;
+    // non-cacheable per-turn context (`reminder`, `hook-context`) projects into
+    // the append-only snapshot tail across all model families, while Gemini
+    // models additionally project every `cacheable == Some(false)` slot
+    // (`collaboration-mode`, `permissions`, `orchestration-mode`, dynamic
+    // fragments) so `systemInstruction` stays byte-stable across mode/policy turns.
+    let include_all_non_cacheable =
+        resolve_provider_behavior_profile(None, &request.model).family == Some("gemini");
     let previous = request
         .messages
         .iter()
@@ -98,14 +104,14 @@ pub(crate) fn project(request: &mut ModelRequest, active: bool) {
     let has_current = request
         .system
         .iter()
-        .any(|part| is_dynamic(part, include_turn_context));
+        .any(|part| is_dynamic(part, include_all_non_cacheable));
     if !has_current && previous.is_none() {
         return;
     }
-    let text = snapshot(&request.system, include_turn_context);
+    let text = snapshot(&request.system, include_all_non_cacheable);
     request
         .system
-        .retain(|part| !is_dynamic(part, include_turn_context));
+        .retain(|part| !is_dynamic(part, include_all_non_cacheable));
     if previous.is_some_and(|message| {
         matches!(message, Message::User(user)
             if matches!(&user.content[0], ContentBlock::Text(previous) if previous.text == text))

@@ -47,6 +47,8 @@ pub(super) struct StoredAccount {
 #[serde(rename_all = "camelCase")]
 struct StoredQueue {
     accounts: Vec<StoredAccount>,
+    #[serde(default)]
+    account_sharding: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -157,21 +159,29 @@ fn validate(credential: &Credential) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn accounts() -> Vec<StoredAccount> {
+fn read_store_value() -> Option<Value> {
     use std::io::Read;
     let mut raw = Vec::new();
-    let Ok(file) = std::fs::File::open(path()) else {
-        return Vec::new();
-    };
+    let file = std::fs::File::open(path()).ok()?;
     if file
         .take(MAX_STORE_BYTES as u64 + 1)
         .read_to_end(&mut raw)
         .is_err()
         || raw.len() > MAX_STORE_BYTES
     {
-        return Vec::new();
+        return None;
     }
-    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+    serde_json::from_slice::<Value>(&raw).ok()
+}
+
+pub(super) fn account_sharding() -> bool {
+    read_store_value()
+        .and_then(|value| value.get("accountSharding").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+pub(super) fn accounts() -> Vec<StoredAccount> {
+    let Some(value) = read_store_value() else {
         return Vec::new();
     };
     if let Some(entries) = value.get("accounts").and_then(Value::as_array) {
@@ -204,13 +214,13 @@ pub(super) fn accounts() -> Vec<StoredAccount> {
     Vec::new()
 }
 
-fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
+fn write_store_unlocked(entries: &[StoredAccount], account_sharding: bool) -> Result<(), String> {
     use std::io::Write;
     if entries.len() > MAX_ACCOUNTS {
         return Err("antigravity_account_limit_reached".into());
     }
     let path = path();
-    if entries.is_empty() {
+    if entries.is_empty() && !account_sharding {
         return match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -229,6 +239,7 @@ fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
     }
     let queue = StoredQueue {
         accounts: entries.to_vec(),
+        account_sharding,
     };
     let outcome: Result<(), String> = (|| {
         let mut file = options
@@ -251,6 +262,11 @@ fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
     outcome
 }
 
+fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
+    let sharding = !entries.is_empty() && account_sharding();
+    write_store_unlocked(entries, sharding)
+}
+
 fn entry_needs_login(entry: &StoredAccount, now: i64) -> bool {
     entry.needs_login
         || (entry
@@ -262,8 +278,15 @@ fn entry_needs_login(entry: &StoredAccount, now: i64) -> bool {
 
 pub fn status() -> Value {
     let entries = accounts();
+    let sharding = account_sharding();
     let Some(head) = entries.first() else {
-        return json!({"ok":true,"signedIn":false,"loggedIn":false,"accounts":[]});
+        return json!({
+            "ok": true,
+            "signedIn": false,
+            "loggedIn": false,
+            "accountSharding": sharding,
+            "accounts": [],
+        });
     };
     let now = chrono::Utc::now().timestamp_millis();
     let head_needs_login = entry_needs_login(head, now);
@@ -291,6 +314,7 @@ pub fn status() -> Value {
         "authMethod": head.credential.auth_method,
         "canRefresh": head.credential.refresh_token.is_some() && !head_needs_login,
         "needsLogin": head_needs_login,
+        "accountSharding": sharding,
         "accounts": rows,
     })
 }
@@ -461,10 +485,19 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
         return Ok(status());
     }
     super::login::invalidate_pending();
-    with_store_file_lock(|| write_accounts_unlocked(&[]))?;
+    with_store_file_lock(|| write_store_unlocked(&[], false))?;
     super::forget_catalog();
     super::egress::reset_pool(None).await;
-    Ok(json!({"ok":true,"signedIn":false,"loggedIn":false,"accounts":[]}))
+    Ok(status())
+}
+
+pub async fn set_account_sharding(enabled: bool) -> Result<Value, String> {
+    let _guard = credential_lock().lock().await;
+    with_store_file_lock(|| {
+        let entries = accounts();
+        write_store_unlocked(&entries, enabled)
+    })?;
+    Ok(status())
 }
 
 static MANUAL_SWITCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

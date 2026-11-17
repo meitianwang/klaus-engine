@@ -13,6 +13,9 @@
 #[path = "regressions/r20261117_antigravity_compaction_and_account_routing.rs"]
 mod r20261117_antigravity_compaction_and_account_routing;
 
+#[path = "regressions/r20261117_antigravity_gemini_prompt_cache.rs"]
+mod r20261117_antigravity_gemini_prompt_cache;
+
 #[path = "regressions/rb5aee5b5_antigravity_runtime_reminders.rs"]
 mod rb5aee5b5_antigravity_runtime_reminders;
 

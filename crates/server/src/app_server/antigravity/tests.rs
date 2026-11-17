@@ -3279,6 +3279,53 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
         "plain Gemini must not emit source-specific diagnostics"
     );
 
+    // Sub-sessions (`:sub:` / `:readonly:`) sharing the parent's pooled
+    // `CloudClient` must stamp distinct wire `sessionId`s so they never overwrite
+    // the parent chat's upstream KV cache slot, while Stage 1 `skip_cache_write`
+    // compaction forks keep the parent's `sessionId` to reuse the hot prefix.
+    captured_bodies.lock().unwrap().clear();
+    let mut sub_req = make_req();
+    sub_req.cache_key = Some("thread-fixed-42:sub:agent-alpha".into());
+    let _sub_events: Vec<_> = agy_provider
+        .stream(sub_req, AbortSignal::new())
+        .collect()
+        .await;
+    let mut readonly_req = make_req();
+    readonly_req.cache_key = Some("thread-fixed-42:readonly:side-1".into());
+    let _readonly_events: Vec<_> = agy_provider
+        .stream(readonly_req, AbortSignal::new())
+        .collect()
+        .await;
+    let mut compact_fork_req = make_req();
+    compact_fork_req.cache_key = Some("thread-fixed-42".into());
+    compact_fork_req.skip_cache_write = Some(true);
+    let _compact_events: Vec<_> = agy_provider
+        .stream(compact_fork_req, AbortSignal::new())
+        .collect()
+        .await;
+    let isolated_sent = captured_bodies.lock().unwrap().clone();
+    assert_eq!(isolated_sent.len(), 3);
+    assert_eq!(
+        isolated_sent[0]["request"]["sessionId"].as_str().unwrap(),
+        cloud::compute_session_id("thread-fixed-42:sub:agent-alpha")
+    );
+    assert_ne!(
+        isolated_sent[0]["request"]["sessionId"],
+        wire_body["request"]["sessionId"]
+    );
+    assert_eq!(
+        isolated_sent[1]["request"]["sessionId"].as_str().unwrap(),
+        cloud::compute_session_id("thread-fixed-42:readonly:side-1")
+    );
+    assert_ne!(
+        isolated_sent[1]["request"]["sessionId"],
+        wire_body["request"]["sessionId"]
+    );
+    assert_eq!(
+        isolated_sent[2]["request"]["sessionId"],
+        wire_body["request"]["sessionId"]
+    );
+
     server.abort();
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
@@ -3704,38 +3751,82 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
 
     let chat_a = make_session_provider("thread-alpha");
     let chat_b = make_session_provider("thread-beta");
+    let chat_c = make_session_provider("thread-gamma");
+    let chat_d = make_session_provider("thread-delta");
     assert_eq!(
         chat_a
             .model_metadata(&RuntimeString::from("gemini-3.8-flash-medium"))
             .auto_compact_token_limit,
         Some(256_000)
     );
+    assert_eq!(auth::status()["accountSharding"], false);
 
+    // Default (accountSharding = false): new threads stick to the head account without sharding.
     {
         let mut p = plans.lock().unwrap();
         p.insert(
             "acct-1-tok".into(),
-            VecDeque::from([ReplyPlan::Ok("a1"), ReplyPlan::Ok("a2")]),
-        );
-        p.insert(
-            "acct-2-tok".into(),
-            VecDeque::from([ReplyPlan::Ok("b1"), ReplyPlan::Ok("b2")]),
+            VecDeque::from([ReplyPlan::Ok("a1"), ReplyPlan::Ok("b1")]),
         );
     }
     assert_eq!(ask(chat_a.clone()).await, "a1");
     assert_eq!(ask(chat_b.clone()).await, "b1");
-    assert_eq!(ask(chat_a.clone()).await, "a2");
-    assert_eq!(ask(chat_b.clone()).await, "b2");
     assert_eq!(
         seen.lock().unwrap().clone(),
         vec![
             ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
+        ],
+        "with accountSharding off by default, new threads bind to the head account"
+    );
+
+    // Enabling accountSharding routes new threads to the idle standby account while keeping existing leases sticky.
+    let enabled = auth::set_account_sharding(true).await.unwrap();
+    assert_eq!(enabled["ok"], true);
+    assert_eq!(enabled["accountSharding"], true);
+    seen.lock().unwrap().clear();
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert("acct-1-tok".into(), VecDeque::from([ReplyPlan::Ok("a2")]));
+        p.insert(
+            "acct-2-tok".into(),
+            VecDeque::from([ReplyPlan::Ok("c1"), ReplyPlan::Ok("c2")]),
+        );
+    }
+    assert_eq!(ask(chat_c.clone()).await, "c1");
+    assert_eq!(ask(chat_a.clone()).await, "a2");
+    assert_eq!(ask(chat_c.clone()).await, "c2");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![
             ("acct-2-tok".into(), "proj-2".into()),
             ("acct-1-tok".into(), "proj-1".into()),
             ("acct-2-tok".into(), "proj-2".into()),
         ],
-        "distinct threads must shard across pooled accounts and stay sticky per thread"
+        "when accountSharding is enabled, new threads shard to idle accounts and stay sticky"
     );
+
+    // Turning accountSharding back off preserves already-bound sticky leases, while unleased threads use the head account.
+    let disabled = auth::set_account_sharding(false).await.unwrap();
+    assert_eq!(disabled["accountSharding"], false);
+    seen.lock().unwrap().clear();
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert("acct-1-tok".into(), VecDeque::from([ReplyPlan::Ok("d1")]));
+        p.insert("acct-2-tok".into(), VecDeque::from([ReplyPlan::Ok("c3")]));
+    }
+    assert_eq!(ask(chat_c.clone()).await, "c3");
+    assert_eq!(ask(chat_d.clone()).await, "d1");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![
+            ("acct-2-tok".into(), "proj-2".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
+        ],
+        "disabling accountSharding preserves existing sticky leases while new threads bind to head"
+    );
+
+    auth::set_account_sharding(true).await.unwrap();
 
     // Pre-response HTTP 503 overload on acct-1 fails over immediately to acct-2 and rebinds chat_a.
     seen.lock().unwrap().clear();
@@ -3761,9 +3852,11 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
         ]
     );
 
-    // Explicit manual account switch resets sticky leases so existing chats honor the user's pick.
+    // Explicit manual account switch resets sticky leases so existing chats honor the user's pick,
+    // and preserves the stored accountSharding preference.
     seen.lock().unwrap().clear();
-    auth::switch_account(&acct1_id).await.unwrap();
+    let switched = auth::switch_account(&acct1_id).await.unwrap();
+    assert_eq!(switched["accountSharding"], true);
     plans.lock().unwrap().insert(
         "acct-1-tok".into(),
         VecDeque::from([ReplyPlan::Ok("manual-1")]),

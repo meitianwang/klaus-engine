@@ -51,7 +51,6 @@ use super::split_compaction_protected;
 use super::stream_and_dispatch;
 use super::support::notify;
 use super::trim_ecmascript_whitespace;
-use super::visible_tool_specs;
 use super::EventQueue;
 use super::InferenceCapture;
 use super::Outcome;
@@ -607,6 +606,7 @@ async fn run_turn(
         tools: Mutex::new(tools0),
         tool_specs: Mutex::new(specs0),
         surfaced: Mutex::new(surfaced0),
+        oversized_inventory_deferred: std::sync::atomic::AtomicBool::new(false),
         turn_context: Mutex::new(turn_context0),
         turn_state,
         cwd,
@@ -1031,12 +1031,7 @@ async fn run_turn(
             });
         }
         // 1) Pre-turn compaction check.
-        let tool_specs: Arc<Vec<ToolSpec>> = {
-            let tools = shared.tools.lock_recover().clone();
-            let precomp = shared.tool_specs.lock_recover().clone();
-            let surfaced = shared.surfaced.lock_recover();
-            Arc::new(visible_tool_specs(&tools, &surfaced, &precomp))
-        };
+        let tool_specs: Arc<Vec<ToolSpec>> = Arc::new(shared.visible_tool_specs_for_step());
         // Request-time reminders reflect the current plan after tool execution.
         // Replace the slot even when the provider returns None: completion and
         // tool filtering must remove an earlier missing/open-plan message.

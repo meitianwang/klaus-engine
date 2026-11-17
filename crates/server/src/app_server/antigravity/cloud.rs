@@ -1036,6 +1036,7 @@ fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<Str
     if usable.is_empty() {
         return auth::generation();
     }
+    let sharding = auth::account_sharding();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
     if auth::manual_switch_epoch() != epoch {
@@ -1053,18 +1054,22 @@ fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<Str
         existing.last_active_ms = now_ms;
         return Some(existing.generation.clone());
     }
-    let chosen = usable
-        .iter()
-        .min_by_key(|gen| {
-            let active = state.in_flight.get(*gen).copied().unwrap_or(0);
-            let leased = state
-                .leases
-                .values()
-                .filter(|lease| lease.generation == **gen)
-                .count();
-            (active, leased)
-        })?
-        .clone();
+    let chosen = if sharding {
+        usable
+            .iter()
+            .min_by_key(|gen| {
+                let active = state.in_flight.get(*gen).copied().unwrap_or(0);
+                let leased = state
+                    .leases
+                    .values()
+                    .filter(|lease| lease.generation == **gen)
+                    .count();
+                (active, leased)
+            })?
+            .clone()
+    } else {
+        usable.into_iter().next()?
+    };
     state.leases.insert(
         key.to_string(),
         SessionLease {
@@ -2269,8 +2274,18 @@ impl GeminiClient for CloudClient {
         let conversation_id = request_routing_key
             .clone()
             .unwrap_or(default_conversation_id);
-        let sticky_key =
-            request_routing_key.or_else(|| self.sticky_session_key().map(str::to_string));
+        let lease_routing_key = request_routing_key.as_deref().map(|key| {
+            key.split_once(":readonly:")
+                .map_or(key, |(base, _)| base)
+                .to_owned()
+        });
+        let sticky_key = if auth::account_sharding() {
+            lease_routing_key.or_else(|| self.sticky_session_key().map(str::to_string))
+        } else {
+            self.sticky_session_key()
+                .map(str::to_string)
+                .or(lease_routing_key)
+        };
         let pooled = self.generation.is_empty();
         let mut attempted: Vec<String> = Vec::new();
         let mut forced_next: Option<String> = None;
