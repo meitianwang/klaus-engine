@@ -707,6 +707,201 @@ async fn historical_images_and_pdfs_project_to_text_notes_while_fresh_pdf_is_sti
     process.shutdown().await.unwrap();
 }
 
+struct CappedLargeWindowTargetProvider {
+    info: ProviderInfo,
+    raw_window: u64,
+    auto_compact_ceiling: u64,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl CappedLargeWindowTargetProvider {
+    fn new(
+        raw_window: u64,
+        auto_compact_ceiling: u64,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            info: ProviderInfo {
+                name: "capped-large-target".into(),
+                default_model: "capped-large-model".into(),
+                base_url: None,
+                env_key: None,
+            },
+            raw_window,
+            auto_compact_ceiling,
+            requests,
+        })
+    }
+}
+
+impl ModelProvider for CappedLargeWindowTargetProvider {
+    fn info(&self) -> &ProviderInfo {
+        &self.info
+    }
+
+    fn capabilities(&self, _: &RuntimeString) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            tools: true,
+            thinking: false,
+            structured_output: false,
+            web_search: false,
+            prompt_cache_control: false,
+            context_window: self.raw_window,
+            max_output_tokens: 1_000,
+            vision: true,
+            native_pdf: true,
+            image_limits: None,
+            max_media_blocks: None,
+            supports_image_detail_original: false,
+        }
+    }
+
+    fn model_auto_compact_token_limit(&self, _: &RuntimeString) -> Option<u64> {
+        Some(self.auto_compact_ceiling)
+    }
+
+    fn stream(&self, request: ModelRequest, _: AbortSignal) -> ModelStream {
+        let total_tokens = estimate_context_tokens(&request.messages)
+            + estimate_prefix_tokens(&request.system, &request.tools);
+        assert!(
+            total_tokens <= self.auto_compact_ceiling,
+            "target request of {total_tokens} tokens exceeded declared auto-compact ceiling {}",
+            self.auto_compact_ceiling
+        );
+        let is_summary = request.skip_cache_write == Some(true);
+        self.requests.lock().unwrap().push(request);
+        let reply = if is_summary {
+            "Chunk checkpoint: retained goal and verified progress within the 25.6k budget."
+        } else {
+            "Answered promptly within the model's declared compaction ceiling."
+        };
+        Box::pin(futures::stream::iter([
+            ModelStreamEvent::MessageStart {
+                model: "capped-large-model".into(),
+            },
+            ModelStreamEvent::TextDelta { text: reply.into() },
+            ModelStreamEvent::MessageStop {
+                stop_reason: ModelStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 400,
+                    output_tokens: 30,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    total_tokens: None,
+                },
+            },
+        ]))
+    }
+}
+
+#[tokio::test]
+async fn switching_to_larger_raw_window_with_tighter_auto_compact_ceiling_chunks_below_ceiling() {
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let target_requests = Arc::new(Mutex::new(Vec::new()));
+
+    // Source has an 80k window (76k usable, 72k ceiling); target has a larger
+    // 104,858 raw window (99,615 usable) paired with a 25,600 model-declared
+    // automatic compaction ceiling.
+    let mut initial_history = Vec::new();
+    for idx in 0..10 {
+        let prose = format!("turn-{idx} ") + &"detailed_design_notes ".repeat(900);
+        initial_history.push(msg(json!({
+            "type": "user",
+            "uuid": format!("u-cap-{idx}"),
+            "content": [{"type": "text", "text": prose}]
+        })));
+        initial_history.push(msg(json!({
+            "type": "assistant",
+            "uuid": format!("a-cap-{idx}"),
+            "model": "large-model",
+            "content": [{"type": "text", "text": format!("ack-{idx} ") + &"analysis_prose ".repeat(900)}],
+            "usage": {"inputTokens": 45_000, "outputTokens": 500}
+        })));
+    }
+    let history_tokens = estimate_context_tokens(&initial_history);
+    assert!(
+        history_tokens > 35_000 && history_tokens < 90_000,
+        "history ({history_tokens}) must exceed 25.6k ceiling while fitting inside raw 99.6k usable window"
+    );
+
+    let mut opts = agent_options(process.clone());
+    opts.provider = ExhaustedOldProvider::new(ProviderErrorKind::Quota, old_calls.clone());
+    opts.config = Some(source_config(
+        "exhausted-large-source",
+        "large-model",
+        80_000,
+    ));
+    opts.cwd = Some(dir.path().to_string_lossy().into_owned());
+    opts.include_default_agents = Some(false);
+
+    let session = Agent::new(opts).start_session(StartSessionOptions {
+        initial_history: Some(initial_history),
+        user_config_dir: Some(dir.path().to_string_lossy().into_owned().into()),
+        base_instructions: Some("Answer concisely.".into()),
+        ..Default::default()
+    });
+
+    let target_provider =
+        CappedLargeWindowTargetProvider::new(104_858, 25_600, target_requests.clone());
+    session
+        .reconfigure_inference(
+            target_provider,
+            resolve_config(source_config(
+                "capped-large-target",
+                "capped-large-model",
+                104_858,
+            ))
+            .unwrap(),
+            None,
+            None,
+            session.model_revision(),
+        )
+        .unwrap();
+
+    let before_snapshot = session.context_snapshot();
+    assert_eq!(before_snapshot.context_window, 104_858);
+    assert_eq!(before_snapshot.compact_threshold_tokens, 25_600);
+    assert_eq!(before_snapshot.auto_compact_token_limit, Some(25_600));
+
+    let events: Vec<_> = session
+        .run_streamed(
+            Input::Text("Summarize next actions.".into()),
+            TurnOptions::default(),
+        )
+        .events
+        .collect()
+        .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TurnFailed { .. })),
+        "turn failed after switching to capped target: {events:?}"
+    );
+    assert_eq!(
+        old_calls.load(Ordering::SeqCst),
+        0,
+        "deselected source must never be called"
+    );
+    {
+        let recorded = target_requests.lock().unwrap();
+        assert!(
+            recorded.len() >= 3,
+            "expected multi-chunk summary requests plus final turn, got {}",
+            recorded.len()
+        );
+        assert!(recorded[..recorded.len() - 1]
+            .iter()
+            .all(|req| req.skip_cache_write == Some(true)));
+        assert_ne!(recorded.last().unwrap().skip_cache_write, Some(true));
+    }
+
+    session.shutdown_and_wait().await.unwrap();
+    process.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn openai_native_checkpoint_rejects_mismatched_comp_hash_on_same_endpoint() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

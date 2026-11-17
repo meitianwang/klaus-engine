@@ -166,6 +166,7 @@ pub struct SessionContextSnapshot {
     pub output_reserve_tokens: u64,
     pub compact_threshold: f64,
     pub compact_threshold_tokens: u64,
+    pub auto_compact_token_limit: Option<u64>,
     /// Current model-visible context occupancy, not cumulative billed usage.
     pub total_tokens: u64,
     /// Session-cumulative provider usage retained for cost/accounting displays.
@@ -188,6 +189,9 @@ impl RuntimeEncode for SessionContextSnapshot {
         object.field("outputReserveTokens", &self.output_reserve_tokens)?;
         object.field("compactThreshold", &self.compact_threshold)?;
         object.field("compactThresholdTokens", &self.compact_threshold_tokens)?;
+        if let Some(value) = &self.auto_compact_token_limit {
+            object.field("autoCompactTokenLimit", value)?;
+        }
         object.field("totalTokens", &self.total_tokens)?;
         object.field("tokenTotals", &self.token_totals)?;
         object.field("cost", &self.cost)?;
@@ -215,6 +219,7 @@ impl RuntimeDecode for SessionContextSnapshot {
                 output_reserve_tokens: object.required("outputReserveTokens", &[])?,
                 compact_threshold: object.required("compactThreshold", &[])?,
                 compact_threshold_tokens: object.required("compactThresholdTokens", &[])?,
+                auto_compact_token_limit: object.optional("autoCompactTokenLimit", &[])?,
                 total_tokens: object.required("totalTokens", &[])?,
                 token_totals: object.required("tokenTotals", &[])?,
                 cost: object.required("cost", &[])?,

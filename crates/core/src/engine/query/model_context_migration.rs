@@ -2,7 +2,10 @@
 //! calling the deselected model source.
 
 use super::*;
-use crate::context::compact::policy::{model_auto_compact_token_limit, usable_context_window};
+use crate::context::compact::policy::{
+    model_auto_compact_token_limit, model_downshift_ceiling, usable_context_window,
+};
+use crate::engine::session::PriorContextBounds;
 use crate::schemas::config::{AutoCompactScope, ResolvedConfig};
 
 #[allow(clippy::too_many_arguments)]
@@ -46,8 +49,8 @@ pub(super) async fn compact(
         .map_or(rendered, |state| state.sample(rendered));
 
     if let Some(downshift) = target.context_downshift.clone() {
-        if let Some(previous_usable) = downshift.previous_usable_window() {
-            if !downshift_needed(previous_usable, &config, active) {
+        if let Some(previous) = downshift.previous_bounds() {
+            if !downshift_needed(previous, &config, active) {
                 downshift.complete();
                 return Ok(false);
             }
@@ -71,17 +74,17 @@ pub(super) async fn compact(
 }
 
 /// Trigger model-switch downshift compaction when the smaller target model's
-/// own boundary is exceeded. Earlier session-level budgets still flow through
-/// the ordinary preflight compaction check on the selected model.
-fn downshift_needed(previous_usable_window: u64, target: &ResolvedConfig, active: u64) -> bool {
+/// own boundary is exceeded, including when a target with a larger raw window
+/// declares a tighter automatic compaction ceiling. Earlier session-level
+/// budgets still flow through the ordinary preflight compaction check.
+fn downshift_needed(previous: PriorContextBounds, target: &ResolvedConfig, active: u64) -> bool {
     let target_window = usable_context_window(target);
-    if previous_usable_window <= target_window {
-        return false;
-    }
-    if active >= target_window {
+    if previous.usable_window > target_window && active >= target_window {
         return true;
     }
-    target.auto_compaction
+    let target_ceiling = model_downshift_ceiling(target);
+    previous.model_ceiling > target_ceiling
+        && target.auto_compaction
         && !target.compaction_disabled
         && target.auto_compact_scope == AutoCompactScope::Total
         && active > model_auto_compact_token_limit(target)
@@ -100,9 +103,16 @@ mod migration_budget_contracts {
         }
     }
 
+    fn bounds(source: &ResolvedConfig) -> PriorContextBounds {
+        PriorContextBounds {
+            usable_window: usable_context_window(source),
+            model_ceiling: model_downshift_ceiling(source),
+        }
+    }
+
     #[test]
     fn total_budget_uses_a_strict_model_boundary_and_inclusive_complete_window() {
-        let source = usable_context_window(&config(500_000, 95));
+        let source = bounds(&config(500_000, 95));
         let target = config(256_000, 95);
         for (active, expected) in [
             (230_399, false),
@@ -117,7 +127,7 @@ mod migration_budget_contracts {
 
     #[test]
     fn an_earlier_session_budget_keeps_compaction_on_the_ordinary_preflight_path() {
-        let source = usable_context_window(&config(500_000, 95));
+        let source = bounds(&config(500_000, 95));
         let mut target = config(256_000, 95);
         target.auto_compact_window = Some(100_000);
         assert!(
@@ -129,7 +139,7 @@ mod migration_budget_contracts {
 
     #[test]
     fn body_growth_does_not_force_downshift_below_the_complete_window() {
-        let source = usable_context_window(&config(500_000, 95));
+        let source = bounds(&config(500_000, 95));
         let mut target = config(256_000, 95);
         target.auto_compact_scope = AutoCompactScope::BodyAfterPrefix;
         target.auto_compact_window = Some(10_000);
@@ -145,7 +155,7 @@ mod migration_budget_contracts {
 
     #[test]
     fn metadata_limits_are_capped_before_the_strict_comparison() {
-        let source = usable_context_window(&config(500_000, 95));
+        let source = bounds(&config(500_000, 95));
         let mut target = config(256_000, 95);
         target.model_auto_compact_token_limit = Some(200_000);
         assert!(!downshift_needed(source, &target, 200_000));
@@ -156,14 +166,31 @@ mod migration_budget_contracts {
     }
 
     #[test]
+    fn tighter_model_compaction_ceiling_downshifts_even_when_usable_window_grows() {
+        let source = bounds(&config(800_000, 95));
+        let mut target = config(1_048_576, 95);
+        target.model_auto_compact_token_limit = Some(256_000);
+        assert!(source.usable_window < usable_context_window(&target));
+        assert!(source.model_ceiling > model_downshift_ceiling(&target));
+        assert!(!downshift_needed(source, &target, 256_000));
+        assert!(downshift_needed(source, &target, 256_001));
+        assert!(downshift_needed(source, &target, 500_000));
+
+        // Moving up to a strictly larger window and ceiling does not downshift.
+        let smaller = bounds(&config(260_000, 95));
+        let slightly_larger = config(272_000, 95);
+        assert!(!downshift_needed(smaller, &slightly_larger, 250_000));
+    }
+
+    #[test]
     fn effective_windows_determine_whether_selected_capacity_is_smaller() {
         assert!(!downshift_needed(
-            usable_context_window(&config(500_000, 40)),
+            bounds(&config(500_000, 40)),
             &config(256_000, 95),
             250_000,
         ));
         assert!(downshift_needed(
-            usable_context_window(&config(200_000, 100)),
+            bounds(&config(200_000, 100)),
             &config(256_000, 50),
             150_000,
         ));
@@ -171,7 +198,7 @@ mod migration_budget_contracts {
 
     #[test]
     fn disabled_automatic_compaction_only_intercepts_a_complete_window_downshift() {
-        let source = usable_context_window(&config(500_000, 95));
+        let source = bounds(&config(500_000, 95));
         for globally_disabled in [false, true] {
             let mut target = config(256_000, 95);
             target.auto_compaction = globally_disabled;

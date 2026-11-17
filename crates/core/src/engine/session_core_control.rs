@@ -3264,6 +3264,20 @@ impl Session {
                 / status.full_context_window_limit.max(1) as f64)
                 .clamp(0.0, 1.0),
             compact_threshold_tokens,
+            auto_compact_token_limit: if config.auto_compaction
+                && !config.compaction_disabled
+                && config.auto_compact_scope == crate::schemas::config::AutoCompactScope::Total
+            {
+                config
+                    .model_auto_compact_token_limit
+                    .map(|_| {
+                        crate::context::compact::policy::model_auto_compact_token_limit(&config)
+                            .min(status.full_context_window_limit)
+                    })
+                    .filter(|&limit| limit > 0 && limit < status.full_context_window_limit)
+            } else {
+                None
+            },
             total_tokens,
             token_totals,
             cost: cost_snapshot,

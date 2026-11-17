@@ -92,6 +92,21 @@ pub fn model_auto_compact_token_limit(config: &ResolvedConfig) -> u64 {
         .map_or(capacity_limit, |limit| limit.min(capacity_limit))
 }
 
+/// Active-context ceiling of a model selection before model-level compaction
+/// or full-window admission applies. Excludes session-level `auto_compact_window`
+/// overrides and body-only scopes, which stay on the ordinary preflight path.
+pub fn model_downshift_ceiling(config: &ResolvedConfig) -> u64 {
+    let usable = usable_context_window(config);
+    if config.auto_compaction
+        && !config.compaction_disabled
+        && config.auto_compact_scope == AutoCompactScope::Total
+    {
+        model_auto_compact_token_limit(config).min(usable)
+    } else {
+        usable
+    }
+}
+
 /// An explicit total-input limit may advance compaction, never postpone the
 /// default boundary. A body-only limit excludes its persisted prefill baseline.
 pub fn auto_compact_token_limit(config: &ResolvedConfig) -> u64 {

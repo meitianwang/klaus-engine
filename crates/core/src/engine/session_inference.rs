@@ -44,27 +44,33 @@ pub(crate) struct InferenceBundle {
     /// Immutable rate table carried by the request that captured this bundle,
     /// so a later publication cannot reprice work already in flight.
     pub rates: PricingTable,
-    /// Usable context window of the larger prior selection when switching down
-    /// to a smaller model, without retaining the deselected provider.
+    /// Prior selection capacity bounds when switching down to a model with a
+    /// smaller usable window or tighter model-level compaction ceiling, without
+    /// retaining the deselected provider.
     pub context_downshift: Option<Arc<ContextWindowDownshift>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PriorContextBounds {
+    pub(crate) usable_window: u64,
+    pub(crate) model_ceiling: u64,
+}
+
 pub(crate) struct ContextWindowDownshift {
-    previous_usable_window: u64,
+    previous: PriorContextBounds,
     completed: std::sync::atomic::AtomicBool,
 }
 
 impl ContextWindowDownshift {
-    pub(crate) fn new(previous_usable_window: u64) -> Self {
+    pub(crate) fn new(previous: PriorContextBounds) -> Self {
         Self {
-            previous_usable_window,
+            previous,
             completed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn previous_usable_window(&self) -> Option<u64> {
-        (!self.completed.load(std::sync::atomic::Ordering::Acquire))
-            .then_some(self.previous_usable_window)
+    pub(crate) fn previous_bounds(&self) -> Option<PriorContextBounds> {
+        (!self.completed.load(std::sync::atomic::Ordering::Acquire)).then_some(self.previous)
     }
 
     pub(crate) fn complete(&self) {
@@ -102,22 +108,27 @@ pub(crate) async fn prepare_review_requirements_for_provider(
 
 impl InferenceBundle {
     fn downshift_to(&self, target: &ResolvedConfig) -> Option<Arc<ContextWindowDownshift>> {
-        let previous_usable_window = self
+        let current_bounds = PriorContextBounds {
+            usable_window: crate::context::compact::policy::usable_context_window(&self.config),
+            model_ceiling: crate::context::compact::policy::model_downshift_ceiling(&self.config),
+        };
+        let previous = self
             .context_downshift
             .as_ref()
-            .and_then(|downshift| downshift.previous_usable_window())
-            .unwrap_or_else(|| {
-                crate::context::compact::policy::usable_context_window(&self.config)
+            .and_then(|downshift| downshift.previous_bounds())
+            .map_or(current_bounds, |prior| PriorContextBounds {
+                usable_window: prior.usable_window.max(current_bounds.usable_window),
+                model_ceiling: prior.model_ceiling.max(current_bounds.model_ceiling),
             });
         let target_usable_window = crate::context::compact::policy::usable_context_window(target);
-        if previous_usable_window <= target_usable_window {
+        let target_model_ceiling = crate::context::compact::policy::model_downshift_ceiling(target);
+        if previous.usable_window <= target_usable_window
+            && previous.model_ceiling <= target_model_ceiling
+        {
             return None;
         }
-        // Keep one high-water prior window across rapid, unused selections.
-        Some(Arc::new(ContextWindowDownshift {
-            previous_usable_window,
-            completed: std::sync::atomic::AtomicBool::new(false),
-        }))
+        // Keep high-water prior bounds across rapid, unused selections.
+        Some(Arc::new(ContextWindowDownshift::new(previous)))
     }
 
     pub(crate) async fn load_review_requirements(
@@ -1317,6 +1328,7 @@ impl Session {
         let mut current = self.inference.write_recover();
         let config = current.config_for_model(&current.config.model);
         let usable = crate::context::compact::policy::usable_context_window(&config);
+        let ceiling = crate::context::compact::policy::model_downshift_ceiling(&config);
         let history = self.history_snapshot();
         let estimated = crate::context::tokens::estimate_context_tokens(&history);
         let current_source = config
@@ -1360,13 +1372,18 @@ impl Session {
                 })
                 .unwrap_or(0),
         );
-        if estimated >= usable || (model_changed && prior_high_water > usable) {
+        if estimated >= usable || (model_changed && prior_high_water > ceiling) {
             let mut next = (**current).clone();
-            next.context_downshift = Some(Arc::new(ContextWindowDownshift::new(
-                prior_high_water
-                    .saturating_add(1)
-                    .max(usable.saturating_add(1)),
-            )));
+            let high_water = prior_high_water.saturating_add(1);
+            next.context_downshift =
+                Some(Arc::new(ContextWindowDownshift::new(PriorContextBounds {
+                    usable_window: if estimated >= usable || prior_high_water > usable {
+                        high_water.max(usable.saturating_add(1))
+                    } else {
+                        usable
+                    },
+                    model_ceiling: high_water.max(ceiling.saturating_add(1)),
+                })));
             *current = Arc::new(next);
         }
     }

@@ -558,6 +558,10 @@ fn antigravity_sessions_cap_compaction_at_256k_run_four_streams_concurrently_and
             snapshot["result"]["context"]["compactThresholdTokens"], 256_000,
             "{snapshot}"
         );
+        assert_eq!(
+            snapshot["result"]["context"]["autoCompactTokenLimit"], 256_000,
+            "snapshot must expose active model-declared working ceiling for ring display: {snapshot}"
+        );
         sid
     };
 

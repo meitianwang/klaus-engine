@@ -286,7 +286,7 @@ mod session_targets_part;
 pub(crate) use session_core_state_part::*;
 use session_inference_part::InferenceAdmission;
 pub(crate) use session_inference_part::{
-    InferenceActivityGuard, InferenceBundle, InferenceSlot, InputModelRevision,
+    InferenceActivityGuard, InferenceBundle, InferenceSlot, InputModelRevision, PriorContextBounds,
 };
 pub use session_subagent_targets_part::{
     is_supported_model_source, SubagentTargetResolver, MODEL_TARGET_SOURCES,

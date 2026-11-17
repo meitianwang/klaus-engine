@@ -389,6 +389,9 @@ async fn summarize_for_target(
     let summary_body = crate::context::runtime_reminders::without_steps(&raw_body);
     let mut body = pre_prune_summary_body(&summary_body);
     let usable = usable_context_window(config);
+    let request_ceiling = config
+        .model_auto_compact_token_limit
+        .map_or(usable, |declared| declared.min(usable));
 
     // Fast path: if the pre-pruned body fits in one summary call on the
     // selected model, run a single pass (allowing native remote compaction or
@@ -396,10 +399,10 @@ async fn summarize_for_target(
     let lean_single =
         prepare_lean_summary_request(shared, &body, turn_override, effective_max_output);
     let single_budget = if compactor.native_summary_active() {
-        usable
+        request_ceiling
     } else {
-        let reserve = (usable / 10).clamp(1_024, 8_192);
-        usable.saturating_sub(reserve)
+        let reserve = (request_ceiling / 10).clamp(1_024, 8_192);
+        request_ceiling.saturating_sub(reserve)
     };
     if !body.is_empty()
         && single_budget > 0
@@ -460,7 +463,11 @@ async fn summarize_for_target(
         let empty_lean =
             prepare_lean_summary_request(shared, &[], turn_override, effective_max_output);
         let fixed = fixed_prefix_tokens(&empty_lean.request);
-        let chunk_ceiling = limit.max(usable);
+        let chunk_ceiling = if limit > 0 {
+            limit.min(request_ceiling)
+        } else {
+            request_ceiling
+        };
         let chunk_reserve = (chunk_ceiling / 4).min(8_192);
         let budget = chunk_ceiling
             .saturating_sub(fixed)
