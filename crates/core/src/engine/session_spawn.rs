@@ -1672,7 +1672,11 @@ impl Session {
             // record carries the turn that owns it.
             let child_turn_id: RuntimeString = (this.deps.uuid)().into();
             let child_turn_started_at_ms = (this.deps.now)();
-            let env_rebuild = this.system_prompt_is_default || inherited_context.is_some();
+            let env_rebuild = if inherited_context.is_some() {
+                run_opts.cwd_override.is_some() || child_model != this.config.model
+            } else {
+                this.system_prompt_is_default
+            };
             let teammate_of: Option<SwarmIdentity> =
                 match (&opts.swarm, this.swarm_identity.lock_recover().clone()) {
                     (Some(s), Some(id)) => Some(SwarmIdentity {

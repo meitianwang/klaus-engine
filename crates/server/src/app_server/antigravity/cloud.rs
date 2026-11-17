@@ -2259,8 +2259,18 @@ impl GeminiClient for CloudClient {
             .model
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
-        let (conversation_id, step) = self.next_conversation_step();
-        let sticky_key = self.sticky_session_key().map(str::to_string);
+        let request_routing_key = params
+            .routing_session_key
+            .as_ref()
+            .and_then(|key| key.try_to_utf8().ok())
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty());
+        let (default_conversation_id, step) = self.next_conversation_step();
+        let conversation_id = request_routing_key
+            .clone()
+            .unwrap_or(default_conversation_id);
+        let sticky_key =
+            request_routing_key.or_else(|| self.sticky_session_key().map(str::to_string));
         let pooled = self.generation.is_empty();
         let mut attempted: Vec<String> = Vec::new();
         let mut forced_next: Option<String> = None;

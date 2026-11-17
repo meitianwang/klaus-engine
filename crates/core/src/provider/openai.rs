@@ -3042,6 +3042,16 @@ fn merge_reported_usage(
         // reads for those routes, indistinguishable from a true miss.
         *cache_read = value;
         reported = true;
+    } else if let Some(value) = usage
+        .get("cached_tokens")
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        // Flat cache accounting used by Kimi/Moonshot and Anthropic-bridged
+        // OpenAI-compatible gateways that expose top-level `cached_tokens` or
+        // `cache_read_input_tokens` without `prompt_tokens_details`.
+        *cache_read = value;
+        reported = true;
     }
     reported
 }
@@ -9870,6 +9880,23 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.cache_read, 30);
+    }
+
+    #[test]
+    fn chat_usage_reads_flat_cached_tokens_and_cache_read_input_tokens() {
+        let mut state = ChatState::default();
+        assert!(update_chat_usage(
+            &json!({ "usage": { "prompt_tokens": 200, "completion_tokens": 15, "total_tokens": 215, "cached_tokens": 160 } }),
+            &mut state,
+        ));
+        assert_eq!(state.cache_read, 160);
+
+        let mut bridged_state = ChatState::default();
+        assert!(update_chat_usage(
+            &json!({ "usage": { "prompt_tokens": 300, "completion_tokens": 25, "total_tokens": 325, "cache_read_input_tokens": 240 } }),
+            &mut bridged_state,
+        ));
+        assert_eq!(bridged_state.cache_read, 240);
     }
 
     #[test]

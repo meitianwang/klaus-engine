@@ -228,6 +228,7 @@ impl Compactor for RealCompactor {
     ) -> Result<Arc<dyn Compactor>, String> {
         let full = self.full.rebind_model(call_model, config);
         full.retain_native_provider_from(&self.full)?;
+        full.retain_session_memory_from(&self.full);
         Ok(Arc::new(Self {
             full: Arc::new(full),
         }))

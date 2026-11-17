@@ -672,3 +672,53 @@ async fn real_gemini_encoding_keeps_prior_contents_and_system_across_updates_cle
     assert_eq!(steps(&session.history()).len(), 3);
     session.dispose().await;
 }
+
+#[tokio::test]
+async fn non_gemini_antigravity_models_project_turn_reminders_outside_system() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fixture.txt");
+    std::fs::write(&path, "fixture content\n").unwrap();
+    let provider = FixtureProvider::new(
+        path.to_string_lossy().into_owned(),
+        vec![Reply::Read, Reply::Text],
+    );
+    let mut cfg = config("antigravity", false);
+    cfg["model"] = json!("claude-sonnet-4-6");
+    let mut options =
+        agent_options(RuntimeProcessContext::initialize(process_supervisor()).unwrap());
+    options.provider = provider.clone();
+    options.config = Some(cfg);
+    options.tools = Some(vec![create_read_tool()]);
+    options.include_default_agents = Some(false);
+    options.system_prompt_provider = Some(Arc::new(|| {
+        Box::pin(async {
+            vec![
+                SystemPromptPart {
+                    name: "base".into(),
+                    text: "Stable fixture instructions.".into(),
+                    cacheable: Some(true),
+                    cache_scope: None,
+                },
+                SystemPromptPart {
+                    name: "reminder".into(),
+                    text: "Dynamic todo state.".into(),
+                    cacheable: Some(false),
+                    cache_scope: None,
+                },
+            ]
+        })
+    }));
+    let session = Agent::new(options).start_session(session_options(root.path()));
+    run(&session, "Read the fixture.").await;
+    let requests = provider.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.system.iter().any(|part| part.name == "reminder")),
+        "non-Gemini models on antigravity must move per-turn reminders out of system"
+    );
+    assert_eq!(steps(&session.history()).len(), 1);
+    drop(requests);
+    session.dispose().await;
+}

@@ -4,7 +4,6 @@
 //! cuts and compaction own their lifetime. Request preparation only projects a
 //! possible next snapshot; the turn owner admits it before calling the model.
 
-use crate::provider::behavior::resolve_provider_behavior_profile;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::config::ResolvedConfig;
 use crate::schemas::content::{ContentBlock, TextBlock};
@@ -86,10 +85,11 @@ pub(crate) fn project(request: &mut ModelRequest, active: bool) {
         request.messages.retain(|message| !is_step(message));
         return;
     }
-    // Extend turn-scoped context placement only for this source's Gemini models.
-    // Other model families retain their existing instruction placement.
-    let include_turn_context =
-        resolve_provider_behavior_profile(None, &request.model).family == Some("gemini");
+    // Every model routed through this source concatenates `request.system` into
+    // a single leading instruction field ahead of conversation history, so
+    // non-cacheable per-turn context (`reminder`, `hook-context`) must also
+    // project into the append-only snapshot tail regardless of model family.
+    let include_turn_context = true;
     let previous = request
         .messages
         .iter()

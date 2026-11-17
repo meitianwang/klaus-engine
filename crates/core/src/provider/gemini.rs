@@ -1627,10 +1627,16 @@ fn build_gemini_request_with_policy(
     if contents.last().is_some_and(is_continuable_model_turn) {
         contents.push(continuation_reminder_content());
     }
+    let routing_session_key = req
+        .cache_domain
+        .clone()
+        .or_else(|| req.cache_key.clone())
+        .filter(|key| !key.is_empty());
     GenerateContentParameters {
         model: req.model.clone(),
         contents,
         config,
+        routing_session_key,
     }
 }
 
@@ -2520,6 +2526,9 @@ pub struct GenerateContentParameters {
     pub model: RuntimeString,
     pub contents: Vec<Content>,
     pub config: GenerateContentConfig,
+    /// Optional wire-cache / sticky-routing session domain derived from
+    /// `ModelRequest::cache_domain` or `ModelRequest::cache_key`.
+    pub routing_session_key: Option<RuntimeString>,
 }
 
 impl RuntimeEncode for GenerateContentParameters {
@@ -2539,6 +2548,7 @@ impl RuntimeDecode for GenerateContentParameters {
                 model: object.required("model", &[])?,
                 contents: object.required("contents", &[])?,
                 config: object.required("config", &[])?,
+                routing_session_key: None,
             })
         })
     }
@@ -4049,6 +4059,7 @@ mod tests {
                 response_json_schema: None,
                 thinking_config: None,
             },
+            routing_session_key: None,
         };
 
         let wire_text = NodeBufferUtf8::decode(&to_generate_content_wire(&params));
@@ -5677,6 +5688,28 @@ mod tests {
         assert_eq!(
             built.contents[2].parts[0].text.as_ref().unwrap(),
             EMPTY_CONTINUATION_REMINDER
+        );
+    }
+
+    #[test]
+    fn routing_session_key_prefers_cache_domain_over_cache_key() {
+        let mut req = base_req();
+        let caps = ModelCapabilities::default();
+        assert_eq!(
+            build_gemini_request(&req, &caps, GeminiThinkingDialect::Level).routing_session_key,
+            None
+        );
+
+        req.cache_key = Some("parent-session".into());
+        assert_eq!(
+            build_gemini_request(&req, &caps, GeminiThinkingDialect::Level).routing_session_key,
+            Some("parent-session".into())
+        );
+
+        req.cache_domain = Some("parent-session:subagent:Explore".into());
+        assert_eq!(
+            build_gemini_request(&req, &caps, GeminiThinkingDialect::Level).routing_session_key,
+            Some("parent-session:subagent:Explore".into())
         );
     }
 }
