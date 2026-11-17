@@ -269,6 +269,7 @@ impl Session {
         ));
         let (system, messages) =
             crate::context::instruction_policy::project_workspace_instructions(&parts, history);
+        let messages = crate::context::runtime_reminders::without_steps(&messages);
         let policy = self.runtime_policy_snapshot();
         let permission = self.permission_context_for_policy(&policy);
         let mut context = super::bare_tool_context(

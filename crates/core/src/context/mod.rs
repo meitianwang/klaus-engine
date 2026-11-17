@@ -20,6 +20,7 @@ pub mod nested_memory;
 pub mod nested_memory_reminder;
 pub mod request_media_budget;
 pub(crate) mod retained_fragments;
+pub(crate) mod runtime_reminders;
 pub mod system_prompt;
 pub mod tokens;
 pub mod tool_result_budget;

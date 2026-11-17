@@ -524,6 +524,7 @@ impl FullCompactor {
             .retain(crate::context::instruction_policy::is_workspace_instruction_projection);
         request.messages.extend(messages.iter().filter(|message| {
             !crate::context::instruction_policy::is_workspace_instruction_projection(message)
+                && !crate::context::runtime_reminders::is_step(message)
                 && !matches!(message, Message::System(system) if system.subtype == crate::schemas::message::SystemSubtype::UserDisplay)
         }).cloned());
         if let Some(provider) = self

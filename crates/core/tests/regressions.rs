@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/rb5aee5b5_antigravity_runtime_reminders.rs"]
+mod rb5aee5b5_antigravity_runtime_reminders;
+
 #[path = "regressions/r20261114_antigravity_auth_and_error_classification.rs"]
 mod r20261114_antigravity_auth_and_error_classification;
 

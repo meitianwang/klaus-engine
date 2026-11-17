@@ -434,7 +434,7 @@ pub(super) fn prepare_with_inference(
     } else {
         None
     };
-    let request = ModelRequest {
+    let mut request = ModelRequest {
         model,
         image_limits: None,
         max_media_blocks: None,
@@ -474,6 +474,10 @@ pub(super) fn prepare_with_inference(
             params.thinking_context_cold,
         ),
     };
+    crate::context::runtime_reminders::project(
+        &mut request,
+        crate::context::runtime_reminders::enabled(config),
+    );
     PreparedModelRequest { request, profile }
 }
 

@@ -386,7 +386,8 @@ async fn summarize_for_target(
         (None, Some(note)) | (Some(_), Some(note)) => Some(note),
         (None, None) => None,
     };
-    let mut body = pre_prune_summary_body(&raw_body);
+    let summary_body = crate::context::runtime_reminders::without_steps(&raw_body);
+    let mut body = pre_prune_summary_body(&summary_body);
     let usable = usable_context_window(config);
 
     // Fast path: if the pre-pruned body fits in one summary call on the
@@ -574,13 +575,18 @@ fn prepare_lean_summary_request(
 ) -> PreparedModelRequest {
     // Summarization neither calls tools nor benefits from a cross-model system
     // prompt prefix, so omitting both reserves the new model's window for history.
-    shared.prepare(
+    let mut prepared = shared.prepare(
         messages,
         &[],
         effective_max_output,
         &[],
         Some(turn_override),
-    )
+    );
+    prepared
+        .request
+        .messages
+        .retain(|message| !crate::context::runtime_reminders::is_step(message));
+    prepared
 }
 
 fn authoritative_unprotected(

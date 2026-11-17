@@ -743,8 +743,18 @@ async fn send_once(
         request = request.header(name, value);
     }
     request = request.bearer_auth(&used_token);
-    let response = tokio::select! {
-        _ = signal.cancelled() => return Err((api_error("antigravity_request_cancelled"), Some(used_token))),
+    let wire_request = (method == "streamGenerateContent")
+        .then(|| {
+            body.as_deref()
+                .map(|bytes| super::cache_diagnostics::WireRequest::record(bytes, generation))
+        })
+        .flatten();
+    let mut wire_send = super::cache_diagnostics::WireSend::new(wire_request.clone());
+    let mut response = tokio::select! {
+        _ = signal.cancelled() => {
+            wire_send.outcome("cancelled", None);
+            return Err((api_error("antigravity_request_cancelled"), Some(used_token)));
+        },
         response = request.send() => match response {
             Ok(response) => response,
             // A connect error is the only reqwest stage that proves the
@@ -757,17 +767,28 @@ async fn send_once(
                 } else {
                     TransportStage::Sent
                 };
+                wire_send.outcome(match stage {
+                    TransportStage::Connect => "connect_error",
+                    TransportStage::Sent => "transport_error",
+                }, None);
                 return Err((transport_error(stage), Some(used_token)));
             }
         },
     };
+    let response_status = Some(response.status().as_u16());
+    wire_send.outcome("response_started", response_status);
+    if let Some(diagnostics) = wire_request {
+        response.extensions_mut().insert(diagnostics);
+    }
     if generation.is_some_and(|generation| !auth::is_current(generation)) {
+        wire_send.outcome("credential_changed", response_status);
         return Err((
             api_error("antigravity_credential_changed"),
             Some(used_token),
         ));
     }
     if !response.status().is_success() {
+        wire_send.outcome("http_error", response_status);
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -1132,14 +1153,28 @@ fn classify_finish_reason_value(
     }
 }
 
+#[cfg(test)]
 fn decode_raw_frame(
     bytes: &[u8],
     generation: Option<&str>,
+) -> Result<DecodedCloudFrame, GeminiApiError> {
+    decode_raw_frame_observed(bytes, generation, None)
+}
+
+fn decode_raw_frame_observed(
+    bytes: &[u8],
+    generation: Option<&str>,
+    diagnostics: Option<&mut super::cache_diagnostics::WireResponse>,
 ) -> Result<DecodedCloudFrame, GeminiApiError> {
     let payload = runtime_json::parse(&RuntimeString::from(
         String::from_utf8_lossy(bytes).as_ref(),
     ))
     .map_err(|_| api_error("antigravity_stream_invalid"))?;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.observe(&super::cache_diagnostics::RawUsage::of(
+            payload.get("response").unwrap_or(&payload),
+        ));
+    }
     if payload.get("error").is_some()
         || (payload.get("code").is_some()
             && payload.get("status").is_some()
@@ -2232,6 +2267,9 @@ impl GeminiClient for CloudClient {
             let mut in_stream_auth_renewed = false;
             let mut pre_candidate_overload_retries = 0usize;
             'leg: loop {
+                let mut wire_response = super::cache_diagnostics::WireResponse::new(
+                    response.extensions().get::<std::sync::Arc<super::cache_diagnostics::WireRequest>>().cloned(),
+                );
                 let mut stream = response.bytes_stream();
                 let mut buffered = Vec::new();
                 let mut data = Vec::new();
@@ -2239,9 +2277,13 @@ impl GeminiClient for CloudClient {
                 let mut leg_err: Option<GeminiApiError> = None;
                 'read: loop {
                     let chunk = tokio::select! {
-                        _ = signal.cancelled() => return,
+                        _ = signal.cancelled() => {
+                            wire_response.outcome("cancelled");
+                            return;
+                        },
                         _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                             if !auth::is_current(&generation) {
+                                wire_response.outcome("credential_changed");
                                 yield Err(api_error("antigravity_credential_changed"));
                                 return;
                             }
@@ -2249,24 +2291,31 @@ impl GeminiClient for CloudClient {
                         },
                         chunk = stream.next() => chunk,
                     };
-                    let Some(chunk) = chunk else { break 'read; };
+                    let Some(chunk) = chunk else {
+                        wire_response.outcome("eof");
+                        break 'read;
+                    };
                     if !auth::is_current(&generation) {
+                        wire_response.outcome("credential_changed");
                         yield Err(api_error("antigravity_credential_changed"));
                         return;
                     }
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
                         Err(_) => {
+                            wire_response.outcome("transport_error");
                             leg_err = Some(api_error("antigravity_stream_interrupted"));
                             break 'read;
                         }
                     };
                     total_bytes = total_bytes.saturating_add(chunk.len());
                     if total_bytes > MAX_BODY_BYTES {
+                        wire_response.outcome("response_too_large");
                         yield Err(api_error("antigravity_stream_response_too_large"));
                         return;
                     }
                     if buffered.len().saturating_add(data.len()).saturating_add(chunk.len()) > MAX_SSE_FRAME_BYTES {
+                        wire_response.outcome("frame_too_large");
                         yield Err(api_error("antigravity_stream_frame_too_large"));
                         return;
                     }
@@ -2281,10 +2330,11 @@ impl GeminiClient for CloudClient {
                             if !data.is_empty() {
                                 if data.as_slice() != b"[DONE]" {
                                     if !auth::is_current(&generation) {
+                                        wire_response.outcome("credential_changed");
                                         yield Err(api_error("antigravity_credential_changed"));
                                         return;
                                     }
-                                    match decode_raw_frame(&data, Some(&generation)) {
+                                    match decode_raw_frame_observed(&data, Some(&generation), Some(&mut wire_response)) {
                                         Ok(decoded) => {
                                             yield Ok(finalize_recorded_frame(
                                                 tracker.record_frame(decoded),
@@ -2293,6 +2343,7 @@ impl GeminiClient for CloudClient {
                                             ));
                                         }
                                         Err(error) => {
+                                            wire_response.outcome("frame_error");
                                             leg_err = Some(error);
                                             break 'read;
                                         }
@@ -2307,8 +2358,9 @@ impl GeminiClient for CloudClient {
                             }
                             data.extend_from_slice(payload);
                         } else if data.is_empty() && line.trim_ascii().starts_with(b"{") {
-                            if let Err(error) = decode_raw_frame(line.trim_ascii(), Some(&generation)) {
+                            if let Err(error) = decode_raw_frame_observed(line.trim_ascii(), Some(&generation), Some(&mut wire_response)) {
                                 if error.message != "antigravity_stream_invalid" {
+                                    wire_response.outcome("frame_error");
                                     leg_err = Some(error);
                                     break 'read;
                                 }
@@ -2323,18 +2375,20 @@ impl GeminiClient for CloudClient {
                         }
                         data.extend_from_slice(payload.strip_prefix(b" ").unwrap_or(payload));
                     } else if data.is_empty() && buffered.trim_ascii().starts_with(b"{") {
-                        if let Err(error) = decode_raw_frame(buffered.trim_ascii(), Some(&generation)) {
+                        if let Err(error) = decode_raw_frame_observed(buffered.trim_ascii(), Some(&generation), Some(&mut wire_response)) {
                             if error.message != "antigravity_stream_invalid" {
+                                wire_response.outcome("frame_error");
                                 leg_err = Some(error);
                             }
                         }
                     }
                     if leg_err.is_none() && !data.is_empty() && data.as_slice() != b"[DONE]" {
                         if !auth::is_current(&generation) {
+                            wire_response.outcome("credential_changed");
                             yield Err(api_error("antigravity_credential_changed"));
                             return;
                         }
-                        match decode_raw_frame(&data, Some(&generation)) {
+                        match decode_raw_frame_observed(&data, Some(&generation), Some(&mut wire_response)) {
                             Ok(decoded) => {
                                 yield Ok(finalize_recorded_frame(
                                     tracker.record_frame(decoded),
@@ -2343,16 +2397,19 @@ impl GeminiClient for CloudClient {
                                 ));
                             }
                             Err(error) => {
+                                wire_response.outcome("frame_error");
                                 leg_err = Some(error);
                             }
                         }
                     }
                 }
                 if !auth::is_current(&generation) {
+                    wire_response.outcome("credential_changed");
                     yield Err(api_error("antigravity_credential_changed"));
                     return;
                 }
                 if signal.is_cancelled() {
+                    wire_response.outcome("cancelled");
                     return;
                 }
                 if !tracker.leg.saw_candidate
@@ -2387,6 +2444,7 @@ impl GeminiClient for CloudClient {
                                         tracker =
                                             StreamContinuationTracker::new(initial_max_output_tokens);
                                         text_restorer = Default::default();
+                                        wire_response.outcome("retry");
                                         continue 'leg;
                                     }
                                     Err(retry_err) => {
@@ -2456,6 +2514,7 @@ impl GeminiClient for CloudClient {
                                     tracker =
                                         StreamContinuationTracker::new(initial_max_output_tokens);
                                     text_restorer = Default::default();
+                                    wire_response.outcome("retry");
                                     continue 'leg;
                                 }
                                 Err(err)
@@ -2514,6 +2573,7 @@ impl GeminiClient for CloudClient {
                             leg_token = auth::peek_access_token(&generation);
                             tracker = StreamContinuationTracker::new(initial_max_output_tokens);
                             text_restorer = Default::default();
+                            wire_response.outcome("retry");
                             continue 'leg;
                         }
                         Err(retry_err) => {
@@ -2545,6 +2605,7 @@ impl GeminiClient for CloudClient {
                 }
                 match tracker.evaluate_leg_end(leg_err) {
                     LegEndAction::FinishCleanly => {
+                        wire_response.outcome("completed");
                         let leftover = text_restorer.flush();
                         if !leftover.is_empty() {
                             yield Ok(GenerateContentResponse {
@@ -2566,6 +2627,7 @@ impl GeminiClient for CloudClient {
                         return;
                     }
                     LegEndAction::EmitSyntheticMaxTokens => {
+                        wire_response.outcome("max_tokens");
                         let leftover = text_restorer.flush();
                         if !leftover.is_empty() {
                             yield Ok(GenerateContentResponse {
@@ -2588,6 +2650,7 @@ impl GeminiClient for CloudClient {
                         return;
                     }
                     LegEndAction::Fail(error) => {
+                        wire_response.outcome("error");
                         yield Err(error);
                         return;
                     }
@@ -2595,6 +2658,7 @@ impl GeminiClient for CloudClient {
                         is_mid_stream_retry,
                         retry_delay_ms,
                     } => {
+                        wire_response.outcome(if is_mid_stream_retry { "retry" } else { "continuation" });
                         if is_mid_stream_retry {
                             let delay_ms = tracker.mid_stream_retry_delay_ms(retry_delay_ms);
                             if let Err(error) =
@@ -2693,6 +2757,63 @@ impl GeminiClient for CloudClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_usage_is_recorded_even_when_typed_frame_decoding_fails() {
+        let id = format!("usage-rejection-{}", uuid::Uuid::new_v4());
+        let request = super::super::cache_diagnostics::WireRequest::record(
+            &serde_json::to_vec(&json!({
+                "model": "fixture-model", "requestId": id, "request": {"contents": []}
+            }))
+            .unwrap(),
+            Some("fixture-generation"),
+        );
+        let mut response =
+            super::super::cache_diagnostics::WireResponse::new(Some(request.clone()));
+        let result = decode_raw_frame_observed(
+            br#"{"response":{"candidates":[{"content":"invalid-shape"}],"usageMetadata":{"promptTokenCount":20,"cachedContentTokenCount":"private-invalid-value"}}}"#,
+            None,
+            Some(&mut response),
+        );
+        assert!(result.is_err());
+        response.outcome("frame_error");
+        drop(response);
+        let mut send = super::super::cache_diagnostics::WireSend::new(Some(request));
+        send.outcome("http_error", Some(503));
+        drop(send);
+        let path = klaus_agent_core::observability::provider_diagnostics::log_path_named(
+            "antigravity-cache.log",
+        );
+        let records: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record["upstreamRequestId"].as_str() == Some(id.as_str()))
+            .collect();
+        let usage = records
+            .iter()
+            .find(|record| record["kind"] == "wire_usage")
+            .unwrap();
+        assert_eq!(
+            usage["rawUsage"]["fields"]["cachedContentTokenCount"]["present"],
+            true
+        );
+        assert!(usage["rawUsage"]["fields"]["cachedContentTokenCount"]["value"].is_null());
+        assert!(records
+            .iter()
+            .any(|record| record["kind"] == "wire_response_end"
+                && record["rawFrames"] == 1
+                && record["usageMetadataFrames"] == 1
+                && record["outcome"] == "frame_error"));
+        assert!(records
+            .iter()
+            .any(|record| record["kind"] == "wire_send_end"
+                && record["outcome"] == "http_error"
+                && record["status"] == 503));
+        assert!(!serde_json::to_string(&records)
+            .unwrap()
+            .contains("private-invalid-value"));
+    }
 
     // A truncated cloud response was classified as Unknown and skipped the
     // engine's bounded stream recovery. Response-read and transport failures

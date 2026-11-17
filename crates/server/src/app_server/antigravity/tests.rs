@@ -2986,15 +2986,18 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_wire_bytes: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let captured_clone = captured_bodies.clone();
+    let captured_wire_clone = captured_wire_bytes.clone();
     let server = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
             let captured = captured_clone.clone();
+            let captured_wire = captured_wire_clone.clone();
             tokio::spawn(async move {
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -3038,8 +3041,12 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
                     }
                 }
                 if path.contains("streamGenerateContent") {
+                    captured_wire
+                        .lock()
+                        .unwrap()
+                        .push(raw[header_end..header_end + content_len].to_vec());
                     let sse = concat!(
-                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Chart:\\n::inline-\"}]}}]}}\n\n",
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Chart:\\n::inline-\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":0}}}\n\n",
                         "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"vis-frame{path=\\\"/tmp/x.html\\\"}\"},{\"functionCall\":{\"name\":\"app_state_query\",\"args\":{\"key\":\"docs\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}}\n\n"
                     );
                     let reply = format!(
@@ -3135,8 +3142,12 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
         req
     };
 
-    let events: Vec<_> = agy_provider
-        .stream(make_req(), AbortSignal::new())
+    let diagnostic_session = format!("wire-fixture-{}", uuid::Uuid::new_v4());
+    let events: Vec<_> =
+        klaus_agent_core::observability::provider_diagnostics::scoped_trace_stream(
+            diagnostic_session.clone().into(),
+            agy_provider.stream(make_req(), AbortSignal::new()),
+        )
         .collect()
         .await;
     let combined_text: String = events
@@ -3177,11 +3188,71 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
         wire_body["request"]["tools"][0]["functionDeclarations"][0]["name"],
         "app_state_query"
     );
+    let diagnostics_path = klaus_agent_core::observability::provider_diagnostics::log_path_named(
+        "antigravity-cache.log",
+    );
+    let records: Vec<Value> = std::fs::read_to_string(&diagnostics_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["upstreamRequestId"].as_str() == Some(req_id))
+        .collect();
+    let request_record = records
+        .iter()
+        .find(|record| record["kind"] == "wire_request")
+        .unwrap();
+    use sha2::{Digest, Sha256};
+    let mut wire_hash = Sha256::new();
+    wire_hash.update(b"wire-body\0");
+    wire_hash.update(&captured_wire_bytes.lock().unwrap()[0]);
+    assert_eq!(
+        request_record["wireBodyHash"],
+        format!("{:x}", wire_hash.finalize())
+    );
+    assert_eq!(
+        request_record["wireMessageCount"],
+        wire_body["request"]["contents"].as_array().unwrap().len()
+    );
+    let mut account_hash = Sha256::new();
+    account_hash.update(b"account-generation\0");
+    account_hash.update(auth::generation().unwrap().as_bytes());
+    assert_eq!(
+        request_record["accountGenerationHash"],
+        format!("{:x}", account_hash.finalize())
+    );
+    let usage_records: Vec<_> = records
+        .iter()
+        .filter(|record| record["kind"] == "wire_usage")
+        .collect();
+    assert_eq!(usage_records.len(), 2);
+    let first = &usage_records[0]["rawUsage"]["fields"]["cachedContentTokenCount"];
+    let last = &usage_records[1]["rawUsage"]["fields"]["cachedContentTokenCount"];
+    assert_eq!(first["present"], true);
+    assert_eq!(first["value"], 0);
+    assert_eq!(last["present"], false);
+    assert!(last["value"].is_null());
+    assert!(records
+        .iter()
+        .any(|record| record["kind"] == "wire_response_end"
+            && record["usageMetadataFrames"] == 2
+            && record["cachedTokenCountPresentFrames"] == 1));
+    let serialized_records = serde_json::to_string(&records).unwrap();
+    for private in [
+        "tok-sanitize",
+        "proj-sanitize",
+        "You are Klaus",
+        "Inspect status",
+    ] {
+        assert!(!serialized_records.contains(private));
+    }
 
     // Non-Antigravity GeminiProvider preserves original system prompt and tool names verbatim.
     captured_bodies.lock().unwrap().clear();
-    let _plain_events: Vec<_> = base_provider
-        .stream(make_req(), AbortSignal::new())
+    let _plain_events: Vec<_> =
+        klaus_agent_core::observability::provider_diagnostics::scoped_trace_stream(
+            diagnostic_session.clone().into(),
+            base_provider.stream(make_req(), AbortSignal::new()),
+        )
         .collect()
         .await;
     let plain_sent = captured_bodies.lock().unwrap().clone();
@@ -3193,6 +3264,19 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
     assert_eq!(
         plain_sent[0]["tools"][0]["functionDeclarations"][0]["name"],
         "klaus_query"
+    );
+    let scoped_wire_requests = std::fs::read_to_string(&diagnostics_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| {
+            record["sessionId"].as_str() == Some(diagnostic_session.as_str())
+                && record["kind"] == "wire_request"
+        })
+        .count();
+    assert_eq!(
+        scoped_wire_requests, 1,
+        "plain Gemini must not emit source-specific diagnostics"
     );
 
     server.abort();

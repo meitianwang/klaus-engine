@@ -691,14 +691,15 @@ async fn run_precompute(
     }));
     // Mirror the foreground dispatch so the background pass runs exactly the
     // operation the synchronous path would run at the boundary.
+    let summary_messages = crate::context::runtime_reminders::without_steps(&arm.snapshot);
     let result = if arm.compactor.reactive_enabled() {
         arm.compactor
-            .threshold_compact(&arm.snapshot, &arm.config, instructions.as_ref())
+            .threshold_compact(&summary_messages, &arm.config, instructions.as_ref())
             .await
     } else {
         arm.compactor
             .maybe_compact(
-                &arm.snapshot,
+                &summary_messages,
                 arm.estimated_tokens,
                 &arm.config,
                 instructions.as_ref(),

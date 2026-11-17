@@ -2,6 +2,7 @@
 
 mod audio;
 pub mod auth;
+mod cache_diagnostics;
 mod catalog;
 mod cloud;
 mod egress;

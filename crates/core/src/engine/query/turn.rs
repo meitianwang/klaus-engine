@@ -1171,6 +1171,31 @@ async fn run_turn(
                 Some(&turn_override),
             );
         }
+        // Estimates project snapshots without writing history. Admit the final
+        // post-compaction view once so retries and reloads preserve its prefix.
+        if crate::context::runtime_reminders::enabled(&shared.config()) {
+            let pending: Vec<_> = prepared
+                .request
+                .messages
+                .iter()
+                .filter(|message| crate::context::runtime_reminders::is_step(message))
+                .filter(|message| {
+                    !messages.iter().any(|existing| {
+                        super::query_message_uuid(existing) == super::query_message_uuid(message)
+                    })
+                })
+                .cloned()
+                .collect();
+            for message in pending {
+                if let Some(on_message) = &shared.params.on_message {
+                    if on_message(message.clone()).await.is_err() {
+                        emit_preparation_aborted(&shared, final_usage.clone());
+                        return;
+                    }
+                }
+                messages.push(message);
+            }
+        }
         // 2/3) Stream + dispatch, with streaming-fallback retry on transient
         // errors.
         let StreamTurnResult {
@@ -2726,20 +2751,22 @@ fn apply_total_tokens_reminder(
             matches!(message,
             Message::User(user) if user.is_meta != Some(true) && user.question_answer.is_none())
         });
-    let attachment = (after_tool_batch || after_user).then(|| {
-        Message::User(UserMessage {
-            uuid: RuntimeString::from("total-tokens:").concat(&shared.params.turn_id),
-            content: vec![ContentBlock::Text(TextBlock {
-                text: line.clone(),
-                citations: None,
-                harness_envelope: None,
-                message_id: None,
-                phase: Some("total_tokens_reminder".into()),
-            })],
-            is_meta: Some(true),
-            question_answer: None,
-        })
-    });
+    let attachment = (!crate::context::runtime_reminders::enabled(config)
+        && (after_tool_batch || after_user))
+        .then(|| {
+            Message::User(UserMessage {
+                uuid: RuntimeString::from("total-tokens:").concat(&shared.params.turn_id),
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: line.clone(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: Some("total_tokens_reminder".into()),
+                })],
+                is_meta: Some(true),
+                question_answer: None,
+            })
+        });
     system_prompt.push(SystemPromptPart {
         name: TOTAL_TOKENS_PART.into(),
         text: line,
@@ -3414,6 +3441,7 @@ async fn run_turn_compact(
     });
     let (compactable, protected) =
         split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
+    let compactable = crate::context::runtime_reminders::without_steps(&compactable);
     let before = crate::context::tokens::estimate_context_tokens(messages);
     let source_ids: Vec<RuntimeString> = messages
         .iter()

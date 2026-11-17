@@ -425,6 +425,7 @@ impl Session {
         let snapshot = self.model_history();
         let before_tokens = estimate_context_tokens(&snapshot);
         let before_messages = snapshot.len();
+        let snapshot = crate::context::runtime_reminders::without_steps(&snapshot);
         let unchanged = |reason, diagnostics| {
             (
                 CompactOutcome {
