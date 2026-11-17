@@ -962,82 +962,138 @@ async fn not_offered_or_original(
     )
 }
 
-const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 2;
 const DEFAULT_ROTATION_COOLDOWN_MS: u64 = 1_200;
-const MIN_STREAM_LAUNCH_SPACING_MS: u64 = 80;
+const SESSION_LEASE_TTL_MS: i64 = 30 * 60 * 1000;
 
-struct AccountStreamLimiter {
-    capacity: usize,
-    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    last_launch: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+struct SessionLease {
+    generation: String,
+    last_active_ms: i64,
+    manual_switch_epoch: u64,
 }
 
-fn configured_max_concurrent_streams() -> usize {
-    std::env::var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| (1..=32).contains(v))
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_STREAMS)
+#[derive(Default)]
+struct AccountPoolRouting {
+    in_flight: std::collections::HashMap<String, usize>,
+    leases: std::collections::HashMap<String, SessionLease>,
 }
 
-fn stream_limiters() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Arc<AccountStreamLimiter>>,
-> {
-    static LIMITERS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<AccountStreamLimiter>>>,
-    > = std::sync::OnceLock::new();
-    LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn pool_routing() -> &'static std::sync::Mutex<AccountPoolRouting> {
+    static ROUTING: std::sync::OnceLock<std::sync::Mutex<AccountPoolRouting>> =
+        std::sync::OnceLock::new();
+    ROUTING.get_or_init(|| std::sync::Mutex::new(AccountPoolRouting::default()))
 }
 
-pub(super) fn prune_stream_limiter(generation: &str) {
-    stream_limiters()
+pub(super) fn clear_session_leases() {
+    pool_routing()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .remove(generation);
+        .leases
+        .clear();
 }
 
-async fn acquire_stream_permit(
-    generation: &str,
-    signal: &AbortSignal,
-) -> Result<tokio::sync::OwnedSemaphorePermit, GeminiApiError> {
-    let desired = configured_max_concurrent_streams();
-    let limiter = {
-        let mut guard = stream_limiters().lock().unwrap_or_else(|p| p.into_inner());
-        match guard.get(generation) {
-            Some(existing) if existing.capacity == desired => existing.clone(),
-            _ => {
-                let created = std::sync::Arc::new(AccountStreamLimiter {
-                    capacity: desired,
-                    semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(desired)),
-                    last_launch: tokio::sync::Mutex::new(None),
-                });
-                guard.insert(generation.to_string(), created.clone());
-                created
-            }
-        }
-    };
-    let permit = tokio::select! {
-        _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
-        acquired = limiter.semaphore.clone().acquire_owned() => {
-            acquired.map_err(|_| api_error("antigravity_transport_unavailable"))?
-        }
-    };
-    let mut launch_guard = tokio::select! {
-        _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
-        guard = limiter.last_launch.lock() => guard,
-    };
-    if let Some(prev) = *launch_guard {
-        let min_gap = std::time::Duration::from_millis(MIN_STREAM_LAUNCH_SPACING_MS);
-        let elapsed = prev.elapsed();
-        if elapsed < min_gap {
-            tokio::select! {
-                _ = signal.cancelled() => return Err(api_error("antigravity_request_cancelled")),
-                _ = tokio::time::sleep(min_gap - elapsed) => {}
+pub(super) fn switch_session_leases(generation: &str, epoch: u64) {
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    for lease in state.leases.values_mut() {
+        lease.generation = generation.to_string();
+        lease.manual_switch_epoch = epoch;
+    }
+}
+
+pub(super) fn prune_session_leases(generation: &str) {
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    state.in_flight.remove(generation);
+    state
+        .leases
+        .retain(|_, lease| lease.generation != generation);
+}
+
+struct ActiveGenerationGuard {
+    generation: String,
+}
+
+impl Drop for ActiveGenerationGuard {
+    fn drop(&mut self) {
+        let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = state.in_flight.get_mut(&self.generation) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.in_flight.remove(&self.generation);
             }
         }
     }
-    *launch_guard = Some(tokio::time::Instant::now());
-    Ok(permit)
+}
+
+fn enter_active_generation(generation: &str) -> ActiveGenerationGuard {
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    *state.in_flight.entry(generation.to_string()).or_insert(0) += 1;
+    ActiveGenerationGuard {
+        generation: generation.to_string(),
+    }
+}
+
+fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<String> {
+    let usable = auth::usable_generations();
+    if usable.is_empty() {
+        return auth::generation();
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    if auth::manual_switch_epoch() != epoch {
+        return auth::generation();
+    }
+    state.leases.retain(|_, lease| {
+        lease.manual_switch_epoch == epoch
+            && now_ms.saturating_sub(lease.last_active_ms) <= SESSION_LEASE_TTL_MS
+            && usable.contains(&lease.generation)
+    });
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else {
+        return usable.into_iter().next();
+    };
+    if let Some(existing) = state.leases.get_mut(key) {
+        existing.last_active_ms = now_ms;
+        return Some(existing.generation.clone());
+    }
+    let chosen = usable
+        .iter()
+        .min_by_key(|gen| {
+            let active = state.in_flight.get(*gen).copied().unwrap_or(0);
+            let leased = state
+                .leases
+                .values()
+                .filter(|lease| lease.generation == **gen)
+                .count();
+            (active, leased)
+        })?
+        .clone();
+    state.leases.insert(
+        key.to_string(),
+        SessionLease {
+            generation: chosen.clone(),
+            last_active_ms: now_ms,
+            manual_switch_epoch: epoch,
+        },
+    );
+    Some(chosen)
+}
+
+fn rebind_session_lease(session_key: Option<&str>, generation: &str, epoch: u64) {
+    let Some(key) = session_key.filter(|k| !k.is_empty()) else {
+        return;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    // An older in-flight request must not undo an explicit account selection.
+    if auth::manual_switch_epoch() != epoch {
+        return;
+    }
+    state.leases.insert(
+        key.to_string(),
+        SessionLease {
+            generation: generation.to_string(),
+            last_active_ms: now_ms,
+            manual_switch_epoch: epoch,
+        },
+    );
 }
 
 pub(super) async fn wait_rotation_cooldown(signal: &AbortSignal) -> Result<(), &'static str> {
@@ -1083,6 +1139,12 @@ impl CloudClient {
                 step_counter: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }),
         }
+    }
+
+    fn sticky_session_key(&self) -> Option<&str> {
+        self.session
+            .as_ref()
+            .map(|ctx| ctx.conversation_id.as_str())
     }
 
     fn next_conversation_step(&self) -> (String, usize) {
@@ -2093,6 +2155,9 @@ pub(super) fn is_rotatable_message(message: &str) -> bool {
         "antigravity_quota_exhausted",
         "antigravity_auth_required",
         "antigravity_login_expired",
+        "antigravity_service_unavailable",
+        "antigravity_model_access_denied",
+        "antigravity_model_not_offered",
     ]
     .iter()
     .any(|tag| has_tag_prefix(message, tag))
@@ -2195,23 +2260,35 @@ impl GeminiClient for CloudClient {
             .try_to_utf8()
             .map_err(|_| api_error("antigravity_model_invalid"))?;
         let (conversation_id, step) = self.next_conversation_step();
+        let sticky_key = self.sticky_session_key().map(str::to_string);
         let pooled = self.generation.is_empty();
         let mut attempted: Vec<String> = Vec::new();
+        let mut forced_next: Option<String> = None;
+        let mut routing_epoch = auth::manual_switch_epoch();
         let (
             mut generation,
-            mut stream_permit,
+            active_guard,
             mut project,
             mut base_request,
             mut tool_projection,
             initial_max_output_tokens,
             response,
         ) = loop {
-            let candidate_gen = if pooled {
-                auth::generation().ok_or_else(|| api_error("antigravity_not_signed_in"))?
+            let current_epoch = auth::manual_switch_epoch();
+            if current_epoch != routing_epoch {
+                routing_epoch = current_epoch;
+                forced_next = None;
+                attempted.clear();
+            }
+            let candidate_gen = if let Some(next) = forced_next.take() {
+                next
+            } else if pooled {
+                select_pooled_generation(sticky_key.as_deref(), routing_epoch)
+                    .ok_or_else(|| api_error("antigravity_not_signed_in"))?
             } else {
                 self.generation.clone()
             };
-            let permit = acquire_stream_permit(&candidate_gen, &signal).await?;
+            let guard = enter_active_generation(&candidate_gen);
             match establish_initial_leg_for_generation(
                 &candidate_gen,
                 &params,
@@ -2224,9 +2301,12 @@ impl GeminiClient for CloudClient {
             .await
             {
                 Ok((project, base_request, projection, max_tokens, response)) => {
+                    if pooled {
+                        rebind_session_lease(sticky_key.as_deref(), &candidate_gen, routing_epoch);
+                    }
                     break (
                         candidate_gen,
-                        permit,
+                        guard,
                         project,
                         base_request,
                         projection,
@@ -2241,14 +2321,16 @@ impl GeminiClient for CloudClient {
                         && auth::account_count() > 1
                         && !attempted.contains(&candidate_gen) =>
                 {
-                    drop(permit);
+                    drop(guard);
                     attempted.push(candidate_gen.clone());
-                    match auth::rotate(&candidate_gen).await {
+                    match auth::rotate_excluding(&candidate_gen, &attempted).await {
                         RotateOutcome::Rotated(next) if !attempted.contains(&next) => {
+                            forced_next = Some(next);
                             wait_rotation_cooldown(&signal).await.map_err(api_error)?;
                             continue;
                         }
                         RotateOutcome::AlreadyAdvanced(next) if !attempted.contains(&next) => {
+                            forced_next = Some(next);
                             continue;
                         }
                         _ => return Err(err),
@@ -2259,7 +2341,7 @@ impl GeminiClient for CloudClient {
         };
 
         Ok(Box::pin(async_stream::stream! {
-            let _active_permit = &mut stream_permit;
+            let mut _active_guard = active_guard;
             let mut tracker = StreamContinuationTracker::new(initial_max_output_tokens);
             let mut text_restorer = super::sanitize::TextRestorer::default();
             let mut response = response;
@@ -2465,7 +2547,7 @@ impl GeminiClient for CloudClient {
                         attempted.push(generation.clone());
                         let mut terminal_err = first_err;
                         loop {
-                            let rotated = auth::rotate(&generation).await;
+                            let rotated = auth::rotate_excluding(&generation, &attempted).await;
                             let (next, was_rotated) = match rotated {
                                 RotateOutcome::Rotated(next) => (next, true),
                                 RotateOutcome::AlreadyAdvanced(next) => (next, false),
@@ -2482,17 +2564,8 @@ impl GeminiClient for CloudClient {
                                     return;
                                 }
                             }
-                            let next_permit = match acquire_stream_permit(&next, &signal).await {
-                                Ok(permit) => permit,
-                                Err(err) => {
-                                    if !signal.is_cancelled() {
-                                        yield Err(err);
-                                    }
-                                    return;
-                                }
-                            };
+                            let next_guard = enter_active_generation(&next);
                             generation = next.clone();
-                            *_active_permit = next_permit;
                             in_stream_auth_renewed = false;
                             match establish_initial_leg_for_generation(
                                 &generation,
@@ -2506,6 +2579,8 @@ impl GeminiClient for CloudClient {
                             .await
                             {
                                 Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
+                                    _active_guard = next_guard;
+                                    rebind_session_lease(sticky_key.as_deref(), &generation, routing_epoch);
                                     project = next_proj;
                                     base_request = next_base;
                                     tool_projection = next_proj_map;
@@ -2521,10 +2596,12 @@ impl GeminiClient for CloudClient {
                                     if is_rotatable_message(&err.message)
                                         && !attempted.contains(&generation) =>
                                 {
+                                    drop(next_guard);
                                     attempted.push(generation.clone());
                                     terminal_err = err;
                                 }
                                 Err(err) => {
+                                    drop(next_guard);
                                     yield Err(err);
                                     return;
                                 }
@@ -2534,7 +2611,8 @@ impl GeminiClient for CloudClient {
                     } else {
                         leg_err = Some(first_err);
                     }
-                } else if !tracker.leg.saw_candidate
+                }
+                if !tracker.leg.saw_candidate
                     && !tracker.has_prior_leg
                     && pre_candidate_overload_retries < 2
                     && leg_err
@@ -2757,6 +2835,21 @@ impl GeminiClient for CloudClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_account_selection_fences_late_lease_replies() {
+        let epoch = auth::manual_switch_epoch();
+        clear_session_leases();
+        rebind_session_lease(Some("chat"), "old-account", epoch);
+        let _active = enter_active_generation("selected-account");
+        switch_session_leases("selected-account", epoch);
+        rebind_session_lease(Some("chat"), "old-account", epoch.wrapping_sub(1));
+        let state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+        let lease = state.leases.get("chat").unwrap();
+        assert_eq!(lease.generation, "selected-account");
+        assert_eq!(lease.manual_switch_epoch, epoch);
+        assert_eq!(state.in_flight.get("selected-account"), Some(&1));
+    }
 
     #[test]
     fn raw_usage_is_recorded_even_when_typed_frame_decoding_fails() {

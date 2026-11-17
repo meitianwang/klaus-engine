@@ -437,6 +437,28 @@ pub(super) fn minimal_reasoning_models(
     result
 }
 
+/// Keep long-running chats within a conservative prefill budget without
+/// changing the provider-advertised context window.
+pub(super) const MAX_AUTO_COMPACT_TOKENS: u64 = 256_000;
+const MIN_AUTO_COMPACT_OUTPUT_HEADROOM_TOKENS: u64 = 40_000;
+
+pub(super) fn auto_compact_token_limit(
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+) -> Option<u64> {
+    let total = context_window?;
+    match max_output_tokens {
+        Some(max_output) => {
+            let reserve = max_output.max(MIN_AUTO_COMPACT_OUTPUT_HEADROOM_TOKENS);
+            total
+                .checked_sub(reserve)
+                .filter(|&available| available > 0)
+                .map(|available| available.min(MAX_AUTO_COMPACT_TOKENS))
+        }
+        None => (total > MAX_AUTO_COMPACT_TOKENS).then_some(MAX_AUTO_COMPACT_TOKENS),
+    }
+}
+
 /// Project only fields accepted by the engine's capability contract.
 pub fn model_capabilities(entry: &Value) -> Value {
     let raw = entry.get("providerMetadata").unwrap_or(entry);
@@ -467,11 +489,16 @@ pub fn model_capabilities(entry: &Value) -> Value {
     if !media_mimes.is_empty() {
         capabilities["mediaInputMimeTypes"] = json!(media_mimes);
     }
-    if let Some(tokens) = positive_integer(raw.get("maxTokens")) {
+    let context_window = positive_integer(raw.get("maxTokens"));
+    let max_output_tokens = positive_integer(raw.get("maxOutputTokens"));
+    if let Some(tokens) = context_window {
         capabilities["contextWindow"] = json!(tokens);
     }
-    if let Some(tokens) = positive_integer(raw.get("maxOutputTokens")) {
+    if let Some(tokens) = max_output_tokens {
         capabilities["maxOutputTokens"] = json!(tokens);
+    }
+    if let Some(limit) = auto_compact_token_limit(context_window, max_output_tokens) {
+        capabilities["autoCompactTokenLimit"] = json!(limit);
     }
     let budget = declared_thinking_budget(raw);
     let level = positive_integer(raw.get("thinkingLevel")).is_some();
@@ -1172,9 +1199,43 @@ mod tests {
                 .expect("catalog capabilities must be accepted at session initialization");
         assert_eq!(decoded.context_window, Some(1048576));
         assert_eq!(decoded.max_output_tokens, Some(65536));
+        assert_eq!(decoded.auto_compact_token_limit, Some(256_000));
         let dialect = decoded.gemini_thinking.unwrap();
         assert_eq!(dialect.min, Some(0));
         assert_eq!(dialect.max, None);
+    }
+
+    #[test]
+    fn auto_compact_limit_caps_large_windows_and_preserves_headroom_for_smaller_windows() {
+        let one_million = model_capabilities(&json!({
+            "maxTokens": 1_048_576,
+            "maxOutputTokens": 262_144
+        }));
+        assert_eq!(one_million["autoCompactTokenLimit"], 256_000);
+
+        let anthropic_million = model_capabilities(&json!({
+            "maxTokens": 1_000_000,
+            "maxOutputTokens": 128_000
+        }));
+        assert_eq!(anthropic_million["autoCompactTokenLimit"], 256_000);
+
+        let mid_window = model_capabilities(&json!({
+            "maxTokens": 200_000,
+            "maxOutputTokens": 32_000
+        }));
+        assert_eq!(mid_window["autoCompactTokenLimit"], 160_000);
+
+        let tight_window = model_capabilities(&json!({
+            "maxTokens": 65_536,
+            "maxOutputTokens": 65_536
+        }));
+        assert!(tight_window.get("autoCompactTokenLimit").is_none());
+
+        let completion_window = model_capabilities(&json!({
+            "maxTokens": 16_384,
+            "maxOutputTokens": 4_096
+        }));
+        assert!(completion_window.get("autoCompactTokenLimit").is_none());
     }
 
     #[test]

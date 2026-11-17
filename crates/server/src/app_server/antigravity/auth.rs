@@ -467,6 +467,12 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
     Ok(json!({"ok":true,"signedIn":false,"loggedIn":false,"accounts":[]}))
 }
 
+static MANUAL_SWITCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn manual_switch_epoch() -> u64 {
+    MANUAL_SWITCH_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub async fn switch_account(account_id: &str) -> Result<Value, String> {
     let target_id = account_id.trim();
     if target_id.is_empty() || !clean(target_id) {
@@ -489,6 +495,10 @@ pub async fn switch_account(account_id: &str) -> Result<Value, String> {
     let Some(changed_head) = switched else {
         return Ok(json!({"ok":false,"error":"antigravity_account_not_found"}));
     };
+    let epoch = MANUAL_SWITCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if let Some(generation) = generation() {
+        super::cloud::switch_session_leases(&generation, epoch);
+    }
     if changed_head {
         super::sync_head_catalog();
     }
@@ -498,33 +508,55 @@ pub async fn switch_account(account_id: &str) -> Result<Value, String> {
 }
 
 pub(super) async fn rotate(failed_generation: &str) -> RotateOutcome {
+    rotate_excluding(failed_generation, &[failed_generation.to_string()]).await
+}
+
+pub(super) async fn rotate_excluding(
+    failed_generation: &str,
+    attempted: &[String],
+) -> RotateOutcome {
     let _guard = credential_lock().lock().await;
+    let mut head_changed = false;
     let outcome = with_store_file_lock(|| {
         let mut entries = accounts();
         if entries.len() < 2 {
             return Ok(RotateOutcome::Exhausted);
         }
-        let head_generation = entries[0].generation.clone();
-        if head_generation != failed_generation {
-            return if entries
-                .iter()
-                .any(|entry| entry.generation == failed_generation)
-            {
-                Ok(RotateOutcome::AlreadyAdvanced(head_generation))
-            } else {
-                Ok(RotateOutcome::Exhausted)
-            };
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.generation == failed_generation)
+        else {
+            return Ok(RotateOutcome::Exhausted);
+        };
+        let moved = index + 1 < entries.len();
+        if moved {
+            let failed = entries.remove(index);
+            entries.push(failed);
+            head_changed = index == 0;
+            write_accounts_unlocked(&entries)?;
         }
-        let failed = entries.remove(0);
-        entries.push(failed);
-        let next = entries[0].generation.clone();
-        write_accounts_unlocked(&entries)?;
-        Ok(RotateOutcome::Rotated(next))
+        let now = chrono::Utc::now().timestamp_millis();
+        let next = entries
+            .iter()
+            .find(|entry| !attempted.contains(&entry.generation) && !entry_needs_login(entry, now))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| !attempted.contains(&entry.generation))
+            })
+            .map(|entry| entry.generation.clone());
+        match next {
+            Some(gen) if moved => Ok(RotateOutcome::Rotated(gen)),
+            Some(gen) => Ok(RotateOutcome::AlreadyAdvanced(gen)),
+            None => Ok(RotateOutcome::Exhausted),
+        }
     });
     match outcome {
         Ok(outcome) => {
-            if matches!(outcome, RotateOutcome::Rotated(_)) {
+            if head_changed {
                 super::sync_head_catalog();
+            }
+            if matches!(outcome, RotateOutcome::Rotated(_)) {
                 super::egress::reset_pool(Some(failed_generation)).await;
             }
             outcome
@@ -535,6 +567,15 @@ pub(super) async fn rotate(failed_generation: &str) -> RotateOutcome {
 
 pub(crate) fn generation() -> Option<String> {
     accounts().into_iter().next().map(|entry| entry.generation)
+}
+
+pub(super) fn usable_generations() -> Vec<String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    accounts()
+        .into_iter()
+        .filter(|entry| !entry_needs_login(entry, now))
+        .map(|entry| entry.generation)
+        .collect()
 }
 
 pub(super) fn generations() -> Vec<String> {

@@ -48,6 +48,7 @@ pub fn set_config_root(root: &Path) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        cloud::clear_session_leases();
     }
 }
 
@@ -131,7 +132,7 @@ pub(super) fn prune_generation(generation: &str) {
         .remove(generation);
     unmark(&HEARTBEAT_SPAWNED, generation);
     unmark(&SURFACE_BOOTSTRAPPED, generation);
-    cloud::prune_stream_limiter(generation);
+    cloud::prune_session_leases(generation);
 }
 
 pub(super) fn sync_head_catalog() {
@@ -216,6 +217,7 @@ fn forget_catalog() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    cloud::clear_session_leases();
     let _ = std::fs::remove_file(config_root().join("antigravity-models.json"));
 }
 
@@ -1025,25 +1027,70 @@ fn selected_dialect(model: &RuntimeString, init: &ProtocolSessionInit) -> Gemini
     dialect(declared)
 }
 
+fn apply_source_compaction_cap(
+    model_id: Option<&str>,
+    capabilities: &mut klaus_agent_core::types::provider::ModelCapabilities,
+    generation: Option<&str>,
+) {
+    let details = generation
+        .zip(model_id)
+        .and_then(|(gen, id)| model_details(gen, id));
+    let context_window = capabilities.context_window.or_else(|| {
+        details
+            .as_ref()
+            .and_then(|d| d.get("maxTokens"))
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0)
+    });
+    let max_output = capabilities.max_output_tokens.or_else(|| {
+        details
+            .as_ref()
+            .and_then(|d| d.get("maxOutputTokens"))
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0)
+    });
+    if let Some(source_limit) = catalog::auto_compact_token_limit(context_window, max_output) {
+        capabilities.auto_compact_token_limit = Some(
+            capabilities
+                .auto_compact_token_limit
+                .map_or(source_limit, |declared| declared.min(source_limit)),
+        );
+    }
+}
+
 pub(super) fn decorate(
     provider: Arc<dyn ModelProvider>,
     init: &ProtocolSessionInit,
 ) -> Arc<dyn ModelProvider> {
+    let head_generation = auth::generation();
     let model = provider.info().default_model.clone();
-    let capabilities = provider.model_metadata(&model);
+    let default_model_id = model.try_to_utf8().ok();
+    let mut capabilities = provider.model_metadata(&model);
+    apply_source_compaction_cap(
+        default_model_id.as_deref(),
+        &mut capabilities,
+        head_generation.as_deref(),
+    );
     let mut by_model: HashMap<_, _> = provider
         .offline_model_catalog()
         .into_iter()
-        .filter_map(|(id, caps)| Some((id.try_to_utf8().ok()?, caps)))
+        .filter_map(|(id, mut caps)| {
+            let id = id.try_to_utf8().ok()?;
+            apply_source_compaction_cap(Some(&id), &mut caps, head_generation.as_deref());
+            Some((id, caps))
+        })
         .collect();
     for entry in init.capabilities_by_model.iter().flatten() {
         if let Ok(id) = entry.model.try_to_utf8() {
-            by_model.insert(id, provider.model_metadata(&entry.model));
+            let mut caps = provider.model_metadata(&entry.model);
+            apply_source_compaction_cap(Some(&id), &mut caps, head_generation.as_deref());
+            by_model.insert(id, caps);
         }
     }
-    let minimal_reasoning_models: HashMap<String, RuntimeString> = auth::generation()
+    let minimal_reasoning_models: HashMap<String, RuntimeString> = head_generation
+        .as_deref()
         .map(|generation| {
-            let payload = cached_payload(&generation)
+            let payload = cached_payload(generation)
                 .map(|cached| cached.payload)
                 .unwrap_or_else(catalog::bundled_payload);
             let mut mapped = HashMap::new();
@@ -1090,7 +1137,7 @@ pub(super) fn decorate(
     let admission_generations = auth::generations();
     let multi_account = admission_generations.len() > 1;
     Arc::new(GeminiProvider::new(GeminiProviderOptions {
-        default_model: model.try_to_utf8().ok(),
+        default_model: default_model_id,
         client: Some(Arc::new(cloud::CloudClient::pooled(conversation_id))),
         retry: Some(RetryOptions {
             yield_to_credential_rotation: multi_account,

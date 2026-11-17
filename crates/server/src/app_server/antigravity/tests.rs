@@ -3285,7 +3285,7 @@ async fn antigravity_wire_projection_rewrites_prompt_and_tools_only_for_antigrav
 }
 
 #[tokio::test]
-async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_excess_streams() {
+async fn heartbeat_runs_only_for_active_head_account_and_concurrent_streams_run_in_parallel() {
     use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
     use klaus_agent_core::types::provider::{ModelProvider, ModelRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3294,16 +3294,15 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
     let active_in_flight = Arc::new(AtomicUsize::new(0));
     let peak_in_flight = Arc::new(AtomicUsize::new(0));
     let heartbeat_tokens: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let release_gate = Arc::new(tokio::sync::Notify::new());
-    let two_entered = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let all_entered = Arc::new(tokio::sync::Notify::new());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let active_clone = active_in_flight.clone();
     let peak_clone = peak_in_flight.clone();
     let hb_clone = heartbeat_tokens.clone();
-    let release_clone = release_gate.clone();
-    let two_entered_clone = two_entered.clone();
+    let all_entered_clone = all_entered.clone();
 
     let server = tokio::spawn(async move {
         loop {
@@ -3313,8 +3312,8 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
             let active = active_clone.clone();
             let peak = peak_clone.clone();
             let hb = hb_clone.clone();
-            let release = release_clone.clone();
-            let two_in = two_entered_clone.clone();
+            let mut release = release_rx.clone();
+            let all_in = all_entered_clone.clone();
             tokio::spawn(async move {
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -3348,10 +3347,10 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
                 if path.contains("streamGenerateContent") {
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    if now == 2 {
-                        two_in.notify_one();
+                    if now == 4 {
+                        all_in.notify_one();
                     }
-                    release.notified().await;
+                    let _ = release.wait_for(|&open| open).await;
                     active.fetch_sub(1, Ordering::SeqCst);
                     let sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n";
                     let reply = format!(
@@ -3385,7 +3384,6 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
     set_config_root(root.path());
     set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
     set_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS", "1");
-    set_process_environment_var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS", "2");
 
     auth::adopt(auth::Credential {
         access_token: "head-tok".into(),
@@ -3456,16 +3454,12 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
         })
     };
     let tasks: Vec<_> = (0..4).map(|_| launch_one(provider.clone())).collect();
-    tokio::time::timeout(std::time::Duration::from_secs(5), two_entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(5), all_entered.notified())
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(active_in_flight.load(Ordering::SeqCst), 2);
-    assert_eq!(peak_in_flight.load(Ordering::SeqCst), 2);
-    for _ in 0..8 {
-        release_gate.notify_waiters();
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    }
+    assert_eq!(active_in_flight.load(Ordering::SeqCst), 4);
+    assert_eq!(peak_in_flight.load(Ordering::SeqCst), 4);
+    let _ = release_tx.send(true);
     for task in tasks {
         let evs = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
@@ -3473,15 +3467,338 @@ async fn heartbeat_runs_only_for_active_head_account_and_concurrency_cap_queues_
             .unwrap();
         assert!(!evs.is_empty());
     }
-    assert!(
-        peak_in_flight.load(Ordering::SeqCst) <= 2,
-        "peak concurrent streams exceeded cap of 2: {}",
-        peak_in_flight.load(Ordering::SeqCst)
-    );
 
     server.abort();
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
     remove_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS");
-    remove_process_environment_var("KLAUS_ANTIGRAVITY_MAX_CONCURRENT_STREAMS");
+}
+
+#[test]
+fn source_compaction_ceiling_preserves_lower_declared_limits() {
+    use klaus_agent_core::types::provider::ModelCapabilities;
+
+    for (declared, expected) in [
+        (Some(900_000), 256_000),
+        (Some(100_000), 100_000),
+        (None, 256_000),
+    ] {
+        let mut caps = ModelCapabilities {
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(262_144),
+            auto_compact_token_limit: declared,
+            ..Default::default()
+        };
+        apply_source_compaction_cap(None, &mut caps, None);
+        assert_eq!(caps.auto_compact_token_limit, Some(expected));
+        assert_eq!(caps.context_window, Some(1_048_576));
+    }
+}
+
+#[tokio::test]
+async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overload() {
+    use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+    use klaus_agent_core::types::provider::{ModelProvider, ModelRequest, ModelStreamEvent};
+    use std::collections::VecDeque;
+
+    #[derive(Clone)]
+    enum ReplyPlan {
+        Http503Overloaded,
+        ModelAccessDenied,
+        Ok(&'static str),
+    }
+
+    let plans: Arc<Mutex<HashMap<String, VecDeque<ReplyPlan>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let plans_srv = plans.clone();
+    let seen_srv = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let plans = plans_srv.clone();
+            let seen = seen_srv.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (header_end, content_len) = loop {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let hdr = String::from_utf8_lossy(&raw[..pos]);
+                        let len = hdr
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while raw.len() < header_end + content_len {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let header = String::from_utf8_lossy(&raw[..header_end]);
+                let path = header
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let bearer = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("authorization: bearer ")
+                            .map(|idx| line[line.len() - idx.len()..].trim().to_string())
+                    })
+                    .unwrap_or_default();
+                if !path.contains("streamGenerateContent") {
+                    let body = if path.contains("fetchAvailableModels") {
+                        r#"{"models":{"gemini-3.8-flash-medium":{"displayName":"Flash","maxTokens":1048576,"maxOutputTokens":65536}}}"#
+                    } else {
+                        "{}"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    return;
+                }
+                let body_json: Value =
+                    serde_json::from_slice(&raw[header_end..header_end + content_len])
+                        .unwrap_or(Value::Null);
+                let proj = body_json["project"].as_str().unwrap_or("").to_string();
+                seen.lock().unwrap().push((bearer.clone(), proj));
+                let step = plans
+                    .lock()
+                    .unwrap()
+                    .get_mut(&bearer)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(ReplyPlan::Ok("default-ok"));
+                match step {
+                    ReplyPlan::ModelAccessDenied => {
+                        let err = json!({"error": {
+                            "code": 403, "status": "PERMISSION_DENIED",
+                            "message": "Your account does not have access to this model.",
+                            "details": [{"reason": "MODEL_ACCESS_DENIED"}]
+                        }})
+                        .to_string();
+                        let reply = format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    ReplyPlan::Http503Overloaded => {
+                        let err = json!({
+                            "error": {
+                                "code": 503,
+                                "status": "UNAVAILABLE",
+                                "message": "overloaded prefill queue",
+                                "details": [{"reason": "PREFILL_QUEUE_OVERLOADED"}]
+                            }
+                        })
+                        .to_string();
+                        let reply = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    ReplyPlan::Ok(text) => {
+                        let sse = format!(
+                            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{text}\"}}]}},\"finishReason\":\"STOP\"}}]}}}}\n\n"
+                        );
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS", "0");
+
+    let first = auth::adopt(auth::Credential {
+        access_token: "acct-1-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("acct1@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-1".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    let acct1_id = first["accountId"].as_str().unwrap().to_string();
+
+    auth::adopt(auth::Credential {
+        access_token: "acct-2-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("acct2@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-2".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+
+    let make_session_provider = |thread_id: &str| {
+        let init: ProtocolSessionInit = decode(json!({
+            "threadId": thread_id,
+            "modelSource": {"source": "antigravity"},
+        }));
+        let base: Arc<dyn ModelProvider> = Arc::new(GeminiProvider::new(GeminiProviderOptions {
+            default_model: Some("gemini-3.8-flash-medium".into()),
+            ..Default::default()
+        }));
+        decorate(base, &init)
+    };
+    let ask = |provider: Arc<dyn ModelProvider>| async move {
+        let req: ModelRequest = decode(json!({
+            "model": "gemini-3.8-flash-medium",
+            "system": [],
+            "messages": [],
+            "tools": [],
+            "maxOutputTokens": 64
+        }));
+        let events: Vec<ModelStreamEvent> =
+            provider.stream(req, AbortSignal::new()).collect().await;
+        events
+            .into_iter()
+            .filter_map(|ev| match ev {
+                ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+
+    let chat_a = make_session_provider("thread-alpha");
+    let chat_b = make_session_provider("thread-beta");
+    assert_eq!(
+        chat_a
+            .model_metadata(&RuntimeString::from("gemini-3.8-flash-medium"))
+            .auto_compact_token_limit,
+        Some(256_000)
+    );
+
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert(
+            "acct-1-tok".into(),
+            VecDeque::from([ReplyPlan::Ok("a1"), ReplyPlan::Ok("a2")]),
+        );
+        p.insert(
+            "acct-2-tok".into(),
+            VecDeque::from([ReplyPlan::Ok("b1"), ReplyPlan::Ok("b2")]),
+        );
+    }
+    assert_eq!(ask(chat_a.clone()).await, "a1");
+    assert_eq!(ask(chat_b.clone()).await, "b1");
+    assert_eq!(ask(chat_a.clone()).await, "a2");
+    assert_eq!(ask(chat_b.clone()).await, "b2");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-2-tok".into(), "proj-2".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-2-tok".into(), "proj-2".into()),
+        ],
+        "distinct threads must shard across pooled accounts and stay sticky per thread"
+    );
+
+    // Pre-response HTTP 503 overload on acct-1 fails over immediately to acct-2 and rebinds chat_a.
+    seen.lock().unwrap().clear();
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert(
+            "acct-1-tok".into(),
+            VecDeque::from([ReplyPlan::Http503Overloaded]),
+        );
+        p.insert(
+            "acct-2-tok".into(),
+            VecDeque::from([ReplyPlan::Ok("failover-2"), ReplyPlan::Ok("sticky-2")]),
+        );
+    }
+    assert_eq!(ask(chat_a.clone()).await, "failover-2");
+    assert_eq!(ask(chat_a.clone()).await, "sticky-2");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-2-tok".into(), "proj-2".into()),
+            ("acct-2-tok".into(), "proj-2".into()),
+        ]
+    );
+
+    // Explicit manual account switch resets sticky leases so existing chats honor the user's pick.
+    seen.lock().unwrap().clear();
+    auth::switch_account(&acct1_id).await.unwrap();
+    plans.lock().unwrap().insert(
+        "acct-1-tok".into(),
+        VecDeque::from([ReplyPlan::Ok("manual-1")]),
+    );
+    assert_eq!(ask(chat_a.clone()).await, "manual-1");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![("acct-1-tok".into(), "proj-1".into())]
+    );
+
+    // Different account entitlements must not turn automatic sharding into a dead end.
+    seen.lock().unwrap().clear();
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert(
+            "acct-1-tok".into(),
+            VecDeque::from([ReplyPlan::ModelAccessDenied]),
+        );
+        p.insert(
+            "acct-2-tok".into(),
+            VecDeque::from([ReplyPlan::Ok("entitled-2")]),
+        );
+    }
+    assert_eq!(ask(chat_a.clone()).await, "entitled-2");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-2-tok".into(), "proj-2".into()),
+        ]
+    );
+    assert_eq!(auth::usable_generations().len(), 2);
+
+    server.abort();
+    auth::logout().await.unwrap();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS");
 }
