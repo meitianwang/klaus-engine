@@ -793,3 +793,6 @@ mod r20261114_gemini_empty_continuation_model_turn;
 
 #[path = "regressions/r20261115_antigravity_egress_unavailable_classification.rs"]
 mod r20261115_antigravity_egress_unavailable_classification;
+
+#[path = "regressions/r20261117_antigravity_turn_context.rs"]
+mod r20261117_antigravity_turn_context;

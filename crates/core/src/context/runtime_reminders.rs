@@ -4,6 +4,7 @@
 //! cuts and compaction own their lifetime. Request preparation only projects a
 //! possible next snapshot; the turn owner admits it before calling the model.
 
+use crate::provider::behavior::resolve_provider_behavior_profile;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::config::ResolvedConfig;
 use crate::schemas::content::{ContentBlock, TextBlock};
@@ -24,11 +25,14 @@ pub(crate) fn enabled(config: &ResolvedConfig) -> bool {
         == Some("antigravity")
 }
 
-fn is_dynamic(part: &SystemPromptPart) -> bool {
+fn is_dynamic(part: &SystemPromptPart, include_turn_context: bool) -> bool {
     part.name == "task-plan-reminder"
         || part.name == "edited-files"
         || part.name == "loop-recovery"
         || part.name == "total-tokens"
+        || (include_turn_context
+            && part.cacheable == Some(false)
+            && (part.name == "reminder" || part.name == "hook-context"))
 }
 
 pub(crate) fn is_step(message: &Message) -> bool {
@@ -51,8 +55,11 @@ pub(crate) fn without_steps(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-fn snapshot(parts: &[SystemPromptPart]) -> RuntimeString {
-    let mut parts: Vec<_> = parts.iter().filter(|part| is_dynamic(part)).collect();
+fn snapshot(parts: &[SystemPromptPart], include_turn_context: bool) -> RuntimeString {
+    let mut parts: Vec<_> = parts
+        .iter()
+        .filter(|part| is_dynamic(part, include_turn_context))
+        .collect();
     parts.sort_by(|a, b| a.name.cmp(&b.name));
     let mut text = RuntimeString::from(SNAPSHOT_PREFIX);
     if parts.is_empty() {
@@ -79,17 +86,26 @@ pub(crate) fn project(request: &mut ModelRequest, active: bool) {
         request.messages.retain(|message| !is_step(message));
         return;
     }
+    // Extend turn-scoped context placement only for this source's Gemini models.
+    // Other model families retain their existing instruction placement.
+    let include_turn_context =
+        resolve_provider_behavior_profile(None, &request.model).family == Some("gemini");
     let previous = request
         .messages
         .iter()
         .rev()
         .find(|message| is_step(message));
-    let has_current = request.system.iter().any(is_dynamic);
+    let has_current = request
+        .system
+        .iter()
+        .any(|part| is_dynamic(part, include_turn_context));
     if !has_current && previous.is_none() {
         return;
     }
-    let text = snapshot(&request.system);
-    request.system.retain(|part| !is_dynamic(part));
+    let text = snapshot(&request.system, include_turn_context);
+    request
+        .system
+        .retain(|part| !is_dynamic(part, include_turn_context));
     if previous.is_some_and(|message| {
         matches!(message, Message::User(user)
             if matches!(&user.content[0], ContentBlock::Text(previous) if previous.text == text))
