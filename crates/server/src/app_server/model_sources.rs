@@ -97,20 +97,19 @@ const CODEX_FALLBACK_MODEL: &str = "gpt-5.6-terra";
 /// Sol — the flagship stays a deliberate pick, exactly as it does for the
 /// auxiliary tiers below. Older lineups keep the previous Sol; a lineup with
 /// neither falls back to its head rather than naming an unavailable model.
-const CODEX_DEFAULT_MAIN_MODEL: &str = "gpt-6.1-sol";
-const CODEX_PREVIOUS_MAIN_MODEL: &str = "gpt-6-sol";
+const CODEX_DEFAULT_MAIN_MODEL: &str = "gpt-6.2-sol";
+const CODEX_PREVIOUS_MAIN_MODEL: &str = "gpt-6.1-sol";
+const CODEX_LEGACY_MAIN_MODEL: &str = "gpt-6-sol";
 /// Codex rejects a request whose client version it does not recognise, so the
 /// header is always sent; the variable exists to follow the service without a
 /// rebuild.
 ///
 /// This is a GATE, not a label. The service advertises only the models whose
 /// `minimal_client_version` the announced version meets, so this value decides
-/// which lineup the picker can show at all. Pinned at 0.153.1 the account's own
-/// `gpt-6-sol` and `gpt-6-luna` rows (both `0.155.0`) were withheld: the picker
-/// offered five models where the official client offers seven, and only a
-/// version bump could reveal them. Follow the official client's lineup, not
-/// just the first request that starts failing.
-const CODEX_CLIENT_VERSION: &str = "0.159.2";
+/// which lineup the picker can show at all. Pinned below `0.166.0` the account's
+/// `gpt-6.2-sol` and `gpt-6.2-astra` rows are withheld, so follow the current
+/// service gate rather than waiting for requests to fail.
+const CODEX_CLIENT_VERSION: &str = "0.169.1";
 
 /// The client version every Codex call announces: the override when it looks like
 /// a version, else the pinned fallback. One reader, because the session's request
@@ -1268,6 +1267,7 @@ fn codex_catalog_default_model(models: &[Value]) -> Option<&str> {
     ids()
         .find(|id| id.eq_ignore_ascii_case(CODEX_DEFAULT_MAIN_MODEL))
         .or_else(|| ids().find(|id| id.eq_ignore_ascii_case(CODEX_PREVIOUS_MAIN_MODEL)))
+        .or_else(|| ids().find(|id| id.eq_ignore_ascii_case(CODEX_LEGACY_MAIN_MODEL)))
         .or_else(|| ids().next())
 }
 
@@ -1549,9 +1549,12 @@ pub(crate) fn codex_capabilities(limits: super::codex_catalog::ModelLimits) -> V
         "structuredOutput": true,
         "webSearch": true,
         "nativePdf": true,
-        "vision": true,
+        "vision": limits.vision.unwrap_or(true),
         "reasoningDialect": "openai",
     });
+    if !limits.media_input_mime_types.is_empty() {
+        capabilities["mediaInputMimeTypes"] = json!(limits.media_input_mime_types);
+    }
     if let Some(native) = limits.native_deferred_tools {
         capabilities["nativeDeferredTools"] = json!(native);
     }
@@ -1636,8 +1639,8 @@ pub(crate) fn codex_capabilities(limits: super::codex_catalog::ModelLimits) -> V
 /// constant checks every id is one the engine can price, which is what catches a
 /// default that drifted off the lineup.
 const CODEX_TIER_DEFAULTS: [(&str, &str); 3] = [
-    ("high", "gpt-6-sol"),
-    ("medium", "gpt-5.6-terra"),
+    ("high", "gpt-6.2-sol"),
+    ("medium", "gpt-6.1-terra"),
     ("low", "gpt-6-luna"),
 ];
 
@@ -1706,6 +1709,9 @@ async fn codex_tiers(
 /// usage panel and spend budget report whatever is here.
 fn codex_pricing(model: &str) -> Option<Value> {
     let rates = match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-6.2-sol" => (2.0, 10.0, 0.1, 2.5),
+        "gpt-6.2-astra" => (8.0, 40.0, 0.4, 10.0),
+        "gpt-6.1-terra" => (1.0, 5.0, 0.05, 1.25),
         "gpt-6.1-sol" => (2.0, 10.0, 0.1, 2.5),
         "gpt-6-astra" => (10.0, 50.0, 1.0, 12.5),
         "gpt-6-sol" => (2.0, 10.0, 0.2, 2.5),
@@ -2970,15 +2976,15 @@ mod tests {
     #[test]
     fn codex_auto_prefers_latest_sol_over_the_flagship_head() {
         let models = super::super::codex_catalog::parse(&json!({ "models": [
-            { "slug": "gpt-6-astra", "visibility": "list", "priority": 2 },
-            { "slug": "gpt-6-sol", "visibility": "list", "priority": 3 },
-            { "slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list",
-              "priority": 1, "context_window": 272000,
+            { "slug": "gpt-6.2-astra", "visibility": "list", "priority": 2 },
+            { "slug": "gpt-6.1-sol", "visibility": "list", "priority": 5 },
+            { "slug": "gpt-6.2-sol", "display_name": "GPT-6.2-Sol", "visibility": "list",
+              "priority": 1, "context_window": 500000,
               "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "medium" }, { "effort": "ultra" }] },
-            { "slug": "gpt-5.6-terra", "visibility": "list", "priority": 8 }
+            { "slug": "gpt-5.6-terra", "visibility": "list", "priority": 10 }
         ] }));
-        assert_eq!(codex_catalog_default_model(&models), Some("gpt-6.1-sol"));
-        assert_eq!(models[0]["contextWindow"], json!(272000));
+        assert_eq!(codex_catalog_default_model(&models), Some("gpt-6.2-sol"));
+        assert_eq!(models[0]["contextWindow"], json!(500000));
         assert_eq!(
             models[0]["supportedReasoningLevels"],
             json!(["low", "medium", "ultra"])
@@ -2987,6 +2993,11 @@ mod tests {
 
     #[test]
     fn codex_auto_keeps_previous_sol_when_latest_is_not_listed() {
+        let previous = vec![
+            json!({ "id": "gpt-6.2-astra" }),
+            json!({ "id": "gpt-6.1-sol" }),
+        ];
+        assert_eq!(codex_catalog_default_model(&previous), Some("gpt-6.1-sol"));
         let models = vec![json!({ "id": "gpt-6-astra" }), json!({ "id": "gpt-6-sol" })];
         assert_eq!(codex_catalog_default_model(&models), Some("gpt-6-sol"));
     }
@@ -3397,6 +3408,9 @@ mod tests {
     #[test]
     fn every_gpt_6_model_is_priced_at_its_published_rate() {
         for (model, input, output, cache_read, cache_write) in [
+            ("gpt-6.2-sol", 2.0, 10.0, 0.1, 2.5),
+            ("gpt-6.2-astra", 8.0, 40.0, 0.4, 10.0),
+            ("gpt-6.1-terra", 1.0, 5.0, 0.05, 1.25),
             ("gpt-6.1-sol", 2.0, 10.0, 0.1, 2.5),
             ("gpt-6-astra", 10.0, 50.0, 1.0, 12.5),
             ("gpt-6-sol", 2.0, 10.0, 0.2, 2.5),
@@ -3441,7 +3455,9 @@ mod tests {
         // The flagship is deliberately absent: a tier is a DEFAULT, so promoting
         // Astra would re-price every sub-agent and summary by five times.
         assert!(
-            !CODEX_TIER_DEFAULTS.iter().any(|(_, m)| *m == "gpt-6-astra"),
+            !CODEX_TIER_DEFAULTS
+                .iter()
+                .any(|(_, m)| *m == "gpt-6.2-astra" || *m == "gpt-6-astra"),
             "Astra must stay a deliberate pick, not an auxiliary-work default"
         );
     }
@@ -3488,12 +3504,22 @@ mod tests {
             .unwrap()
             .expect("resolves");
         let defaults = serde_json::from_value::<Map<String, Value>>(json!({
-            "high": "gpt-6-sol",
-            "medium": "gpt-5.6-terra",
+            "high": "gpt-6.2-sol",
+            "medium": "gpt-6.1-terra",
             "low": "gpt-6-luna"
         }))
         .unwrap();
         assert_eq!(bare.provider["model"], json!(CODEX_DEFAULT_MAIN_MODEL));
+        assert_eq!(bare.capabilities["nativeDeferredTools"], json!(true));
+        assert_eq!(
+            bare.capabilities["multiAgentReasoningEffort"],
+            json!("xhigh")
+        );
+        assert!(bare.capabilities["mediaInputMimeTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mime| mime == "audio/wav"));
         assert_eq!(bare.model_tiers, defaults);
         let full_catalog = super::super::codex_catalog::all_models(root.path())
             .await
@@ -3503,6 +3529,10 @@ mod tests {
             .capabilities_by_model
             .iter()
             .any(|entry| entry["model"] == "codex-auto-review"));
+        assert!(bare
+            .capabilities_by_model
+            .iter()
+            .any(|entry| entry["model"] == "gpt-reserve"));
         assert_eq!(
             bare.capabilities_by_model
                 .iter()
@@ -3510,9 +3540,9 @@ mod tests {
                 .map(|entry| entry["model"].clone())
                 .collect::<Vec<_>>(),
             vec![
-                json!("gpt-6-sol"),
-                json!("gpt-5.6-terra"),
-                json!("gpt-6-luna")
+                json!("gpt-6.1-terra"),
+                json!("gpt-6-luna"),
+                json!("gpt-6.2-astra")
             ]
         );
 
@@ -3537,9 +3567,9 @@ mod tests {
                 .map(|entry| entry["model"].clone())
                 .collect::<Vec<_>>(),
             vec![
-                json!("gpt-6-sol"),
-                json!("gpt-5.6-terra"),
-                json!("gpt-5.6-luna")
+                json!("gpt-6.1-terra"),
+                json!("gpt-5.6-luna"),
+                json!("gpt-6.2-astra")
             ]
         );
         let low = picked

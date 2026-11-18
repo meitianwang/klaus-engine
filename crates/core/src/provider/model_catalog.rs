@@ -70,6 +70,12 @@ pub(crate) fn native_deferred_tools_default(provider: &str, model: &RuntimeStrin
             "gpt-6-luna",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-reserve",
+            "codex-auto-review",
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
         ],
         _ => &[],
     };

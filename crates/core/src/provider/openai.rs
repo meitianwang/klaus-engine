@@ -2548,10 +2548,12 @@ fn chat_user_content(blocks: &[ContentBlock]) -> Value {
 }
 
 fn responses_user_content(blocks: &[ContentBlock]) -> Value {
-    if !blocks
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Image(_) | ContentBlock::Document(_)))
-    {
+    if !blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Image(_) | ContentBlock::Document(_) | ContentBlock::Media(_)
+        )
+    }) {
         return Value::String(text_of_blocks(blocks));
     }
 
@@ -2564,7 +2566,7 @@ fn responses_user_content(blocks: &[ContentBlock]) -> Value {
                     ("text", vs(text.text.clone())),
                 ]));
             }
-            ContentBlock::Image(_) | ContentBlock::Document(_) => {
+            ContentBlock::Image(_) | ContentBlock::Document(_) | ContentBlock::Media(_) => {
                 parts.extend(media_to_responses_parts(std::slice::from_ref(block)));
             }
             _ => {}
@@ -2613,8 +2615,19 @@ fn media_to_chat_parts(blocks: &[ContentBlock]) -> Vec<Value> {
     parts
 }
 
+fn canonical_responses_audio_mime(mime: &str) -> Option<&'static str> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" => Some("audio/wav"),
+        "audio/mpeg" | "audio/mp3" => Some("audio/mpeg"),
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => Some("audio/mp4"),
+        "audio/webm" => Some("audio/webm"),
+        "audio/ogg" => Some("audio/ogg"),
+        _ => None,
+    }
+}
+
 /// Responses-surface counterpart of [`media_to_chat_parts`]
-/// (`input_image` / `input_file`).
+/// (`input_image` / `input_file` / `input_audio`).
 fn media_to_responses_parts(blocks: &[ContentBlock]) -> Vec<Value> {
     let mut parts = Vec::new();
     for b in blocks {
@@ -2635,6 +2648,17 @@ fn media_to_responses_parts(blocks: &[ContentBlock]) -> Vec<Value> {
                     m.insert("filename", vs(fname.clone()));
                 }
                 parts.push(Value::Object(m));
+            }
+            ContentBlock::Media(media) => {
+                if let Ok(raw_mime) = media.mime_type.try_to_utf8() {
+                    if let Some(canonical) = canonical_responses_audio_mime(&raw_mime) {
+                        let canonical_mime = RuntimeString::from(canonical);
+                        parts.push(vobj([
+                            ("type", vs("input_audio")),
+                            ("audio_url", vs(data_url(&canonical_mime, &media.base64))),
+                        ]));
+                    }
+                }
             }
             _ => {}
         }
@@ -5308,6 +5332,7 @@ impl OpenAIProvider {
                     capabilities.image_limits = None;
                     capabilities.supports_image_detail_original = false;
                     capabilities.max_media_blocks = None;
+                    capabilities.media_input_mime_types.clear();
                     capabilities.output_verbosity = None;
                     capabilities.native_deferred_tools = None;
                 }
@@ -6012,7 +6037,24 @@ impl ModelProvider for OpenAIProvider {
         {
             return crate::provider::native_compaction::rejected_checkpoint_stream();
         }
-        if let Err(error) = crate::provider::native_media::validate_request(&req, &[]) {
+        let capabilities = self.capabilities_for(&req.model);
+        let supported_media: Vec<RuntimeString> = if self.api == OpenAiApi::Responses {
+            capabilities
+                .media_input_mime_types
+                .iter()
+                .filter(|mime| {
+                    mime.try_to_utf8()
+                        .ok()
+                        .and_then(|raw| canonical_responses_audio_mime(&raw))
+                        .is_some()
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Err(error) = crate::provider::native_media::validate_request(&req, &supported_media)
+        {
             return crate::provider::native_media::rejected_stream(error);
         }
         if req.web_search.as_ref().is_some_and(|search| {
@@ -6021,7 +6063,6 @@ impl ModelProvider for OpenAIProvider {
             req.web_search = None;
         }
 
-        let capabilities = self.capabilities_for(&req.model);
         apply_model_default_effort(&mut req, &capabilities, self.compatibility.as_ref());
         if crate::context::inspection_images::request_uses_image_detail(&req) {
             req.supports_image_detail_original &= capabilities.supports_image_detail_original;
@@ -10106,6 +10147,61 @@ mod tests {
         );
         assert_eq!(compatible["session_id"], json!("klaus-session-1"));
         assert_eq!(compatible["request_id"], json!("req-1"));
+    }
+
+    #[test]
+    fn responses_user_content_serializes_audio_media_with_canonical_mime() {
+        use crate::schemas::content::MediaBlock;
+
+        let blocks = vec![
+            text_block("Transcribe this clip"),
+            ContentBlock::Media(MediaBlock {
+                base64: "UklGRg==".into(),
+                mime_type: "audio/x-m4a".into(),
+                filename: Some("clip.m4a".into()),
+            }),
+        ];
+        assert_eq!(
+            responses_user_content(&blocks),
+            json!([
+                { "type": "input_text", "text": "Transcribe this clip" },
+                { "type": "input_audio", "audio_url": "data:audio/mp4;base64,UklGRg==" }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_audio_input_requires_per_model_capability_declaration() {
+        use crate::schemas::content::MediaBlock;
+        use futures::StreamExt;
+
+        let mut req = base_req();
+        req.model = "gpt-6.2-astra".into();
+        req.messages = vec![Message::User(UserMessage {
+            question_answer: None,
+            uuid: "user-audio".into(),
+            content: vec![ContentBlock::Media(MediaBlock {
+                base64: "UklGRg==".into(),
+                mime_type: "audio/wav".into(),
+                filename: Some("voice.wav".into()),
+            })],
+            is_meta: None,
+        })];
+
+        let mut audio_caps = ModelCapabilities::default();
+        audio_caps.media_input_mime_types = vec!["audio/wav".into()];
+        let provider = OpenAIProvider::new(OpenAIProviderOptions {
+            api: Some(OpenAiApi::Responses),
+            default_model: Some("gpt-6.2-sol".into()),
+            capabilities: Some(audio_caps),
+            ..Default::default()
+        });
+
+        let events: Vec<_> = provider.stream(req, AbortSignal::new()).collect().await;
+        assert!(
+            matches!(events.as_slice(), [ModelStreamEvent::Error { .. }]),
+            "non-default model without explicit audio capability must reject inline audio: {events:?}"
+        );
     }
 
     #[test]

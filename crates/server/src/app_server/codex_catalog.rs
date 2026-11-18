@@ -25,8 +25,24 @@ use serde_json::{json, Map, Value};
 use super::model_sources;
 
 const CATALOG_TTL_MS: i64 = 6 * 60 * 60 * 1000;
-const NORMALIZED_CATALOG_VERSION: u64 = 3;
+const NORMALIZED_CATALOG_VERSION: u64 = 4;
 const FETCH_TIMEOUT_MS: u64 = 15_000;
+
+/// Audio MIME types accepted by Codex subscription Responses endpoints for
+/// models that advertise `"audio"` in `input_modalities`.
+pub(crate) const CODEX_AUDIO_INPUT_MIME_TYPES: &[&str] = &[
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/vnd.wave",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/m4a",
+    "audio/x-m4a",
+    "audio/webm",
+    "audio/ogg",
+];
 /// A dead route or a blackholed DNS must fail fast instead of spending the whole
 /// fetch timeout: the background revalidation retries after its cooldown anyway.
 const CONNECT_TIMEOUT_MS: u64 = 4_000;
@@ -233,6 +249,10 @@ fn restore_legacy_review_metadata(models: &mut Vec<Value>) {
                     "effectiveContextWindowPercent",
                     "supportedReasoningEfforts",
                     "defaultReasoningEffort",
+                    "multiAgentReasoningEffort",
+                    "nativeDeferredTools",
+                    "inputModalities",
+                    "mediaInputMimeTypes",
                 ] {
                     if !fields.contains_key(key) {
                         if let Some(value) = entry.get(key) {
@@ -465,6 +485,8 @@ pub(crate) async fn ids(config_root: &Path) -> Option<Vec<String>> {
 /// than a number invented here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelLimits {
+    pub vision: Option<bool>,
+    pub media_input_mime_types: Vec<String>,
     pub native_deferred_tools: Option<bool>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
@@ -549,7 +571,14 @@ pub(crate) fn limits_from_entry(entry: &Value) -> ModelLimits {
         })
         .map(|levels| spellable_effort_levels(&levels));
     ModelLimits {
-        native_deferred_tools: entry.get("nativeDeferredTools").and_then(Value::as_bool),
+        vision: declared_vision(entry),
+        media_input_mime_types: declared_media_input_mime_types(entry),
+        native_deferred_tools: entry
+            .get("nativeDeferredTools")
+            .or_else(|| entry.get("supports_search_tool"))
+            .or_else(|| entry.get("supportsSearchTool"))
+            .or_else(|| entry.get("supports_tool_search"))
+            .and_then(Value::as_bool),
         context_window: entry
             .get("contextWindow")
             .or_else(|| entry.get("maxContextWindow"))
@@ -669,6 +698,62 @@ fn declared_output_verbosity(
             .and_then(OutputVerbosity::parse)
             .unwrap_or(OutputVerbosity::Low),
     )
+}
+
+fn declared_input_modalities(entry: &Value) -> Option<Vec<String>> {
+    let raw = entry
+        .get("input_modalities")
+        .or_else(|| entry.get("inputModalities"))
+        .and_then(Value::as_array)?;
+    let mut modalities = Vec::new();
+    for item in raw {
+        if let Some(modality) = item
+            .as_str()
+            .map(|text| text.trim().to_ascii_lowercase())
+            .filter(|text| !text.is_empty())
+        {
+            if !modalities.contains(&modality) {
+                modalities.push(modality);
+            }
+        }
+    }
+    (!modalities.is_empty()).then_some(modalities)
+}
+
+fn declared_vision(entry: &Value) -> Option<bool> {
+    if let Some(flag) = entry.get("vision").and_then(Value::as_bool) {
+        return Some(flag);
+    }
+    declared_input_modalities(entry)
+        .map(|modalities| modalities.iter().any(|modality| modality == "image"))
+}
+
+fn declared_media_input_mime_types(entry: &Value) -> Vec<String> {
+    if let Some(explicit) = entry
+        .get("mediaInputMimeTypes")
+        .or_else(|| entry.get("media_input_mime_types"))
+        .and_then(Value::as_array)
+    {
+        let mimes: Vec<String> = explicit
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|mime| !mime.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !mimes.is_empty() {
+            return mimes;
+        }
+    }
+    if declared_input_modalities(entry)
+        .is_some_and(|modalities| modalities.iter().any(|modality| modality == "audio"))
+    {
+        return CODEX_AUDIO_INPUT_MIME_TYPES
+            .iter()
+            .map(|mime| (*mime).to_string())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// The catalog in the shape a model picker reads: visible choices, plus which
@@ -794,6 +879,8 @@ pub(crate) fn parse(body: &Value) -> Vec<Value> {
                 &[
                     "native_deferred_tools",
                     "nativeDeferredTools",
+                    "supports_search_tool",
+                    "supportsSearchTool",
                     "supports_tool_search",
                 ][..],
             ),
@@ -927,6 +1014,13 @@ pub(crate) fn parse(body: &Value) -> Vec<Value> {
         }
         if let Some(verbosity) = declared_output_verbosity(item) {
             model.insert("outputVerbosity".into(), json!(verbosity.as_str()));
+        }
+        if let Some(modalities) = declared_input_modalities(item) {
+            model.insert("inputModalities".into(), json!(modalities));
+        }
+        let media_mimes = declared_media_input_mime_types(item);
+        if !media_mimes.is_empty() {
+            model.insert("mediaInputMimeTypes".into(), json!(media_mimes));
         }
         if let Some(window) = first_positive(
             item,
@@ -1204,8 +1298,20 @@ mod tests {
     fn complete_internal_catalog_keeps_picker_seed_separate() {
         let public = super::bundled_models();
         let all = super::bundled_review_models();
-        assert_eq!(all.len(), 11);
-        assert_eq!(public.len(), 8);
+        assert_eq!(all.len(), 15);
+        assert_eq!(public.len(), 12);
+        let sol = public
+            .iter()
+            .find(|entry| entry["id"] == "gpt-6.2-sol")
+            .unwrap();
+        assert_eq!(sol["contextWindow"], 500000);
+        assert_eq!(sol["multiAgentReasoningEffort"], "xhigh");
+        assert_eq!(sol["nativeDeferredTools"], true);
+        assert!(sol["mediaInputMimeTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mime| mime == "audio/wav"));
         let cyber = all
             .iter()
             .find(|entry| entry["id"] == "gpt-daybreak-blue-latest")
@@ -1216,6 +1322,36 @@ mod tests {
         assert!(super::bundled_api_models()
             .iter()
             .any(|entry| entry["id"] == "gpt-5.5"));
+    }
+
+    #[test]
+    fn parse_extracts_search_tool_and_input_modalities_from_service_rows() {
+        let entries = super::parse(&serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-6.2-sol",
+                    "supports_search_tool": true,
+                    "input_modalities": ["text", "image", "audio"]
+                },
+                {
+                    "slug": "text-only-model",
+                    "supports_search_tool": false,
+                    "input_modalities": ["text"]
+                }
+            ]
+        }));
+        let sol_limits = super::limits_from_entry(&entries[0]);
+        assert_eq!(sol_limits.native_deferred_tools, Some(true));
+        assert_eq!(sol_limits.vision, Some(true));
+        assert!(sol_limits
+            .media_input_mime_types
+            .iter()
+            .any(|mime| mime == "audio/mpeg"));
+
+        let text_limits = super::limits_from_entry(&entries[1]);
+        assert_eq!(text_limits.native_deferred_tools, Some(false));
+        assert_eq!(text_limits.vision, Some(false));
+        assert!(text_limits.media_input_mime_types.is_empty());
     }
 
     #[test]
