@@ -8,6 +8,7 @@ mod cloud;
 mod egress;
 pub mod login;
 mod sanitize;
+mod usage;
 
 use klaus_agent_core::provider::gemini::{
     GeminiAdapterPolicy, GeminiProvider, GeminiProviderOptions, GeminiThinkingDialect,
@@ -48,6 +49,7 @@ pub fn set_config_root(root: &Path) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        usage::clear_all();
         cloud::clear_session_leases();
     }
 }
@@ -130,6 +132,7 @@ pub(super) fn prune_generation(generation: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(generation);
+    usage::prune_generation(generation);
     unmark(&HEARTBEAT_SPAWNED, generation);
     unmark(&SURFACE_BOOTSTRAPPED, generation);
     cloud::prune_session_leases(generation);
@@ -158,6 +161,7 @@ pub(super) fn sync_head_catalog() {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|gen, _| valid.contains(gen));
+        usage::retain_generations(&valid);
         let path = root.join("antigravity-models.json");
         let existing_gen = std::fs::read(&path)
             .ok()
@@ -217,6 +221,7 @@ fn forget_catalog() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    usage::clear_all();
     cloud::clear_session_leases();
     let _ = std::fs::remove_file(config_root().join("antigravity-models.json"));
 }
@@ -279,6 +284,7 @@ pub(super) async fn project(
         signal,
     )
     .await?;
+    usage::cache_load_code_assist(&generation, &result);
     let project = result
         .get("cloudaicompanionProject")
         .and_then(|value| {
@@ -451,13 +457,16 @@ fn spawn_heartbeat(generation: &str) {
                 break;
             }
             let signal = AbortSignal::new();
-            let _ = cloud::rpc(
+            if let Ok(payload) = cloud::rpc(
                 "loadCodeAssist",
                 json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
                 Some(&generation),
                 &signal,
             )
-            .await;
+            .await
+            {
+                usage::cache_load_code_assist(&generation, &payload);
+            }
             if !auth::is_current(&generation)
                 || !auth::is_head_generation(&generation)
                 || auth::is_generation_disabled(&generation)
@@ -774,125 +783,8 @@ pub async fn transcribe_audio(
     Ok(response)
 }
 
-async fn account_usage(entry: &auth::StoredAccount) -> Result<Value, String> {
-    let generation = entry.generation.as_str();
-    let signal = AbortSignal::new();
-    let project = project(Some(generation), &signal).await?;
-    let quota = cloud::rpc(
-        "retrieveUserQuota",
-        json!({"project":project}),
-        Some(generation),
-        &signal,
-    )
-    .await;
-    let summary = cloud::rpc(
-        "retrieveUserQuotaSummary",
-        json!({"project":project}),
-        Some(generation),
-        &signal,
-    )
-    .await;
-    if quota.is_err() && summary.is_err() {
-        return Err(quota
-            .err()
-            .unwrap_or_else(|| "antigravity_usage_unavailable".into()));
-    }
-    if !auth::is_current(generation) {
-        return Err("antigravity_credential_changed".into());
-    }
-    let metadata = cloud::rpc(
-        "loadCodeAssist",
-        json!({
-            "cloudaicompanionProject": project,
-            "metadata": { "ideType": "ANTIGRAVITY" }
-        }),
-        Some(generation),
-        &signal,
-    )
-    .await
-    .unwrap_or(Value::Null);
-    let plan = metadata
-        .get("paidTier")
-        .or_else(|| metadata.get("currentTier"))
-        .and_then(|tier| tier.get("name").or_else(|| tier.get("id")))
-        .and_then(Value::as_str);
-    let mut summary = summary.unwrap_or(Value::Null);
-    if summary.is_null() {
-        summary = json!({});
-    }
-    let live_credits = credit_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(generation)
-        .cloned();
-    let credits = live_credits
-        .as_ref()
-        .and_then(|value| value.get("remainingCredits"))
-        .or_else(|| metadata.pointer("/paidTier/availableCredits"))
-        .or_else(|| metadata.pointer("/currentTier/availableCredits"));
-    if let Some(credits) = credits {
-        summary["availableCredits"] = credits.clone();
-    }
-    if !auth::is_current(generation) {
-        return Err("antigravity_credential_changed".into());
-    }
-    let mut usage = catalog::normalize_usage(
-        &quota.unwrap_or(Value::Null),
-        &summary,
-        entry.credential.account.as_deref(),
-        plan,
-    );
-    if let Some(consumed) = live_credits
-        .as_ref()
-        .and_then(|value| value.get("consumedCredits"))
-    {
-        usage["lastRequestConsumedCredits"] = consumed.clone();
-    }
-    Ok(usage)
-}
-
-pub async fn usage() -> Result<Value, String> {
-    let entries = auth::accounts();
-    let Some(current) = entries.first() else {
-        return Ok(json!({"signedIn":false,"accounts":[]}));
-    };
-    if entries.len() == 1 {
-        return account_usage(current).await;
-    }
-    let label = current
-        .credential
-        .account
-        .as_deref()
-        .filter(|account| !account.is_empty())
-        .unwrap_or("Antigravity")
-        .to_string();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(current))
-        .await
-        .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
-    let row = match outcome {
-        Ok(mut row) => {
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("id".into(), json!(current.id));
-                obj.insert("label".into(), json!(label));
-                obj.insert("isCurrent".into(), json!(true));
-                obj.insert("state".into(), json!("ok"));
-            }
-            row
-        }
-        Err(error) => json!({
-            "id": current.id,
-            "label": label,
-            "isCurrent": true,
-            "state": "error",
-            "error": error,
-        }),
-    };
-    let mut top = row.clone();
-    if let Some(obj) = top.as_object_mut() {
-        obj.insert("signedIn".into(), json!(true));
-        obj.insert("accounts".into(), json!([row]));
-    }
-    Ok(top)
+pub async fn usage(force: bool) -> Result<Value, String> {
+    usage::usage(force).await
 }
 
 pub async fn main_model(

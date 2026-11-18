@@ -638,7 +638,7 @@ facade_methods! {
     AntigravitySwitchAccount => "antigravity/switchAccount" (wire::AntigravitySwitchAccountParams) -> Value;
     AntigravityLogout => "antigravity/logout" (wire::AntigravityLogoutParams) -> Value;
     AntigravityModels => "antigravity/models" (wire::QoderModelsParams) -> Value;
-    AntigravityUsage => "antigravity/usage" (wire::QoderParams) -> Value;
+    AntigravityUsage => "antigravity/usage" (wire::AntigravityUsageParams) -> Value;
     AntigravityCapabilities => "antigravity/capabilities" (wire::QoderParams) -> Value;
     AntigravityGenerateImage => "antigravity/generateImage" (wire::AntigravityImageParams) -> Value;
     AntigravitySearch => "antigravity/search" (wire::AntigravitySearchParams) -> Value;

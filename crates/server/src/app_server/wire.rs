@@ -1459,6 +1459,15 @@ pub struct AntigravitySwitchAccountParams {
     pub account_id: String,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AntigravityUsageParams {
+    #[serde(default)]
+    pub submission_id: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KiroAdoptParams {

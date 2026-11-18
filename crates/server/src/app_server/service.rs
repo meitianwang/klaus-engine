@@ -6710,7 +6710,16 @@ async fn dispatch_antigravity(state: Arc<AppServerState>, id: Value, method: &st
                 }
                 Err(error) => Err(error),
             },
-            "antigravity/usage" => super::antigravity::usage().await,
+            "antigravity/usage" => {
+                if params.is_null() {
+                    super::antigravity::usage(false).await
+                } else {
+                    match decode_qoder::<wire::AntigravityUsageParams>(&params) {
+                        Ok(params) => super::antigravity::usage(params.force).await,
+                        Err(error) => Err(error),
+                    }
+                }
+            }
             "antigravity/capabilities" => super::antigravity::capabilities().await,
             _ => Err("antigravity_method_unavailable".into()),
         };

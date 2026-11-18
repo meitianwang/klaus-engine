@@ -359,7 +359,7 @@ async fn direct_cloud_account_refresh_catalog_native_media_and_mixed_models() {
         main_model("auto", &serde_json::Map::new()).await.unwrap(),
         "fixture-level"
     );
-    let allowance = usage().await.unwrap();
+    let allowance = usage(false).await.unwrap();
     assert!(allowance["windows"]
         .as_array()
         .unwrap()
@@ -2203,7 +2203,7 @@ async fn multi_account_usage_isolates_failures_and_native_media_search_rotate_on
     .unwrap();
 
     // Multi-account usage queries only the active head account (`limited@`), never polling standby accounts.
-    let quota = usage().await.unwrap();
+    let quota = usage(false).await.unwrap();
     assert_eq!(quota["signedIn"], true);
     let rows = quota["accounts"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
