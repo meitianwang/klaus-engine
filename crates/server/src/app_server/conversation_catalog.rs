@@ -48,12 +48,21 @@ pub(super) fn mark_purpose(source: &str, raw: &Value, entry: &mut Map<String, Va
 /// Map non-chat Antigravity routing and restricted-placeholder aliases onto concrete chat models.
 pub(super) fn canonical_antigravity_model_id(model: &str) -> &str {
     match model.trim() {
-        "gemini-pro-orchestrator" | "gemini-4-carbon-disabled" => "gemini-4-carbon-high",
-        "gemini-pro-orchestrator-argon" | "gemini-4-argon-disabled" => "gemini-4-argon-high",
+        "gemini-pro-orchestrator" => "gemini-4-carbon-high",
+        "gemini-pro-orchestrator-argon" => "gemini-4-argon-high",
         "gemini-flash-worker-agy" => "gemini-4-hydrogen-xhigh",
-        "gemini-4-hydrogen-disabled" => "gemini-4-hydrogen-high",
         other => other,
     }
+}
+
+/// Keep placeholders distinct from explicit model choices until the account catalog is known.
+pub(super) fn antigravity_placeholder_family(model: &str) -> Option<&str> {
+    let family = model.strip_suffix("-disabled")?;
+    (family
+        .strip_prefix("gemini-")
+        .or_else(|| family.strip_prefix("claude-"))
+        .is_some_and(|name| !name.is_empty()))
+    .then_some(family)
 }
 
 /// Rewrite legacy Antigravity harness aliases inside per-source tier maps before lookup.
@@ -185,8 +194,7 @@ fn dedicated_identity(source: &str, key: &str) -> bool {
         "antigravity" => {
             key.starts_with("gemini-pro-orchestrator")
                 || key == "gemini-flash-worker-agy"
-                || ((key.starts_with("gemini-") || key.starts_with("claude-"))
-                    && key.ends_with("-disabled"))
+                || antigravity_placeholder_family(key).is_some()
         }
         "kiro" => key == "auto" || key.starts_with("auto::effort="),
         "bailian" => {

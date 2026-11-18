@@ -147,7 +147,10 @@ pub fn normalize_models(payload: &Value) -> Vec<Value> {
                 .is_some_and(|ids| ids.iter().any(|value| value.as_str() == Some(id)));
             let native_role=[("imageGenerationModelIds","image"),("webSearchModelIds","search"),("audioTranscriptionModelIds","transcription")].into_iter()
                 .find_map(|(field,role)|payload.get(field).and_then(Value::as_array).is_some_and(|ids|ids.iter().any(|value|value.as_str()==Some(id))).then_some(role));
-            let disabled = disabled || completion_only || native_role.is_some();
+            let disabled = disabled
+                || super::super::conversation_catalog::antigravity_placeholder_family(id).is_some()
+                || completion_only
+                || native_role.is_some();
             let capabilities = model_capabilities(raw);
             let efforts = declared_efforts(raw);
             let default_effort = first_string(
@@ -1779,18 +1782,6 @@ mod tests {
         assert_eq!(
             canonical_antigravity_model_id("gemini-flash-worker-agy"),
             "gemini-4-hydrogen-xhigh"
-        );
-        assert_eq!(
-            canonical_antigravity_model_id("gemini-4-carbon-disabled"),
-            "gemini-4-carbon-high"
-        );
-        assert_eq!(
-            canonical_antigravity_model_id("gemini-4-argon-disabled"),
-            "gemini-4-argon-high"
-        );
-        assert_eq!(
-            canonical_antigravity_model_id("gemini-4-hydrogen-disabled"),
-            "gemini-4-hydrogen-high"
         );
         assert_eq!(
             canonical_antigravity_model_id("gemini-4-carbon-medium"),

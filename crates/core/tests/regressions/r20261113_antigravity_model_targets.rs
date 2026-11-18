@@ -145,7 +145,7 @@ async fn antigravity_orchestrator_advisor_tier_and_feature_targets_are_ready_on_
 }
 
 #[tokio::test]
-async fn cold_account_reconfigure_awaits_live_catalog_for_unbundled_model() {
+async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder_models() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -181,7 +181,9 @@ async fn cold_account_reconfigure_awaits_live_catalog_for_unbundled_model() {
                             "thinkingLevel": 3,
                             "maxTokens": 1048576,
                             "maxOutputTokens": 65536
-                        }
+                        },
+                        "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6"},
+                        "claude-opus-5-5-disabled": {"displayName": "Unavailable placeholder"}
                     }
                 })
                 .to_string();
@@ -256,8 +258,8 @@ async fn cold_account_reconfigure_awaits_live_catalog_for_unbundled_model() {
             "changeId": "chg-cold-hydrogen",
             "expectedRevision": 0,
             "init": {
-                "modelSelection": "antigravity:gemini-4-neon-high",
-                "orchestratorTarget": antigravity_target("gemini-4-neon-high")
+                "modelSelection": "antigravity:claude-opus-5-5-disabled",
+                "orchestratorTarget": antigravity_target("claude-sonnet-4-6-disabled")
             }
         }),
     )
@@ -267,7 +269,32 @@ async fn cold_account_reconfigure_awaits_live_catalog_for_unbundled_model() {
     assert_eq!(runtime["model"], "gemini-4-neon-high", "{runtime}");
     assert!(runtime["pendingChangeId"].is_null(), "{runtime}");
     assert!(runtime["modelUpdateError"].is_null(), "{runtime}");
-    assert_ready_antigravity_target(&runtime["orchestratorTarget"], "gemini-4-neon-high");
+    assert_ready_antigravity_target(&runtime["orchestratorTarget"], "claude-sonnet-4-6");
+
+    for (id, selection, expected) in [
+        (213, "gemini-4-neon-high", "gemini-4-neon-high"),
+        (214, "gemini-4-neon-disabled", "gemini-4-neon-high"),
+        (215, "gemini-4-argon-disabled", "gemini-4-neon-high"),
+        (216, "claude-sonnet-4-6-disabled", "claude-sonnet-4-6"),
+        (217, "high", "gemini-4-neon-high"),
+    ] {
+        let reply = request(
+            &mut fixture.client,
+            id,
+            "model/selection/resolve",
+            json!({
+                "source": "antigravity",
+                "selection": selection,
+                "modelTierSelections": {"high": "antigravity:claude-opus-5-5-disabled"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            reply["result"]["selection"],
+            format!("antigravity:{expected}"),
+            "{reply}"
+        );
+    }
 
     fixture.close().await;
     crate::app_server::antigravity::auth::logout()

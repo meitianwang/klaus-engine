@@ -917,13 +917,41 @@ fn explicit_selection_model(
     })
 }
 
+fn callable_chat_model(model: &Value) -> bool {
+    catalog::is_chat_model(model) && model.get("disabled").and_then(Value::as_bool) != Some(true)
+}
+
 fn default_chat_model(payload: &Value) -> Result<String, String> {
+    resolve_chat_placeholder(payload, None)
+}
+
+fn resolve_chat_placeholder(payload: &Value, family: Option<&str>) -> Result<String, String> {
     let models = catalog::normalize_models(payload);
-    models
+    let mut callable = models
         .iter()
-        .filter(|model| catalog::is_chat_model(model))
-        .find(|model| model.get("disabled").and_then(Value::as_bool) != Some(true))
-        .and_then(|model| model["key"].as_str())
+        .filter(|model| callable_chat_model(model))
+        .filter_map(|model| model["key"].as_str());
+    let same_family = family.and_then(|family| {
+        // Prefer the normal high variant, then the base/legacy thinking variant,
+        // then any other declared effort in the service's catalog order.
+        callable
+            .clone()
+            .filter_map(|key| {
+                let suffix = key.strip_prefix(family)?;
+                let rank = match suffix {
+                    "-high" => 0,
+                    "" | "-thinking" => 1,
+                    "-off" | "-minimal" | "-extra-low" | "-low" | "-medium" | "-xhigh"
+                    | "-extra-high" | "-max" => 2,
+                    _ => return None,
+                };
+                Some((rank, key))
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, key)| key)
+    });
+    same_family
+        .or_else(|| callable.next())
         .map(str::to_string)
         .ok_or_else(|| "antigravity_no_models".into())
 }
@@ -934,6 +962,13 @@ pub async fn main_model(
 ) -> Result<String, String> {
     let tiers = super::conversation_catalog::canonical_antigravity_tiers(tiers);
     if let Some(model) = explicit_selection_model(selection, &tiers) {
+        if super::conversation_catalog::antigravity_placeholder_family(&model).is_some() {
+            let resolved = resolve(selection, &tiers).await?;
+            return resolved.provider["model"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "antigravity_no_models".into());
+        }
         return Ok(model);
     }
     cloud::ensure_identity().await;
@@ -944,9 +979,12 @@ pub async fn resolve(
     selection: &str,
     tiers: &serde_json::Map<String, Value>,
 ) -> Result<super::model_sources::Resolved, String> {
+    use super::conversation_catalog::antigravity_placeholder_family;
+
     cloud::ensure_identity().await;
     let tiers = super::conversation_catalog::canonical_antigravity_tiers(tiers);
     let explicit = explicit_selection_model(selection, &tiers);
+    let placeholder = explicit.as_deref().and_then(antigravity_placeholder_family);
     for attempt in 0..3 {
         auth::active_or_rotated_credential().await?;
         let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
@@ -961,7 +999,7 @@ pub async fn resolve(
         let is_baseline = payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true);
         let fresh_in_memory = has_fresh_memory_catalog(&generation);
 
-        if explicit.is_none() && is_baseline {
+        if (explicit.is_none() && is_baseline) || (placeholder.is_some() && !fresh_in_memory) {
             match ensure_live_catalog(&generation).await {
                 Ok(live) => {
                     payload = live;
@@ -969,13 +1007,15 @@ pub async fn resolve(
                 }
                 Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
                 Err(err) if err == "antigravity_credential_changed" => return Err(err),
+                Err(err) if placeholder.is_some() => return Err(err),
                 Err(_) => {}
             }
         }
 
-        let model = match &explicit {
-            Some(model) => model.clone(),
-            None => default_chat_model(&payload)?,
+        let model = match (&explicit, placeholder) {
+            (_, Some(family)) => resolve_chat_placeholder(&payload, Some(family))?,
+            (Some(model), None) => model.clone(),
+            (None, None) => default_chat_model(&payload)?,
         };
         let mut rows = catalog::models_with_unavailable_paid(&payload);
         let selected_present = rows
@@ -987,7 +1027,13 @@ pub async fn resolve(
                 .and_then(Value::as_str)
                 .filter(|pick| !pick.is_empty())
                 .map(|pick| pick.strip_prefix("antigravity:").unwrap_or(pick))
-                .is_some_and(|pick| !rows.iter().any(|entry| entry["key"].as_str() == Some(pick)))
+                .is_some_and(|pick| {
+                    if antigravity_placeholder_family(pick).is_some() {
+                        is_baseline
+                    } else {
+                        !rows.iter().any(|entry| entry["key"].as_str() == Some(pick))
+                    }
+                })
         });
 
         if !selected_present && !fresh_in_memory {
@@ -1041,6 +1087,14 @@ pub async fn resolve(
         for tier in ["high", "medium", "low"] {
             if let Some(pick) = tiers.get(tier).and_then(Value::as_str) {
                 let pick = pick.strip_prefix("antigravity:").unwrap_or(pick);
+                if let Some(family) = antigravity_placeholder_family(pick) {
+                    if payload["catalogBaseline"] != true {
+                        if let Ok(model) = resolve_chat_placeholder(&payload, Some(family)) {
+                            model_tiers.insert(tier.into(), json!(model));
+                        }
+                    }
+                    continue;
+                }
                 if rows.iter().any(|entry| {
                     entry["key"].as_str() == Some(pick) && catalog::is_chat_model(entry)
                 }) {

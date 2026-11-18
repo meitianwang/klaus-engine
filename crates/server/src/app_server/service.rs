@@ -4807,6 +4807,15 @@ async fn resolve_tier_target(
             serde_json::json!({"type":"unavailable","source":source,"modelId":model_id,"code":"MODEL_TARGET_UNAVAILABLE","message":error}),
         );
     }
+    let model_id = if source == "antigravity"
+        && super::conversation_catalog::antigravity_placeholder_family(&model_id).is_some()
+    {
+        init.pointer("/provider/model")
+            .and_then(Value::as_str)
+            .map_or(model_id, str::to_string)
+    } else {
+        model_id
+    };
     if source != "custom"
         && !init
             .pointer("/provider/model")
