@@ -423,7 +423,10 @@ static HEARTBEAT_SPAWNED: std::sync::OnceLock<std::sync::Mutex<std::collections:
 /// Periodic control-plane keepalive for the single active head account only.
 /// Standby accounts in the pool stay silent until promoted to the head slot.
 fn spawn_heartbeat(generation: &str) {
-    if !auth::is_head_generation(generation) || !mark_once(&HEARTBEAT_SPAWNED, generation) {
+    if !auth::is_head_generation(generation)
+        || auth::is_generation_disabled(generation)
+        || !mark_once(&HEARTBEAT_SPAWNED, generation)
+    {
         return;
     }
     let generation = generation.to_string();
@@ -440,21 +443,14 @@ fn spawn_heartbeat(generation: &str) {
                 .map(|elapsed| u64::from(elapsed.subsec_nanos()) % spread)
                 .unwrap_or(0);
             tokio::time::sleep(std::time::Duration::from_secs(base + jitter)).await;
-            if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
+            if !auth::is_current(&generation)
+                || !auth::is_head_generation(&generation)
+                || auth::is_generation_disabled(&generation)
+            {
                 unmark(&HEARTBEAT_SPAWNED, &generation);
                 break;
             }
             let signal = AbortSignal::new();
-            let project = match project(Some(&generation), &signal).await {
-                Ok(project) => project,
-                Err(_) => {
-                    if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
-                        unmark(&HEARTBEAT_SPAWNED, &generation);
-                        break;
-                    }
-                    continue;
-                }
-            };
             let _ = cloud::rpc(
                 "loadCodeAssist",
                 json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
@@ -462,17 +458,10 @@ fn spawn_heartbeat(generation: &str) {
                 &signal,
             )
             .await;
-            let _ = cloud::rpc(
-                "loadCodeAssist",
-                json!({
-                    "cloudaicompanionProject": project,
-                    "metadata": { "ideType": "ANTIGRAVITY" }
-                }),
-                Some(&generation),
-                &signal,
-            )
-            .await;
-            if !auth::is_current(&generation) || !auth::is_head_generation(&generation) {
+            if !auth::is_current(&generation)
+                || !auth::is_head_generation(&generation)
+                || auth::is_generation_disabled(&generation)
+            {
                 unmark(&HEARTBEAT_SPAWNED, &generation);
                 break;
             }
@@ -518,6 +507,9 @@ async fn fetch_available_models(
 }
 
 fn refresh_allowed(generation: &str, now: i64) -> bool {
+    if auth::is_generation_disabled(generation) {
+        return false;
+    }
     let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
     state.get(generation).copied().unwrap_or(0) <= now
 }
@@ -861,55 +853,44 @@ async fn account_usage(entry: &auth::StoredAccount) -> Result<Value, String> {
 
 pub async fn usage() -> Result<Value, String> {
     let entries = auth::accounts();
-    if entries.is_empty() {
+    let Some(current) = entries.first() else {
         return Ok(json!({"signedIn":false,"accounts":[]}));
-    }
+    };
     if entries.len() == 1 {
-        return account_usage(&entries[0]).await;
+        return account_usage(current).await;
     }
-    let mut rows = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.into_iter().enumerate() {
-        if index > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        }
-        let label = entry
-            .credential
-            .account
-            .as_deref()
-            .filter(|account| !account.is_empty())
-            .unwrap_or("Antigravity")
-            .to_string();
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(&entry))
-                .await
-                .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
-        let row = match outcome {
-            Ok(mut row) => {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("id".into(), json!(entry.id));
-                    obj.insert("label".into(), json!(label));
-                    obj.insert("isCurrent".into(), json!(index == 0));
-                    obj.insert("state".into(), json!("ok"));
-                }
-                row
+    let label = current
+        .credential
+        .account
+        .as_deref()
+        .filter(|account| !account.is_empty())
+        .unwrap_or("Antigravity")
+        .to_string();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), account_usage(current))
+        .await
+        .unwrap_or_else(|_| Err("antigravity_catalog_timeout".into()));
+    let row = match outcome {
+        Ok(mut row) => {
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("id".into(), json!(current.id));
+                obj.insert("label".into(), json!(label));
+                obj.insert("isCurrent".into(), json!(true));
+                obj.insert("state".into(), json!("ok"));
             }
-            Err(error) => json!({
-                "id": entry.id,
-                "label": label,
-                "isCurrent": index == 0,
-                "state": "error",
-                "error": error,
-            }),
-        };
-        rows.push(row);
-    }
-    let mut top = rows
-        .first()
-        .cloned()
-        .unwrap_or_else(|| json!({"signedIn": true}));
+            row
+        }
+        Err(error) => json!({
+            "id": current.id,
+            "label": label,
+            "isCurrent": true,
+            "state": "error",
+            "error": error,
+        }),
+    };
+    let mut top = row.clone();
     if let Some(obj) = top.as_object_mut() {
         obj.insert("signedIn".into(), json!(true));
-        obj.insert("accounts".into(), json!(rows));
+        obj.insert("accounts".into(), json!([row]));
     }
     Ok(top)
 }

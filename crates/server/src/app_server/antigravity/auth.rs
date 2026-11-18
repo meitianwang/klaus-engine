@@ -47,8 +47,6 @@ pub(super) struct StoredAccount {
 #[serde(rename_all = "camelCase")]
 struct StoredQueue {
     accounts: Vec<StoredAccount>,
-    #[serde(default)]
-    account_sharding: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -174,10 +172,36 @@ fn read_store_value() -> Option<Value> {
     serde_json::from_slice::<Value>(&raw).ok()
 }
 
-pub(super) fn account_sharding() -> bool {
-    read_store_value()
-        .and_then(|value| value.get("accountSharding").and_then(Value::as_bool))
-        .unwrap_or(false)
+static DISABLED_GENERATIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn disabled_generations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    DISABLED_GENERATIONS.get_or_init(Default::default)
+}
+
+pub(super) fn mark_generation_disabled(generation: &str) {
+    if generation.is_empty() {
+        return;
+    }
+    disabled_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(generation.to_string());
+    super::cloud::prune_session_leases(generation);
+}
+
+pub(super) fn clear_generation_disabled(generation: &str) {
+    disabled_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
+}
+
+pub(super) fn is_generation_disabled(generation: &str) -> bool {
+    disabled_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(generation)
 }
 
 pub(super) fn accounts() -> Vec<StoredAccount> {
@@ -214,13 +238,13 @@ pub(super) fn accounts() -> Vec<StoredAccount> {
     Vec::new()
 }
 
-fn write_store_unlocked(entries: &[StoredAccount], account_sharding: bool) -> Result<(), String> {
+fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
     use std::io::Write;
     if entries.len() > MAX_ACCOUNTS {
         return Err("antigravity_account_limit_reached".into());
     }
     let path = path();
-    if entries.is_empty() && !account_sharding {
+    if entries.is_empty() {
         return match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -239,7 +263,6 @@ fn write_store_unlocked(entries: &[StoredAccount], account_sharding: bool) -> Re
     }
     let queue = StoredQueue {
         accounts: entries.to_vec(),
-        account_sharding,
     };
     let outcome: Result<(), String> = (|| {
         let mut file = options
@@ -262,11 +285,6 @@ fn write_store_unlocked(entries: &[StoredAccount], account_sharding: bool) -> Re
     outcome
 }
 
-fn write_accounts_unlocked(entries: &[StoredAccount]) -> Result<(), String> {
-    let sharding = !entries.is_empty() && account_sharding();
-    write_store_unlocked(entries, sharding)
-}
-
 fn entry_needs_login(entry: &StoredAccount, now: i64) -> bool {
     entry.needs_login
         || (entry
@@ -278,13 +296,11 @@ fn entry_needs_login(entry: &StoredAccount, now: i64) -> bool {
 
 pub fn status() -> Value {
     let entries = accounts();
-    let sharding = account_sharding();
     let Some(head) = entries.first() else {
         return json!({
             "ok": true,
             "signedIn": false,
             "loggedIn": false,
-            "accountSharding": sharding,
             "accounts": [],
         });
     };
@@ -314,7 +330,6 @@ pub fn status() -> Value {
         "authMethod": head.credential.auth_method,
         "canRefresh": head.credential.refresh_token.is_some() && !head_needs_login,
         "needsLogin": head_needs_login,
-        "accountSharding": sharding,
         "accounts": rows,
     })
 }
@@ -472,6 +487,7 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
             return Ok(json!({"ok":false,"error":"antigravity_account_not_found"}));
         }
         if let Some(ref generation) = removed_generation {
+            clear_generation_disabled(generation);
             super::prune_generation(generation);
         }
         if let Some(ref generation) = removed_generation {
@@ -485,18 +501,13 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
         return Ok(status());
     }
     super::login::invalidate_pending();
-    with_store_file_lock(|| write_store_unlocked(&[], false))?;
+    with_store_file_lock(|| write_accounts_unlocked(&[]))?;
+    disabled_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     super::forget_catalog();
     super::egress::reset_pool(None).await;
-    Ok(status())
-}
-
-pub async fn set_account_sharding(enabled: bool) -> Result<Value, String> {
-    let _guard = credential_lock().lock().await;
-    with_store_file_lock(|| {
-        let entries = accounts();
-        write_store_unlocked(&entries, enabled)
-    })?;
     Ok(status())
 }
 
@@ -571,11 +582,16 @@ pub(super) async fn rotate_excluding(
         let now = chrono::Utc::now().timestamp_millis();
         let next = entries
             .iter()
-            .find(|entry| !attempted.contains(&entry.generation) && !entry_needs_login(entry, now))
+            .find(|entry| {
+                !attempted.contains(&entry.generation)
+                    && !entry_needs_login(entry, now)
+                    && !is_generation_disabled(&entry.generation)
+            })
             .or_else(|| {
-                entries
-                    .iter()
-                    .find(|entry| !attempted.contains(&entry.generation))
+                entries.iter().find(|entry| {
+                    !attempted.contains(&entry.generation)
+                        && !is_generation_disabled(&entry.generation)
+                })
             })
             .map(|entry| entry.generation.clone());
         match next {
@@ -678,6 +694,7 @@ pub(super) fn remove_generation(expected: &str) -> Result<(), String> {
         Ok(true)
     })?;
     if changed {
+        clear_generation_disabled(expected);
         super::prune_generation(expected);
         if accounts().is_empty() {
             super::forget_catalog();

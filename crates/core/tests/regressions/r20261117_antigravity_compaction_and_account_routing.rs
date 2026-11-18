@@ -616,11 +616,9 @@ fn antigravity_sessions_cap_compaction_at_256k_run_four_streams_concurrently_and
         });
     }
 
-    // 3. By default (`accountSharding == false`), Session 2 binds to the head account (`tok-1`)
-    //    without automatic sharding; once `antigravity/setAccountSharding` enables sharding, a new
-    //    Session 3 shards onto standby `tok-2` while existing sessions remain sticky.
+    // 3. All conversations bind to the active head account (`tok-1`) without multi-account sharding.
     let initial_status = facade.call("antigravity/status", json!({}));
-    assert_eq!(initial_status["result"]["accountSharding"], false);
+    assert!(initial_status["result"].get("accountSharding").is_none());
 
     let ask_side = |facade: &mut AppServerFacade, sid: &str, sub: &str| -> String {
         let _ = facade.call(
@@ -643,47 +641,27 @@ fn antigravity_sessions_cap_compaction_at_256k_run_four_streams_concurrently_and
         answer
     };
 
+    let sid_3 = start_session(&mut facade);
     upstream.seen.lock().unwrap().clear();
     upstream.plans.lock().unwrap().insert(
         "tok-1".into(),
-        VecDeque::from([MockAction::Reply("head-b1")]),
+        VecDeque::from([
+            MockAction::Reply("head-b1"),
+            MockAction::Reply("head-c1"),
+            MockAction::Reply("head-a2"),
+        ]),
     );
     assert_eq!(ask_side(&mut facade, &sid_2, "sticky-only-b1"), "head-b1");
-    assert_eq!(
-        upstream.seen.lock().unwrap().clone(),
-        vec![("tok-1".into(), "proj-1".into())],
-        "with accountSharding off by default, second conversation must stick to the head account"
-    );
-
-    let sharding_reply = facade.call("antigravity/setAccountSharding", json!({"enabled": true}));
-    assert_eq!(sharding_reply["result"]["ok"], true);
-    assert_eq!(sharding_reply["result"]["accountSharding"], true);
-    let sid_3 = start_session(&mut facade);
-
-    upstream.seen.lock().unwrap().clear();
-    {
-        let mut plans = upstream.plans.lock().unwrap();
-        plans.insert(
-            "tok-1".into(),
-            VecDeque::from([MockAction::Reply("from-1")]),
-        );
-        plans.insert(
-            "tok-2".into(),
-            VecDeque::from([MockAction::Reply("from-3a"), MockAction::Reply("from-3b")]),
-        );
-    }
-
-    assert_eq!(ask_side(&mut facade, &sid_3, "shard-c1"), "from-3a");
-    assert_eq!(ask_side(&mut facade, &sid_1, "sticky-a2"), "from-1");
-    assert_eq!(ask_side(&mut facade, &sid_3, "sticky-c2"), "from-3b");
+    assert_eq!(ask_side(&mut facade, &sid_3, "sticky-only-c1"), "head-c1");
+    assert_eq!(ask_side(&mut facade, &sid_1, "sticky-a2"), "head-a2");
     assert_eq!(
         upstream.seen.lock().unwrap().clone(),
         vec![
-            ("tok-2".into(), "proj-2".into()),
             ("tok-1".into(), "proj-1".into()),
-            ("tok-2".into(), "proj-2".into()),
+            ("tok-1".into(), "proj-1".into()),
+            ("tok-1".into(), "proj-1".into()),
         ],
-        "with accountSharding enabled, new conversation must shard onto standby account and remain sticky"
+        "all conversations must stick to the active head account without sharding"
     );
 
     // 4. Pre-response HTTP 503 overload on `tok-1` fails Session 1 over to `tok-2` immediately.

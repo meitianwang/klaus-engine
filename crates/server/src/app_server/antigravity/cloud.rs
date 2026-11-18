@@ -803,10 +803,14 @@ async fn send_once(
         let bytes = read_refusal_body(response, generation, signal)
             .await
             .map_err(|err| (err, Some(used_token.clone())))?;
-        return Err((
-            service_error(Some(status), &bytes, headers),
-            Some(used_token),
-        ));
+        let error = service_error(Some(status), &bytes, headers);
+        if has_tag_prefix(&error.message, "antigravity_account_disabled") {
+            if let Some(gen) = generation {
+                auth::mark_generation_disabled(gen);
+                super::egress::reset_pool(Some(gen)).await;
+            }
+        }
+        return Err((error, Some(used_token)));
     }
     Ok((response, used_token))
 }
@@ -1036,7 +1040,6 @@ fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<Str
     if usable.is_empty() {
         return auth::generation();
     }
-    let sharding = auth::account_sharding();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
     if auth::manual_switch_epoch() != epoch {
@@ -1046,6 +1049,7 @@ fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<Str
         lease.manual_switch_epoch == epoch
             && now_ms.saturating_sub(lease.last_active_ms) <= SESSION_LEASE_TTL_MS
             && usable.contains(&lease.generation)
+            && !auth::is_generation_disabled(&lease.generation)
     });
     let Some(key) = session_key.filter(|k| !k.is_empty()) else {
         return usable.into_iter().next();
@@ -1054,22 +1058,7 @@ fn select_pooled_generation(session_key: Option<&str>, epoch: u64) -> Option<Str
         existing.last_active_ms = now_ms;
         return Some(existing.generation.clone());
     }
-    let chosen = if sharding {
-        usable
-            .iter()
-            .min_by_key(|gen| {
-                let active = state.in_flight.get(*gen).copied().unwrap_or(0);
-                let leased = state
-                    .leases
-                    .values()
-                    .filter(|lease| lease.generation == **gen)
-                    .count();
-                (active, leased)
-            })?
-            .clone()
-    } else {
-        usable.into_iter().next()?
-    };
+    let chosen = usable.into_iter().next()?;
     state.leases.insert(
         key.to_string(),
         SessionLease {
@@ -1247,7 +1236,13 @@ fn decode_raw_frame_observed(
             && payload.get("status").is_some()
             && payload.get("message").is_some())
     {
-        return Err(service_error(None, bytes, Default::default()));
+        let error = service_error(None, bytes, Default::default());
+        if has_tag_prefix(&error.message, "antigravity_account_disabled") {
+            if let Some(gen) = generation {
+                auth::mark_generation_disabled(gen);
+            }
+        }
+        return Err(error);
     }
     if let Some(generation) = generation {
         if payload.get("remainingCredits").is_some() || payload.get("consumedCredits").is_some() {
@@ -2279,13 +2274,10 @@ impl GeminiClient for CloudClient {
                 .map_or(key, |(base, _)| base)
                 .to_owned()
         });
-        let sticky_key = if auth::account_sharding() {
-            lease_routing_key.or_else(|| self.sticky_session_key().map(str::to_string))
-        } else {
-            self.sticky_session_key()
-                .map(str::to_string)
-                .or(lease_routing_key)
-        };
+        let sticky_key = self
+            .sticky_session_key()
+            .map(str::to_string)
+            .or(lease_routing_key);
         let pooled = self.generation.is_empty();
         let mut attempted: Vec<String> = Vec::new();
         let mut forced_next: Option<String> = None;

@@ -1127,22 +1127,37 @@ async fn heartbeat_repeats_the_paired_control_plane_poll() {
     })
     .await
     .expect("the heartbeat must keep the paired poll alive");
-    let minimal = fixture
-        .requests
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|request| {
-            request["path"]
-                .as_str()
-                .unwrap_or_default()
-                .ends_with(":loadCodeAssist")
-                && request["body"] == json!({"metadata":{"ideType":"ANTIGRAVITY"}})
-        })
-        .count();
+    let (minimal, duplicate_scoped) = {
+        let requests = fixture.requests.lock().unwrap();
+        let minimal = requests
+            .iter()
+            .filter(|request| {
+                request["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(":loadCodeAssist")
+                    && request["body"] == json!({"metadata":{"ideType":"ANTIGRAVITY"}})
+            })
+            .count();
+        let scoped = requests
+            .iter()
+            .filter(|request| {
+                request["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(":loadCodeAssist")
+                    && request["body"]["cloudaicompanionProject"] == "fixture-project"
+            })
+            .count();
+        (minimal, scoped)
+    };
     assert!(
         minimal >= 2,
         "each heartbeat tick revalidates the account: {minimal}"
+    );
+    assert!(
+        duplicate_scoped <= 1,
+        "heartbeat ticks must not emit a duplicate project-scoped loadCodeAssist: {duplicate_scoped}"
     );
     auth::logout().await.unwrap();
     remove_process_environment_var("KLAUS_ANTIGRAVITY_HEARTBEAT_SECS");
@@ -1955,7 +1970,9 @@ async fn pooled_stream_rotates_across_accounts_with_isolated_projects_and_safe_p
     assert_eq!(st["accounts"][2]["email"], "c@example.invalid");
     assert_eq!(st["accounts"][2]["needsLogin"], true);
 
-    // 3. Account-disabled 403 is InvalidRequest and never rotates the queue.
+    // 3. Account-disabled 403 is InvalidRequest, trips the per-generation circuit breaker,
+    //    and never rotates the queue onto standby accounts.
+    let gen_a = auth::generation().unwrap();
     trace.lock().unwrap().clear();
     plans.lock().unwrap().insert(
         "tok-a".into(),
@@ -1967,6 +1984,8 @@ async fn pooled_stream_rotates_across_accounts_with_isolated_projects_and_safe_p
         ModelStreamEvent::Error { error } if error.code.as_ref().is_some_and(|code| code == "antigravity_account_disabled")
     )));
     assert_eq!(auth::status()["account"], "a@example.invalid");
+    assert!(auth::is_generation_disabled(&gen_a));
+    auth::clear_generation_disabled(&gen_a);
 
     // 4. Parallel subagent safety: Stream 1 streaming on A stays alive while Stream 2 rotates A -> B.
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -2183,19 +2202,14 @@ async fn multi_account_usage_isolates_failures_and_native_media_search_rotate_on
     .await
     .unwrap();
 
-    // Multi-account usage isolates broken@'s 401 without blanking limited@ or healthy@, and never rotates.
+    // Multi-account usage queries only the active head account (`limited@`), never polling standby accounts.
     let quota = usage().await.unwrap();
     assert_eq!(quota["signedIn"], true);
     let rows = quota["accounts"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["label"], "limited@example.invalid");
     assert_eq!(rows[0]["isCurrent"], true);
     assert_eq!(rows[0]["state"], "ok");
-    assert_eq!(rows[1]["label"], "broken@example.invalid");
-    assert_eq!(rows[1]["isCurrent"], false);
-    assert_eq!(rows[1]["state"], "error");
-    assert_eq!(rows[2]["label"], "healthy@example.invalid");
-    assert_eq!(rows[2]["state"], "ok");
     assert_eq!(
         auth::status()["account"],
         "limited@example.invalid",
@@ -3759,74 +3773,35 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
             .auto_compact_token_limit,
         Some(256_000)
     );
-    assert_eq!(auth::status()["accountSharding"], false);
+    assert!(auth::status().get("accountSharding").is_none());
 
-    // Default (accountSharding = false): new threads stick to the head account without sharding.
+    // All new threads stick to the active head account without sharding across standby accounts.
     {
         let mut p = plans.lock().unwrap();
         p.insert(
             "acct-1-tok".into(),
-            VecDeque::from([ReplyPlan::Ok("a1"), ReplyPlan::Ok("b1")]),
+            VecDeque::from([
+                ReplyPlan::Ok("a1"),
+                ReplyPlan::Ok("b1"),
+                ReplyPlan::Ok("c1"),
+                ReplyPlan::Ok("d1"),
+            ]),
         );
     }
     assert_eq!(ask(chat_a.clone()).await, "a1");
     assert_eq!(ask(chat_b.clone()).await, "b1");
-    assert_eq!(
-        seen.lock().unwrap().clone(),
-        vec![
-            ("acct-1-tok".into(), "proj-1".into()),
-            ("acct-1-tok".into(), "proj-1".into()),
-        ],
-        "with accountSharding off by default, new threads bind to the head account"
-    );
-
-    // Enabling accountSharding routes new threads to the idle standby account while keeping existing leases sticky.
-    let enabled = auth::set_account_sharding(true).await.unwrap();
-    assert_eq!(enabled["ok"], true);
-    assert_eq!(enabled["accountSharding"], true);
-    seen.lock().unwrap().clear();
-    {
-        let mut p = plans.lock().unwrap();
-        p.insert("acct-1-tok".into(), VecDeque::from([ReplyPlan::Ok("a2")]));
-        p.insert(
-            "acct-2-tok".into(),
-            VecDeque::from([ReplyPlan::Ok("c1"), ReplyPlan::Ok("c2")]),
-        );
-    }
     assert_eq!(ask(chat_c.clone()).await, "c1");
-    assert_eq!(ask(chat_a.clone()).await, "a2");
-    assert_eq!(ask(chat_c.clone()).await, "c2");
-    assert_eq!(
-        seen.lock().unwrap().clone(),
-        vec![
-            ("acct-2-tok".into(), "proj-2".into()),
-            ("acct-1-tok".into(), "proj-1".into()),
-            ("acct-2-tok".into(), "proj-2".into()),
-        ],
-        "when accountSharding is enabled, new threads shard to idle accounts and stay sticky"
-    );
-
-    // Turning accountSharding back off preserves already-bound sticky leases, while unleased threads use the head account.
-    let disabled = auth::set_account_sharding(false).await.unwrap();
-    assert_eq!(disabled["accountSharding"], false);
-    seen.lock().unwrap().clear();
-    {
-        let mut p = plans.lock().unwrap();
-        p.insert("acct-1-tok".into(), VecDeque::from([ReplyPlan::Ok("d1")]));
-        p.insert("acct-2-tok".into(), VecDeque::from([ReplyPlan::Ok("c3")]));
-    }
-    assert_eq!(ask(chat_c.clone()).await, "c3");
     assert_eq!(ask(chat_d.clone()).await, "d1");
     assert_eq!(
         seen.lock().unwrap().clone(),
         vec![
-            ("acct-2-tok".into(), "proj-2".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
+            ("acct-1-tok".into(), "proj-1".into()),
             ("acct-1-tok".into(), "proj-1".into()),
         ],
-        "disabling accountSharding preserves existing sticky leases while new threads bind to head"
+        "new threads always bind to the active head account without sharding"
     );
-
-    auth::set_account_sharding(true).await.unwrap();
 
     // Pre-response HTTP 503 overload on acct-1 fails over immediately to acct-2 and rebinds chat_a.
     seen.lock().unwrap().clear();
@@ -3852,11 +3827,10 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
         ]
     );
 
-    // Explicit manual account switch resets sticky leases so existing chats honor the user's pick,
-    // and preserves the stored accountSharding preference.
+    // Explicit manual account switch resets sticky leases so existing chats honor the user's pick.
     seen.lock().unwrap().clear();
     let switched = auth::switch_account(&acct1_id).await.unwrap();
-    assert_eq!(switched["accountSharding"], true);
+    assert!(switched.get("accountSharding").is_none());
     plans.lock().unwrap().insert(
         "acct-1-tok".into(),
         VecDeque::from([ReplyPlan::Ok("manual-1")]),
@@ -3867,7 +3841,7 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
         vec![("acct-1-tok".into(), "proj-1".into())]
     );
 
-    // Different account entitlements must not turn automatic sharding into a dead end.
+    // Different account entitlements still fail over cleanly on model access denial.
     seen.lock().unwrap().clear();
     {
         let mut p = plans.lock().unwrap();

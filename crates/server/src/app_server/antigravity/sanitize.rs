@@ -64,6 +64,20 @@ const PROSE_REPLACEMENTS: &[(&str, &str)] = &[
     ("signed in to Klaus", "signed in to the host app"),
     ("in Klaus?", "in the host app?"),
     ("covers Klaus", "covers the host app"),
+    (
+        "in the codex *** Begin Patch format",
+        "in the *** Begin Patch format",
+    ),
+    ("Klaus's", "the host app's"),
+    ("inside Klaus", "inside the host app"),
+    ("with Klaus", "with the assistant"),
+    ("from Klaus", "from the host app"),
+    ("by Klaus", "by the host app"),
+    ("Klaus desktop", "desktop host"),
+    ("Klaus engine", "agent engine"),
+    ("Klaus client", "desktop client"),
+    ("Klaus session", "workspace session"),
+    ("Klaus workspace", "current workspace"),
 ];
 
 /// Reversible directive markers that the model may emit in assistant text or
@@ -148,7 +162,7 @@ impl ToolProjection {
                 out = replace_identifier_tokens(&out, internal, wire);
             }
         }
-        out
+        scrub_standalone_klaus_prose(&out)
     }
 
     pub(super) fn restore_response(
@@ -568,7 +582,7 @@ pub(super) fn sanitize_outbound_request(request: &mut RuntimeJson) -> ToolProjec
                     .and_then(RuntimeJson::as_string)
                     .and_then(|s| s.try_to_utf8().ok())
                 {
-                    let rewritten = map_content_markers(&text);
+                    let rewritten = map_content_markers(&text, &projection);
                     if rewritten != text {
                         part_obj
                             .insert("text", RuntimeJson::String(RuntimeString::from(rewritten)));
@@ -581,7 +595,10 @@ pub(super) fn sanitize_outbound_request(request: &mut RuntimeJson) -> ToolProjec
     projection
 }
 
-fn map_content_markers(text: &str) -> String {
+fn map_content_markers(text: &str, projection: &ToolProjection) -> String {
+    if text.contains("<system-reminder>") || text.contains("<skill-catalog:") {
+        return projection.map_outbound_text(text, false);
+    }
     let mut out = text.to_string();
     for &(from, to) in &[
         ("::klaus-inline-vis", "::inline-vis-frame"),
@@ -597,6 +614,43 @@ fn map_content_markers(text: &str) -> String {
             out = out.replace(from, to);
         }
     }
+    out
+}
+
+/// Scrub residual standalone capitalized `Klaus` tokens in prose without
+/// altering filesystem paths (`/workspace/klaus`, `~/.klaus/`, `/Applications/Klaus.app/...`)
+/// or compound identifiers (`klaus_query`, `klaus-agent`).
+fn scrub_standalone_klaus_prose(text: &str) -> String {
+    if !text.contains("Klaus") {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let needle = b"Klaus";
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find("Klaus") {
+        let start = cursor + rel;
+        let end = start + needle.len();
+        let left_blocked = start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[start - 1], b'/' | b'\\' | b'.' | b'-' | b'_' | b':'));
+        let right_blocked = end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric()
+                || matches!(bytes[end], b'/' | b'\\' | b'-' | b'_')
+                || text[end..].starts_with(".app"));
+        if left_blocked || right_blocked {
+            out.push_str(&text[cursor..end]);
+        } else {
+            out.push_str(&text[cursor..start]);
+            if out.ends_with("the ") || out.ends_with("The ") || out.ends_with("a ") {
+                out.push_str("host app");
+            } else {
+                out.push_str("the host app");
+            }
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -681,6 +735,11 @@ mod tests {
                         "parameters": { "type": "OBJECT" }
                     },
                     {
+                        "name": "apply_patch",
+                        "description": "Apply a multi-file patch (add/update/delete) in the codex *** Begin Patch format.",
+                        "parameters": { "type": "OBJECT" }
+                    },
+                    {
                         "name": "bash",
                         "description": "Execute a shell command.",
                         "parameters": { "type": "OBJECT" }
@@ -733,12 +792,21 @@ mod tests {
         let decls = out["tools"][0]["functionDeclarations"].as_array().unwrap();
         assert_eq!(decls[0]["name"], "app_state_query");
         assert!(!decls[0]["description"].as_str().unwrap().contains("Klaus"));
+        assert!(!decls[0]["parameters"]["properties"]["key"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Klaus"));
         assert_eq!(decls[1]["name"], "app_state_action");
         assert!(decls[1]["description"]
             .as_str()
             .unwrap()
             .contains("app_state_query"));
-        assert_eq!(decls[2]["name"], "bash");
+        assert_eq!(decls[2]["name"], "apply_patch");
+        assert_eq!(
+            decls[2]["description"],
+            "Apply a multi-file patch (add/update/delete) in the *** Begin Patch format."
+        );
+        assert_eq!(decls[3]["name"], "bash");
 
         assert_eq!(
             out["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
