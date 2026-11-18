@@ -50,6 +50,10 @@ pub fn set_config_root(root: &Path) {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         usage::clear_all();
+        refresh_locks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         cloud::clear_session_leases();
     }
 }
@@ -82,14 +86,28 @@ fn cache() -> &'static Mutex<HashMap<String, CachedCatalog>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn refresh_lock() -> Arc<tokio::sync::Mutex<()>> {
-    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
-    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+#[derive(Clone)]
+struct RefreshCooldown {
+    retry_at: i64,
+    error: String,
+}
+
+fn refresh_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn generation_refresh_lock(generation: &str) -> Arc<tokio::sync::Mutex<()>> {
+    refresh_locks()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(generation.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
-fn refresh_state() -> &'static Mutex<HashMap<String, i64>> {
-    static STATE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+fn refresh_state() -> &'static Mutex<HashMap<String, RefreshCooldown>> {
+    static STATE: OnceLock<Mutex<HashMap<String, RefreshCooldown>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -128,6 +146,10 @@ pub(super) fn prune_generation(generation: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(generation);
+    refresh_locks()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(generation);
     credit_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -162,6 +184,10 @@ pub(super) fn sync_head_catalog() {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|gen, _| valid.contains(gen));
         usage::retain_generations(&valid);
+        refresh_locks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|gen, _| valid.contains(gen));
         let path = root.join("antigravity-models.json");
         let existing_gen = std::fs::read(&path)
             .ok()
@@ -214,6 +240,10 @@ fn forget_catalog() {
         .unwrap_or_else(|p| p.into_inner());
     cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
     refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    refresh_locks()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
@@ -520,10 +550,14 @@ fn refresh_allowed(generation: &str, now: i64) -> bool {
         return false;
     }
     let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
-    state.get(generation).copied().unwrap_or(0) <= now
+    state
+        .get(generation)
+        .map(|entry| entry.retry_at)
+        .unwrap_or(0)
+        <= now
 }
 
-fn record_refresh_failure(generation: &str, now: i64) {
+fn record_refresh_failure(generation: &str, now: i64, error: impl Into<String>) {
     if !auth::is_current(generation) {
         return;
     }
@@ -532,8 +566,19 @@ fn record_refresh_failure(generation: &str, now: i64) {
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             generation.to_string(),
-            now.saturating_add(CATALOG_RETRY_COOLDOWN_MS),
+            RefreshCooldown {
+                retry_at: now.saturating_add(CATALOG_RETRY_COOLDOWN_MS),
+                error: error.into(),
+            },
         );
+}
+
+fn last_refresh_error(generation: &str) -> Option<String> {
+    refresh_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(generation)
+        .map(|entry| entry.error.clone())
 }
 
 fn record_refresh_success(generation: &str) {
@@ -543,15 +588,27 @@ fn record_refresh_success(generation: &str) {
         .remove(generation);
 }
 
+fn has_fresh_memory_catalog(generation: &str) -> bool {
+    cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(generation)
+        .is_some_and(|cached| {
+            !cached.from_disk
+                && chrono::Utc::now().timestamp_millis() - cached.fetched_at <= CATALOG_TTL_MS
+        })
+}
+
 /// Revalidate behind the caller. A catalog read never waits for this task, and
-/// the refresh lock makes concurrent picker reads share one request. A failed
-/// fetch is not retried until the cooldown passes, so an offline machine does
-/// not start one request per read.
+/// the per-generation refresh lock makes concurrent picker reads share one
+/// request without an outgoing account's in-flight fetch dropping the new
+/// account's refresh. A failed fetch is not retried by passive reads until the
+/// cooldown passes, so an offline machine does not start one request per read.
 fn schedule_refresh(generation: String) {
     if !refresh_allowed(&generation, chrono::Utc::now().timestamp_millis()) {
         return;
     }
-    let Ok(permit) = refresh_lock().try_lock_owned() else {
+    let Ok(permit) = generation_refresh_lock(&generation).try_lock_owned() else {
         return;
     };
     tokio::spawn(async move {
@@ -563,9 +620,13 @@ fn schedule_refresh(generation: String) {
         .await
         {
             Ok(Ok(_)) => record_refresh_success(&generation),
-            Err(_) => record_refresh_failure(&generation, chrono::Utc::now().timestamp_millis()),
-            Ok(Err(_)) => {
-                record_refresh_failure(&generation, chrono::Utc::now().timestamp_millis())
+            Err(_) => record_refresh_failure(
+                &generation,
+                chrono::Utc::now().timestamp_millis(),
+                "antigravity_catalog_timeout",
+            ),
+            Ok(Err(err)) => {
+                record_refresh_failure(&generation, chrono::Utc::now().timestamp_millis(), err)
             }
         }
         #[cfg(test)]
@@ -573,12 +634,66 @@ fn schedule_refresh(generation: String) {
     });
 }
 
+/// Await a live catalog for the given credential generation when model
+/// resolution cannot answer from local state alone. Joins an already in-flight
+/// refresh for the same generation instead of issuing a second request.
+async fn ensure_live_catalog(generation: &str) -> Result<Value, String> {
+    let lock = generation_refresh_lock(generation);
+    let (joined_inflight, _permit) = match lock.try_lock() {
+        Ok(permit) => (false, permit),
+        Err(_) => {
+            let permit = tokio::time::timeout(std::time::Duration::from_secs(15), lock.lock())
+                .await
+                .map_err(|_| "antigravity_catalog_timeout".to_string())?;
+            (true, permit)
+        }
+    };
+    if !auth::is_current(generation) {
+        return Err("antigravity_credential_changed".into());
+    }
+    if has_fresh_memory_catalog(generation) {
+        if let Some(cached) = cached_payload(generation) {
+            return Ok(cached.payload);
+        }
+    }
+    if joined_inflight {
+        if let Some(error) = last_refresh_error(generation) {
+            return Err(error);
+        }
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        refresh_catalog(generation),
+    )
+    .await
+    {
+        Ok(Ok(payload)) => {
+            record_refresh_success(generation);
+            Ok(payload)
+        }
+        Ok(Err(err)) => {
+            if err != "antigravity_credential_changed" {
+                record_refresh_failure(generation, chrono::Utc::now().timestamp_millis(), &err);
+            }
+            Err(err)
+        }
+        Err(_) => {
+            record_refresh_failure(
+                generation,
+                chrono::Utc::now().timestamp_millis(),
+                "antigravity_catalog_timeout",
+            );
+            Err("antigravity_catalog_timeout".into())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn refresh_blocked(generation: &str) -> bool {
     let state = refresh_state().lock().unwrap_or_else(|p| p.into_inner());
     state
         .get(generation)
-        .is_some_and(|retry_at| *retry_at > chrono::Utc::now().timestamp_millis())
+        .is_some_and(|entry| entry.retry_at > chrono::Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
@@ -663,8 +778,7 @@ pub(crate) async fn stream_dictation(
     signal: AbortSignal,
 ) -> Result<String, String> {
     let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-    let payload = catalog_payload(true).await?;
-    let model = native_model(&payload, "audioTranscriptionModelIds", None)?;
+    let model = resolve_native_model(&generation, "audioTranscriptionModelIds", None).await?;
     let credential = auth::credential(Some(&generation)).await?;
     let partial_generation = generation.clone();
     let ready_generation = generation.clone();
@@ -729,8 +843,7 @@ pub async fn transcribe_audio(
     {
         return Err("antigravity_credential_changed".into());
     }
-    let payload = catalog_payload(true).await?;
-    let model = native_model(&payload, "audioTranscriptionModelIds", None)?;
+    let model = resolve_native_model(&generation, "audioTranscriptionModelIds", None).await?;
     let credential = auth::credential(Some(&generation)).await?;
     let response = match audio::transcribe(
         audio::AudioInput {
@@ -787,10 +900,10 @@ pub async fn usage(force: bool) -> Result<Value, String> {
     usage::usage(force).await
 }
 
-pub async fn main_model(
+fn explicit_selection_model(
     selection: &str,
     tiers: &serde_json::Map<String, Value>,
-) -> Result<String, String> {
+) -> Option<String> {
     let requested = match selection {
         "" | "auto" | "high" | "medium" | "low" => tiers
             .get(selection)
@@ -798,13 +911,14 @@ pub async fn main_model(
             .filter(|model| !model.is_empty()),
         model => Some(model),
     };
-    if let Some(model) = requested {
-        return Ok(model
-            .strip_prefix("antigravity:")
-            .unwrap_or(model)
-            .to_string());
-    }
-    let models = catalog::normalize_models(&catalog_payload(true).await?);
+    requested.map(|model| {
+        let bare = model.strip_prefix("antigravity:").unwrap_or(model);
+        super::conversation_catalog::canonical_antigravity_model_id(bare).to_string()
+    })
+}
+
+fn default_chat_model(payload: &Value) -> Result<String, String> {
+    let models = catalog::normalize_models(payload);
     models
         .iter()
         .filter(|model| catalog::is_chat_model(model))
@@ -814,45 +928,136 @@ pub async fn main_model(
         .ok_or_else(|| "antigravity_no_models".into())
 }
 
+pub async fn main_model(
+    selection: &str,
+    tiers: &serde_json::Map<String, Value>,
+) -> Result<String, String> {
+    let tiers = super::conversation_catalog::canonical_antigravity_tiers(tiers);
+    if let Some(model) = explicit_selection_model(selection, &tiers) {
+        return Ok(model);
+    }
+    cloud::ensure_identity().await;
+    default_chat_model(&catalog_payload(true).await?)
+}
+
 pub async fn resolve(
     selection: &str,
     tiers: &serde_json::Map<String, Value>,
 ) -> Result<super::model_sources::Resolved, String> {
-    auth::active_or_rotated_credential().await?;
-    let model = main_model(selection, tiers).await?;
-    let rows = catalog::models_with_unavailable_paid(&catalog_payload(true).await?);
-    let selected = rows
-        .iter()
-        .find(|entry| entry["key"].as_str() == Some(&model))
-        .ok_or("antigravity_model_unavailable")?;
-    if !catalog::is_chat_model(selected) {
-        return Err("antigravity_model_purpose_unsupported".into());
-    }
-    let by_model: Vec<Value> = rows
-        .iter()
-        .filter(|entry| entry["key"].as_str() != Some(&model) && catalog::is_chat_model(entry))
-        .map(|entry| json!({"model":entry["key"],"capabilities":entry["capabilities"]}))
-        .collect();
-    let mut model_tiers = serde_json::Map::new();
-    for tier in ["high", "medium", "low"] {
-        if let Some(pick) = tiers.get(tier).and_then(Value::as_str) {
-            let pick = pick.strip_prefix("antigravity:").unwrap_or(pick);
-            if rows
-                .iter()
-                .any(|entry| entry["key"].as_str() == Some(pick) && catalog::is_chat_model(entry))
-            {
-                model_tiers.insert(tier.into(), json!(pick));
+    cloud::ensure_identity().await;
+    let tiers = super::conversation_catalog::canonical_antigravity_tiers(tiers);
+    let explicit = explicit_selection_model(selection, &tiers);
+    for attempt in 0..3 {
+        auth::active_or_rotated_credential().await?;
+        let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
+        let (mut payload, mut schedule_background_refresh) =
+            if let Some(cached) = cached_payload(&generation) {
+                let stale = cached.from_disk
+                    || chrono::Utc::now().timestamp_millis() - cached.fetched_at > CATALOG_TTL_MS;
+                (cached.payload, stale)
+            } else {
+                (catalog::bundled_payload(), true)
+            };
+        let is_baseline = payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true);
+        let fresh_in_memory = has_fresh_memory_catalog(&generation);
+
+        if explicit.is_none() && is_baseline {
+            match ensure_live_catalog(&generation).await {
+                Ok(live) => {
+                    payload = live;
+                    schedule_background_refresh = false;
+                }
+                Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
+                Err(err) if err == "antigravity_credential_changed" => return Err(err),
+                Err(_) => {}
             }
         }
+
+        let model = match &explicit {
+            Some(model) => model.clone(),
+            None => default_chat_model(&payload)?,
+        };
+        let mut rows = catalog::models_with_unavailable_paid(&payload);
+        let selected_present = rows
+            .iter()
+            .any(|entry| entry["key"].as_str() == Some(model.as_str()));
+        let tier_missing = ["high", "medium", "low"].into_iter().any(|tier| {
+            tiers
+                .get(tier)
+                .and_then(Value::as_str)
+                .filter(|pick| !pick.is_empty())
+                .map(|pick| pick.strip_prefix("antigravity:").unwrap_or(pick))
+                .is_some_and(|pick| !rows.iter().any(|entry| entry["key"].as_str() == Some(pick)))
+        });
+
+        if !selected_present && !fresh_in_memory {
+            match ensure_live_catalog(&generation).await {
+                Ok(live) => {
+                    payload = live;
+                    rows = catalog::models_with_unavailable_paid(&payload);
+                    schedule_background_refresh = false;
+                }
+                Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
+                Err(err) => return Err(err),
+            }
+        } else if tier_missing && !fresh_in_memory {
+            match ensure_live_catalog(&generation).await {
+                Ok(live) => {
+                    payload = live;
+                    rows = catalog::models_with_unavailable_paid(&payload);
+                    schedule_background_refresh = false;
+                }
+                Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
+                Err(err) if err == "antigravity_credential_changed" => return Err(err),
+                Err(_) => {}
+            }
+        }
+
+        if !auth::is_current(&generation) {
+            if attempt < 2 {
+                continue;
+            }
+            return Err("antigravity_credential_changed".into());
+        }
+        if schedule_background_refresh {
+            schedule_refresh(generation);
+        }
+
+        let selected = rows
+            .iter()
+            .find(|entry| entry["key"].as_str() == Some(model.as_str()))
+            .ok_or("antigravity_model_unavailable")?;
+        if !catalog::is_chat_model(selected) {
+            return Err("antigravity_model_purpose_unsupported".into());
+        }
+        let by_model: Vec<Value> = rows
+            .iter()
+            .filter(|entry| {
+                entry["key"].as_str() != Some(model.as_str()) && catalog::is_chat_model(entry)
+            })
+            .map(|entry| json!({"model":entry["key"],"capabilities":entry["capabilities"]}))
+            .collect();
+        let mut model_tiers = serde_json::Map::new();
+        for tier in ["high", "medium", "low"] {
+            if let Some(pick) = tiers.get(tier).and_then(Value::as_str) {
+                let pick = pick.strip_prefix("antigravity:").unwrap_or(pick);
+                if rows.iter().any(|entry| {
+                    entry["key"].as_str() == Some(pick) && catalog::is_chat_model(entry)
+                }) {
+                    model_tiers.insert(tier.into(), json!(pick));
+                }
+            }
+        }
+        return Ok(super::model_sources::Resolved {
+            provider: json!({"type":"gemini","model":model}),
+            auth: Value::Null,
+            capabilities: selected["capabilities"].clone(),
+            capabilities_by_model: by_model,
+            model_tiers,
+            pricing: None,
+        });
     }
-    Ok(super::model_sources::Resolved {
-        provider: json!({"type":"gemini","model":model}),
-        auth: Value::Null,
-        capabilities: selected["capabilities"].clone(),
-        capabilities_by_model: by_model,
-        model_tiers,
-        pricing: None,
-    })
+    Err("antigravity_credential_changed".into())
 }
 
 fn dialect(init: Option<&GeminiThinkingInit>) -> GeminiThinkingDialect {
@@ -1054,6 +1259,34 @@ fn native_model(payload: &Value, field: &str, requested: Option<&str>) -> Result
     }
 }
 
+async fn resolve_native_model(
+    generation: &str,
+    field: &str,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    cloud::ensure_identity().await;
+    let (payload, schedule_background_refresh) = if let Some(cached) = cached_payload(generation) {
+        let stale = cached.from_disk
+            || chrono::Utc::now().timestamp_millis() - cached.fetched_at > CATALOG_TTL_MS;
+        (cached.payload, stale)
+    } else {
+        (catalog::bundled_payload(), true)
+    };
+    match native_model(&payload, field, requested) {
+        Ok(model) => {
+            if schedule_background_refresh {
+                schedule_refresh(generation.to_string());
+            }
+            Ok(model)
+        }
+        Err(_) if !has_fresh_memory_catalog(generation) => {
+            let live = ensure_live_catalog(generation).await?;
+            native_model(&live, field, requested)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn generate_content_with_rotation(
     model_field: &str,
     requested_model: Option<&str>,
@@ -1069,8 +1302,7 @@ async fn generate_content_with_rotation(
     let mut attempted: Vec<String> = Vec::new();
     loop {
         let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
-        let payload = catalog_payload(true).await?;
-        let model = native_model(&payload, model_field, requested_model)?;
+        let model = resolve_native_model(&generation, model_field, requested_model).await?;
         let outcome: Result<Value, String> = async {
             let project = project(Some(&generation), signal).await?;
             let mut inner_request = build_request(&model);

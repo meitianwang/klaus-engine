@@ -421,3 +421,209 @@ async fn a_late_refresh_cannot_publish_for_a_replaced_account() {
     client.close().await;
     antigravity::auth::logout().await.unwrap();
 }
+
+#[tokio::test]
+async fn cold_resolve_awaits_inflight_catalog_refresh_without_duplicate_fetch() {
+    let root = tempfile::tempdir().unwrap();
+    antigravity::set_config_root(root.path());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let server = CloudFixture::start(Reply::DelayedCatalog(
+        json!({
+            "defaultAgentModelId": "gemini-4-carbon-medium",
+            "models": {
+                "gemini-4-carbon-medium": {
+                    "displayName": "Gemini 4 Carbon (Medium)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 2
+                },
+                "gemini-4-neon-high": {
+                    "displayName": "Gemini 4 Neon (High)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3,
+                    "maxTokens": 1048576,
+                    "maxOutputTokens": 65536
+                }
+            }
+        }),
+        Arc::clone(&release),
+    ))
+    .await;
+    let _environment = Environment::set(&server.origin);
+    antigravity::auth::adopt(credential()).await.unwrap();
+    let mut client = start_client(root.path());
+    client.initialize().await;
+
+    let baseline = catalog_request(&mut client, 130).await;
+    assert_eq!(baseline["result"]["catalogBaseline"], true, "{baseline}");
+    assert!(
+        wait_until(
+            || server.requests_to(":fetchAvailableModels") == 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "local-first read must start one background refresh"
+    );
+
+    let mut tiers = serde_json::Map::new();
+    tiers.insert("medium".into(), json!("antigravity:gemini-4-carbon-medium"));
+    let resolving = tokio::spawn(async move {
+        antigravity::resolve("antigravity:gemini-4-neon-high", &tiers).await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !resolving.is_finished(),
+        "cold resolve for an unbundled model must await the in-flight catalog refresh"
+    );
+    release.notify_one();
+
+    let resolved = tokio::time::timeout(Duration::from_secs(3), resolving)
+        .await
+        .expect("resolve timed out")
+        .unwrap()
+        .expect("resolve must succeed once the live catalog arrives");
+    assert_eq!(resolved.provider["model"], "gemini-4-neon-high");
+    assert_eq!(resolved.capabilities["contextWindow"], 1_048_576);
+    assert_eq!(
+        resolved.model_tiers.get("medium"),
+        Some(&json!("gemini-4-carbon-medium"))
+    );
+    assert_eq!(
+        server.requests_to(":fetchAvailableModels"),
+        1,
+        "resolve must join the in-flight catalog refresh without issuing a duplicate fetch"
+    );
+
+    client.close().await;
+    antigravity::auth::logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn switching_accounts_does_not_drop_or_block_new_account_catalog_behind_stalled_refresh() {
+    let root = tempfile::tempdir().unwrap();
+    antigravity::set_config_root(root.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let release_stalled = Arc::new(tokio::sync::Notify::new());
+    let release_clone = Arc::clone(&release_stalled);
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let release = Arc::clone(&release_clone);
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let header = loop {
+                    let Ok(count) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    received.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break String::from_utf8_lossy(&received[..end]).to_string();
+                    }
+                };
+                let stalled = header
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: bearer tok-slow"));
+                if stalled {
+                    release.notified().await;
+                }
+                let body = json!({
+                    "defaultAgentModelId": "gemini-4-neon-high",
+                    "models": {
+                        "gemini-4-neon-high": {
+                            "displayName": "Gemini 4 Neon (High)",
+                            "supportsThinking": true,
+                            "thinkingLevel": 3
+                        }
+                    }
+                })
+                .to_string();
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    let _environment = Environment::set(&origin);
+
+    antigravity::auth::adopt(
+        serde_json::from_value(json!({
+            "accessToken": "tok-fast",
+            "account": "fast@example.invalid",
+            "authMethod": "consumer",
+            "project": "proj-fast"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    antigravity::auth::adopt(
+        serde_json::from_value(json!({
+            "accessToken": "tok-slow",
+            "account": "slow@example.invalid",
+            "authMethod": "consumer",
+            "project": "proj-slow"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let status = antigravity::auth::status();
+    let accounts = status["accounts"].as_array().unwrap();
+    let fast_id = accounts
+        .iter()
+        .find(|row| row["email"] == "fast@example.invalid")
+        .and_then(|row| row["id"].as_str())
+        .unwrap()
+        .to_string();
+
+    let mut client = start_client(root.path());
+    client.initialize().await;
+
+    // Start slow account's background catalog refresh and leave it held in flight.
+    let _ = catalog_request(&mut client, 140).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Switch head to the fast account while tok-slow's refresh is still stalled.
+    antigravity::auth::switch_account(&fast_id).await.unwrap();
+    let resolved = antigravity::resolve("gemini-4-neon-high", &serde_json::Map::new())
+        .await
+        .expect("new account resolve must succeed without waiting on outgoing account refresh");
+    assert_eq!(resolved.provider["model"], "gemini-4-neon-high");
+
+    release_stalled.notify_waiters();
+    server_task.abort();
+    client.close().await;
+    antigravity::auth::logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_resolve_surfaces_catalog_fetch_failure_instead_of_claiming_model_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    antigravity::set_config_root(root.path());
+    let server = CloudFixture::start(Reply::Status(500)).await;
+    let _environment = Environment::set(&server.origin);
+    antigravity::auth::adopt(credential()).await.unwrap();
+
+    let err = antigravity::resolve("gemini-4-neon-high", &serde_json::Map::new())
+        .await
+        .unwrap_err();
+    assert_ne!(
+        err, "antigravity_model_unavailable",
+        "a failed catalog fetch on a cold account must not claim the model does not exist"
+    );
+
+    antigravity::auth::logout().await.unwrap();
+}

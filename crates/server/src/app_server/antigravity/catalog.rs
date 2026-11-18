@@ -674,11 +674,52 @@ fn paid_model_inventory() -> Value {
         ("high", "High", 3),
     ] {
         models.insert(
+            format!("gemini-4-carbon-{suffix}"),
+            json!({
+                "displayName": format!("Gemini 4 Carbon ({label})"),
+                "maxTokens": 1048576,
+                "maxOutputTokens": 262144,
+                "thinkingLevel": level,
+                "thinkingBudget": 0,
+                "minThinkingBudget": 0,
+                "supportsImages": true,
+                "supportsPdf": true,
+                "supportsVideo": true,
+                "supportsTools": true,
+                "supportsThinking": true,
+                "supportsAdaptiveThinking": false,
+            }),
+        );
+        models.insert(
             format!("gemini-4-argon-{suffix}"),
             json!({
                 "displayName": format!("Gemini 4 Argon ({label})"),
                 "maxTokens": 1048576,
                 "maxOutputTokens": 65536,
+                "thinkingLevel": level,
+                "thinkingBudget": 0,
+                "minThinkingBudget": 0,
+                "supportsImages": true,
+                "supportsPdf": true,
+                "supportsVideo": true,
+                "supportsTools": true,
+                "supportsThinking": true,
+                "supportsAdaptiveThinking": false,
+            }),
+        );
+    }
+    for (suffix, label, level) in [
+        ("low", "Low", 1),
+        ("medium", "Medium", 2),
+        ("high", "High", 3),
+        ("xhigh", "XHigh", 100),
+    ] {
+        models.insert(
+            format!("gemini-4-hydrogen-{suffix}"),
+            json!({
+                "displayName": format!("Gemini 4 Hydrogen ({label})"),
+                "maxTokens": 1048576,
+                "maxOutputTokens": 262144,
                 "thinkingLevel": level,
                 "thinkingBudget": 0,
                 "minThinkingBudget": 0,
@@ -1314,9 +1355,16 @@ mod tests {
         assert!(normalize_models(&payload).is_empty());
         let models = models_with_unavailable_paid(&payload);
         let expected: BTreeSet<_> = [
+            "gemini-4-carbon-low",
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-high",
             "gemini-4-argon-low",
             "gemini-4-argon-medium",
             "gemini-4-argon-high",
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-xhigh",
             "claude-sonnet-5-5-low",
             "claude-sonnet-5-5-medium",
             "claude-sonnet-5-5-high",
@@ -1356,7 +1404,7 @@ mod tests {
         }});
         let dynamic = normalize_models(&payload);
         let inventory = models_with_unavailable_paid(&payload);
-        assert_eq!(inventory.len(), 11);
+        assert_eq!(inventory.len(), 18);
         assert_eq!(inventory[0], dynamic[0]);
         assert_eq!(inventory[0]["displayName"], "Account model");
         assert_eq!(inventory[0]["contextWindow"], 900000);
@@ -1421,9 +1469,14 @@ mod tests {
             assert_eq!(model["defaultThinkingBudget"], 0);
             assert_eq!(model["canDisableThinking"], false);
             assert!(capabilities.get("effort").is_none());
-            if id.starts_with("gemini-4-argon-") {
+            if id.starts_with("gemini-4-") {
                 assert_eq!(decoded.context_window, Some(1048576));
-                assert_eq!(decoded.max_output_tokens, Some(65536));
+                let expected_output = if id.starts_with("gemini-4-argon-") {
+                    65536
+                } else {
+                    262144
+                };
+                assert_eq!(decoded.max_output_tokens, Some(expected_output));
                 assert!(decoded.native_pdf);
                 assert_eq!(model["supportsVideo"], true);
                 assert!(!decoded.thinking.unwrap().adaptive);
@@ -1728,6 +1781,18 @@ mod tests {
             "gemini-4-hydrogen-xhigh"
         );
         assert_eq!(
+            canonical_antigravity_model_id("gemini-4-carbon-disabled"),
+            "gemini-4-carbon-high"
+        );
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-4-argon-disabled"),
+            "gemini-4-argon-high"
+        );
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-4-hydrogen-disabled"),
+            "gemini-4-hydrogen-high"
+        );
+        assert_eq!(
             canonical_antigravity_model_id("gemini-4-carbon-medium"),
             "gemini-4-carbon-medium"
         );
@@ -1762,6 +1827,21 @@ mod tests {
                     "supportsThinking": true,
                     "thinkingLevel": 100
                 },
+                "gemini-4-carbon-disabled": {
+                    "displayName": "Gemini 4 Carbon",
+                    "disabled": true,
+                    "supportsThinking": false
+                },
+                "gemini-4-argon-disabled": {
+                    "displayName": "Gemini 4 Argon",
+                    "disabled": true,
+                    "supportsThinking": false
+                },
+                "gemini-4-hydrogen-disabled": {
+                    "displayName": "Gemini 4 Hydrogen",
+                    "disabled": true,
+                    "supportsThinking": false
+                },
                 "gemini-4-carbon-high": {
                     "displayName": "Gemini 4 Carbon (High)",
                     "supportsThinking": true,
@@ -1774,6 +1854,9 @@ mod tests {
             "gemini-pro-orchestrator",
             "gemini-pro-orchestrator-argon",
             "gemini-flash-worker-agy",
+            "gemini-4-carbon-disabled",
+            "gemini-4-argon-disabled",
+            "gemini-4-hydrogen-disabled",
         ] {
             let row = rows.iter().find(|entry| entry["key"] == alias).unwrap();
             assert_eq!(row["conversationModel"], json!(false));

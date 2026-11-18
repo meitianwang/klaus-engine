@@ -143,3 +143,145 @@ async fn antigravity_orchestrator_advisor_tier_and_feature_targets_are_ready_on_
     );
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn cold_account_reconfigure_awaits_live_catalog_for_unbundled_model() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let Ok(count) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if count == 0 || received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    received.extend_from_slice(&buffer[..count]);
+                    if received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                let body = json!({
+                    "defaultAgentModelId": "gemini-4-neon-high",
+                    "models": {
+                        "gemini-4-neon-high": {
+                            "displayName": "Gemini 4 Neon High",
+                            "supportsImages": true,
+                            "supportsThinking": true,
+                            "thinkingLevel": 3,
+                            "maxTokens": 1048576,
+                            "maxOutputTokens": 65536
+                        }
+                    }
+                })
+                .to_string();
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    let previous_api = std::env::var_os("KLAUS_ANTIGRAVITY_API_URL");
+    let previous_direct = std::env::var_os("KLAUS_ANTIGRAVITY_ALLOW_DIRECT");
+    unsafe {
+        std::env::set_var("KLAUS_ANTIGRAVITY_API_URL", &origin);
+        std::env::set_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", "1");
+    }
+
+    let main = LoopbackProvider::start().await;
+    let store: Arc<dyn klaus_agent_core::credential_store::CredentialStore> =
+        Arc::new(klaus_agent_core::mcp::credential_store::InMemoryCredentialStore::new());
+    let mut fixture = Fixture::with_credentials(false, None, Some(store)).await;
+    let _ = main;
+    std::fs::write(
+        fixture.root.path().join("config.toml"),
+        "# Isolated fixture\n",
+    )
+    .unwrap();
+    crate::app_server::antigravity::set_config_root(fixture.root.path());
+    crate::app_server::antigravity::auth::adopt(crate::app_server::antigravity::auth::Credential {
+        access_token: "cold-account-access".into(),
+        refresh_token: Some("cold-account-refresh".into()),
+        expires_at: Some(32_503_680_000_000i64),
+        account: Some("cold@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("cold-project".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        !fixture.root.path().join("antigravity-models.json").exists(),
+        "test requires a cold account with no disk catalog snapshot"
+    );
+
+    let fenced = request(
+        &mut fixture.client,
+        210,
+        "session/beginModelUpdate",
+        json!({
+            "sessionId": "side",
+            "changeId": "chg-cold-hydrogen",
+            "expectedRevision": 0
+        }),
+    )
+    .await;
+    assert_eq!(fenced["result"]["revision"], 0, "{fenced}");
+
+    let reply = request(
+        &mut fixture.client,
+        211,
+        "session/reconfigureModel",
+        json!({
+            "sessionId": "side",
+            "changeId": "chg-cold-hydrogen",
+            "expectedRevision": 0,
+            "init": {
+                "modelSelection": "antigravity:gemini-4-neon-high",
+                "orchestratorTarget": antigravity_target("gemini-4-neon-high")
+            }
+        }),
+    )
+    .await;
+    assert_eq!(reply["result"]["revision"], 1, "{reply}");
+    let runtime = super::runtime(&mut fixture, 212).await;
+    assert_eq!(runtime["model"], "gemini-4-neon-high", "{runtime}");
+    assert!(runtime["pendingChangeId"].is_null(), "{runtime}");
+    assert!(runtime["modelUpdateError"].is_null(), "{runtime}");
+    assert_ready_antigravity_target(&runtime["orchestratorTarget"], "gemini-4-neon-high");
+
+    fixture.close().await;
+    crate::app_server::antigravity::auth::logout()
+        .await
+        .unwrap();
+    server_task.abort();
+    unsafe {
+        match previous_api {
+            Some(value) => std::env::set_var("KLAUS_ANTIGRAVITY_API_URL", value),
+            None => std::env::remove_var("KLAUS_ANTIGRAVITY_API_URL"),
+        }
+        match previous_direct {
+            Some(value) => std::env::set_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", value),
+            None => std::env::remove_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT"),
+        }
+    }
+}
