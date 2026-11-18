@@ -48,21 +48,23 @@ const KLAUS_MANUAL_URL: &str = "https://klaus-ai.cn/klaus-manual.md";
 /// stays as the fallback for hosts that expose no such tool.
 const KLAUS_DOCS_BODY_TEMPLATE: &str = r#"# Klaus Docs
 
-You are answering a question about Klaus itself — the product the user is talking to.
+You are answering a question about Klaus itself — the desktop app, Klaus iOS, or Klaus Cli.
 
 ## 1. Get the manual
 - If a `klaus_query` tool is available, that is the source: `klaus_query { key: "docs", action: "outline" }` for the chapter list, then `{ key: "docs", action: "section", arguments: { name } }` for the part you need, or `{ key: "docs", action: "search", arguments: { query } }` to locate a term. It is the same manual, offline and section-addressed, so prefer it over any fetch.
 - Otherwise fetch the official product manual with web_fetch from {manual_url}. If this thread already fetched it, reuse that instead of fetching again.
 - If neither source is reachable, say plainly that the manual is unavailable right now, then answer from general knowledge with the uncertainty clearly marked.
 
-## 2. Answer from the manual
-- Ground the answer in what the manual actually says, not model memory. Name the manual section the answer comes from.
-- If the user sent a screenshot, first state which Klaus surface or control it shows, then map it to the matching manual section and answer.
+## 2. Answer from the manual and live state
+- Ground the answer in what the manual actually says, not model memory. Name the manual section or exact UI path (`Settings → …`) the answer comes from.
+- Keep current product boundaries straight: Klaus uses the user's own model subscriptions or API keys (there is no Klaus model plan or built-in local GGUF runtime), and session work modes (`Plan`, `Goal`, `Orchestrate`, `Parallel`) are independent of permission modes.
+- If the user sent a screenshot, first state which Klaus surface, panel, or control it shows, then map it to the matching manual section and answer.
 - Answer only what was asked; skip unrelated product tours.
-- "Why did X not happen for me" is a question about this installation, not only about the documented rule. When `klaus_query` is available, read the relevant live surface too (the scheduled task and its runs, the setting, the connector state) and answer from what is actually configured; say so when the live state contradicts the documented default.
+- "Why did X happen / not happen for me" is a question about this installation, not only about the documented rule. When `klaus_query` is available, read the relevant live surface too (the setting or preference, model sources, scheduled tasks and runs, extensions, permissions, browser, or worktrees) — call `klaus_query { key: "<surface>" }` first to inspect its actions — and answer from what is actually configured; say so when the live state differs from the documented default.
+- When the user asks to open a setting or change a Klaus configuration on their behalf and `klaus_action` is available, use `klaus_action` (for example `{ key: "nav", action: "open", arguments: { view: "settings", tab: "<tab>" } }`), respecting confirmation gates on destructive or externally visible actions.
 
 ## 3. Gaps
-- If the manual does not cover the question, say so plainly. A clearly-labeled guess is allowed, but NEVER invent setting names, file paths, defaults, or behaviors.
+- If the manual does not cover the question, say so plainly. A clearly-labeled guess is allowed, but NEVER invent setting names, UI paths, file paths, CLI flags, defaults, or behaviors.
 - For a suspected bug or behavior contradicting the manual, point the user to the log files listed in the manual's troubleshooting section and the in-app feedback entry."#;
 
 /// The Computer Use execution policy and observation workflow. The product
@@ -249,10 +251,10 @@ pub fn builtin_skills() -> Vec<Skill> {
         Skill {
             name: RuntimeString::from("klaus-docs"),
             description:
-                "Klaus product self-knowledge: how features work, what settings mean, product mechanics, subscription, and troubleshooting — answered from the official Klaus manual instead of model memory."
+                "Klaus product self-knowledge: how features work, what settings mean, work modes, model sources, extensions, mobile & CLI, and troubleshooting — answered from the official Klaus manual instead of model memory."
                     .into(),
             when_to_use: Some(
-                "When the user asks about Klaus itself — a feature, a setting, how a mechanism works, subscription, or a problem with the app — including 'you' / 'this app' meaning Klaus, and screenshots of the Klaus UI. Not for ordinary tasks that merely mention Klaus."
+                "When the user asks about Klaus itself — a feature, a setting, work modes, model sources or provider sign-in, extensions, mobile/CLI, how a mechanism works, or a problem with the app — including 'you' / 'this app' meaning Klaus, and screenshots of the Klaus UI. Not for ordinary tasks that merely mention Klaus."
                     .into(),
             ),
             // inline: the MAIN loop fetches the manual itself and keeps the grounded
