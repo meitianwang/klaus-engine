@@ -636,7 +636,9 @@ pub async fn resolve(
     }
     if let Some(model) = selection.strip_prefix("antigravity:") {
         super::antigravity::set_config_root(config_root);
-        return super::antigravity::resolve(model, tiers).await.map(Some);
+        let tiers = super::conversation_catalog::canonical_antigravity_tiers(tiers);
+        let model = super::conversation_catalog::canonical_antigravity_model_id(model);
+        return super::antigravity::resolve(model, &tiers).await.map(Some);
     }
     if let Some(alias) = selection.strip_prefix("subscription:") {
         return claude(alias, config_root, tiers).await.map(Some);
@@ -1213,6 +1215,9 @@ pub(super) fn model_target_matches_provider(
     provider_model: &str,
 ) -> bool {
     model_id == provider_model
+        || (source == "antigravity"
+            && super::conversation_catalog::canonical_antigravity_model_id(model_id)
+                == provider_model)
         || (source == "subscription"
             && claude_lineup()["models"].as_array().is_some_and(|models| {
                 models.iter().any(|model| {

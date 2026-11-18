@@ -110,7 +110,8 @@ pub fn normalize_models(payload: &Value) -> Vec<Value> {
     let Some(models) = payload.get("models").and_then(Value::as_object) else {
         return Vec::new();
     };
-    let default_model = first_string(payload, &["defaultAgentModelId"]);
+    let default_model = first_string(payload, &["defaultAgentModelId"])
+        .map(super::super::conversation_catalog::canonical_antigravity_model_id);
     let catalog_order = catalog_model_order(payload);
     let mut entries: Vec<_> = models.iter().collect();
     entries.sort_by(|left, right| {
@@ -1707,5 +1708,82 @@ mod tests {
             Some("claude-opus-5-5-high")
         );
         assert!(!mapped.contains_key("gpt-oss-120b-medium"));
+    }
+
+    #[test]
+    fn harness_aliases_are_excluded_from_chat_choices_and_mapped_to_concrete_models() {
+        use super::super::super::conversation_catalog::{
+            canonical_antigravity_model_id, canonical_antigravity_tiers,
+        };
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-pro-orchestrator"),
+            "gemini-4-carbon-high"
+        );
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-pro-orchestrator-argon"),
+            "gemini-4-argon-high"
+        );
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-flash-worker-agy"),
+            "gemini-4-hydrogen-xhigh"
+        );
+        assert_eq!(
+            canonical_antigravity_model_id("gemini-4-carbon-medium"),
+            "gemini-4-carbon-medium"
+        );
+
+        let mut tiers = Map::new();
+        tiers.insert("high".into(), json!("antigravity:gemini-pro-orchestrator"));
+        tiers.insert("medium".into(), json!("gemini-pro-orchestrator-argon"));
+        tiers.insert("low".into(), json!("antigravity:gemini-flash-worker-agy"));
+        let canonical = canonical_antigravity_tiers(&tiers);
+        assert_eq!(canonical["high"], json!("antigravity:gemini-4-carbon-high"));
+        assert_eq!(canonical["medium"], json!("gemini-4-argon-high"));
+        assert_eq!(
+            canonical["low"],
+            json!("antigravity:gemini-4-hydrogen-xhigh")
+        );
+
+        let payload = json!({
+            "defaultAgentModelId": "gemini-pro-orchestrator",
+            "models": {
+                "gemini-pro-orchestrator": {
+                    "displayName": "Orchestrator (Carbon)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3
+                },
+                "gemini-pro-orchestrator-argon": {
+                    "displayName": "Orchestrator (Argon)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3
+                },
+                "gemini-flash-worker-agy": {
+                    "displayName": "Gemini 4 Hydrogen (Orchestrator)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 100
+                },
+                "gemini-4-carbon-high": {
+                    "displayName": "Gemini 4 Carbon (High)",
+                    "supportsThinking": true,
+                    "thinkingLevel": 3
+                }
+            }
+        });
+        let rows = normalize_models(&payload);
+        for alias in [
+            "gemini-pro-orchestrator",
+            "gemini-pro-orchestrator-argon",
+            "gemini-flash-worker-agy",
+        ] {
+            let row = rows.iter().find(|entry| entry["key"] == alias).unwrap();
+            assert_eq!(row["conversationModel"], json!(false));
+            assert!(!is_chat_model(row));
+        }
+        let carbon = rows
+            .iter()
+            .find(|entry| entry["key"] == "gemini-4-carbon-high")
+            .unwrap();
+        assert!(is_chat_model(carbon));
+        assert_eq!(carbon["isDefault"], json!(true));
     }
 }

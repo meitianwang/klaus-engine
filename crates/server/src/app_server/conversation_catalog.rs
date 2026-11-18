@@ -31,9 +31,51 @@ pub(super) fn is_conversation_model(source: &str, model: &Value) -> bool {
 /// Keep the purpose decision when normalizing a source row. This marker stays
 /// in the runtime inventory and is excluded from conversation responses.
 pub(super) fn mark_purpose(source: &str, raw: &Value, entry: &mut Map<String, Value>) {
-    if !is_conversation_model(source, raw) {
+    let key = entry
+        .get("key")
+        .or_else(|| raw.get("key"))
+        .or_else(|| raw.get("id"))
+        .or_else(|| raw.get("serverModelName"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if dedicated_identity(source, &key) || !is_conversation_model(source, raw) {
         entry.insert("conversationModel".into(), json!(false));
     }
+}
+
+/// Map dedicated Antigravity multi-step harness aliases onto the concrete chat models they wrap.
+pub(super) fn canonical_antigravity_model_id(model: &str) -> &str {
+    match model.trim() {
+        "gemini-pro-orchestrator" => "gemini-4-carbon-high",
+        "gemini-pro-orchestrator-argon" => "gemini-4-argon-high",
+        "gemini-flash-worker-agy" => "gemini-4-hydrogen-xhigh",
+        other => other,
+    }
+}
+
+/// Rewrite legacy Antigravity harness aliases inside per-source tier maps before lookup.
+pub(super) fn canonical_antigravity_tiers(tiers: &Map<String, Value>) -> Map<String, Value> {
+    tiers
+        .iter()
+        .map(|(tier, value)| {
+            let rewritten = value.as_str().map(|raw| {
+                let trimmed = raw.trim();
+                let prefixed = trimmed.starts_with("antigravity:");
+                let bare = trimmed.strip_prefix("antigravity:").unwrap_or(trimmed);
+                let canonical = canonical_antigravity_model_id(bare);
+                if canonical == bare {
+                    value.clone()
+                } else if prefixed {
+                    json!(format!("antigravity:{canonical}"))
+                } else {
+                    json!(canonical)
+                }
+            });
+            (tier.clone(), rewritten.unwrap_or_else(|| value.clone()))
+        })
+        .collect()
 }
 
 fn conversation_declaration(model: &Value) -> bool {
@@ -139,6 +181,9 @@ fn dedicated_identity(source: &str, key: &str) -> bool {
         return true;
     }
     match source {
+        "antigravity" => {
+            key.starts_with("gemini-pro-orchestrator") || key == "gemini-flash-worker-agy"
+        }
         "kiro" => key == "auto" || key.starts_with("auto::effort="),
         "bailian" => {
             key == "decision-model-preview"
@@ -187,6 +232,9 @@ mod tests {
     #[test]
     fn explicit_exclusions_are_scoped_to_their_source() {
         for (source, key) in [
+            ("antigravity", "gemini-pro-orchestrator"),
+            ("antigravity", "gemini-pro-orchestrator-argon"),
+            ("antigravity", "gemini-flash-worker-agy"),
             ("bailian", "decision-model-preview"),
             ("kiro", "auto"),
             ("kiro", "auto::effort=max"),

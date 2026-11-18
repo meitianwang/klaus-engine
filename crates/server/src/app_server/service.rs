@@ -4785,6 +4785,11 @@ async fn resolve_tier_target(
         qualify_tier_oauth(&mut value);
         return Ok(value);
     };
+    let model_id = if source == "antigravity" {
+        super::conversation_catalog::canonical_antigravity_model_id(&model_id).to_string()
+    } else {
+        model_id
+    };
     if !klaus_agent_core::engine::session::is_supported_model_source(&source) {
         return Ok(
             serde_json::json!({"type":"unavailable","source":source,"modelId":model_id,"code":"MODEL_TARGET_UNAVAILABLE","message":format!("Unsupported model source: {source}")}),

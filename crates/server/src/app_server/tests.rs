@@ -316,6 +316,9 @@ mod r01a16397_model_picker_visibility;
 #[path = "../../../core/tests/regressions/r01a16397_conversation_model_purpose.rs"]
 mod r01a16397_conversation_model_purpose;
 
+#[path = "../../../core/tests/regressions/r20261117_antigravity_harness_model_filter.rs"]
+mod r20261117_antigravity_harness_model_filter;
+
 #[path = "antigravity/local_first_tests.rs"]
 mod antigravity_local_first_tests;
 

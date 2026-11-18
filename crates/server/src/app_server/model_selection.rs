@@ -49,7 +49,11 @@ pub(super) async fn resolve(
         }
         "antigravity" => {
             super::antigravity::set_config_root(&model_sources::config_root_of(config_path));
-            super::antigravity::main_model(value, &params.model_tier_selections).await?
+            let tiers = super::conversation_catalog::canonical_antigravity_tiers(
+                &params.model_tier_selections,
+            );
+            let value = super::conversation_catalog::canonical_antigravity_model_id(value);
+            super::antigravity::main_model(value, &tiers).await?
         }
         "custom" => {
             let document = config_store::load(config_path)
