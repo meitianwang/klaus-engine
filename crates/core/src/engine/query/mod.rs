@@ -309,6 +309,10 @@ pub(crate) struct InferenceCapture {
     pub effort_override: Option<EffortValue>,
     /// Per-turn local orchestration override; `None` reads the captured bundle.
     pub ultra_override: Option<bool>,
+    /// Optional sink capturing the most recent post-projection wire `ModelRequest`
+    /// dispatched in this query so idle prompt-cache keep-alive can replay the
+    /// exact cached prefix.
+    pub last_wire_request: Option<Arc<Mutex<Option<ModelRequest>>>>,
 }
 
 impl InferenceCapture {
@@ -476,6 +480,13 @@ pub struct QueryParams {
     /// `context_hint_state`. A hint clear drops the baselines of cleared reads
     /// so the next edit re-reads files the model can no longer see.
     pub file_state: Option<Arc<crate::tools::file_state::InMemoryFileStateCache>>,
+    /// Snapshot reader for skill bodies already invoked in this conversation or
+    /// agent scope, allowing post-compaction context restoration to preserve
+    /// active skill instructions without forcing redundant skill loads.
+    #[allow(clippy::type_complexity)]
+    pub invoked_skills: Option<
+        Arc<dyn Fn() -> Vec<crate::context::skill_receipts::InvokedSkillContent> + Send + Sync>,
+    >,
     /// Persist fresh budget replacement records so a resumed session re-applies
     /// the same bodies byte-identically. Called with this turn's new records.
     pub on_tool_result_budget_records: Option<OnToolResultBudgetRecords>,

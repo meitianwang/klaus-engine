@@ -706,6 +706,7 @@ impl Session {
     ) -> Turn {
         crate::schemas::effort::normalize_legacy_ultra(&mut opts.effort, &mut opts.ultra_mode);
         let this = self.clone();
+        this.cancel_cache_keepalive();
         let Ok(inference_activity) = this.begin_inference_activity_for(opts.model.as_ref()) else {
             return this.defer_model_update_turn(validated.input, opts, pending_resume);
         };
@@ -718,6 +719,9 @@ impl Session {
             .or_else(|| this.pending_model())
             .unwrap_or_else(|| initial_bundle.config.model.clone());
         let inference_slot: super::InferenceSlot = Arc::new(Mutex::new(None));
+        let last_wire_request: Arc<Mutex<Option<crate::types::provider::ModelRequest>>> =
+            Arc::new(Mutex::new(None));
+        let last_step_warm_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let resolved_reviewer = Arc::new(RwLock::new(None));
         let inference_capture = crate::engine::query::InferenceCapture {
             slot: inference_slot.clone(),
@@ -753,6 +757,7 @@ impl Session {
             model_override: opts.model.clone(),
             effort_override: opts.effort.clone(),
             ultra_override: opts.ultra_mode,
+            last_wire_request: is_main_role.then(|| last_wire_request.clone()),
         };
         // The turn identity is minted up front so every turn-scoped artifact this
         // run produces (the rollout turn_context boundary, the query params the
@@ -1624,9 +1629,11 @@ impl Session {
         let on_message: crate::engine::query::OnMessage = {
             let this = this.clone();
             let turn_id = turn_id.clone();
+            let warm_tokens_sink = last_step_warm_tokens.clone();
             Box::new(move |m: Message| {
                 let this = this.clone();
                 let turn_id = turn_id.clone();
+                let warm_tokens_sink = warm_tokens_sink.clone();
                 Box::pin(async move {
                     let context_update = this.turn.context_window_update_gate.lock().await;
                     let prepared = match this.persistence.rollout() {
@@ -1652,6 +1659,12 @@ impl Session {
                     }
                     if let Message::Assistant(assistant) = &m {
                         if let Some(usage) = &assistant.usage {
+                            warm_tokens_sink.store(
+                                usage
+                                    .cache_read_input_tokens
+                                    .saturating_add(usage.cache_creation_input_tokens),
+                                Ordering::SeqCst,
+                            );
                             let mut window = this.turn.context_window_usage.lock_recover();
                             let previous = window.clone();
                             window.prefill_input_tokens.get_or_insert(
@@ -2087,6 +2100,22 @@ impl Session {
             file_state: (this.meta.role
                 != Some(crate::schemas::rollout::SessionRole::SideTask))
                 .then(|| this.file_state.clone()),
+            invoked_skills: (this.meta.role
+                != Some(crate::schemas::rollout::SessionRole::SideTask))
+                .then(|| {
+                    let session = Arc::downgrade(&this);
+                    Arc::new(move || {
+                        session
+                            .upgrade()
+                            .map(|session| session.invoked_skills_snapshot(None))
+                            .unwrap_or_default()
+                    })
+                        as Arc<
+                            dyn Fn() -> Vec<crate::context::skill_receipts::InvokedSkillContent>
+                                + Send
+                                + Sync,
+                        >
+                }),
             on_tool_result_budget_records: {
                 let this = this.clone();
                 Some(Arc::new(move |records| {
@@ -2672,6 +2701,25 @@ impl Session {
             if let Some(goal) = this2.goal_observation_runtime() { goal.testing_note_phase("query.dispatch"); }
             let mut gen = crate::engine::query::query_with_inference(params, deps, inference_capture);
             while let Some(ev) = gen.next().await {
+                if is_main_role
+                    && !abort2.is_cancelled()
+                    && matches!(
+                        &ev,
+                        EngineEvent::TurnCompleted {
+                            stop_reason: TerminalReason::Completed,
+                            ..
+                        }
+                    )
+                {
+                    let latest_req = last_wire_request.lock_recover().take();
+                    let warm = last_step_warm_tokens.load(Ordering::SeqCst);
+                    this2.arm_cache_keepalive_after_turn(
+                        &inference_slot,
+                        &initial_bundle,
+                        latest_req,
+                        warm,
+                    );
+                }
                 yield ev;
             }
         };

@@ -757,6 +757,7 @@ impl Session {
         }
         self.cancel_ordinary_runtimes_for_shutdown();
         self.cancel_transport_prewarm();
+        self.cancel_cache_keepalive();
         self.mcp_elicitation_router.cancel_all();
     }
 
@@ -4121,6 +4122,7 @@ impl Session {
             // long-lived cached prefix, so the idle pass never applies.
             context_hint_state: None,
             file_state: None,
+            invoked_skills: None,
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),
@@ -4139,6 +4141,7 @@ impl Session {
                 model_override: None,
                 effort_override: opts.effort,
                 ultra_override: None,
+                last_wire_request: None,
             },
         );
         let mut final_text = RuntimeString::default();

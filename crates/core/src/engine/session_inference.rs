@@ -1314,6 +1314,7 @@ impl Session {
         drop(admission);
         self.inference_changed.notify_waiters();
         self.cancel_transport_prewarm();
+        self.cancel_cache_keepalive();
         self.transport_prewarm_consumed
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.schedule_transport_prewarm();

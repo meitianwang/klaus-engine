@@ -1659,6 +1659,7 @@ impl Session {
             goal_observer: goal_observer_slot,
             transport_prewarm: Mutex::new(None),
             transport_prewarm_consumed: AtomicBool::new(false),
+            cache_keepalive: Mutex::new(None),
             maintenance_tasks: Mutex::new(maintenance_registry),
             maintenance_admission: Arc::new(MaintenanceAdmissionTracker::default()),
         });

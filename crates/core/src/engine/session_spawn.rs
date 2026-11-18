@@ -2545,6 +2545,16 @@ impl Session {
                 // means the sub-agent has already finished.
                 context_hint_state: None,
                 file_state: None,
+                invoked_skills: Some({
+                    let session = Arc::downgrade(&this);
+                    let agent = effective_agent_id.clone();
+                    Arc::new(move || {
+                        session
+                            .upgrade()
+                            .map(|session| session.invoked_skills_snapshot(Some(agent.clone().into())))
+                            .unwrap_or_default()
+                    })
+                }),
                 tool_result_budget_state: child_budget_state,
                 on_tool_result_budget_records: None,
                 // Sub-agents consult the main thread's cache-cold decision but never
@@ -2567,7 +2577,7 @@ impl Session {
                 host_observable: observable, settled: false,
             };
             let mut gen = crate::engine::query::query_with_inference(params, bundle.deps.to_engine_deps(),
-                crate::engine::query::InferenceCapture { slot: Arc::new(Mutex::new(Some(capture))), next: None, model_override: None, effort_override: None, ultra_override: None });
+                crate::engine::query::InferenceCapture { slot: Arc::new(Mutex::new(Some(capture))), next: None, model_override: None, effort_override: None, ultra_override: None, last_wire_request: None });
             let mut final_agent_text: Option<RuntimeString> = None;
             let mut final_agent_message_id: Option<RuntimeString> = None;
             let mut lifecycle_terminal: Option<SubagentStatus> = None;

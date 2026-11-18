@@ -444,6 +444,7 @@ impl Session {
             agent_id: None,
             context_hint_state: None,
             file_state: None,
+            invoked_skills: None,
             tool_result_budget_state: None,
             on_tool_result_budget_records: None,
             thinking_context_cold: false,

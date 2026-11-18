@@ -4,13 +4,17 @@
 /// The latest checkpoint summary text, or an empty string for opaque checkpoints.
 use super::CompactionRecord;
 use super::QueryParams;
+use crate::context::compact::policy::usable_context_window;
 use crate::context::retained_fragments::reinject_retained_fragments;
+use crate::context::retained_fragments::InvokedSkillsSection;
+use crate::context::retained_fragments::RecentWorkingFilesSection;
 use crate::context::retained_fragments::RunningTasksSection;
 use crate::context::retained_fragments::SurfacedToolsSection;
 use crate::provider::behavior::ProviderBehaviorProfile;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::message::Message;
 use crate::sync_ext::MutexExt;
+use crate::types::file_state::FileStateCache;
 use std::collections::HashSet;
 pub fn compaction_summary_of(messages: &[Message]) -> RuntimeString {
     for m in messages.iter().rev() {
@@ -150,15 +154,33 @@ pub(super) fn reinject_query_retained_fragments(
     messages: &mut Vec<Message>,
     profile: &ProviderBehaviorProfile,
 ) {
+    let config = shared.config();
+    let usable_window = usable_context_window(&config);
     let running = RunningTasksSection::new(shared.background_tasks.as_ref());
     let surfaced = {
         let surfaced_tools = shared.surfaced.lock_recover();
         let tools = shared.tools.lock_recover().clone();
         SurfacedToolsSection::new(&tools, &surfaced_tools)
     };
+    let skills_snapshot = shared
+        .params
+        .invoked_skills
+        .as_ref()
+        .map(|reader| reader())
+        .unwrap_or_default();
+    let invoked_skills = InvokedSkillsSection::new(&skills_snapshot, messages, usable_window);
+    let recent_files = RecentWorkingFilesSection::new(
+        shared
+            .params
+            .file_state
+            .as_deref()
+            .map(|cache| cache as &dyn FileStateCache),
+        messages,
+        usable_window,
+    );
     reinject_retained_fragments(
         messages,
-        &[&running, &surfaced],
+        &[&running, &surfaced, &invoked_skills, &recent_files],
         &|| (shared.deps.uuid)(),
         profile,
     );

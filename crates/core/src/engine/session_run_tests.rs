@@ -18323,3 +18323,186 @@ async fn manual_session_memory_extraction_updates_notes_and_advances_the_cursor(
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+struct KeepAliveFixtureProvider {
+    info: crate::types::provider::ProviderInfo,
+    warm_tokens_on_turn: u64,
+    warm_tokens_on_ping: u64,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<crate::types::provider::ModelRequest>>>,
+}
+
+impl crate::types::provider::ModelProvider for KeepAliveFixtureProvider {
+    fn info(&self) -> &crate::types::provider::ProviderInfo {
+        &self.info
+    }
+
+    fn capabilities(
+        &self,
+        _: &crate::runtime_values::RuntimeString,
+    ) -> crate::types::provider::ProviderCapabilities {
+        crate::types::provider::ProviderCapabilities {
+            supports_image_detail_original: false,
+            streaming: true,
+            tools: true,
+            thinking: true,
+            structured_output: false,
+            web_search: false,
+            prompt_cache_control: true,
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+            native_pdf: false,
+            vision: false,
+            image_limits: None,
+            max_media_blocks: None,
+        }
+    }
+
+    fn has_prewarm_endpoints(&self) -> bool {
+        true
+    }
+
+    fn stream(
+        &self,
+        req: crate::types::provider::ModelRequest,
+        _signal: crate::types::abort::AbortSignal,
+    ) -> crate::types::provider::ModelStream {
+        use crate::types::provider::{ModelStopReason, ModelStreamEvent};
+        let idx = {
+            let mut guard = self.calls.lock().unwrap();
+            let idx = guard.len();
+            guard.push(req.clone());
+            idx
+        };
+        let warm = if idx == 0 {
+            self.warm_tokens_on_turn
+        } else {
+            self.warm_tokens_on_ping
+        };
+        Box::pin(futures::stream::iter(vec![
+            ModelStreamEvent::MessageStart {
+                model: req.model.clone(),
+            },
+            ModelStreamEvent::TextDelta { text: "ok".into() },
+            ModelStreamEvent::MessageStop {
+                stop_reason: ModelStopReason::EndTurn,
+                usage: crate::schemas::message::Usage {
+                    input_tokens: 128,
+                    output_tokens: 1,
+                    cache_read_input_tokens: warm,
+                    cache_creation_input_tokens: 0,
+                    total_tokens: None,
+                },
+            },
+        ]))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_cache_keepalive_refreshes_large_warm_prefix_twice_and_cancels_on_shutdown() {
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let clock_ms = std::sync::Arc::new(AtomicI64::new(1_000));
+    let provider: std::sync::Arc<dyn crate::types::provider::ModelProvider> =
+        std::sync::Arc::new(KeepAliveFixtureProvider {
+            info: crate::types::provider::ProviderInfo {
+                name: "anthropic".into(),
+                default_model: "claude-sonnet-4-6".into(),
+                env_key: None,
+                base_url: Some("https://api.anthropic.com".into()),
+            },
+            warm_tokens_on_turn: 24_000,
+            warm_tokens_on_ping: 24_000,
+            calls: calls.clone(),
+        });
+    let mut cfg = crate::schemas::config::default_config();
+    cfg.model = "claude-sonnet-4-6".into();
+    cfg.prewarm = true;
+    let seq = std::sync::Arc::new(AtomicUsize::new(0));
+    let clock_reader = clock_ms.clone();
+    let deps = crate::engine::deps::production_deps(
+        provider.clone(),
+        crate::engine::deps::EngineDepsOverrides {
+            now: Some(std::sync::Arc::new(move || {
+                clock_reader.load(Ordering::SeqCst)
+            })),
+            uuid: Some(std::sync::Arc::new(move || {
+                format!("ka-turn-{}", seq.fetch_add(1, Ordering::SeqCst))
+            })),
+            ..Default::default()
+        },
+    );
+    let session =
+        mk_session_with_provider_and_memory(provider, deps, cfg.clone(), Vec::new(), None);
+
+    let first_turn = session
+        .run(
+            Input::Text("Inspect cache keep-alive".into()),
+            Default::default(),
+        )
+        .await;
+    assert!(first_turn.error.is_none());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let history_len = session.history_snapshot().len();
+
+    // First refresh at 4m.
+    clock_ms.store(241_000, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(241)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].max_output_tokens, 1);
+        assert_eq!(recorded[1].messages, recorded[0].messages);
+    }
+    assert_eq!(session.history_snapshot().len(), history_len);
+    assert_eq!(session.turn.last_response_at_ms(), Some(241_000));
+
+    // Second refresh at 8m.
+    clock_ms.store(482_000, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(241)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    assert_eq!(session.turn.last_response_at_ms(), Some(482_000));
+
+    // Bounded to MAX_CONSECUTIVE_KEEPALIVES = 2; 10 more minutes emits zero extra pings.
+    clock_ms.store(1_082_000, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    session.shutdown_and_wait().await.unwrap();
+
+    // Small prefix (< 16,384 warm tokens) and shutdown before 4m both emit zero pings.
+    let small_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let small_provider: std::sync::Arc<dyn crate::types::provider::ModelProvider> =
+        std::sync::Arc::new(KeepAliveFixtureProvider {
+            info: crate::types::provider::ProviderInfo {
+                name: "anthropic".into(),
+                default_model: "claude-sonnet-4-6".into(),
+                env_key: None,
+                base_url: Some("https://api.anthropic.com".into()),
+            },
+            warm_tokens_on_turn: 4_096,
+            warm_tokens_on_ping: 4_096,
+            calls: small_calls.clone(),
+        });
+    let small_deps =
+        crate::engine::deps::production_deps(small_provider.clone(), Default::default());
+    let small_session =
+        mk_session_with_provider_and_memory(small_provider, small_deps, cfg, Vec::new(), None);
+    let short_turn = small_session
+        .run(Input::Text("Short prompt".into()), Default::default())
+        .await;
+    assert!(short_turn.error.is_none());
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(small_calls.lock().unwrap().len(), 1);
+    small_session.shutdown_and_wait().await.unwrap();
+}

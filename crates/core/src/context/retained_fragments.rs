@@ -23,11 +23,16 @@
 
 use crate::context::manager::ContextFragment;
 use crate::context::manager::ContextManager;
+use crate::context::skill_receipts::InvokedSkillContent;
+use crate::context::tokens::estimate_context_tokens;
 use crate::provider::behavior::ProviderBehaviorProfile;
+use crate::runtime_values::RuntimePath;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::content::ContentBlock;
 use crate::schemas::content::HarnessEnvelope;
 use crate::schemas::message::Message;
+use crate::types::file_state::FileStateCache;
+use crate::types::file_state::FileStateEntry;
 use crate::types::tool::BackgroundTaskHandle;
 use crate::types::tool::BackgroundTaskRegistry;
 use crate::types::tool::BackgroundTaskStatus;
@@ -359,6 +364,372 @@ impl RetainedFragmentSection for SurfacedToolsSection {
         Some(RetainedFragmentRender {
             id: "surfaced-tools",
             order: 20,
+            text: self.text.clone()?,
+        })
+    }
+}
+
+// ---- Active invoked skills ----
+
+const INVOKED_SKILLS_CLASS_PREFIX: &str =
+    "Previously loaded skill instructions remain active after context compaction";
+
+const INVOKED_SKILLS_PREAMBLE: &str = "Previously loaded skill instructions remain active after context compaction — follow them directly without calling the skill tool again unless deeper sections are needed:\n";
+
+const MIN_RESTORATION_WINDOW_TOKENS: u64 = 16_000;
+const MAX_RESTORED_SKILLS: usize = 3;
+const MAX_SKILL_TOKENS_EACH: usize = 2_500;
+const MAX_SKILL_TOKENS_TOTAL: usize = 6_000;
+
+fn estimate_str_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+fn truncate_utf8_to_tokens(text: &str, max_tokens: usize, notice: &str) -> String {
+    let max_bytes = max_tokens.saturating_mul(4);
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let body_budget = max_bytes.saturating_sub(notice.len()).max(64);
+    let mut end = body_budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].trim_end().to_string();
+    out.push_str(notice);
+    out
+}
+
+fn history_already_carries_non_meta_text(history: &[Message], needle: &str) -> bool {
+    let probe = needle.trim();
+    if probe.is_empty() {
+        return false;
+    }
+    let probe = if probe.len() > 256 {
+        let mut end = 256;
+        while end > 0 && !probe.is_char_boundary(end) {
+            end -= 1;
+        }
+        &probe[..end]
+    } else {
+        probe
+    };
+    for message in history {
+        match message {
+            Message::User(user) if user.is_meta != Some(true) => {
+                for block in &user.content {
+                    if let ContentBlock::Text(text) = block {
+                        if text
+                            .text
+                            .try_to_utf8()
+                            .is_ok_and(|rendered| rendered.contains(probe))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                for block in &result.content {
+                    if let crate::schemas::content::OutputBlock::Text(text) = block {
+                        if text
+                            .text
+                            .try_to_utf8()
+                            .is_ok_and(|rendered| rendered.contains(probe))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Previously invoked skill bodies so compaction does not force the model to
+/// reload active `SKILL.md` instructions or lose domain rules while `has_invoked_skill_content`
+/// still marks the skill as already expanded.
+pub(crate) struct InvokedSkillsSection {
+    text: Option<RuntimeString>,
+    payload: Option<String>,
+}
+
+impl InvokedSkillsSection {
+    pub(crate) fn new(
+        skills: &[InvokedSkillContent],
+        history: &[Message],
+        usable_window_tokens: u64,
+    ) -> Self {
+        if skills.is_empty() || usable_window_tokens < MIN_RESTORATION_WINDOW_TOKENS {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        let total_cap = usize::try_from(
+            (usable_window_tokens / 20).clamp(1_024, MAX_SKILL_TOKENS_TOTAL as u64),
+        )
+        .unwrap_or(MAX_SKILL_TOKENS_TOTAL);
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
+        for entry in skills.iter().rev() {
+            let Ok(path) = entry.path.try_to_utf8() else {
+                continue;
+            };
+            let Ok(content) = entry.content.try_to_utf8() else {
+                continue;
+            };
+            let trimmed = content.trim();
+            if path.is_empty() || trimmed.is_empty() || !seen.insert(path.clone()) {
+                continue;
+            }
+            if history_already_carries_non_meta_text(history, trimmed) {
+                continue;
+            }
+            selected.push((path, trimmed.to_string()));
+            if selected.len() >= MAX_RESTORED_SKILLS {
+                break;
+            }
+        }
+        if selected.is_empty() {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        selected.reverse();
+
+        let mut remaining = total_cap;
+        let mut blocks = Vec::new();
+        for (path, content) in selected {
+            if remaining < 128 {
+                break;
+            }
+            let allowance = remaining.min(MAX_SKILL_TOKENS_EACH);
+            let excerpt = truncate_utf8_to_tokens(
+                &content,
+                allowance,
+                "\n... [truncated after context compaction; re-read this skill file if deeper sections are needed]",
+            );
+            let spent = estimate_str_tokens(&excerpt) + estimate_str_tokens(&path) + 8;
+            remaining = remaining.saturating_sub(spent);
+            blocks.push(RuntimeString::from(format!(
+                "### Skill ({path})\n{excerpt}"
+            )));
+        }
+        if blocks.is_empty() {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        let separator = RuntimeString::from("\n\n");
+        let mut body = blocks[0].clone();
+        for block in &blocks[1..] {
+            body = body.concat(&separator).concat(block);
+        }
+        let text = RuntimeString::from(INVOKED_SKILLS_PREAMBLE).concat(&body);
+        let payload = text.try_to_utf8().ok();
+        Self {
+            text: Some(text),
+            payload,
+        }
+    }
+}
+
+impl RetainedFragmentSection for InvokedSkillsSection {
+    fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
+        role == "user" && text.contains(INVOKED_SKILLS_CLASS_PREFIX)
+    }
+
+    fn matches_current_retained_fragment(&self, role: &str, text: &str) -> bool {
+        let Some(current) = self.payload.as_deref() else {
+            return false;
+        };
+        role == "user"
+            && retained_payload(text, INVOKED_SKILLS_CLASS_PREFIX)
+                .is_some_and(|found| found == current)
+    }
+
+    fn render_current(&self) -> Option<RetainedFragmentRender> {
+        Some(RetainedFragmentRender {
+            id: "invoked-skills",
+            order: 25,
+            text: self.text.clone()?,
+        })
+    }
+}
+
+// ---- Recent working files ----
+
+const RECENT_FILES_CLASS_PREFIX: &str =
+    "Recently read or edited workspace files preserved across context compaction";
+
+const RECENT_FILES_PREAMBLE: &str = "Recently read or edited workspace files preserved across context compaction (re-read any omitted middle range before editing it):\n";
+
+const MAX_RESTORED_FILES: usize = 5;
+const MAX_FILE_TOKENS_EACH: usize = 3_000;
+const MAX_FILE_TOKENS_TOTAL: usize = 12_000;
+const MAX_FULL_FILE_LINES: usize = 200;
+const EXCERPT_HEAD_LINES: usize = 120;
+const EXCERPT_TAIL_LINES: usize = 60;
+
+fn format_file_snippet(path: &str, content: &str, max_tokens: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let full_tokens = estimate_str_tokens(content);
+    if total_lines <= MAX_FULL_FILE_LINES && full_tokens <= max_tokens {
+        return format!("### {path} (complete, {total_lines} lines)\n{content}");
+    }
+    let body = if total_lines > EXCERPT_HEAD_LINES + EXCERPT_TAIL_LINES {
+        let head = lines[..EXCERPT_HEAD_LINES].join("\n");
+        let tail = lines[total_lines - EXCERPT_TAIL_LINES..].join("\n");
+        let omitted = total_lines - EXCERPT_HEAD_LINES - EXCERPT_TAIL_LINES;
+        format!(
+            "{head}\n... [{omitted} middle lines omitted after context compaction — call read with offset/limit before editing omitted lines] ...\n{tail}"
+        )
+    } else {
+        content.to_string()
+    };
+    let bounded = truncate_utf8_to_tokens(
+        &body,
+        max_tokens,
+        "\n... [tail truncated to fit post-compaction working-file budget; call read with offset/limit before editing]",
+    );
+    format!("### {path} (excerpt of {total_lines} lines)\n{bounded}")
+}
+
+/// Bounded working-file snippets from the canonical `FileStateCache` so the
+/// model keeps concrete code context across compaction without immediately
+/// re-reading files it just touched.
+pub(crate) struct RecentWorkingFilesSection {
+    text: Option<RuntimeString>,
+    payload: Option<String>,
+}
+
+impl RecentWorkingFilesSection {
+    pub(crate) fn new(
+        cache: Option<&dyn FileStateCache>,
+        history: &[Message],
+        usable_window_tokens: u64,
+    ) -> Self {
+        let Some(cache) = cache else {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        };
+        let occupied = estimate_context_tokens(history);
+        Self::from_entries(cache.entries(), history, usable_window_tokens, occupied)
+    }
+
+    pub(crate) fn from_entries(
+        entries: Vec<(RuntimePath, FileStateEntry)>,
+        history: &[Message],
+        usable_window_tokens: u64,
+        occupied_tokens: u64,
+    ) -> Self {
+        if entries.is_empty() || usable_window_tokens < MIN_RESTORATION_WINDOW_TOKENS {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        let headroom = usable_window_tokens.saturating_sub(occupied_tokens);
+        let budget_u64 = (usable_window_tokens / 12)
+            .min(MAX_FILE_TOKENS_TOTAL as u64)
+            .min(headroom / 4);
+        if budget_u64 < 256 {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        let mut remaining = usize::try_from(budget_u64).unwrap_or(MAX_FILE_TOKENS_TOTAL);
+        let mut selected = Vec::new();
+        for (path, entry) in entries.into_iter().rev() {
+            if entry.partial_view {
+                continue;
+            }
+            let Some(raw) = entry.content else {
+                continue;
+            };
+            let Ok(path_str) = path.as_runtime_string().try_to_utf8() else {
+                continue;
+            };
+            let Ok(content_str) = raw.try_to_utf8() else {
+                continue;
+            };
+            if path_str.is_empty() || content_str.trim().is_empty() {
+                continue;
+            }
+            if history_already_carries_non_meta_text(history, &content_str) {
+                continue;
+            }
+            selected.push((path_str, content_str));
+            if selected.len() >= MAX_RESTORED_FILES {
+                break;
+            }
+        }
+        if selected.is_empty() {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        selected.reverse();
+
+        let mut blocks = Vec::new();
+        for (path, content) in selected {
+            if remaining < 128 {
+                break;
+            }
+            let allowance = remaining.min(MAX_FILE_TOKENS_EACH);
+            let rendered = format_file_snippet(&path, &content, allowance);
+            let spent = estimate_str_tokens(&rendered) + 4;
+            remaining = remaining.saturating_sub(spent);
+            blocks.push(RuntimeString::from(rendered));
+        }
+        if blocks.is_empty() {
+            return Self {
+                text: None,
+                payload: None,
+            };
+        }
+        let separator = RuntimeString::from("\n\n");
+        let mut body = blocks[0].clone();
+        for block in &blocks[1..] {
+            body = body.concat(&separator).concat(block);
+        }
+        let text = RuntimeString::from(RECENT_FILES_PREAMBLE).concat(&body);
+        let payload = text.try_to_utf8().ok();
+        Self {
+            text: Some(text),
+            payload,
+        }
+    }
+}
+
+impl RetainedFragmentSection for RecentWorkingFilesSection {
+    fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
+        role == "user" && text.contains(RECENT_FILES_CLASS_PREFIX)
+    }
+
+    fn matches_current_retained_fragment(&self, role: &str, text: &str) -> bool {
+        let Some(current) = self.payload.as_deref() else {
+            return false;
+        };
+        role == "user"
+            && retained_payload(text, RECENT_FILES_CLASS_PREFIX)
+                .is_some_and(|found| found == current)
+    }
+
+    fn render_current(&self) -> Option<RetainedFragmentRender> {
+        Some(RetainedFragmentRender {
+            id: "recent-working-files",
+            order: 30,
             text: self.text.clone()?,
         })
     }
@@ -807,5 +1178,137 @@ mod tests {
             resolve_previous_state(&messages, &section),
             PreviousFragmentState::Known
         );
+    }
+
+    #[test]
+    fn recent_working_files_section_preserves_most_recent_complete_views_within_budget() {
+        let entries: Vec<(RuntimePath, FileStateEntry)> = (0..7)
+            .map(|idx| {
+                (
+                    RuntimePath::from(format!("/repo/src/file_{idx}.rs")),
+                    FileStateEntry {
+                        mtime_ms: idx as f64,
+                        size: Some(64),
+                        content: Some(RuntimeString::from(format!(
+                            "pub fn item_{idx}() -> usize {{ {idx} }}\n"
+                        ))),
+                        encoding: None,
+                        partial_view: idx == 6,
+                    },
+                )
+            })
+            .collect();
+        let mut messages = vec![boundary()];
+        let section = RecentWorkingFilesSection::from_entries(entries, &messages, 200_000, 1_000);
+        assert!(reinject_retained_fragments(
+            &mut messages,
+            &[&section],
+            &|| "files-1".to_string(),
+            &test_profile("fake-model"),
+        ));
+        let rendered = messages
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::User(u) if u.is_meta == Some(true) => Some(u),
+                _ => None,
+            })
+            .flat_map(|u| &u.content)
+            .find_map(|b| match b {
+                ContentBlock::Text(t) => t.text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .expect("injected file restoration fragment");
+        // Entry 6 is `partial_view: true` (auto-injected memory), so entries 1..=5 win (cap = 5).
+        assert!(!rendered.contains("file_6.rs"), "{rendered}");
+        assert!(!rendered.contains("file_0.rs"), "{rendered}");
+        for kept in 1..=5 {
+            assert!(rendered.contains(&format!("file_{kept}.rs")), "{rendered}");
+        }
+        // Idempotent on a second pass when nothing changed.
+        assert!(!reinject_retained_fragments(
+            &mut messages,
+            &[&section],
+            &|| "files-2".to_string(),
+            &test_profile("fake-model"),
+        ));
+    }
+
+    #[test]
+    fn recent_working_files_skips_injection_when_post_compaction_headroom_is_tight() {
+        let entries = vec![(
+            RuntimePath::from("/repo/src/lib.rs"),
+            FileStateEntry {
+                mtime_ms: 1.0,
+                size: Some(32),
+                content: Some(RuntimeString::from("pub fn tight() {}\n")),
+                encoding: None,
+                partial_view: false,
+            },
+        )];
+        let messages = vec![boundary()];
+        let tight =
+            RecentWorkingFilesSection::from_entries(entries.clone(), &messages, 20_000, 19_500);
+        assert!(tight.render_current().is_none());
+        let tiny_window = RecentWorkingFilesSection::from_entries(entries, &messages, 12_000, 500);
+        assert!(tiny_window.render_current().is_none());
+    }
+
+    #[test]
+    fn invoked_skills_section_restores_active_skills_and_replaces_stale_snapshot() {
+        let first = vec![InvokedSkillContent {
+            path: RuntimeString::from("/skills/push-code/SKILL.md"),
+            content: RuntimeString::from("Verify remote delivery before finishing."),
+        }];
+        let mut messages = vec![boundary()];
+        let section_v1 = InvokedSkillsSection::new(&first, &messages, 200_000);
+        assert!(reinject_retained_fragments(
+            &mut messages,
+            &[&section_v1],
+            &|| "skills-1".to_string(),
+            &test_profile("fake-model"),
+        ));
+        assert!(!reinject_retained_fragments(
+            &mut messages,
+            &[&section_v1],
+            &|| "skills-1b".to_string(),
+            &test_profile("fake-model"),
+        ));
+
+        let second = vec![
+            first[0].clone(),
+            InvokedSkillContent {
+                path: RuntimeString::from("/skills/engine-test/SKILL.md"),
+                content: RuntimeString::from("Run scoped verification first."),
+            },
+        ];
+        let after_second_compact = vec![messages[0].clone(), messages[1].clone()];
+        let mut updated = after_second_compact;
+        let section_v2 = InvokedSkillsSection::new(&second, &updated, 200_000);
+        assert!(reinject_retained_fragments(
+            &mut updated,
+            &[&section_v2],
+            &|| "skills-2".to_string(),
+            &test_profile("fake-model"),
+        ));
+        let skill_blocks: Vec<String> = updated
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::User(u) if u.is_meta == Some(true) => Some(u),
+                _ => None,
+            })
+            .flat_map(|u| &u.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => t.text.try_to_utf8().ok(),
+                _ => None,
+            })
+            .filter(|t| t.contains(INVOKED_SKILLS_CLASS_PREFIX))
+            .collect();
+        assert_eq!(
+            skill_blocks.len(),
+            1,
+            "stale skill fragment must be replaced, not duplicated"
+        );
+        assert!(skill_blocks[0].contains("push-code/SKILL.md"));
+        assert!(skill_blocks[0].contains("engine-test/SKILL.md"));
     }
 }

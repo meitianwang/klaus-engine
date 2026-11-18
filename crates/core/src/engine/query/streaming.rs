@@ -642,6 +642,13 @@ async fn stream_and_dispatch_inner(
     if attempt.is_cancelled() {
         return cancelled_before_provider_call(assistant_uuid);
     }
+    if let Some(slot) = shared
+        .inference
+        .as_ref()
+        .and_then(|capture| capture.last_wire_request.as_ref())
+    {
+        *slot.lock_recover() = Some(wire_req.clone());
+    }
     let deps = shared.deps();
     let provider_stream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (deps.call_model)(wire_req, attempt.clone())

@@ -151,6 +151,54 @@ impl Session {
                 }
             }
         }
+        {
+            let bundle = self.inference_snapshot();
+            let profile = crate::provider::behavior::resolve_provider_behavior_profile(
+                Some(bundle.provider.info()),
+                &config.model,
+            );
+            let usable_window = crate::context::compact::policy::usable_context_window(config);
+            let running_registry = self
+                .snapshot
+                .resolve_self()
+                .map(|session| session.background_task_registry_in_context(None, None));
+            let running = crate::context::retained_fragments::RunningTasksSection::new(
+                running_registry.as_ref(),
+            );
+            let surfaced = {
+                let surfaced_tools = self.surfaced_tools.lock_recover().clone();
+                let tools = self.current_tools();
+                crate::context::retained_fragments::SurfacedToolsSection::new(
+                    &tools,
+                    &surfaced_tools,
+                )
+            };
+            let is_side_task =
+                self.meta.role == Some(crate::schemas::rollout::SessionRole::SideTask);
+            let skills_snapshot = if is_side_task {
+                Vec::new()
+            } else {
+                self.invoked_skills_snapshot(None)
+            };
+            let invoked_skills = crate::context::retained_fragments::InvokedSkillsSection::new(
+                &skills_snapshot,
+                &history,
+                usable_window,
+            );
+            let recent_files = crate::context::retained_fragments::RecentWorkingFilesSection::new(
+                (!is_side_task).then_some(
+                    self.file_state.as_ref() as &dyn crate::types::file_state::FileStateCache
+                ),
+                &history,
+                usable_window,
+            );
+            crate::context::retained_fragments::reinject_retained_fragments(
+                &mut history,
+                &[&running, &surfaced, &invoked_skills, &recent_files],
+                &|| (self.deps.uuid)(),
+                &profile,
+            );
+        }
         crate::context::compact::full_compact::place_retained_context(&mut history);
         history
     }
@@ -368,5 +416,13 @@ impl Session {
         cache
             .get(&None)
             .is_some_and(|entries| entries.iter().any(|entry| entry.path == *path))
+    }
+
+    pub(crate) fn invoked_skills_snapshot(
+        &self,
+        agent: Option<RuntimeString>,
+    ) -> Vec<InvokedSkillContent> {
+        let cache = self.memory_roots.invoked_skill_content.lock_recover();
+        cache.get(&agent).cloned().unwrap_or_default()
     }
 }

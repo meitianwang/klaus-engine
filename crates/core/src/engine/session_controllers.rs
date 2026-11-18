@@ -4228,6 +4228,7 @@ impl<'a> ManualCompactionLease<'a> {
             .maintenance_admission
             .begin()
             .ok_or_else(|| "cannot compact a closing session".to_owned())?;
+        session.cancel_cache_keepalive();
         let mut stack = session.turn.active_stack.lock_recover();
         if session.lifecycle.is_disposed() {
             return Err("cannot compact a disposed session".to_owned());

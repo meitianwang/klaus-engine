@@ -3224,6 +3224,7 @@ fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {
         agent_type: None,
         context_hint_state: None,
         file_state: None,
+        invoked_skills: None,
         tool_result_budget_state: None,
         on_tool_result_budget_records: None,
         thinking_context_cold: false,
@@ -3248,6 +3249,7 @@ async fn missing_fixed_capture_fails_without_calling_legacy_transport() {
         model_override: None,
         effort_override: None,
         ultra_override: None,
+        last_wire_request: None,
     };
     let events =
         super::query_with_inference(mk_params(vec![user_msg("hi")], Vec::new()), deps, capture)
@@ -3277,6 +3279,7 @@ async fn failed_main_capture_does_not_send_with_legacy_transport() {
         model_override: None,
         effort_override: None,
         ultra_override: None,
+        last_wire_request: None,
     };
     let events =
         super::query_with_inference(mk_params(vec![user_msg("hi")], Vec::new()), deps, capture)
@@ -3301,6 +3304,7 @@ async fn cancelled_main_capture_settles_as_aborted_without_transport() {
         model_override: None,
         effort_override: None,
         ultra_override: None,
+        last_wire_request: None,
     };
     let task = tokio::spawn(async move {
         super::query_with_inference(

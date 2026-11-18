@@ -437,8 +437,8 @@ pub(super) fn prepare_with_inference(
     } else {
         None
     };
-    let isolate_gemini_session =
-        crate::context::runtime_reminders::enabled(config) && profile.family == Some("gemini");
+    let isolate_gemini_session = crate::context::runtime_reminders::is_antigravity_source(config)
+        && profile.family == Some("gemini");
     let (cache_key, cache_domain) = if isolate_gemini_session {
         (
             (!params.thread_id.is_empty())
@@ -489,10 +489,7 @@ pub(super) fn prepare_with_inference(
             params.thinking_context_cold,
         ),
     };
-    crate::context::runtime_reminders::project(
-        &mut request,
-        crate::context::runtime_reminders::enabled(config),
-    );
+    crate::context::runtime_reminders::project_for_source(&mut request, config, provider_info);
     PreparedModelRequest { request, profile }
 }
 
@@ -1083,7 +1080,7 @@ pub(crate) fn antigravity_gemini_eager_tools(
     provider_info: Option<&ProviderInfo>,
     model: &RuntimeString,
 ) -> bool {
-    crate::context::runtime_reminders::enabled(config)
+    crate::context::runtime_reminders::is_antigravity_source(config)
         && resolve_provider_behavior_profile(provider_info, model).family == Some("gemini")
 }
 

@@ -337,6 +337,8 @@ pub(crate) use session_spawn_part::*;
 mod session_run_part;
 #[allow(unused_imports)]
 pub(crate) use session_run_part::*;
+#[path = "session_cache_keepalive.rs"]
+mod session_cache_keepalive_part;
 #[path = "session_cron.rs"]
 mod session_cron_part;
 #[path = "session_goal.rs"]
@@ -345,6 +347,8 @@ mod session_goal_part;
 mod session_prewarm_part;
 #[path = "session_retained_goal.rs"]
 mod session_retained_goal_part;
+#[allow(unused_imports)]
+pub(crate) use session_cache_keepalive_part::*;
 #[allow(unused_imports)]
 pub(crate) use session_cron_part::*;
 #[allow(unused_imports)]
@@ -1415,6 +1419,8 @@ pub struct Session {
     transport_prewarm: Mutex<Option<(u64, crate::provider::prewarm::TransportPrewarm)>>,
     /// Set once the first turn has resolved the startup prewarm.
     transport_prewarm_consumed: AtomicBool,
+    /// Cost-gated sliding-TTL prompt-cache keep-alive for idle main sessions.
+    cache_keepalive: Mutex<Option<PromptCacheKeepAlive>>,
     /// Atomically gates registration against shutdown and owns cancellation +
     /// join handles for automatic extraction and automatic/manual Dream forks.
     maintenance_tasks: Mutex<MaintenanceRegistry>,

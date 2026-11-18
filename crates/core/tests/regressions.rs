@@ -802,3 +802,6 @@ mod r20261115_antigravity_egress_unavailable_classification;
 
 #[path = "regressions/rd180b66_antigravity_turn_context.rs"]
 mod rd180b66_antigravity_turn_context;
+
+#[path = "regressions/r20261117_context_restoration_and_prefix_stability.rs"]
+mod r20261117_context_restoration_and_prefix_stability;

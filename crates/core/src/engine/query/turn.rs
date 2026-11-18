@@ -1168,7 +1168,14 @@ async fn run_turn(
         }
         // Estimates project snapshots without writing history. Admit the final
         // post-compaction view once so retries and reloads preserve its prefix.
-        if crate::context::runtime_reminders::enabled(&shared.config()) {
+        let runtime_provider_info = shared
+            .bundle()
+            .map(|bundle| bundle.provider.info().clone())
+            .or_else(|| shared.params.provider_info.clone());
+        if crate::context::runtime_reminders::enabled_with_provider(
+            &shared.config(),
+            runtime_provider_info.as_ref(),
+        ) {
             let pending: Vec<_> = prepared
                 .request
                 .messages
@@ -2746,8 +2753,14 @@ fn apply_total_tokens_reminder(
             matches!(message,
             Message::User(user) if user.is_meta != Some(true) && user.question_answer.is_none())
         });
-    let attachment = (!crate::context::runtime_reminders::enabled(config)
-        && (after_tool_batch || after_user))
+    let runtime_provider_info = shared
+        .bundle()
+        .map(|bundle| bundle.provider.info().clone())
+        .or_else(|| shared.params.provider_info.clone());
+    let attachment = (!crate::context::runtime_reminders::enabled_with_provider(
+        config,
+        runtime_provider_info.as_ref(),
+    ) && (after_tool_batch || after_user))
         .then(|| {
             Message::User(UserMessage {
                 uuid: RuntimeString::from("total-tokens:").concat(&shared.params.turn_id),
