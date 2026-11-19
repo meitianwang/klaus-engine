@@ -463,6 +463,7 @@ pub(super) fn prepare_with_inference(
         deferred_tools: Vec::new(),
         wire_caps: None,
         frozen_tools: None,
+        frozen_instructions: None,
         tool_inventory_events: Vec::new(),
         tool_choice,
         max_output_tokens,
@@ -841,6 +842,7 @@ impl Shared {
                 prefix_hash,
                 oversized,
                 events: Vec::new(),
+                instructions: Some(crate::types::provider::stable_system_text(&request.system)),
             });
         }
         let epoch = state.as_mut().expect("epoch just established");
@@ -856,6 +858,7 @@ impl Shared {
         }
         request.frozen_tools = Some(epoch.specs.clone());
         request.tool_inventory_events = epoch.events.clone();
+        request.frozen_instructions = epoch.instructions.clone();
     }
 
     /// Whether the current model could ride an in-place tool-change transport

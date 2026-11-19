@@ -700,6 +700,10 @@ pub(super) struct ToolFreezeEpoch {
     pub(super) prefix_hash: [u8; 32],
     pub(super) oversized: bool,
     pub(super) events: Vec<crate::types::provider::ToolInventoryEvent>,
+    /// Stable instruction text captured with the baseline, for transports that
+    /// send base instructions as a byte-stable prefix history item that is not
+    /// re-asserted while the epoch stands.
+    pub(super) instructions: Option<RuntimeString>,
 }
 
 struct Shared {

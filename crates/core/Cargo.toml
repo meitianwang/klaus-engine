@@ -57,7 +57,7 @@ libc = "0.2"
 sha2 = "0.10"
 hmac = "0.12"
 crc32fast = "1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 encoding_rs = "0.8"
 unicode-normalization = "0.1"
 toml_edit = "0.22"

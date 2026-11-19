@@ -570,6 +570,28 @@ pub struct SystemPromptPart {
     pub cache_scope: Option<CacheScope>,
 }
 
+/// Whether a system part belongs to the stable, cacheable instruction prefix.
+/// Volatile runtime guidance and collaboration-mode parts ride the message
+/// stream instead and may change between requests.
+pub fn is_stable_system_part(part: &SystemPromptPart) -> bool {
+    part.cacheable != Some(false) && part.name != "collaboration-mode"
+}
+
+/// Join the stable system parts into one instruction text, mirroring the
+/// provider-side stable prefix projection.
+pub fn stable_system_text(system: &[SystemPromptPart]) -> RuntimeString {
+    let mut joined = RuntimeString::default();
+    let mut first = true;
+    for part in system.iter().filter(|part| is_stable_system_part(part)) {
+        if !first {
+            joined = joined.concat(&RuntimeString::from("\n\n"));
+        }
+        first = false;
+        joined = joined.concat(&part.text);
+    }
+    joined
+}
+
 impl RuntimeEncode for SystemPromptPart {
     fn encode_runtime(&self, out: &mut RuntimeEncoder) -> Result<(), RuntimeCodecError> {
         let mut object = RuntimeObjectEncoder::new();
@@ -858,6 +880,10 @@ pub struct ModelRequest {
     /// Recorded inventory changes since `frozen_tools`, in order, anchored to
     /// message uuids. Internal only: ordinary decoded requests leave it unset.
     pub tool_inventory_events: Vec<ToolInventoryEvent>,
+    /// Stable instruction text frozen with the tool epoch, for transports that
+    /// send the base instructions as a byte-stable prefix history item.
+    /// Internal only: ordinary decoded requests leave it unset.
+    pub frozen_instructions: Option<RuntimeString>,
     pub deferred_tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
@@ -1028,6 +1054,7 @@ impl RuntimeDecode for ModelRequest {
                 deferred_tools: Vec::new(),
                 wire_caps: None,
                 frozen_tools: None,
+                frozen_instructions: None,
                 tool_inventory_events: Vec::new(),
                 tool_choice: object.optional("toolChoice", &[])?,
                 max_output_tokens: object.required("maxOutputTokens", &[])?,

@@ -318,9 +318,10 @@ impl OpenAIProvider {
             &request,
             &caps,
             self.reasoning_dialect,
-            function_tools,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools,
+                ..ResponsesToolAssembly::plain()
+            },
         )?;
         if self.uses_responses_backend_format() {
             adapt_codex_responses_params(&mut body);

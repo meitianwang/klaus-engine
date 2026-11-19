@@ -158,6 +158,7 @@ fn request(model: &str, round: usize) -> ModelRequest {
         deferred_tools: Vec::new(),
         wire_caps: None,
         frozen_tools: None,
+        frozen_instructions: None,
         tool_inventory_events: Vec::new(),
         tool_choice: None,
         max_output_tokens: 128,
@@ -365,7 +366,15 @@ async fn assert_provider_delivery(api: OpenAiApi, model: &str) {
             OpenAiApi::Chat => {
                 assert_eq!(wire[0], json!({"role":"system","content":STABLE_PREFIX}))
             }
-            OpenAiApi::Responses => assert_eq!(body["instructions"], STABLE_PREFIX),
+            OpenAiApi::Responses => {
+                // The stable prefix rides the input as an identified developer
+                // message item; the top-level instructions field is gone.
+                assert!(body.get("instructions").is_none());
+                assert_eq!(wire[0]["type"], json!("message"));
+                assert_eq!(wire[0]["role"], json!("developer"));
+                assert_eq!(content_text(&wire[0]), STABLE_PREFIX);
+                assert!(wire[0]["id"].as_str().unwrap().starts_with("msg_"));
+            }
         }
         assert_tool_batches(wire, api);
         let history = &wire[..wire.len() - 1];
@@ -492,7 +501,11 @@ async fn persisted_runtime_guidance_keeps_native_roles_and_the_prior_history_pre
             OpenAiApi::Chat => {
                 assert_eq!(prior[0], json!({"role":"system","content":STABLE_PREFIX}))
             }
-            OpenAiApi::Responses => assert_eq!(bodies[0]["instructions"], STABLE_PREFIX),
+            OpenAiApi::Responses => {
+                assert!(bodies[0].get("instructions").is_none());
+                assert_eq!(prior[0]["role"], json!("developer"));
+                assert_eq!(content_text(&prior[0]), STABLE_PREFIX);
+            }
         }
     }
 }
@@ -558,7 +571,18 @@ async fn context_reinsertion_promotes_only_typed_text_and_keeps_user_media_bound
         messages.push(user("human-after-guidance"));
         let bodies = capture_history(api, vec![messages]).await;
         let all = items(&bodies[0], api);
-        let wire = &all[usize::from(matches!(api, OpenAiApi::Chat))..];
+        // Both wires lead with the stable instruction item: Chat as a system
+        // message, Responses as an identified developer message item.
+        let instructions_item = &all[0];
+        assert_eq!(
+            instructions_item["role"],
+            match api {
+                OpenAiApi::Chat => "system",
+                OpenAiApi::Responses => "developer",
+            }
+        );
+        assert_eq!(content_text(instructions_item), STABLE_PREFIX);
+        let wire = &all[1..];
         let guidance_role = match api {
             OpenAiApi::Chat => "system",
             OpenAiApi::Responses => "developer",

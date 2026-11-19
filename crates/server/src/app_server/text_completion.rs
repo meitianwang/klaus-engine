@@ -291,6 +291,7 @@ async fn complete(
         deferred_tools: Vec::new(),
         wire_caps: None,
         frozen_tools: None,
+        frozen_instructions: None,
         tool_inventory_events: Vec::new(),
         tool_choice: None,
         max_output_tokens: params.max_output_tokens.min(capabilities.max_output_tokens),

@@ -277,9 +277,7 @@ impl ClassifierConnector for OpenAIClassifierConnector {
             &request.request,
             &capabilities,
             self.provider.reasoning_dialect,
-            false,
-            false,
-            false,
+            ResponsesToolAssembly::plain(),
         )?;
         let effort = self
             .raw_effort

@@ -1745,18 +1745,77 @@ fn build_responses_params(
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
 ) -> Result<Value, ProviderError> {
-    build_responses_params_with_tool_mode(req, caps, dialect, false, true, true)
+    build_responses_params_with_tool_mode(
+        req,
+        caps,
+        dialect,
+        ResponsesToolAssembly {
+            tool_batches_allowed: true,
+            tool_namespaces_allowed: true,
+            ..ResponsesToolAssembly::plain()
+        },
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Wire assembly options for one Responses request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResponsesToolAssembly {
+    /// Force plain function tools; compatibility surfaces and auxiliary bodies
+    /// must not carry native tool protocol fields.
+    pub function_tools: bool,
+    /// Cumulative in-input tool batches are permitted (learning layer).
+    pub tool_batches_allowed: bool,
+    /// Grouped namespace declarations are permitted (learning layer).
+    pub tool_namespaces_allowed: bool,
+    /// Send the stable system prefix as a base-instructions message item
+    /// instead of the top-level instructions field.
+    pub instructions_item: bool,
+    /// The endpoint is a first-party surface that accepts internal passthrough
+    /// metadata on harness-authored items.
+    pub first_party_metadata: bool,
+}
+
+impl ResponsesToolAssembly {
+    /// The conservative shape for auxiliary bodies: no native tool protocol
+    /// fields and the classic top-level instructions field.
+    pub fn plain() -> Self {
+        Self {
+            function_tools: false,
+            tool_batches_allowed: false,
+            tool_namespaces_allowed: false,
+            instructions_item: false,
+            first_party_metadata: false,
+        }
+    }
+}
+
+/// Whether a model rides the cumulative Responses tool batches per the
+/// declared capability set and the offline compatibility list. Batch-wire
+/// models accept client-executed declarations only: no hosted tool entries and
+/// no top-level declaration list.
+fn responses_batch_wire_model(caps: &ModelCapabilities, model: &RuntimeString) -> bool {
+    let system_messages = caps.mid_convo_system_messages.unwrap_or_else(|| {
+        super::model_catalog::mid_convo_system_messages_default("openai", model)
+    });
+    let additional = caps
+        .additional_tools
+        .unwrap_or_else(|| super::model_catalog::additional_tools_default("openai", model));
+    system_messages && additional
+}
+
 fn build_responses_params_with_tool_mode(
     req: &ModelRequest,
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
-    function_tools: bool,
-    tool_batches_allowed: bool,
-    tool_namespaces_allowed: bool,
+    assembly: ResponsesToolAssembly,
 ) -> Result<Value, ProviderError> {
+    let ResponsesToolAssembly {
+        function_tools,
+        tool_batches_allowed,
+        tool_namespaces_allowed,
+        instructions_item,
+        first_party_metadata,
+    } = assembly;
     let structured = req.output_schema.is_some();
     let native_search = !function_tools
         && req
@@ -1857,6 +1916,10 @@ fn build_responses_params_with_tool_mode(
     if let Some(ws_req) = req
         .web_search
         .as_ref()
+        // Batch-wire bodies carry no top-level declaration list at all; the
+        // hosted search entry has no residence there and the session's
+        // client-executed search tool owns the surface.
+        .filter(|_| !batch_tools)
         .filter(|search| search.access != crate::schemas::config::WebSearchAccess::Disabled)
     {
         let mut ws = Map::new();
@@ -1935,8 +1998,8 @@ fn build_responses_params_with_tool_mode(
             Value::Array(vec![vs("reasoning.encrypted_content")]),
         );
     }
-    if !instructions.is_empty() {
-        obj.insert("instructions", vs(instructions));
+    if !instructions.is_empty() && !instructions_item {
+        obj.insert("instructions", vs(instructions.clone()));
     }
     let (mut input, unresolved_guidance) = project_responses_input(
         &req.messages,
@@ -1954,7 +2017,9 @@ fn build_responses_params_with_tool_mode(
     )?;
     if batch_tools {
         // The initial batch is always the first input item and stays
-        // byte-identical for the lifetime of the cache epoch.
+        // byte-identical for the lifetime of the cache epoch. Its id is
+        // content-derived, so rebuilt requests for the same conversation and
+        // the same declarations reproduce the same identity byte-for-byte.
         if let Value::Array(items) = &mut input {
             let frozen = normalize_batch_kinds(req.frozen_tools.as_ref().expect("checked above"));
             let batch_grouping = if namespaces {
@@ -1962,17 +2027,48 @@ fn build_responses_params_with_tool_mode(
             } else {
                 ResponsesToolGrouping::Flat
             };
-            items.insert(
-                0,
-                vobj([
-                    ("type", vs("additional_tools")),
-                    ("role", vs("developer")),
-                    (
-                        "tools",
-                        Value::Array(grouped_responses_tools(&frozen, batch_grouping)),
-                    ),
-                ]),
+            let batch_tools_value = Value::Array(grouped_responses_tools(&frozen, batch_grouping));
+            let id = responses_prefix_item_id(
+                "at",
+                req,
+                runtime_json::stringify(&batch_tools_value)
+                    .try_to_utf8()
+                    .unwrap_or_default()
+                    .as_bytes(),
             );
+            let mut batch = Map::new();
+            batch.insert("type", vs("additional_tools"));
+            batch.insert("id", vs(id));
+            batch.insert("role", vs("developer"));
+            batch.insert("tools", batch_tools_value);
+            items.insert(0, Value::Object(batch));
+        }
+    }
+    if instructions_item {
+        // The stable system prefix rides the input as a message item with a
+        // content-derived id, never as the top-level instructions field. Batch
+        // mode freezes the text with the tool epoch so the prefix item stays
+        // byte-identical for the epoch's lifetime; the plain mode re-asserts it
+        // at the front of every request.
+        let text = if batch_tools {
+            req.frozen_instructions
+                .clone()
+                .filter(|frozen| !frozen.is_empty())
+                .unwrap_or_else(|| instructions.clone())
+        } else {
+            instructions.clone()
+        };
+        if !text.is_empty() {
+            let id = responses_prefix_item_id(
+                "msg",
+                req,
+                text.try_to_utf8().unwrap_or_default().as_bytes(),
+            );
+            let item = responses_base_instructions_item(&text, id, first_party_metadata);
+            if let Value::Array(items) = &mut input {
+                let position = usize::from(batch_tools).min(items.len());
+                items.insert(position, item);
+            }
         }
     }
     if unresolved_guidance {
@@ -2330,6 +2426,52 @@ fn responses_call_internal_name(item: &Value) -> RuntimeString {
         .and_then(Value::as_str)
         .and_then(|namespace| namespace.try_to_utf8().ok());
     internal_tool_name(namespace.as_deref(), &diagnostic_string(&name))
+}
+
+/// A content-derived wire item id: stable across rebuilds of the same logical
+/// payload inside one conversation identity, so retried and resumed requests
+/// preserve the item's identity byte-for-byte.
+fn responses_prefix_item_id(prefix: &str, req: &ModelRequest, content: &[u8]) -> RuntimeString {
+    let seed = req
+        .cache_domain
+        .clone()
+        .or_else(|| req.cache_key.clone())
+        .unwrap_or_else(|| req.model.clone());
+    let seed = seed.try_to_utf8().unwrap_or_default();
+    let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes());
+    let id = uuid::Uuid::new_v5(&namespace, content);
+    RuntimeString::from(format!("{prefix}_{id}"))
+}
+
+/// The base-instructions prefix item: a developer message whose identity is
+/// recognized by passthrough metadata rather than text sniffing. The metadata
+/// only rides first-party surfaces; the id always ships.
+fn responses_base_instructions_item(
+    text: &RuntimeString,
+    id: RuntimeString,
+    first_party_metadata: bool,
+) -> Value {
+    let mut item = Map::new();
+    item.insert("type", vs("message"));
+    item.insert("role", vs("developer"));
+    item.insert("id", vs(id));
+    item.insert(
+        "content",
+        Value::Array(vec![vobj([
+            ("type", vs("input_text")),
+            ("text", vs(text.clone())),
+        ])]),
+    );
+    if first_party_metadata {
+        item.insert(
+            "internal_chat_message_metadata_passthrough",
+            vobj([(
+                "content_item_kinds",
+                Value::Array(vec![vs("model.base_instructions")]),
+            )]),
+        );
+    }
+    Value::Object(item)
 }
 
 fn responses_custom_format(format: &ToolSpecFormat) -> Value {
@@ -3201,10 +3343,10 @@ fn split_system_for_cache(
     let mut stable = Vec::new();
     let mut volatile = Vec::new();
     for part in system {
-        if part.cacheable == Some(false) || part.name == "collaboration-mode" {
-            volatile.push(part);
-        } else {
+        if crate::types::provider::is_stable_system_part(part) {
             stable.push(part);
+        } else {
+            volatile.push(part);
         }
     }
     (stable, volatile)
@@ -6162,6 +6304,14 @@ impl OpenAIProvider {
                 && self.is_codex_subscription_backend())
     }
 
+    /// Whether requests go directly to a first-party OpenAI surface (the
+    /// official API or the subscription backend). Only those accept internal
+    /// passthrough metadata on harness-authored request items; third-party and
+    /// custom endpoints receive the same items without that metadata.
+    fn responses_first_party_openai(&self) -> bool {
+        self.is_codex_subscription_backend() || self.request_base_url.contains("api.openai.com")
+    }
+
     fn reviewer_attribution_model(&self) -> Option<RuntimeString> {
         self.is_codex_subscription_backend()
             .then(|| self.approval_review_preferred_model())
@@ -6420,6 +6570,7 @@ impl OpenAIProvider {
             !native_tool_support.disabled_for(&url, &req.model, ADDITIONAL_TOOLS_CAPABILITY);
         let tool_namespaces_allowed =
             !native_tool_support.disabled_for(&url, &req.model, TOOL_NAMESPACES_CAPABILITY);
+        let first_party_metadata = self.responses_first_party_openai();
         let reasoning_dialect = self.reasoning_dialect;
         let affinity_format = self.session_affinity_format(&req, &capabilities);
         let review_effort = self.review_effort.clone();
@@ -6469,7 +6620,14 @@ impl OpenAIProvider {
                 };
                 return;
             }
-            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, function_tools, tool_batches_allowed, tool_namespaces_allowed) {
+            let assembly = ResponsesToolAssembly {
+                function_tools,
+                tool_batches_allowed,
+                tool_namespaces_allowed,
+                instructions_item: true,
+                first_party_metadata,
+            };
+            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, assembly) {
                 Ok(mut body) => {
                     retain_scoped_responses_context(&mut body, compatibility.as_ref(), &req.model);
                     // The codex-subscription backend rejects some standard
@@ -6820,7 +6978,12 @@ impl ModelProvider for OpenAIProvider {
             structured_output: caps.structured_output,
             // Native web search is a Responses-API built-in; Chat has no hosted
             // search, so it is gated by the surface AND the declared capability.
-            web_search: self.api == OpenAiApi::Responses && caps.web_search,
+            // Batch-wire models take client-executed declarations only and have
+            // no hosted top-level surface, so their search runs through the
+            // client-side search tool instead.
+            web_search: self.api == OpenAiApi::Responses
+                && caps.web_search
+                && !responses_batch_wire_model(&caps, model),
             // Prompt caching is automatic and server-managed: no request-side control.
             prompt_cache_control: false,
             context_window: caps.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
@@ -6946,17 +7109,21 @@ impl ModelProvider for OpenAIProvider {
                 &request,
                 &capabilities,
                 self.reasoning_dialect,
-                function_tools,
-                !self.native_tool_support.disabled_for(
-                    &self.endpoint("/responses"),
-                    &request.model,
-                    ADDITIONAL_TOOLS_CAPABILITY,
-                ),
-                !self.native_tool_support.disabled_for(
-                    &self.endpoint("/responses"),
-                    &request.model,
-                    TOOL_NAMESPACES_CAPABILITY,
-                ),
+                ResponsesToolAssembly {
+                    function_tools,
+                    tool_batches_allowed: !self.native_tool_support.disabled_for(
+                        &self.endpoint("/responses"),
+                        &request.model,
+                        ADDITIONAL_TOOLS_CAPABILITY,
+                    ),
+                    tool_namespaces_allowed: !self.native_tool_support.disabled_for(
+                        &self.endpoint("/responses"),
+                        &request.model,
+                        TOOL_NAMESPACES_CAPABILITY,
+                    ),
+                    instructions_item: true,
+                    first_party_metadata: self.responses_first_party_openai(),
+                },
             )
             .map_err(|error| error.message)?;
             retain_scoped_responses_context(&mut body, self.compatibility.as_ref(), &request.model);
@@ -7782,6 +7949,7 @@ mod tests {
             deferred_tools: Vec::new(),
             wire_caps: None,
             frozen_tools: None,
+            frozen_instructions: None,
             tool_inventory_events: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1000,
@@ -8458,18 +8626,26 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            false,
-            true,
-            false,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .unwrap();
         let again = build_responses_params_with_tool_mode(
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            false,
-            true,
-            false,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .unwrap();
         assert_eq!(body, again, "batch assembly must be deterministic");
@@ -8567,9 +8743,13 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            false,
-            true,
-            false,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .unwrap();
         assert!(native_tool_loading::contains_tool_batches(&body));
@@ -10241,9 +10421,13 @@ mod tests {
             &request,
             &caps,
             OpenAiReasoningDialect::OpenAi,
-            false,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .unwrap();
         assert_eq!(body["reasoning"]["effort"], json!("high"));
@@ -11292,6 +11476,199 @@ mod tests {
         assert_eq!(body["input"][0]["tools"][0]["name"], vs("read"));
         assert_eq!(body["input"][1]["name"], vs("mcp__calendar__create_event"));
         assert!(body["input"][1].get("namespace").is_none());
+    }
+
+    fn stable_part(name: &str, text: &str) -> SystemPromptPart {
+        SystemPromptPart {
+            name: name.into(),
+            text: text.into(),
+            cacheable: None,
+            cache_scope: None,
+        }
+    }
+
+    fn instructions_assembly(first_party: bool) -> ResponsesToolAssembly {
+        ResponsesToolAssembly {
+            instructions_item: true,
+            first_party_metadata: first_party,
+            ..ResponsesToolAssembly::plain()
+        }
+    }
+
+    #[test]
+    fn base_instructions_ride_a_stable_id_bearing_message_item() {
+        let mut request = base_req();
+        request.system = vec![
+            stable_part("base", "You are Klaus."),
+            stable_part("collaboration-mode", "Mode text."),
+        ];
+        request.cache_key = Some("session-1".into());
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            instructions_assembly(true),
+        )
+        .unwrap();
+        // The top-level instructions field is gone; the stable prefix rides the
+        // input as an identified developer message item.
+        assert!(body.get("instructions").is_none());
+        let item = &body["input"][0];
+        assert_eq!(item["type"], json!("message"));
+        assert_eq!(item["role"], json!("developer"));
+        assert_eq!(
+            item["content"],
+            json!([{"type":"input_text","text":"You are Klaus."}])
+        );
+        assert_eq!(
+            item["internal_chat_message_metadata_passthrough"],
+            json!({"content_item_kinds":["model.base_instructions"]})
+        );
+        let id = item["id"].as_str().unwrap().try_to_utf8().unwrap();
+        assert!(id.starts_with("msg_"), "unexpected id {id}");
+        // Rebuilds are byte-identical, id included.
+        let again = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            instructions_assembly(true),
+        )
+        .unwrap();
+        assert_eq!(body, again);
+        // Third-party surfaces receive the same item and id without the
+        // internal passthrough metadata.
+        let third_party = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            instructions_assembly(false),
+        )
+        .unwrap();
+        assert!(third_party["input"][0]
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none());
+        assert_eq!(third_party["input"][0]["id"], item["id"].clone());
+        // The plain assembly keeps the classic top-level field.
+        let plain = build_responses_params(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        assert_eq!(plain["instructions"], vs("You are Klaus."));
+        // A different conversation identity derives a different id.
+        let mut other = request.clone();
+        other.cache_key = Some("session-2".into());
+        let other_body = build_responses_params_with_tool_mode(
+            &other,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            instructions_assembly(true),
+        )
+        .unwrap();
+        assert_ne!(other_body["input"][0]["id"], item["id"].clone());
+    }
+
+    #[test]
+    fn batch_mode_pins_the_instructions_item_behind_the_frozen_batch() {
+        let mut request = batch_fixture_request();
+        request.system = vec![stable_part("base", "Frozen base.")];
+        request.frozen_instructions = Some("Frozen base.".into());
+        request.cache_key = Some("session-3".into());
+        let assembly = ResponsesToolAssembly {
+            tool_batches_allowed: true,
+            tool_namespaces_allowed: true,
+            instructions_item: true,
+            first_party_metadata: true,
+            function_tools: false,
+        };
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            assembly,
+        )
+        .unwrap();
+        assert_eq!(body["input"][0]["type"], json!("additional_tools"));
+        assert_eq!(body["input"][1]["type"], json!("message"));
+        assert_eq!(
+            body["input"][1]["content"],
+            json!([{"type":"input_text","text":"Frozen base."}])
+        );
+        assert!(body.get("instructions").is_none());
+        let batch_id = body["input"][0]["id"]
+            .as_str()
+            .unwrap()
+            .try_to_utf8()
+            .unwrap();
+        assert!(batch_id.starts_with("at_"), "unexpected id {batch_id}");
+        // Stable-text drift inside the epoch does not move the frozen item.
+        request.system = vec![stable_part("base", "Drifted base.")];
+        let drifted = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            assembly,
+        )
+        .unwrap();
+        assert_eq!(drifted["input"][1], body["input"][1].clone());
+        assert_eq!(drifted["input"][0], body["input"][0].clone());
+        // The batch id is content-derived: a different frozen manifest changes
+        // it, an identical rebuild does not.
+        let same = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            assembly,
+        )
+        .unwrap();
+        assert_eq!(same["input"][0]["id"], body["input"][0]["id"].clone());
+        request.frozen_tools = Some(vec![batch_spec("read")]);
+        let changed = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            assembly,
+        )
+        .unwrap();
+        assert_ne!(changed["input"][0]["id"], body["input"][0]["id"].clone());
+    }
+
+    #[test]
+    fn batch_mode_never_emits_a_top_level_declaration_list() {
+        let mut request = batch_fixture_request();
+        request.web_search = Some(Default::default());
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                ..ResponsesToolAssembly::plain()
+            },
+        )
+        .unwrap();
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], json!("additional_tools"));
+    }
+
+    #[test]
+    fn batch_wire_models_report_no_hosted_web_search_capability() {
+        let provider = OpenAIProvider::new(OpenAIProviderOptions {
+            api: Some(OpenAiApi::Responses),
+            capabilities: Some(ModelCapabilities {
+                web_search: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Batch-wire generations take the client-executed search surface.
+        assert!(!provider.capabilities(&"gpt-5.6-sol".into()).web_search);
+        assert!(!provider.capabilities(&"gpt-6.2-sol".into()).web_search);
+        // Pre-batch generations keep the hosted declaration.
+        assert!(provider.capabilities(&"gpt-5.5".into()).web_search);
+        assert!(provider.capabilities(&"gpt-5.4".into()).web_search);
     }
 
     #[test]
@@ -13381,9 +13758,13 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            true,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .expect("function mode");
         assert!(body["tools"]
@@ -13435,9 +13816,13 @@ mod tests {
                 &request,
                 &ModelCapabilities::default(),
                 OpenAiReasoningDialect::OpenAi,
-                true,
-                false,
-                false,
+                ResponsesToolAssembly {
+                    function_tools: true,
+                    tool_batches_allowed: false,
+                    tool_namespaces_allowed: false,
+                    instructions_item: false,
+                    first_party_metadata: false,
+                },
             )
             .expect("choice");
             assert_eq!(body["tool_choice"], expected);
@@ -13454,9 +13839,13 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            true,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .expect("switch to functions");
         assert_eq!(
@@ -13469,9 +13858,13 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            true,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .expect_err("removed raw schema");
         assert_eq!(
@@ -13485,9 +13878,13 @@ mod tests {
             &request,
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
-            true,
-            false,
-            false,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
         )
         .expect_err("raw history cannot invent another required field");
         assert_eq!(
