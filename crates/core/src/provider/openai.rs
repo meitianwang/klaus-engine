@@ -1198,6 +1198,106 @@ fn apply_openai_cache_fields(
     }
 }
 
+/// Session-affinity headers per the resolved format: the openai face carries a
+/// session id plus a per-request id; the nosession face only the request id;
+/// the openrouter face a single session header. Routing values reuse the
+/// cache-key identity so affinity follows the cache domain.
+fn apply_session_affinity_headers(
+    headers: &mut HashMap<String, String>,
+    req: &ModelRequest,
+    format: &str,
+) {
+    let Some(session) = req
+        .cache_domain
+        .as_ref()
+        .or(req.cache_key.as_ref())
+        .map(diagnostic_string)
+    else {
+        return;
+    };
+    match format {
+        "openrouter" => {
+            headers.insert("x-session-id".to_string(), session);
+        }
+        "openai_nosession" => {
+            headers.insert("x-client-request-id".to_string(), random_request_id());
+        }
+        _ => {
+            headers.insert("session-id".to_string(), session);
+            headers.insert("x-client-request-id".to_string(), random_request_id());
+        }
+    }
+}
+
+fn anthropic_style_marker(long_retention: bool) -> Value {
+    let mut marker = Map::new();
+    marker.insert("type", vs("ephemeral"));
+    if long_retention {
+        marker.insert("ttl", vs("1h"));
+    }
+    Value::Object(marker)
+}
+
+fn attach_marker_to_message(message: &mut Value, long_retention: bool) {
+    if let Some(text) = message.get("content").and_then(Value::as_str).cloned() {
+        if let Some(object) = message.as_object_mut() {
+            object.insert(
+                "content",
+                Value::Array(vec![vobj([
+                    ("type", vs("text")),
+                    ("text", Value::String(text)),
+                    ("cache_control", anthropic_style_marker(long_retention)),
+                ])]),
+            );
+        }
+        return;
+    }
+    if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(part) = parts.iter_mut().rev().find(|part| {
+            part.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "text")
+        }) {
+            if let Some(object) = part.as_object_mut() {
+                object.insert("cache_control", anthropic_style_marker(long_retention));
+            }
+        }
+    }
+}
+
+/// Anthropic-style explicit cache markers borrowed on Chat Completions
+/// endpoints that aggregate Anthropic models: the first system/developer
+/// message, the last tool entry (declaration level), and the last text part of
+/// the final user/assistant/tool message. The long retention upgrades markers
+/// to a one-hour ttl.
+fn apply_anthropic_style_cache_markers(body: &mut Value, long_retention: bool) {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        if let Some(first) = messages.iter_mut().find(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "system" || role == "developer")
+        }) {
+            attach_marker_to_message(first, long_retention);
+        }
+        if let Some(last) = messages.iter_mut().rev().find(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user" || role == "assistant" || role == "tool")
+        }) {
+            attach_marker_to_message(last, long_retention);
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        if let Some(last) = tools.last_mut() {
+            if let Some(object) = last.as_object_mut() {
+                object.insert("cache_control", anthropic_style_marker(long_retention));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn build_chat_params(req: &ModelRequest) -> Value {
     build_chat_params_with_identity(
@@ -5685,6 +5785,44 @@ impl OpenAIProvider {
         format!("{}{}", self.request_base_url.trim_end_matches('/'), path)
     }
 
+    /// Resolved session-affinity header format: catalog policy, host
+    /// declaration, then endpoint auto-detection.
+    fn session_affinity_format(&self, req: &ModelRequest, caps: &ModelCapabilities) -> String {
+        if let Some(format) = req
+            .wire_caps
+            .as_ref()
+            .and_then(|policy| policy.session_affinity_format.clone())
+            .or_else(|| caps.session_affinity_format.clone())
+        {
+            return diagnostic_string(&format);
+        }
+        if self.request_base_url.contains("openrouter") {
+            "openrouter".to_string()
+        } else {
+            "openai".to_string()
+        }
+    }
+
+    /// Whether Chat Completions bodies borrow Anthropic-style explicit cache
+    /// markers: declared format wins; otherwise aggregation endpoints serving
+    /// Anthropic-family model ids default to it.
+    fn anthropic_style_cache_markers(&self, req: &ModelRequest, caps: &ModelCapabilities) -> bool {
+        let declared = req
+            .wire_caps
+            .as_ref()
+            .and_then(|policy| policy.cache_control_format.clone())
+            .or_else(|| caps.cache_control_format.clone());
+        match declared {
+            Some(format) => format == "anthropic",
+            None => {
+                self.request_base_url.contains("openrouter") && {
+                    let model = diagnostic_string(&req.model);
+                    model.starts_with("anthropic/") || model.starts_with("~anthropic/")
+                }
+            }
+        }
+    }
+
     /// Native subscription auth on a declared backend route admits review metadata.
     fn is_codex_subscription_backend(&self) -> bool {
         self.auth_source
@@ -5731,6 +5869,8 @@ impl OpenAIProvider {
         let capabilities = self.capabilities_for(&req.model);
         let reasoning_dialect = self.reasoning_dialect;
         let first_party_cache_endpoint = self.request_base_url.contains("api.openai.com");
+        let anthropic_cache_markers = self.anthropic_style_cache_markers(&req, &capabilities);
+        let affinity_format = self.session_affinity_format(&req, &capabilities);
         let review_effort = self.review_effort.clone();
         let review_stream = self.retry.retry_class_policy
             == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview);
@@ -5758,14 +5898,21 @@ impl OpenAIProvider {
                 .and_then(OpenAICompatibilityOptions::request_identity);
             let request_id = identity.map(|_| random_request_id());
             let mut body = build_chat_params_with_identity(&req, identity, request_id.as_deref(), &capabilities, reasoning_dialect, first_party_cache_endpoint);
+            if anthropic_cache_markers {
+                apply_anthropic_style_cache_markers(
+                    &mut body,
+                    cache_retention_of(&req) == CacheRetention::Long,
+                );
+            }
             if let Err(error) = apply_review_effort_body(&mut body, review_effort.as_ref(), reasoning_dialect, false) { yield ModelStreamEvent::Error { error }; return; }
             if let Some(enabled) = bridge_fast_mode {
                 body["fast_mode"] = Value::Bool(enabled);
             }
-            let extra_headers = compatibility
+            let mut extra_headers = compatibility
                 .as_ref()
                 .map(|options| options.extra_headers().clone())
                 .unwrap_or_default();
+            apply_session_affinity_headers(&mut extra_headers, &req, &affinity_format);
             let mut state = ChatState::default();
             // Surface every establishment retry while its backoff sleeps.
             let (retry, retry_rx) = observe_retries(retry);
@@ -5959,6 +6106,7 @@ impl OpenAIProvider {
         let tool_batches_allowed =
             !native_tool_support.disabled_for(&url, &req.model, ADDITIONAL_TOOLS_CAPABILITY);
         let reasoning_dialect = self.reasoning_dialect;
+        let affinity_format = self.session_affinity_format(&req, &capabilities);
         let review_effort = self.review_effort.clone();
         let review_stream = self.retry.retry_class_policy
             == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview);
@@ -6033,6 +6181,7 @@ impl OpenAIProvider {
             if reviewer_header_model.as_ref() == Some(&req.model) {
                 extra_headers.insert("x-codex-guardian".to_string(), "reviewer".to_string());
             }
+            apply_session_affinity_headers(&mut extra_headers, &req, &affinity_format);
             // Surface every establishment retry while its backoff sleeps.
             let (retry, retry_rx) = observe_retries(retry);
             let establish = native_tool_loading::establish(native_tool_loading::Transport {
@@ -8255,6 +8404,111 @@ mod tests {
         .unwrap();
         let clamped = body["prompt_cache_key"].as_str().unwrap();
         assert_eq!(clamped.as_utf16().len(), 64);
+    }
+
+    #[test]
+    fn session_affinity_headers_follow_the_resolved_format() {
+        let mut req = base_req();
+        req.cache_domain = Some(RuntimeString::from("dom"));
+
+        let mut headers = HashMap::new();
+        apply_session_affinity_headers(&mut headers, &req, "openai");
+        assert_eq!(headers.get("session-id").map(String::as_str), Some("dom"));
+        assert!(headers.contains_key("x-client-request-id"));
+
+        let mut headers = HashMap::new();
+        apply_session_affinity_headers(&mut headers, &req, "openrouter");
+        assert_eq!(headers.get("x-session-id").map(String::as_str), Some("dom"));
+        assert!(!headers.contains_key("session-id"));
+        assert!(!headers.contains_key("x-client-request-id"));
+
+        let mut headers = HashMap::new();
+        apply_session_affinity_headers(&mut headers, &req, "openai_nosession");
+        assert!(!headers.contains_key("session-id"));
+        assert!(headers.contains_key("x-client-request-id"));
+
+        // Without a routing identity no affinity header is invented.
+        let empty = base_req();
+        let mut headers = HashMap::new();
+        apply_session_affinity_headers(&mut headers, &empty, "openai");
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn anthropic_style_markers_land_on_system_last_tool_and_last_message() {
+        let mut body = vobj([
+            (
+                "messages",
+                Value::Array(vec![
+                    vobj([("role", vs("system")), ("content", vs("stable rules"))]),
+                    vobj([("role", vs("user")), ("content", vs("hello"))]),
+                    vobj([
+                        ("role", vs("assistant")),
+                        (
+                            "content",
+                            Value::Array(vec![vobj([("type", vs("text")), ("text", vs("hi"))])]),
+                        ),
+                    ]),
+                ]),
+            ),
+            (
+                "tools",
+                Value::Array(vec![
+                    vobj([
+                        ("type", vs("function")),
+                        ("function", vobj([("name", vs("bash"))])),
+                    ]),
+                    vobj([
+                        ("type", vs("function")),
+                        ("function", vobj([("name", vs("read"))])),
+                    ]),
+                ]),
+            ),
+        ]);
+        apply_anthropic_style_cache_markers(&mut body, true);
+
+        let messages = body["messages"].as_array().unwrap();
+        // First system message: string content wrapped into a marked text part.
+        let system_parts = messages[0]["content"].as_array().unwrap();
+        assert_eq!(system_parts[0]["text"], json!("stable rules"));
+        assert_eq!(system_parts[0]["cache_control"]["type"], json!("ephemeral"));
+        assert_eq!(system_parts[0]["cache_control"]["ttl"], json!("1h"));
+        // Last assistant message: marker on the last text part.
+        let assistant_parts = messages[2]["content"].as_array().unwrap();
+        assert_eq!(
+            assistant_parts[0]["cache_control"]["type"],
+            json!("ephemeral")
+        );
+        // The middle user message stays unmarked.
+        assert!(messages[1]
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none());
+        // Tools: entry-level marker on the LAST declaration only.
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], json!("ephemeral"));
+        assert_eq!(tools[1]["cache_control"]["ttl"], json!("1h"));
+
+        // Short retention: ephemeral markers without the ttl field.
+        let mut short = body.clone();
+        apply_anthropic_style_cache_markers(&mut short, false);
+        // (Re-application is idempotent in placement; assert the short shape
+        // on a freshly built body instead.)
+        let mut fresh = vobj([(
+            "messages",
+            Value::Array(vec![vobj([
+                ("role", vs("system")),
+                ("content", vs("stable rules")),
+            ])]),
+        )]);
+        apply_anthropic_style_cache_markers(&mut fresh, false);
+        let parts = fresh["messages"].as_array().unwrap()[0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts[0]["cache_control"]["type"], json!("ephemeral"));
+        assert!(parts[0]["cache_control"].get("ttl").is_none());
+        let _ = short;
     }
 
     // ---- classifier helpers ----

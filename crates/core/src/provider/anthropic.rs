@@ -595,6 +595,32 @@ impl AnthropicProvider {
             && !self.native_tool_support.disabled(&self.messages_url, model)
     }
 
+    /// Session-affinity header value for aggregation endpoints: only the
+    /// openrouter face of this wire carries `x-session-id`. Resolved from the
+    /// catalog policy, the host declaration, then the endpoint URL.
+    fn openrouter_session_affinity_id(&self, req: &ModelRequest) -> Option<String> {
+        let declared = req
+            .wire_caps
+            .as_ref()
+            .and_then(|policy| policy.session_affinity_format.clone())
+            .or_else(|| {
+                self.capabilities_for(&req.model)
+                    .session_affinity_format
+                    .clone()
+            });
+        let openrouter = match declared {
+            Some(format) => format == "openrouter",
+            None => self.messages_url.contains("openrouter"),
+        };
+        if !openrouter {
+            return None;
+        }
+        req.cache_domain
+            .as_ref()
+            .or(req.cache_key.as_ref())
+            .map(diagnostic_string)
+    }
+
     /// Whether this request rides the inline tool-change protocol: the top-level
     /// tool list stays frozen at its baseline and inventory changes are announced
     /// by `tool_addition` / `tool_removal` blocks inside system messages, so tool
@@ -1141,6 +1167,7 @@ impl ModelProvider for AnthropicProvider {
         let defer_loading_supported =
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
         let inline_tool_changes = self.inline_tool_changes_enabled(&req.model, &req);
+        let affinity_session_id = self.openrouter_session_affinity_id(&req);
         let native_tool_support = self.native_tool_support.clone();
 
         let s = async_stream::stream! {
@@ -1336,6 +1363,7 @@ impl ModelProvider for AnthropicProvider {
                 hint_model: req.model.clone(),
                 native_tool_support,
                 emits_global: emits_global_scope,
+                affinity_session_id,
                 use_native,
                 vertex: uses_vertex,
                 bedrock: bedrock_attempt,
@@ -1680,6 +1708,7 @@ struct AttemptCtx {
     hint_model: RuntimeString,
     native_tool_support: super::native_tools::NativeToolSupport,
     emits_global: bool,
+    affinity_session_id: Option<String>,
     use_native: bool,
     /// Vertex routing: the API version travels in the body, so suppress the
     /// `anthropic-version` header and the first-party `x-api-key` (GCP bearer
@@ -2046,6 +2075,9 @@ async fn attempt_once(
         // advertising the protocol without touching the attempt context.
         if body_declares_inline_tool_blocks(&ctx.body.lock_recover()) {
             merge_beta_header(&mut headers, INLINE_TOOLS_BETA);
+        }
+        if let Some(session) = &ctx.affinity_session_id {
+            headers.insert("x-session-id".to_string(), session.clone());
         }
         if ctx.use_native {
             merge_beta_header(&mut headers, STRUCTURED_OUTPUTS_BETA);
