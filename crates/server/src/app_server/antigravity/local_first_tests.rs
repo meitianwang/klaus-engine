@@ -436,8 +436,8 @@ async fn cold_resolve_awaits_inflight_catalog_refresh_without_duplicate_fetch() 
                     "supportsThinking": true,
                     "thinkingLevel": 2
                 },
-                "gemini-4-neon-high": {
-                    "displayName": "Gemini 4 Neon (High)",
+                "fixture-live-only-high": {
+                    "displayName": "Fixture Live Only (High)",
                     "supportsThinking": true,
                     "thinkingLevel": 3,
                     "maxTokens": 1048576,
@@ -467,7 +467,7 @@ async fn cold_resolve_awaits_inflight_catalog_refresh_without_duplicate_fetch() 
     let mut tiers = serde_json::Map::new();
     tiers.insert("medium".into(), json!("antigravity:gemini-4-carbon-medium"));
     let resolving = tokio::spawn(async move {
-        antigravity::resolve("antigravity:gemini-4-neon-high", &tiers).await
+        antigravity::resolve("antigravity:fixture-live-only-high", &tiers).await
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
@@ -481,7 +481,7 @@ async fn cold_resolve_awaits_inflight_catalog_refresh_without_duplicate_fetch() 
         .expect("resolve timed out")
         .unwrap()
         .expect("resolve must succeed once the live catalog arrives");
-    assert_eq!(resolved.provider["model"], "gemini-4-neon-high");
+    assert_eq!(resolved.provider["model"], "fixture-live-only-high");
     assert_eq!(resolved.capabilities["contextWindow"], 1_048_576);
     assert_eq!(
         resolved.model_tiers.get("medium"),
@@ -533,10 +533,10 @@ async fn switching_accounts_does_not_drop_or_block_new_account_catalog_behind_st
                     release.notified().await;
                 }
                 let body = json!({
-                    "defaultAgentModelId": "gemini-4-neon-high",
+                    "defaultAgentModelId": "fixture-live-only-high",
                     "models": {
-                        "gemini-4-neon-high": {
-                            "displayName": "Gemini 4 Neon (High)",
+                        "fixture-live-only-high": {
+                            "displayName": "Fixture Live Only (High)",
                             "supportsThinking": true,
                             "thinkingLevel": 3
                         }
@@ -598,10 +598,10 @@ async fn switching_accounts_does_not_drop_or_block_new_account_catalog_behind_st
 
     // Switch head to the fast account while tok-slow's refresh is still stalled.
     antigravity::auth::switch_account(&fast_id).await.unwrap();
-    let resolved = antigravity::resolve("gemini-4-neon-high", &serde_json::Map::new())
+    let resolved = antigravity::resolve("fixture-live-only-high", &serde_json::Map::new())
         .await
         .expect("new account resolve must succeed without waiting on outgoing account refresh");
-    assert_eq!(resolved.provider["model"], "gemini-4-neon-high");
+    assert_eq!(resolved.provider["model"], "fixture-live-only-high");
 
     release_stalled.notify_waiters();
     server_task.abort();
@@ -617,7 +617,7 @@ async fn cold_resolve_surfaces_catalog_fetch_failure_instead_of_claiming_model_u
     let _environment = Environment::set(&server.origin);
     antigravity::auth::adopt(credential()).await.unwrap();
 
-    let err = antigravity::resolve("gemini-4-neon-high", &serde_json::Map::new())
+    let err = antigravity::resolve("fixture-live-only-high", &serde_json::Map::new())
         .await
         .unwrap_err();
     assert_ne!(

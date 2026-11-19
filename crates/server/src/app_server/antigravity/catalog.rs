@@ -265,7 +265,7 @@ pub fn normalize_models(payload: &Value) -> Vec<Value> {
 }
 
 /// Preserve account availability while including the known model inventory.
-pub fn models_with_unavailable_paid(payload: &Value) -> Vec<Value> {
+pub(super) fn models_with_unavailable_paid(payload: &Value) -> Vec<Value> {
     let mut models = normalize_models(payload);
     // A bundled snapshot carries identities and capabilities, never a local
     // account's entitlement decision. Keep every known chat model selectable so
@@ -303,6 +303,19 @@ pub fn models_with_unavailable_paid(payload: &Value) -> Vec<Value> {
         );
         models.push(model);
     }
+    models
+}
+
+/// Max variants are retained for saved selections, but the selectable catalog
+/// must only offer them when the service declares them for this account.
+pub(super) fn selectable_models(payload: &Value) -> Vec<Value> {
+    let mut models = models_with_unavailable_paid(payload);
+    models.retain(|model| match model["key"].as_str() {
+        Some(id @ ("claude-opus-5-5-max" | "claude-sonnet-5-5-max")) => {
+            payload["models"][id].is_object()
+        }
+        _ => true,
+    });
     models
 }
 
@@ -463,6 +476,78 @@ pub(super) fn auto_compact_token_limit(
     }
 }
 
+/// The conversation budget is distinct from the service's request window.
+/// Match the concrete wire identity, not a display name or a family prefix.
+fn checkpoint_budget(details: Option<&Value>) -> Option<(u64, u64)> {
+    let budget = match details.and_then(|model| model["model"].as_str()) {
+        Some("MODEL_OPENAI_GPT_OSS_120B_MEDIUM") => (80_000, 8_192),
+        Some(
+            "MODEL_GOOGLE_GEMINI_2_5_FLASH"
+            | "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE"
+            | "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"
+            | "MODEL_GOOGLE_GEMINI_2_5_PRO"
+            | "MODEL_PLACEHOLDER_M18"
+            | "MODEL_PLACEHOLDER_M50"
+            | "MODEL_PLACEHOLDER_M198",
+        ) => (128_000, 16_384),
+        Some(
+            "MODEL_PLACEHOLDER_M318"
+            | "MODEL_PLACEHOLDER_M319"
+            | "MODEL_PLACEHOLDER_M320"
+            | "MODEL_PLACEHOLDER_M322"
+            | "MODEL_PLACEHOLDER_M417"
+            | "MODEL_PLACEHOLDER_M418"
+            | "MODEL_PLACEHOLDER_M419"
+            | "MODEL_PLACEHOLDER_M427"
+            | "MODEL_PLACEHOLDER_M437"
+            | "MODEL_PLACEHOLDER_M438",
+        ) => (256_000, 32_768),
+        Some(
+            "MODEL_PLACEHOLDER_M525"
+            | "MODEL_PLACEHOLDER_M526"
+            | "MODEL_PLACEHOLDER_M527"
+            | "MODEL_PLACEHOLDER_M528",
+        ) => (512_000, 32_768),
+        Some(
+            "MODEL_PLACEHOLDER_M400"
+            | "MODEL_PLACEHOLDER_M401"
+            | "MODEL_PLACEHOLDER_M402"
+            | "MODEL_PLACEHOLDER_M403"
+            | "MODEL_PLACEHOLDER_M404"
+            | "MODEL_PLACEHOLDER_M405",
+        ) => (840_000, 32_768),
+        _ => return None,
+    };
+    Some(budget)
+}
+
+pub(super) fn output_token_defaults(
+    details: Option<&Value>,
+) -> klaus_agent_core::types::provider::ModelOutputTokenDefaults {
+    klaus_agent_core::types::provider::ModelOutputTokenDefaults {
+        turn: Some(16_384),
+        summary: checkpoint_budget(details).map(|(_, output)| output),
+    }
+}
+
+pub(super) fn model_auto_compact_token_limit(
+    details: Option<&Value>,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+) -> Option<u64> {
+    let Some((budget, _)) = checkpoint_budget(details) else {
+        return auto_compact_token_limit(context_window, max_output_tokens);
+    };
+    let window = context_window?;
+    let reserve = max_output_tokens
+        .unwrap_or(0)
+        .max(MIN_AUTO_COMPACT_OUTPUT_HEADROOM_TOKENS);
+    window
+        .checked_sub(reserve)
+        .filter(|&available| available > 0)
+        .map(|available| budget.min(available))
+}
+
 /// Project only fields accepted by the engine's capability contract.
 pub fn model_capabilities(entry: &Value) -> Value {
     let raw = entry.get("providerMetadata").unwrap_or(entry);
@@ -501,7 +586,9 @@ pub fn model_capabilities(entry: &Value) -> Value {
     if let Some(tokens) = max_output_tokens {
         capabilities["maxOutputTokens"] = json!(tokens);
     }
-    if let Some(limit) = auto_compact_token_limit(context_window, max_output_tokens) {
+    if let Some(limit) =
+        model_auto_compact_token_limit(Some(raw), context_window, max_output_tokens)
+    {
         capabilities["autoCompactTokenLimit"] = json!(limit);
     }
     let budget = declared_thinking_budget(raw);
@@ -1231,6 +1318,50 @@ mod tests {
     }
 
     #[test]
+    fn conversation_budgets_do_not_replace_service_windows_or_generation_limits() {
+        let rows = selectable_models(&bundled_payload());
+        for (prefix, count, window, output, budget) in [
+            ("gemini-4-carbon-", 3, 1_048_576, 262_144, 256_000),
+            ("gemini-4-argon-", 3, 1_048_576, 65_536, 256_000),
+            ("gemini-4-hydrogen-", 4, 1_048_576, 262_144, 512_000),
+            ("gemini-3.8-flash-", 3, 1_048_576, 65_536, 256_000),
+            ("claude-opus-5-5-", 3, 1_000_000, 128_000, 840_000),
+            ("claude-sonnet-5-5-", 3, 1_000_000, 128_000, 840_000),
+            ("gpt-oss-120b-", 1, 131_072, 32_768, 80_000),
+        ] {
+            let mut seen = 0;
+            for model in &rows {
+                let id = model["key"].as_str().unwrap();
+                if !id.starts_with(prefix) || model["inRecommendedSort"] != true {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(model["contextWindow"], window, "{id}");
+                assert_eq!(model["maxOutputTokens"], output, "{id}");
+                assert_eq!(
+                    model["capabilities"]["autoCompactTokenLimit"], budget,
+                    "{id}"
+                );
+            }
+            assert_eq!(seen, count, "{prefix}");
+        }
+        let changed_route = model_capabilities(&json!({
+            "model": "MODEL_PLACEHOLDER_M525", "maxTokens": 120000, "maxOutputTokens": 65536
+        }));
+        assert_eq!(changed_route["autoCompactTokenLimit"], 54_464);
+        for (model, summary) in [
+            ("MODEL_PLACEHOLDER_M525", Some(32_768)),
+            ("MODEL_OPENAI_GPT_OSS_120B_MEDIUM", Some(8_192)),
+            ("MODEL_PLACEHOLDER_M532", None),
+        ] {
+            let raw = json!({"model":model});
+            let defaults = output_token_defaults(Some(&raw));
+            assert_eq!(defaults.turn, Some(16_384));
+            assert_eq!(defaults.summary, summary);
+        }
+    }
+
+    #[test]
     fn declared_capabilities_decode_through_the_engine_contract() {
         use klaus_agent_core::runtime_values::{runtime_codec, RuntimeString};
         use klaus_agent_protocol::types::ModelCapabilitiesInit;
@@ -1353,6 +1484,28 @@ mod tests {
     }
 
     #[test]
+    fn claude_max_is_listed_only_when_declared_and_still_resolves_when_saved() {
+        let baseline = bundled_payload();
+        let live = json!({"models":{
+            "claude-opus-5-5-max":{"thinkingLevel":200,"maxTokens":1000000},
+            "claude-sonnet-5-5-max":{"thinkingLevel":200,"maxTokens":1000000,"disabled":true}
+        }});
+        let cold_rows = selectable_models(&baseline);
+        let live_rows = selectable_models(&live);
+        for id in ["claude-opus-5-5-max", "claude-sonnet-5-5-max"] {
+            assert!(!cold_rows.iter().any(|model| model["key"] == id));
+            assert!(model_details(&baseline, id).is_some());
+            assert!(models_with_unavailable_paid(&baseline)
+                .iter()
+                .any(|model| model["key"] == id));
+            let declared = live_rows.iter().find(|model| model["key"] == id).unwrap();
+            assert_eq!(declared["thinkingLevel"], 200);
+            assert_eq!(declared["contextWindow"], 1_000_000);
+            assert_eq!(declared["disabled"], id == "claude-sonnet-5-5-max");
+        }
+    }
+
+    #[test]
     fn paid_inventory_remains_informational_and_outside_the_dynamic_catalog() {
         let payload = json!({"models":{}});
         assert!(normalize_models(&payload).is_empty());
@@ -1442,6 +1595,125 @@ mod tests {
             chat["unavailableReason"],
             "Account access is confirmed when the model service answers. The model remains selectable."
         );
+    }
+
+    #[test]
+    fn bundled_neon_preserves_reasoning_variants_and_catalog_limits() {
+        let payload = bundled_payload();
+        let rows = models_with_unavailable_paid(&payload);
+        let neon: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["key"]
+                    .as_str()
+                    .is_some_and(|key| key.starts_with("gemini-4-neon-"))
+            })
+            .collect();
+        let expected = [
+            ("gemini-4-neon-high", 3),
+            ("gemini-4-neon-xhigh", 100),
+            ("gemini-4-neon-medium", 2),
+            ("gemini-4-neon-low", 1),
+        ];
+        assert_eq!(neon.len(), expected.len());
+        for (order, (row, (id, level))) in neon.into_iter().zip(expected).enumerate() {
+            assert_eq!(row["key"], id);
+            assert_eq!(row["isDefault"], id == "gemini-4-neon-high");
+            assert_eq!(row["inRecommendedSort"], true);
+            assert_eq!(row["catalogOrder"], order);
+            assert_eq!(row["available"], false);
+            assert_eq!(row["entitlementUnknown"], true);
+            assert!(is_chat_model(row));
+            assert_eq!(row["thinkingLevel"], level);
+            assert_eq!(row["minThinkingBudget"], 32);
+            assert_eq!(row["canDisableThinking"], false);
+            assert_eq!(row["capabilities"]["geminiThinking"]["mode"], "level");
+            assert_eq!(row["contextWindow"], 1_048_576);
+            assert_eq!(row["maxOutputTokens"], 262_144);
+            assert_eq!(row["capabilities"]["autoCompactTokenLimit"], 256_000);
+            assert_eq!(row["capabilities"]["tools"], true);
+            assert_eq!(row["capabilities"]["vision"], true);
+            assert_eq!(row["capabilities"]["nativePdf"], true);
+            let mimes = row["capabilities"]["mediaInputMimeTypes"]
+                .as_array()
+                .expect("Neon declares audio and video inputs");
+            assert!(mimes.contains(&json!("audio/wav")));
+            assert!(mimes.contains(&json!("video/mp4")));
+        }
+    }
+
+    #[test]
+    fn bundled_gemini_families_preserve_recommended_variants_and_media() {
+        let payload = bundled_payload();
+        let models = models_with_unavailable_paid(&payload);
+        for (family, efforts, max_output, min_thinking) in [
+            (
+                "gemini-4-carbon",
+                &["medium", "high", "low"][..],
+                262_144,
+                128,
+            ),
+            ("gemini-4-argon", &["medium", "high", "low"][..], 65_536, 32),
+            (
+                "gemini-4-hydrogen",
+                &["high", "xhigh", "medium", "low"][..],
+                262_144,
+                32,
+            ),
+            (
+                "gemini-3.8-flash",
+                &["high", "medium", "low"][..],
+                65_536,
+                32,
+            ),
+        ] {
+            let prefix = format!("{family}-");
+            let expected: Vec<_> = efforts
+                .iter()
+                .map(|effort| format!("{prefix}{effort}"))
+                .collect();
+            let variants: Vec<_> = models
+                .iter()
+                .filter_map(|row| {
+                    let id = row["key"].as_str()?;
+                    (id.starts_with(&prefix) && row["inRecommendedSort"] == true)
+                        .then_some((id, row))
+                })
+                .collect();
+            assert_eq!(
+                variants.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                expected,
+                "{family}"
+            );
+            for ((id, row), &effort) in variants.into_iter().zip(efforts) {
+                let level = match effort {
+                    "low" => 1,
+                    "medium" => 2,
+                    "high" => 3,
+                    "xhigh" => 100,
+                    _ => unreachable!(),
+                };
+                assert!(is_chat_model(row), "{id}");
+                assert_eq!(row["entitlementUnknown"], true, "{id}");
+                assert_eq!(row["contextWindow"], 1_048_576, "{id}");
+                assert_eq!(row["maxOutputTokens"], max_output, "{id}");
+                assert_eq!(row["minThinkingBudget"], min_thinking, "{id}");
+                assert_eq!(row["thinkingLevel"], level, "{id}");
+                let media = row["capabilities"]["mediaInputMimeTypes"]
+                    .as_array()
+                    .unwrap();
+                for mime in ["audio/amr", "audio/x-m4a"] {
+                    assert!(media.contains(&json!(mime)), "{id} is missing {mime}");
+                }
+                for mime in ["presentation", "spreadsheet", "text"] {
+                    let mime = format!("application/vnd.oasis.opendocument.{mime}");
+                    assert_eq!(
+                        row["supportedMimeTypes"][&mime], true,
+                        "{id} is missing {mime}"
+                    );
+                }
+            }
+        }
     }
 
     fn contains_key(value: &Value, key: &str) -> bool {

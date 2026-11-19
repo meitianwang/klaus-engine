@@ -741,10 +741,8 @@ pub async fn models(warm: bool) -> Result<Value, String> {
     if !auth::is_current(&generation) {
         return Err("antigravity_credential_changed".into());
     }
-    let mut reply = super::conversation_catalog::response(
-        "antigravity",
-        catalog::models_with_unavailable_paid(&payload),
-    );
+    let mut reply =
+        super::conversation_catalog::response("antigravity", catalog::selectable_models(&payload));
     reply["catalogBaseline"] =
         json!(payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true));
     Ok(reply)
@@ -1181,7 +1179,9 @@ fn apply_source_compaction_cap(
             .and_then(Value::as_u64)
             .filter(|&n| n > 0)
     });
-    if let Some(source_limit) = catalog::auto_compact_token_limit(context_window, max_output) {
+    if let Some(source_limit) =
+        catalog::model_auto_compact_token_limit(details.as_ref(), context_window, max_output)
+    {
         capabilities.auto_compact_token_limit = Some(
             capabilities
                 .auto_compact_token_limit
@@ -1251,6 +1251,17 @@ pub(super) fn decorate(
             mapped
         })
         .unwrap_or_default();
+    let output_token_defaults = by_model
+        .keys()
+        .map(String::as_str)
+        .chain(default_model_id.as_deref())
+        .map(|id| {
+            let details = head_generation
+                .as_deref()
+                .and_then(|generation| model_details(generation, id));
+            (id.to_owned(), catalog::output_token_defaults(details.as_ref()))
+        })
+        .collect();
     let thinking_dialects_by_model = by_model
         .keys()
         .map(|id| {
@@ -1283,6 +1294,7 @@ pub(super) fn decorate(
         })),
         capabilities: Some(capabilities),
         capabilities_by_model: Some(by_model),
+        output_token_defaults,
         thinking_dialect: Some(selected_dialect(&model, init)),
         thinking_dialects_by_model: Some(thinking_dialects_by_model),
         minimal_reasoning_models: Some(minimal_reasoning_models),

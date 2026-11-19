@@ -200,14 +200,14 @@ fn cold_baseline_read_emits_catalog_changed_once_live_models_land() {
     )
     .unwrap();
     let server = CatalogServer::start(json!({
-        "defaultAgentModelId": "gemini-4-carbon-medium",
+        "defaultAgentModelId": "fixture-live-only-medium",
         "agentModelSorts": [{
             "displayName": "Recommended",
-            "groups": [{"modelIds": ["gemini-4-carbon-medium"]}]
+            "groups": [{"modelIds": ["fixture-live-only-medium"]}]
         }],
         "models": {
-            "gemini-4-carbon-medium": {
-                "displayName": "Gemini 4 Carbon (Medium)",
+            "fixture-live-only-medium": {
+                "displayName": "Fixture Live Only (Medium)",
                 "recommended": true,
                 "supportsThinking": true,
                 "thinkingLevel": 2,
@@ -236,7 +236,7 @@ fn cold_baseline_read_emits_catalog_changed_once_live_models_land() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|row| row["id"] == "gemini-4-carbon-medium"));
+        .any(|row| row["id"] == "fixture-live-only-medium"));
 
     if !notified_during_read {
         let notification = facade.next_until(Duration::from_secs(5), |msg| {
@@ -258,5 +258,5 @@ fn cold_baseline_read_emits_catalog_changed_once_live_models_land() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|row| row["id"] == "gemini-4-carbon-medium" && row["inRecommendedSort"] == true));
+        .any(|row| row["id"] == "fixture-live-only-medium" && row["inRecommendedSort"] == true));
 }

@@ -329,6 +329,7 @@ impl InferenceBundle {
         config.max_output_tokens = Some(
             config
                 .max_output_tokens
+                .or_else(|| self.provider.output_token_defaults(model).turn)
                 .unwrap_or(capabilities.max_output_tokens)
                 .min(capabilities.max_output_tokens),
         );

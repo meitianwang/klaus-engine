@@ -514,6 +514,15 @@ impl FullCompactor {
             .is_some_and(|provider| provider.capabilities(&self.model).prompt_cache_control)
     }
 
+    fn summary_output_token_default(&self) -> Option<u64> {
+        self.capabilities_provider
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.provider.lock().unwrap().clone())
+            .and_then(|provider| provider.output_token_defaults(&self.model).summary)
+    }
+
     fn can_share_live_prefix_cache(&self, snapshot: &ModelRequest) -> bool {
         if snapshot.model != self.model {
             return false;
@@ -570,6 +579,10 @@ impl FullCompactor {
             .max_output_tokens
             .max(self.max_output_tokens.unwrap_or(0))
             .min(config.model_max_output_tokens.unwrap_or(u64::MAX));
+        if let Some(limit) = self.summary_output_token_default() {
+            request.max_output_tokens =
+                limit.min(config.model_max_output_tokens.unwrap_or(u64::MAX));
+        }
         if let Some(projected) = project_cached_prefix_messages(&request.messages, messages) {
             request.messages = projected;
         } else {
@@ -769,7 +782,8 @@ impl FullCompactor {
         });
         request.model = self.model.clone();
         request.max_output_tokens = self
-            .max_output_tokens
+            .summary_output_token_default()
+            .or(self.max_output_tokens)
             .unwrap_or(request.max_output_tokens)
             .min(config.model_max_output_tokens.unwrap_or(u64::MAX));
         request
@@ -1538,6 +1552,57 @@ mod tests {
             assert!(!result.compacted);
             assert!(output.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn source_summary_budget_is_separate_from_the_turn_budget() {
+        use crate::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+        use crate::types::provider::ModelOutputTokenDefaults;
+
+        let compactor = create_full_compactor(FullCompactorOptions {
+            call_model: Box::new(|_, _| panic!("only inspect assembled summary requests")),
+            model: "fixture".into(),
+            max_output_tokens: Some(16_384),
+            uuid: Box::new(|| "summary-id".to_owned()),
+        });
+        let mut config = crate::schemas::config::default_config();
+        config.model_max_output_tokens = Some(65_536);
+        assert_eq!(
+            compactor
+                .summary_request(&[], &config, None)
+                .max_output_tokens,
+            16_384
+        );
+
+        compactor.bind_capabilities_provider(Arc::new(GeminiProvider::new(
+            GeminiProviderOptions {
+                output_token_defaults: [(
+                    "fixture".to_string(),
+                    ModelOutputTokenDefaults {
+                        turn: Some(16_384),
+                        summary: Some(32_768),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        )));
+        let request = compactor.summary_request(&[], &config, None);
+        assert_eq!(request.max_output_tokens, 32_768);
+        assert_eq!(
+            compactor
+                .cache_safe_summary_request(request, &[], &config, None)
+                .max_output_tokens,
+            32_768
+        );
+        config.model_max_output_tokens = Some(20_000);
+        assert_eq!(
+            compactor
+                .summary_request(&[], &config, None)
+                .max_output_tokens,
+            20_000
+        );
     }
 
     #[tokio::test]

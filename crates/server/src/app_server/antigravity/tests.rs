@@ -546,11 +546,11 @@ async fn declared_models_reach_the_service_and_preserve_structured_refusals() {
     .unwrap();
     refresh_catalog(&auth::generation().unwrap()).await.unwrap();
     let listed = models(true).await.unwrap();
-    let paid = listed["models"]
-        .as_array()
-        .unwrap()
+    let rows = listed["models"].as_array().unwrap();
+    assert!(!rows.iter().any(|row| row["key"] == "claude-sonnet-5-5-max"));
+    let paid = rows
         .iter()
-        .find(|row| row["key"] == "claude-sonnet-5-5-max")
+        .find(|row| row["key"] == "gemini-4-argon-high")
         .unwrap();
     assert_eq!(paid["available"], false);
     assert_eq!(paid["entitlementUnknown"], true);

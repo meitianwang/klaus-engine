@@ -172,10 +172,10 @@ async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
                 let body = json!({
-                    "defaultAgentModelId": "gemini-4-neon-high",
+                    "defaultAgentModelId": "fixture-live-only-high",
                     "models": {
-                        "gemini-4-neon-high": {
-                            "displayName": "Gemini 4 Neon High",
+                        "fixture-live-only-high": {
+                            "displayName": "Fixture Live Only (High)",
                             "supportsImages": true,
                             "supportsThinking": true,
                             "thinkingLevel": 3,
@@ -266,17 +266,17 @@ async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder
     .await;
     assert_eq!(reply["result"]["revision"], 1, "{reply}");
     let runtime = super::runtime(&mut fixture, 212).await;
-    assert_eq!(runtime["model"], "gemini-4-neon-high", "{runtime}");
+    assert_eq!(runtime["model"], "fixture-live-only-high", "{runtime}");
     assert!(runtime["pendingChangeId"].is_null(), "{runtime}");
     assert!(runtime["modelUpdateError"].is_null(), "{runtime}");
     assert_ready_antigravity_target(&runtime["orchestratorTarget"], "claude-sonnet-4-6");
 
     for (id, selection, expected) in [
-        (213, "gemini-4-neon-high", "gemini-4-neon-high"),
-        (214, "gemini-4-neon-disabled", "gemini-4-neon-high"),
-        (215, "gemini-4-argon-disabled", "gemini-4-neon-high"),
+        (213, "fixture-live-only-high", "fixture-live-only-high"),
+        (214, "gemini-4-neon-disabled", "fixture-live-only-high"),
+        (215, "gemini-4-argon-disabled", "fixture-live-only-high"),
         (216, "claude-sonnet-4-6-disabled", "claude-sonnet-4-6"),
-        (217, "high", "gemini-4-neon-high"),
+        (217, "high", "fixture-live-only-high"),
     ] {
         let reply = request(
             &mut fixture.client,

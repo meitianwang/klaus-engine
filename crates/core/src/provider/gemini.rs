@@ -281,6 +281,8 @@ pub struct GeminiProviderOptions {
     pub capabilities: Option<ModelCapabilities>,
     /// Exact per-model declarations for auxiliary and tier-selected models.
     pub capabilities_by_model: Option<HashMap<String, ModelCapabilities>>,
+    /// Request budgets declared by the transport for its concrete model IDs.
+    pub output_token_defaults: HashMap<String, crate::types::provider::ModelOutputTokenDefaults>,
     /// The endpoint's thinking wire dialect (level vs budget), declared by the
     /// client per model family.
     pub thinking_dialect: Option<GeminiThinkingDialect>,
@@ -309,6 +311,7 @@ pub struct GeminiProvider {
     /// Client-declared model capabilities; the single source of capability truth.
     capabilities: ModelCapabilities,
     capabilities_by_model: HashMap<String, ModelCapabilities>,
+    output_token_defaults: HashMap<String, crate::types::provider::ModelOutputTokenDefaults>,
     /// The endpoint's thinking wire dialect.
     thinking_dialect: GeminiThinkingDialect,
     thinking_dialects_by_model: HashMap<String, GeminiThinkingDialect>,
@@ -371,6 +374,7 @@ impl GeminiProvider {
             interceptor: opts.interceptor,
             capabilities: opts.capabilities.unwrap_or_default(),
             capabilities_by_model: opts.capabilities_by_model.unwrap_or_default(),
+            output_token_defaults: opts.output_token_defaults,
             thinking_dialect: opts.thinking_dialect.unwrap_or_default(),
             thinking_dialects_by_model: opts.thinking_dialects_by_model.unwrap_or_default(),
             minimal_reasoning_models: opts.minimal_reasoning_models.unwrap_or_default(),
@@ -400,6 +404,17 @@ impl GeminiProvider {
 impl ModelProvider for GeminiProvider {
     fn info(&self) -> &ProviderInfo {
         &self.info
+    }
+
+    fn output_token_defaults(
+        &self,
+        model: &RuntimeString,
+    ) -> crate::types::provider::ModelOutputTokenDefaults {
+        model
+            .try_to_utf8()
+            .ok()
+            .and_then(|id| self.output_token_defaults.get(&id).copied())
+            .unwrap_or_default()
     }
 
     fn model_metadata(&self, model: &RuntimeString) -> ModelCapabilities {

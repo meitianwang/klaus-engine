@@ -2092,6 +2092,9 @@ pub struct NativeCompactionContext {
 #[async_trait::async_trait]
 pub trait ModelProvider: Send + Sync {
     fn info(&self) -> &ProviderInfo;
+    fn output_token_defaults(&self, _model: &RuntimeString) -> ModelOutputTokenDefaults {
+        ModelOutputTokenDefaults::default()
+    }
     fn remote_compaction_support(&self, _model: &RuntimeString) -> RemoteCompactionSupport {
         RemoteCompactionSupport::Unsupported
     }
@@ -2322,6 +2325,13 @@ pub trait ModelProvider: Send + Sync {
     > {
         Box::pin(async { Vec::new() })
     }
+}
+
+/// Source-owned request budgets. Neither value replaces the model's ceiling.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ModelOutputTokenDefaults {
+    pub turn: Option<u64>,
+    pub summary: Option<u64>,
 }
 
 /// The model-call seam — decoupled from the provider object so tests can inject.

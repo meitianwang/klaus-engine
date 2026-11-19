@@ -239,13 +239,17 @@ impl InferenceBundle {
         config.model_effective_context_window_percent =
             Some(provider.effective_context_window_percent(&model));
         config.model_auto_compact_token_limit = provider.model_auto_compact_token_limit(&model);
-        config.max_output_tokens = Some(if target.is_some() {
-            capabilities.max_output_tokens
+        let explicit_output = if target.is_some() {
+            None
         } else {
-            config
-                .max_output_tokens
+            config.max_output_tokens
+        };
+        config.max_output_tokens = Some(
+            explicit_output
+                .or_else(|| provider.output_token_defaults(&model).turn)
                 .unwrap_or(capabilities.max_output_tokens)
-        });
+                .min(capabilities.max_output_tokens),
+        );
         let deps = if target.is_some() {
             SharedDeps::from_engine(production_deps(
                 provider.clone(),
@@ -783,6 +787,12 @@ impl ModelProvider for SummaryProvider {
     }
     fn model_auto_compact_token_limit(&self, model: &RuntimeString) -> Option<u64> {
         self.inner.model_auto_compact_token_limit(model)
+    }
+    fn output_token_defaults(
+        &self,
+        model: &RuntimeString,
+    ) -> crate::types::provider::ModelOutputTokenDefaults {
+        self.inner.output_token_defaults(model)
     }
 
     fn native_compaction_context(

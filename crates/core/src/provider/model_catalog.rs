@@ -713,6 +713,17 @@ pub(crate) fn uncaptured_model_stream(model: &RuntimeString) -> ModelStream {
 
 #[async_trait::async_trait]
 impl ModelProvider for CapturedModelProvider {
+    fn output_token_defaults(
+        &self,
+        model: &RuntimeString,
+    ) -> crate::types::provider::ModelOutputTokenDefaults {
+        if self.has_model_capabilities(model) {
+            self.inner.output_token_defaults(model)
+        } else {
+            Default::default()
+        }
+    }
+
     async fn native_checkpoint_compatibility(
         &self,
         checkpoint: &crate::schemas::message::NativeCompactionCheckpoint,
@@ -979,6 +990,13 @@ impl ModelProvider for CapturedModelProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for CatalogModelProvider {
+    fn output_token_defaults(
+        &self,
+        model: &RuntimeString,
+    ) -> crate::types::provider::ModelOutputTokenDefaults {
+        self.inner.output_token_defaults(model)
+    }
+
     async fn native_checkpoint_compatibility(
         &self,
         checkpoint: &crate::schemas::message::NativeCompactionCheckpoint,
