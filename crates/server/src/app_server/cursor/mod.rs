@@ -153,7 +153,7 @@ pub async fn lookup_model(key: &str) -> Option<Value> {
         .await
         .ok()?;
     let selected = models.iter().find(|model| model["key"] == key)?;
-    Some(catalog::with_max_context(&models, selected).clone())
+    Some(selected.clone())
 }
 
 pub async fn resolve(selection: &str) -> Result<(Value, Value), String> {

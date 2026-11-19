@@ -263,76 +263,21 @@ pub(super) fn normalize(value: &Value) -> Vec<Value> {
             out.push(entry);
         }
     }
-    promote_default_context(&mut out);
     out.sort_by_key(|entry| entry["isDefault"] != true);
     out
 }
 
-fn non_context_parameters(entry: &Value) -> Vec<(String, String)> {
-    entry["requestedModel"]["parameters"]
-        .as_array()
+/// Prefer the catalog's own default, then a non-max projection: legacy slugs and
+/// variant strings name several projections, and only an exact key identifies one.
+pub(super) fn prefer_canonical(candidates: Vec<&Value>) -> Option<&Value> {
+    candidates
         .into_iter()
-        .flatten()
-        .filter_map(|parameter| {
-            let id = parameter["id"].as_str()?;
-            if id == "context" {
-                return None;
-            }
-            Some((
-                id.to_string(),
-                parameter["value"].as_str().unwrap_or("").to_string(),
-            ))
+        .min_by_key(|model| {
+            (
+                model["isDefault"] != true,
+                model["requestedModel"]["maxMode"] == true,
+            )
         })
-        .collect()
-}
-
-fn context_tokens(entry: &Value) -> u64 {
-    entry
-        .get("max_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-/// Same effort and speed, longest context tier the catalog actually offers.
-pub(super) fn with_max_context<'a>(models: &'a [Value], selected: &'a Value) -> &'a Value {
-    let model_id = selected["requestedModel"]["modelId"].as_str();
-    let parameters = non_context_parameters(selected);
-    let current = context_tokens(selected);
-    models
-        .iter()
-        .filter(|candidate| {
-            candidate["requestedModel"]["modelId"].as_str() == model_id
-                && non_context_parameters(candidate) == parameters
-                && context_tokens(candidate) > current
-        })
-        .max_by_key(|candidate| context_tokens(candidate))
-        .unwrap_or(selected)
-}
-
-fn promote_default_context(entries: &mut [Value]) {
-    let plan: Vec<(String, String)> = entries
-        .iter()
-        .filter(|entry| entry["isDefault"] == true)
-        .filter_map(|entry| {
-            let from = text(entry, "key")?;
-            let to = text(with_max_context(entries, entry), "key")?;
-            (from != to).then(|| (from.to_string(), to.to_string()))
-        })
-        .collect();
-    for (from, to) in plan {
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|entry| text(entry, "key") == Some(from.as_str()))
-        {
-            entry["isDefault"] = json!(false);
-        }
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|entry| text(entry, "key") == Some(to.as_str()))
-        {
-            entry["isDefault"] = json!(true);
-        }
-    }
 }
 
 pub async fn fetch_models(force_refresh: bool) -> Result<Vec<Value>, String> {
@@ -608,9 +553,15 @@ pub async fn resolved_model(selection: &str) -> Result<String, String> {
             .iter()
             .find(|m| m["key"] == selection)
             .or_else(|| {
-                models.iter().find(|m| {
-                    m["variantStringRepresentation"] == selection || m["legacySlug"] == selection
-                })
+                prefer_canonical(
+                    models
+                        .iter()
+                        .filter(|m| {
+                            m["variantStringRepresentation"] == selection
+                                || m["legacySlug"] == selection
+                        })
+                        .collect(),
+                )
             })
             .or_else(|| {
                 models
@@ -624,7 +575,6 @@ pub async fn resolved_model(selection: &str) -> Result<String, String> {
             })
     }
     .ok_or("cursor_model_unavailable")?;
-    let selected = with_max_context(&models, selected);
     text(selected, "key")
         .map(str::to_owned)
         .ok_or_else(|| "cursor_model_unavailable".into())

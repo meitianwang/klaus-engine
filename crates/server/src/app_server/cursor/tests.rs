@@ -212,22 +212,46 @@ fn catalog_keeps_real_variants_without_agent_eligibility_filtering() {
     ]}));
     assert_eq!(models.len(), 2);
     assert_ne!(models[0]["key"], models[1]["key"]);
-    assert_eq!(models[0]["display_name"], "Fixture High Fast Max");
-    assert_eq!(models[0]["max_input_tokens"], 1000000);
-    assert_eq!(models[0]["requestedModel"]["maxMode"], true);
+    // The catalog default stays the upstream non-max configuration: its context
+    // tier and speed travel with it instead of being promoted to a longer tier.
+    assert_eq!(models[0]["display_name"], "Fixture High Fast");
+    assert_eq!(models[0]["max_input_tokens"], 200000);
+    assert_eq!(models[0]["requestedModel"]["maxMode"], false);
     assert_eq!(models[0]["isDefault"], true);
-    assert_eq!(models[1]["display_name"], "Fixture High Fast");
+    assert_eq!(models[1]["display_name"], "Fixture High Fast Max");
     assert_eq!(models[1]["isDefault"], false);
-    let short = models
-        .iter()
-        .find(|model| model["requestedModel"]["maxMode"] == false)
-        .expect("short context variant");
-    assert_eq!(
-        catalog::with_max_context(&models, short)["key"],
-        models[0]["key"]
-    );
+    assert_eq!(models[1]["requestedModel"]["maxMode"], true);
     assert_eq!(models[0]["requestedModel"]["modelId"], "fixture-wire");
     assert_eq!(models[0]["is_reasoning"], true);
+}
+
+#[test]
+fn ambiguous_legacy_slug_ties_prefer_catalog_default_then_non_max() {
+    let models = catalog::normalize(&json!({"models":[
+        {"name":"fixture","serverModelName":"fixture-wire","clientDisplayName":"Fixture","variants":[
+            {"displayName":"Max","isMaxMode":true,"parameterValues":[{"id":"effort","value":"high"},{"id":"context","value":"1m"}],"legacySlug":"fixture-high"},
+            {"displayName":"Long","parameterValues":[{"id":"effort","value":"high"},{"id":"context","value":"1m"}],"legacySlug":"fixture-high"},
+            {"displayName":"Standard","parameterValues":[{"id":"effort","value":"high"},{"id":"context","value":"200k"}],"legacySlug":"fixture-high","isDefaultNonMaxConfig":true}
+        ]}
+    ]}));
+    let ties: Vec<&serde_json::Value> = models
+        .iter()
+        .filter(|model| model["legacySlug"] == "fixture-high")
+        .collect();
+    assert_eq!(ties.len(), 3);
+    assert_eq!(
+        catalog::prefer_canonical(ties.clone()).expect("tie member")["isDefault"],
+        true
+    );
+    let remaining: Vec<&serde_json::Value> = ties
+        .iter()
+        .copied()
+        .filter(|model| model["isDefault"] != true)
+        .collect();
+    assert_eq!(
+        catalog::prefer_canonical(remaining).expect("tie member")["requestedModel"]["maxMode"],
+        false
+    );
 }
 
 #[test]

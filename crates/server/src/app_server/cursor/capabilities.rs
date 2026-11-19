@@ -193,7 +193,7 @@ impl NativeSession {
         }
         .ok_or("cursor_model_unavailable")?;
         credential::check_generation(self.generation)?;
-        Ok(super::catalog::with_max_context(&models, model).clone())
+        Ok(model.clone())
     }
 
     async fn serving_model(&self, selection: Option<&str>) -> Result<(String, bool), String> {
