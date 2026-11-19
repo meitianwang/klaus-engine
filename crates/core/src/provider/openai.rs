@@ -1515,7 +1515,7 @@ fn build_responses_params(
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
 ) -> Result<Value, ProviderError> {
-    build_responses_params_with_tool_mode(req, caps, dialect, false)
+    build_responses_params_with_tool_mode(req, caps, dialect, false, true)
 }
 
 fn build_responses_params_with_tool_mode(
@@ -1523,6 +1523,7 @@ fn build_responses_params_with_tool_mode(
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
     function_tools: bool,
+    tool_batches_allowed: bool,
 ) -> Result<Value, ProviderError> {
     let structured = req.output_schema.is_some();
     let native_search = !function_tools
@@ -1540,22 +1541,78 @@ fn build_responses_params_with_tool_mode(
             }
         }
     }
+    // Cumulative tool batches: the top-level declaration list is not sent at
+    // all; the frozen baseline rides as the first input item and every later
+    // inventory change appends another batch, so the request prefix never
+    // moves when tools change.
+    let batch_tools = tool_batches_allowed
+        && !function_tools
+        && req
+            .frozen_tools
+            .as_ref()
+            .is_some_and(|frozen| !frozen.is_empty())
+        && {
+            let system_messages = req
+                .wire_caps
+                .as_ref()
+                .and_then(|policy| policy.mid_convo_system_messages)
+                .or(caps.mid_convo_system_messages)
+                .unwrap_or_else(|| {
+                    super::model_catalog::mid_convo_system_messages_default("openai", &req.model)
+                });
+            let additional = req
+                .wire_caps
+                .as_ref()
+                .and_then(|policy| policy.additional_tools)
+                .or(caps.additional_tools)
+                .unwrap_or_else(|| {
+                    super::model_catalog::additional_tools_default("openai", &req.model)
+                });
+            system_messages && additional
+        };
+    let normalize_batch_kinds = |specs: &[ToolSpec]| -> Vec<ToolSpec> {
+        let mut out = specs.to_vec();
+        if !native_search {
+            for tool in &mut out {
+                if tool.kind == ToolSpecKind::ToolSearch {
+                    tool.kind = ToolSpecKind::Function;
+                }
+            }
+        }
+        out
+    };
+    let batch_events: Vec<crate::types::provider::ToolInventoryEvent> = if batch_tools {
+        req.tool_inventory_events
+            .iter()
+            .map(|event| crate::types::provider::ToolInventoryEvent {
+                anchor_uuid: event.anchor_uuid.clone(),
+                added: normalize_batch_kinds(&event.added),
+                removed: event.removed.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // Leave stable instructions and history unchanged when guidance changes.
     // Responses supports developer input messages, so the trailing update keeps
     // its instruction authority without pretending to be human input.
     let (stable_parts, volatile_parts) = split_system_for_cache(&req.system);
     let instructions = join_system_parts(stable_parts);
     let profile = openai_behavior_profile(&req.model);
-    let mut tools: Vec<Value> = effective_tools
-        .iter()
-        .map(|tool| {
-            if function_tools {
-                to_responses_function_tool(tool)
-            } else {
-                to_responses_tool(tool)
-            }
-        })
-        .collect();
+    let mut tools: Vec<Value> = if batch_tools {
+        Vec::new()
+    } else {
+        effective_tools
+            .iter()
+            .map(|tool| {
+                if function_tools {
+                    to_responses_function_tool(tool)
+                } else {
+                    to_responses_tool(tool)
+                }
+            })
+            .collect()
+    };
 
     // Native server web search: the hosted `web_search` built-in tool. OpenAI
     // accepts allowed-domain filters, user_location, and search_context_size;
@@ -1650,7 +1707,31 @@ fn build_responses_params_with_tool_mode(
         &profile,
         Some(&req.model),
         function_tools,
+        &batch_events,
+        if reasoning_model {
+            "developer"
+        } else {
+            "system"
+        },
     )?;
+    if batch_tools {
+        // The initial batch is always the first input item and stays
+        // byte-identical for the lifetime of the cache epoch.
+        if let Value::Array(items) = &mut input {
+            let frozen = normalize_batch_kinds(req.frozen_tools.as_ref().expect("checked above"));
+            items.insert(
+                0,
+                vobj([
+                    ("type", vs("additional_tools")),
+                    ("role", vs("developer")),
+                    (
+                        "tools",
+                        Value::Array(frozen.iter().map(to_responses_tool).collect()),
+                    ),
+                ]),
+            );
+        }
+    }
     if unresolved_guidance {
         return Err(ProviderError {
             kind: ProviderErrorKind::InvalidRequest,
@@ -2031,7 +2112,7 @@ pub(crate) fn to_responses_input_with_profile(
     tools: &[ToolSpec],
     profile: &ProviderBehaviorProfile,
 ) -> Value {
-    project_responses_input(messages, tools, profile, None, false)
+    project_responses_input(messages, tools, profile, None, false, &[], "developer")
         .expect("native tool projection is infallible")
         .0
 }
@@ -2114,17 +2195,137 @@ fn inferred_custom_tool_input(
     custom_tool_input_string(&call.input)
 }
 
+/// Verbatim wire copy for the incremental tool-batch notice. Functional
+/// protocol text; must stay byte-stable across requests.
+const TOOLS_UPDATE_NOTICE: &str = "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+/// Verbatim wire copy introducing a tool withdrawal notice.
+const TOOLS_REMOVAL_NOTICE: &str = "The following tools are no longer available. Do not call them:";
+/// Capability tag for the endpoint/model-scoped refusal learning of the
+/// cumulative tool-batch protocol.
+const ADDITIONAL_TOOLS_CAPABILITY: &str = "additional_tools";
+
+/// Stable uuid of a persisted message, used as a batch anchor.
+fn responses_message_uuid(message: &Message) -> Option<RuntimeString> {
+    match message {
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::Assistant(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::System(m) => Some(m.uuid.clone()),
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+    }
+}
+
+/// Render the held-back inventory events at a safe input boundary: a notice
+/// item, one cumulative batch item carrying every added or redefined
+/// declaration by value, then a withdrawal notice for the removed names. The
+/// notice repeats the still-unavailable set so smaller models stop re-calling
+/// withdrawn tools.
+fn flush_tool_batches(
+    out: &mut Vec<Value>,
+    pending: &mut Vec<usize>,
+    events: &[crate::types::provider::ToolInventoryEvent],
+    role: &str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let last = *pending.last().expect("pending checked");
+    let mut unavailable: Vec<RuntimeString> = Vec::new();
+    for event in &events[..=last] {
+        for name in &event.removed {
+            if !unavailable.contains(name) {
+                unavailable.push(name.clone());
+            }
+        }
+        for spec in &event.added {
+            unavailable.retain(|existing| existing != &spec.name);
+        }
+    }
+    let mut added: Vec<&ToolSpec> = Vec::new();
+    let mut removed: Vec<RuntimeString> = Vec::new();
+    for index in pending.iter() {
+        for spec in &events[*index].added {
+            if let Some(position) = added.iter().position(|existing| existing.name == spec.name) {
+                added.remove(position);
+            }
+            added.push(spec);
+        }
+        for name in &events[*index].removed {
+            if !removed.contains(name) {
+                removed.push(name.clone());
+            }
+        }
+    }
+    removed.retain(|name| !added.iter().any(|spec| &spec.name == name));
+    if !added.is_empty() {
+        let mut notice = RuntimeString::from(TOOLS_UPDATE_NOTICE);
+        if !unavailable.is_empty() {
+            let names = unavailable
+                .iter()
+                .map(diagnostic_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            notice = notice.concat(&RuntimeString::from(format!(
+                "\nStill unavailable: {names}."
+            )));
+        }
+        out.push(vobj([("role", vs(role)), ("content", vs(notice))]));
+        out.push(vobj([
+            ("type", vs("additional_tools")),
+            ("role", vs("developer")),
+            (
+                "tools",
+                Value::Array(added.iter().map(|spec| to_responses_tool(spec)).collect()),
+            ),
+        ]));
+    }
+    if !removed.is_empty() {
+        let list = removed
+            .iter()
+            .map(|name| format!("- {}", diagnostic_string(name)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push(vobj([
+            ("role", vs(role)),
+            (
+                "content",
+                vs(RuntimeString::from(format!(
+                    "{TOOLS_REMOVAL_NOTICE}\n{list}"
+                ))),
+            ),
+        ]));
+    }
+    pending.clear();
+}
+
 fn project_responses_input(
     messages: &[Message],
     tools: &[ToolSpec],
     profile: &ProviderBehaviorProfile,
     current_model: Option<&RuntimeString>,
     function_tools: bool,
+    inventory_events: &[crate::types::provider::ToolInventoryEvent],
+    notification_role: &str,
 ) -> Result<(Value, bool), ProviderError> {
     let mut out: Vec<Value> = Vec::new();
     let mut tool_use_kinds: HashMap<RuntimeString, ProviderToolCallKind> = HashMap::new();
     let mut open_calls: HashSet<RuntimeString> = HashSet::new();
     let mut pending_guidance = Vec::new();
+    let mut anchored: HashMap<RuntimeString, Vec<usize>> = HashMap::new();
+    let mut pending_batches: Vec<usize> = Vec::new();
+    let mut matched_events: HashSet<usize> = HashSet::new();
+    for (index, event) in inventory_events.iter().enumerate() {
+        match &event.anchor_uuid {
+            Some(uuid) => {
+                anchored.entry(uuid.clone()).or_default().push(index);
+            }
+            None => {
+                if matched_events.insert(index) {
+                    pending_batches.push(index);
+                }
+            }
+        }
+    }
     for msg in messages {
         match msg {
             Message::User(u) => {
@@ -2320,7 +2521,37 @@ fn project_responses_input(
             }
             Message::System(_) => {}
         }
+        if let Some(uuid) = responses_message_uuid(msg) {
+            if let Some(indices) = anchored.get(&uuid) {
+                for index in indices {
+                    if matched_events.insert(*index) {
+                        pending_batches.push(*index);
+                    }
+                }
+            }
+        }
+        // Batches only land where a call/output pair is not open, mirroring the
+        // guidance-hold rule so adjacency stays valid on the wire.
+        if !pending_batches.is_empty() && open_calls.is_empty() {
+            flush_tool_batches(
+                &mut out,
+                &mut pending_batches,
+                inventory_events,
+                notification_role,
+            );
+        }
     }
+    for index in 0..inventory_events.len() {
+        if matched_events.insert(index) {
+            pending_batches.push(index);
+        }
+    }
+    flush_tool_batches(
+        &mut out,
+        &mut pending_batches,
+        inventory_events,
+        notification_role,
+    );
     // The fallible request builder rejects an instruction trapped behind
     // unanswered calls; never fabricate outputs or lower it to a user role.
     let unresolved_guidance = !pending_guidance.is_empty();
@@ -5609,6 +5840,8 @@ impl OpenAIProvider {
         if native_tool_support.disabled(&url, &req.model) {
             capabilities.native_deferred_tools = Some(false);
         }
+        let tool_batches_allowed =
+            !native_tool_support.disabled_for(&url, &req.model, ADDITIONAL_TOOLS_CAPABILITY);
         let reasoning_dialect = self.reasoning_dialect;
         let review_effort = self.review_effort.clone();
         let review_stream = self.retry.retry_class_policy
@@ -5657,7 +5890,7 @@ impl OpenAIProvider {
                 };
                 return;
             }
-            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, function_tools) {
+            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, function_tools, tool_batches_allowed) {
                 Ok(mut body) => {
                     retain_scoped_responses_context(&mut body, compatibility.as_ref(), &req.model);
                     // The codex-subscription backend rejects some standard
@@ -6134,6 +6367,11 @@ impl ModelProvider for OpenAIProvider {
                 &capabilities,
                 self.reasoning_dialect,
                 function_tools,
+                !self.native_tool_support.disabled_for(
+                    &self.endpoint("/responses"),
+                    &request.model,
+                    ADDITIONAL_TOOLS_CAPABILITY,
+                ),
             )
             .map_err(|error| error.message)?;
             retain_scoped_responses_context(&mut body, self.compatibility.as_ref(), &request.model);
@@ -7550,6 +7788,222 @@ mod tests {
         })
     }
 
+    fn batch_msg_user(uuid: &str, text: &str) -> Message {
+        Message::User(UserMessage {
+            question_answer: None,
+            uuid: uuid.into(),
+            content: vec![text_block(text)],
+            is_meta: None,
+        })
+    }
+
+    fn batch_msg_assistant(uuid: &str, text: &str) -> Message {
+        Message::Assistant(crate::schemas::message::AssistantMessage {
+            uuid: uuid.into(),
+            model: "gpt-5.6-sol".into(),
+            usage: None,
+            content: vec![text_block(text)],
+        })
+    }
+
+    fn batch_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "batch fixture".into(),
+            input_schema: required_string_schema("target"),
+            kind: ToolSpecKind::Function,
+            format: None,
+        }
+    }
+
+    fn batch_fixture_request() -> ModelRequest {
+        use crate::types::provider::ToolInventoryEvent;
+        let mut request = base_req();
+        request.model = "gpt-5.6-sol".into();
+        request.frozen_tools = Some(vec![batch_spec("read"), batch_spec("bash")]);
+        request.tools = vec![
+            batch_spec("bash"),
+            batch_spec("calculator"),
+            batch_spec("echo"),
+        ];
+        request.tool_inventory_events = vec![
+            ToolInventoryEvent {
+                anchor_uuid: Some("u1".into()),
+                added: vec![batch_spec("calculator")],
+                removed: vec![],
+            },
+            ToolInventoryEvent {
+                anchor_uuid: Some("u2".into()),
+                added: vec![],
+                removed: vec!["read".into()],
+            },
+            ToolInventoryEvent {
+                anchor_uuid: Some("u3".into()),
+                added: vec![batch_spec("echo")],
+                removed: vec![],
+            },
+        ];
+        request.messages = vec![
+            batch_msg_user("u1", "one"),
+            batch_msg_assistant("a1", "r1"),
+            batch_msg_user("u2", "two"),
+            batch_msg_assistant("a2", "r2"),
+            batch_msg_user("u3", "three"),
+            batch_msg_assistant("a3", "r3"),
+        ];
+        request
+    }
+
+    #[test]
+    fn responses_batch_mode_renders_frozen_initial_batch_and_anchored_updates() {
+        let request = batch_fixture_request();
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            false,
+            true,
+        )
+        .unwrap();
+        let again = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body, again, "batch assembly must be deterministic");
+        assert!(
+            body.get("tools").is_none(),
+            "batch mode must not send the top-level tools key"
+        );
+
+        let input = body.get("input").unwrap().as_array().unwrap();
+        // The initial batch is always the first input item, byte-frozen.
+        assert_eq!(input[0]["type"], json!("additional_tools"));
+        assert_eq!(input[0]["role"], json!("developer"));
+        let frozen = input[0]["tools"].as_array().unwrap();
+        assert_eq!(frozen.len(), 2);
+        assert_eq!(frozen[0]["name"], json!("read"));
+        assert_eq!(frozen[1]["name"], json!("bash"));
+
+        let kinds: Vec<String> = input
+            .iter()
+            .map(|item| {
+                if item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "additional_tools")
+                {
+                    return "batch".to_string();
+                }
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(diagnostic_string)
+                    .unwrap_or_default();
+                if content.starts_with(TOOLS_UPDATE_NOTICE) {
+                    "notice".to_string()
+                } else if content.starts_with(TOOLS_REMOVAL_NOTICE) {
+                    "removal".to_string()
+                } else {
+                    item.get("role")
+                        .and_then(Value::as_str)
+                        .map(diagnostic_string)
+                        .unwrap_or_else(|| "?".to_string())
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "batch",     // initial frozen batch
+                "user",      // u1
+                "notice",    // incremental notice before the calculator batch
+                "batch",     // calculator
+                "assistant", // a1
+                "user",      // u2
+                "removal",   // read withdrawn
+                "assistant", // a2
+                "user",      // u3
+                "notice",    // notice repeats the still-unavailable set
+                "batch",     // echo
+                "assistant", // a3
+            ]
+        );
+
+        // Non-reasoning request: text notices use the system role; batch items
+        // stay developer-owned.
+        assert_eq!(input[2]["role"], json!("system"));
+        assert_eq!(input[3]["role"], json!("developer"));
+        // Verbatim notice copy, with the still-unavailable suffix on the later
+        // flush because `read` was withdrawn and never restored.
+        assert_eq!(
+            input[2]["content"],
+            Value::String(RuntimeString::from(TOOLS_UPDATE_NOTICE))
+        );
+        assert_eq!(
+            input[9]["content"],
+            Value::String(RuntimeString::from(format!(
+                "{TOOLS_UPDATE_NOTICE}\nStill unavailable: read."
+            )))
+        );
+        assert_eq!(
+            input[6]["content"],
+            Value::String(RuntimeString::from(format!(
+                "{TOOLS_REMOVAL_NOTICE}\n- read"
+            )))
+        );
+        // Batches carry declarations by value.
+        let batch_tools = input[3]["tools"].as_array().unwrap();
+        assert_eq!(batch_tools.len(), 1);
+        assert_eq!(batch_tools[0]["name"], json!("calculator"));
+    }
+
+    #[test]
+    fn responses_batch_downgrade_rebuilds_top_level_inventory() {
+        let request = batch_fixture_request();
+        let mut body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(native_tool_loading::contains_tool_batches(&body));
+
+        native_tool_loading::rebuild_without_tool_batches(&mut body);
+        native_tool_loading::apply_policy(&mut body, &request, false);
+
+        assert!(!native_tool_loading::contains_tool_batches(&body));
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        let names: Vec<String> = tools
+            .iter()
+            .map(|tool| diagnostic_string(tool.get("name").and_then(Value::as_str).unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "bash".to_string(),
+                "calculator".to_string(),
+                "echo".to_string()
+            ]
+        );
+        // Conversation items survive; batch notices are gone.
+        let input = body.get("input").unwrap().as_array().unwrap();
+        assert!(input.iter().all(|item| {
+            let content = item
+                .get("content")
+                .and_then(Value::as_str)
+                .map(diagnostic_string)
+                .unwrap_or_default();
+            !content.starts_with(TOOLS_UPDATE_NOTICE) && !content.starts_with(TOOLS_REMOVAL_NOTICE)
+        }));
+        assert_eq!(input.len(), 6);
+    }
+
     // ---- classifier helpers ----
 
     #[test]
@@ -8934,6 +9388,7 @@ mod tests {
             &request,
             &caps,
             OpenAiReasoningDialect::OpenAi,
+            false,
             false,
         )
         .unwrap();
@@ -11863,6 +12318,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
         )
         .expect("function mode");
         assert!(body["tools"]
@@ -11915,6 +12371,7 @@ mod tests {
                 &ModelCapabilities::default(),
                 OpenAiReasoningDialect::OpenAi,
                 true,
+                false,
             )
             .expect("choice");
             assert_eq!(body["tool_choice"], expected);
@@ -11932,6 +12389,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
         )
         .expect("switch to functions");
         assert_eq!(
@@ -11945,6 +12403,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
         )
         .expect_err("removed raw schema");
         assert_eq!(
@@ -11959,6 +12418,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
         )
         .expect_err("raw history cannot invent another required field");
         assert_eq!(

@@ -29,6 +29,7 @@ pub(super) fn apply_policy(body: &mut Value, request: &ModelRequest, native: boo
         }
     }
     let mut loaded = HashSet::new();
+    let batched = contains_tool_batches(body);
     if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
         for item in input {
             let kind = item.get("type").and_then(Value::as_str).cloned();
@@ -74,8 +75,14 @@ pub(super) fn apply_policy(body: &mut Value, request: &ModelRequest, native: boo
             }
         }
     }
-    if !native && body.get("tools").is_none() && !request.tools.is_empty() {
+    if !native && !batched && body.get("tools").is_none() && !request.tools.is_empty() {
         body["tools"] = Value::Array(Vec::new());
+    }
+    if batched {
+        // Cumulative-batch mode owns every tool declaration inside `input`; the
+        // top-level list must stay absent, so neither the eager-restore nor the
+        // namespace reconcile below may run.
+        return;
     }
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         if native {
@@ -116,6 +123,44 @@ pub(super) fn apply_policy(body: &mut Value, request: &ModelRequest, native: boo
                 }
             }
         }
+    }
+}
+
+/// Whether the request declares tools through cumulative input batches.
+pub(super) fn contains_tool_batches(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "additional_tools")
+            })
+        })
+}
+
+/// Strip the cumulative-batch artifacts (batch items plus their notice and
+/// withdrawal messages) so the caller can rebuild the plain top-level
+/// inventory shape. The current declarations themselves come from the request,
+/// which the caller's policy pass restores.
+pub(super) fn rebuild_without_tool_batches(body: &mut Value) {
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            if item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "additional_tools")
+            {
+                return false;
+            }
+            if let Some(content) = item.get("content").and_then(Value::as_str) {
+                let text = diagnostic_string(content);
+                if text.starts_with(TOOLS_UPDATE_NOTICE) || text.starts_with(TOOLS_REMOVAL_NOTICE) {
+                    return false;
+                }
+            }
+            true
+        });
     }
 }
 
@@ -169,6 +214,7 @@ pub(super) async fn establish(
         apply_policy(&mut body, request, false);
     }
     let native = contains_native_search(&body);
+    let batched = contains_tool_batches(&body);
     let result = establish_stream_with_instruction_role(
         transport.client.clone(),
         transport.url.clone(),
@@ -186,7 +232,7 @@ pub(super) async fn establish(
         Ok(response) => return Ok(response),
         Err(error) => error,
     };
-    if !native
+    if !(native || batched)
         || transport.signal.is_cancelled()
         || !crate::provider::native_tools::unsupported_native_tools(
             error.status,
@@ -195,7 +241,12 @@ pub(super) async fn establish(
     {
         return Err(error);
     }
-    learned.disable(&transport.url, &request.model);
+    if batched {
+        learned.disable_for(&transport.url, &request.model, ADDITIONAL_TOOLS_CAPABILITY);
+        rebuild_without_tool_batches(&mut body);
+    } else {
+        learned.disable(&transport.url, &request.model);
+    }
     apply_policy(&mut body, request, false);
     // This second attempt returns directly. Its refusal cannot recurse into
     // negotiation, and ordinary transport retries remain owned by the caller.
