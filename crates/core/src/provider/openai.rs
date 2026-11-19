@@ -1816,6 +1816,10 @@ fn build_responses_params_with_tool_mode(
         instructions_item,
         first_party_metadata,
     } = assembly;
+    // The function-tools compatibility profile marks endpoints that only
+    // accept the plain function-tool shape; they keep the top-level
+    // instructions field and never receive the developer message item form.
+    let instructions_item = instructions_item && !function_tools;
     let structured = req.output_schema.is_some();
     let native_search = !function_tools
         && req
@@ -9033,6 +9037,271 @@ mod tests {
         assert_eq!(
             item_text(&input[9]),
             format!("{TOOLS_REMOVED_NAMESPACES_NOTICE}\n- mcp__calendar")
+        );
+    }
+
+    fn matrix_request(model: &str) -> ModelRequest {
+        let mut request = base_req();
+        request.model = model.into();
+        request.system = vec![stable_part("base", "You are Klaus.")];
+        request.cache_key = Some("matrix-session".into());
+        request.tools = vec![
+            function_spec("read", "Read.", required_string_schema("path")),
+            namespaced_function_spec(
+                "mcp__calendar__create_event",
+                "mcp__calendar",
+                "Create an event.",
+            ),
+            ToolSpec {
+                kind: ToolSpecKind::ToolSearch,
+                ..function_spec(
+                    "tool_search",
+                    "Search tools.",
+                    required_string_schema("query"),
+                )
+            },
+        ];
+        request.messages = vec![batch_msg_user("u1", "one")];
+        request.frozen_tools = Some(request.tools.clone());
+        request
+    }
+
+    fn matrix_body(model: &str, first_party: bool, caps: &ModelCapabilities) -> Value {
+        let request = matrix_request(model);
+        build_responses_params_with_tool_mode(
+            &request,
+            caps,
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                instructions_item: true,
+                first_party_metadata: first_party,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_identified_instructions_item(item: &Value, model: &str) {
+        assert_eq!(item["type"], json!("message"), "{model}");
+        assert_eq!(item["role"], json!("developer"), "{model}");
+        assert_eq!(
+            item["content"],
+            json!([{"type":"input_text","text":"You are Klaus."}]),
+            "{model}"
+        );
+        let id = diagnostic_string(item["id"].as_str().unwrap());
+        assert!(id.starts_with("msg_"), "{model}: unexpected id {id}");
+        assert_eq!(
+            item["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+            json!(["model.base_instructions"]),
+            "{model}"
+        );
+    }
+
+    #[test]
+    fn responses_wire_shape_matrix_covers_every_catalog_model_mode() {
+        // Literal mirror of the offline capability lists and the bundled
+        // subscription catalog; the subscription-catalog drift guard lives in
+        // the server crate beside the bundled file it pins. Every model that
+        // rides the Responses wire must appear in exactly one class here.
+        let batch_models = [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ];
+        let deferred_only_models = [
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.5",
+            "gpt-reserve",
+            "codex-auto-review",
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
+        ];
+        let eager_only_models = [
+            "gpt-5.4-pro",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-mini",
+            "gpt-5.3-codex",
+            "my-custom-responses-model",
+        ];
+        let caps = ModelCapabilities::default();
+        for model in batch_models {
+            let body = matrix_body(model, true, &caps);
+            assert!(
+                body.get("tools").is_none(),
+                "{model}: batch bodies carry no top-level declaration list"
+            );
+            assert!(
+                body.get("instructions").is_none(),
+                "{model}: instructions ride the item form"
+            );
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["type"], json!("additional_tools"), "{model}");
+            assert_eq!(input[0]["role"], json!("developer"), "{model}");
+            let batch_id = diagnostic_string(input[0]["id"].as_str().unwrap());
+            assert!(batch_id.starts_with("at_"), "{model}: {batch_id}");
+            let batch_tools = input[0]["tools"].as_array().unwrap();
+            assert_eq!(batch_tools[0]["name"], json!("functions"), "{model}");
+            assert_eq!(batch_tools[0]["tools"][0]["name"], json!("read"), "{model}");
+            assert_eq!(batch_tools[1]["name"], json!("mcp__calendar"), "{model}");
+            assert_eq!(
+                batch_tools[1]["tools"][0]["name"],
+                json!("create_event"),
+                "{model}"
+            );
+            assert_eq!(batch_tools[2]["type"], json!("tool_search"), "{model}");
+            assert_eq!(batch_tools[2]["execution"], json!("client"), "{model}");
+            assert_identified_instructions_item(&input[1], model);
+            assert_eq!(input[2]["role"], json!("user"), "{model}");
+        }
+        for model in deferred_only_models {
+            let body = matrix_body(model, true, &caps);
+            assert!(
+                body.get("instructions").is_none(),
+                "{model}: instructions ride the item form"
+            );
+            let tools = body["tools"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{model}: top-level declaration list"));
+            assert_eq!(tools[0]["type"], json!("function"), "{model}");
+            assert_eq!(tools[0]["name"], json!("read"), "{model}");
+            assert_eq!(tools[1]["type"], json!("namespace"), "{model}");
+            assert_eq!(tools[1]["name"], json!("mcp__calendar"), "{model}");
+            assert_eq!(
+                tools[1]["tools"][0]["name"],
+                json!("create_event"),
+                "{model}"
+            );
+            assert_eq!(
+                tools[2]["type"],
+                json!("tool_search"),
+                "{model}: deferred models declare the search protocol"
+            );
+            assert_eq!(tools[2]["execution"], json!("client"), "{model}");
+            let input = body["input"].as_array().unwrap();
+            assert_identified_instructions_item(&input[0], model);
+            assert_eq!(input[1]["role"], json!("user"), "{model}");
+        }
+        for model in eager_only_models {
+            let body = matrix_body(model, true, &caps);
+            assert!(
+                body.get("instructions").is_none(),
+                "{model}: instructions ride the item form"
+            );
+            let tools = body["tools"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{model}: top-level declaration list"));
+            assert_eq!(tools[0]["type"], json!("function"), "{model}");
+            assert_eq!(tools[1]["type"], json!("namespace"), "{model}");
+            assert_eq!(
+                tools[2]["type"],
+                json!("function"),
+                "{model}: eager models carry the search tool as a plain function"
+            );
+            assert_eq!(tools[2]["name"], json!("tool_search"), "{model}");
+            let input = body["input"].as_array().unwrap();
+            assert_identified_instructions_item(&input[0], model);
+        }
+        // Third-party surfaces receive the identical items and ids without the
+        // internal passthrough metadata, whatever the shape class.
+        for model in ["gpt-6.2-sol", "gpt-5.5", "my-custom-responses-model"] {
+            let body = matrix_body(model, false, &caps);
+            let input = body["input"].as_array().unwrap();
+            for item in input {
+                assert!(
+                    item.get("internal_chat_message_metadata_passthrough")
+                        .is_none(),
+                    "{model}: third-party surfaces never receive passthrough metadata"
+                );
+            }
+            assert!(
+                input.iter().any(|item| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| diagnostic_string(id).starts_with("msg_"))
+                }),
+                "{model}: identified instruction items survive without the metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_capabilities_override_the_offline_shape_classification() {
+        // A custom-endpoint model whose backend declares the batch protocol
+        // rides the batch shape even though no offline list names it.
+        let mut caps = ModelCapabilities::default();
+        caps.additional_tools = Some(true);
+        caps.mid_convo_system_messages = Some(true);
+        let body = matrix_body("my-custom-responses-model", true, &caps);
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], json!("additional_tools"));
+        // An explicit negative declaration pulls a catalog batch model back to
+        // the eager top-level shape (the same lever the learning layer uses).
+        let mut caps = ModelCapabilities::default();
+        caps.additional_tools = Some(false);
+        let body = matrix_body("gpt-6.2-sol", true, &caps);
+        assert!(body["tools"].as_array().is_some());
+        assert_eq!(body["input"][0]["role"], json!("developer"));
+        assert_eq!(body["input"][0]["type"], json!("message"));
+    }
+
+    #[test]
+    fn function_tools_profile_keeps_the_top_level_instructions_field() {
+        let request = matrix_request("gpt-5.5");
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                instructions_item: true,
+                first_party_metadata: true,
+            },
+        )
+        .unwrap();
+        // The compatibility profile marks endpoints that only accept the plain
+        // function-tool shape: the stable prefix stays on the top-level field,
+        // no identified message item is injected, and every declaration stays
+        // a flat function under its internal registry name.
+        assert_eq!(body["instructions"], vs("You are Klaus."));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], json!("user"));
+        assert!(input.iter().all(|item| item
+            .get("internal_chat_message_metadata_passthrough")
+            .is_none()));
+        let tools = body["tools"].as_array().unwrap();
+        let entries: Vec<(String, String)> = tools
+            .iter()
+            .map(|tool| {
+                (
+                    diagnostic_string(tool["type"].as_str().unwrap()),
+                    diagnostic_string(tool["name"].as_str().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("function".to_string(), "read".to_string()),
+                (
+                    "function".to_string(),
+                    "mcp__calendar__create_event".to_string()
+                ),
+                ("function".to_string(), "tool_search".to_string()),
+            ]
         );
     }
 

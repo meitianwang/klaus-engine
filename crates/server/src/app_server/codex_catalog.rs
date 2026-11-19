@@ -1294,6 +1294,35 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// Drift guard: the bundled subscription catalog drives which models ride
+    /// the cumulative tool-batch wire (see the offline capability lists in the
+    /// core model catalog and the wire-shape matrix test beside them). Adding
+    /// or renaming a bundled model must go together with an explicit
+    /// classification decision there, so this literal set is pinned here.
+    #[test]
+    fn bundled_catalog_ids_match_the_pinned_classification_set() {
+        let mut ids: Vec<String> = super::bundled_models()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        let expected = [
+            "codex-auto-review",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-reserve",
+        ];
+        assert_eq!(ids, expected);
+    }
+
     #[test]
     fn complete_internal_catalog_keeps_picker_seed_separate() {
         let public = super::bundled_models();
