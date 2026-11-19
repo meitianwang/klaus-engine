@@ -223,7 +223,7 @@ pub(super) fn contains_tool_namespaces(body: &Value) -> bool {
         })
     }
     body.get("tools")
-        .is_some_and(|tools| list_has_namespace(tools))
+        .is_some_and(list_has_namespace)
         || body
             .get("input")
             .and_then(Value::as_array)
