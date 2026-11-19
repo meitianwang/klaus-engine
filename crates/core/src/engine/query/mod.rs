@@ -345,6 +345,10 @@ pub struct CompactionRecord {
     pub replaced_range: (usize, usize),
     pub replacement_history: Vec<Message>,
     pub source_message_ids: Vec<RuntimeString>,
+    /// Estimated token cost of the fixed request prefix (`system` + `tools`),
+    /// so post-compaction window resets do not omit fixed overhead before the
+    /// next provider response establishes a new usage anchor.
+    pub prefix_tokens: u64,
 }
 
 /// The parameters that drive one turn of the loop.

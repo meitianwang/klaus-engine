@@ -45,8 +45,8 @@ use crate::context::at_mention::has_at_mention;
 use crate::context::at_mention::FileMention;
 use crate::context::env_info::environment_block;
 use crate::context::env_info::EnvBlockOptions;
-use crate::context::tokens::estimate_context_tokens;
 use crate::context::tokens::tokens_from_usage;
+use crate::context::tokens::{estimate_context_tokens, estimate_context_tokens_with_prefix};
 use crate::engine::message_queue::QueuePriority;
 use crate::engine::message_queue::QueuedMessage;
 use crate::engine::message_queue::QueuedValue;
@@ -1852,7 +1852,10 @@ impl Session {
                     ));
                     if new_summary {
                         let mut window = this.turn.context_window_usage.lock_recover();
-                        window.active_tokens = Some(estimate_context_tokens(&this.model_history()));
+                        window.active_tokens = Some(estimate_context_tokens_with_prefix(
+                            &this.model_history(),
+                            rec.prefix_tokens,
+                        ));
                         window.prefill_input_tokens = None;
                         window.window_number = window.window_number.saturating_add(1);
                         records.push(crate::schemas::rollout::RolloutItem::Event(

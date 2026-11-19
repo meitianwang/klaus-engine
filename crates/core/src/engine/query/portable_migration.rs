@@ -265,7 +265,14 @@ async fn apply_target_context_adaptation(
     if shared.params.signal.is_cancelled() {
         return Err(CompactionFailure::Aborted);
     }
-    super::super::compaction::persist_compaction(shared, &mut candidate, source_ids, before).await;
+    super::super::compaction::persist_compaction(
+        shared,
+        &mut candidate,
+        source_ids,
+        before,
+        fixed_prefix_tokens(&next.request),
+    )
+    .await;
     if shared.params.signal.is_cancelled() {
         return Err(CompactionFailure::Aborted);
     }

@@ -30,12 +30,14 @@ pub(super) async fn persist_compaction(
     snapshot: &mut Vec<Message>,
     source_message_ids: Vec<RuntimeString>,
     before_tokens: u64,
+    prefix_tokens: u64,
 ) {
     persist_compaction_from(
         shared,
         snapshot,
         source_message_ids,
         before_tokens,
+        prefix_tokens,
         shared.deps().compactor.as_ref(),
     )
     .await;
@@ -46,6 +48,7 @@ pub(super) async fn persist_compaction_from(
     snapshot: &mut Vec<Message>,
     source_message_ids: Vec<RuntimeString>,
     before_tokens: u64,
+    prefix_tokens: u64,
     _compactor: &dyn crate::engine::deps::Compactor,
 ) {
     merge_fresh_answers(&shared.params, snapshot, &source_message_ids);
@@ -57,7 +60,14 @@ pub(super) async fn persist_compaction_from(
             .base_tokens
             .saturating_add(before_tokens.saturating_sub(after_tokens));
     }
-    persist_checkpoint(&shared.params, snapshot, source_message_ids.clone(), true).await;
+    persist_checkpoint(
+        &shared.params,
+        snapshot,
+        source_message_ids.clone(),
+        true,
+        prefix_tokens,
+    )
+    .await;
     merge_fresh_answers(&shared.params, snapshot, &source_message_ids);
 }
 
@@ -81,7 +91,7 @@ pub(super) async fn persist_history_repair(
     snapshot: &[Message],
     source_message_ids: Vec<RuntimeString>,
 ) {
-    persist_checkpoint(params, snapshot, source_message_ids, false).await;
+    persist_checkpoint(params, snapshot, source_message_ids, false, 0).await;
 }
 
 async fn persist_checkpoint(
@@ -89,6 +99,7 @@ async fn persist_checkpoint(
     snapshot: &[Message],
     source_message_ids: Vec<RuntimeString>,
     retires_context: bool,
+    prefix_tokens: u64,
 ) {
     if let Some(cb) = &params.on_compaction {
         if let Err(error) = cb(CompactionRecord {
@@ -97,6 +108,7 @@ async fn persist_checkpoint(
             replaced_range: (0, source_message_ids.len()),
             replacement_history: snapshot.to_vec(),
             source_message_ids,
+            prefix_tokens,
         })
         .await
         {

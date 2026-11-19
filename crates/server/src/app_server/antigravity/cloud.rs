@@ -1406,6 +1406,7 @@ struct StreamContinuationTracker {
     latest_continuation_token: Option<RuntimeString>,
     initial_input_tokens: u64,
     max_cache_read_tokens: u64,
+    max_prompt_tokens: u64,
     prior_legs_thinking_tokens: u64,
     prior_legs_response_tokens: u64,
     leg: LegState,
@@ -1432,6 +1433,7 @@ impl StreamContinuationTracker {
             latest_continuation_token: None,
             initial_input_tokens: 0,
             max_cache_read_tokens: 0,
+            max_prompt_tokens: 0,
             prior_legs_thinking_tokens: 0,
             prior_legs_response_tokens: 0,
             leg: LegState::default(),
@@ -1533,6 +1535,7 @@ impl StreamContinuationTracker {
             // to the first leg's uncached prompt so one multi-leg turn is
             // still accounted as a single request.
             self.max_cache_read_tokens = self.max_cache_read_tokens.max(cached);
+            self.max_prompt_tokens = self.max_prompt_tokens.max(prompt);
             let (pinned_input, pinned_cached) = if self.has_prior_leg {
                 if self.has_initial_input_tokens {
                     (self.initial_input_tokens, self.max_cache_read_tokens)
@@ -1544,7 +1547,17 @@ impl StreamContinuationTracker {
                 self.has_initial_input_tokens = true;
                 (uncached_input, self.max_cache_read_tokens)
             };
-            let pinned_prompt = pinned_input.saturating_add(pinned_cached);
+            // When leg 1 was cache-cold (`uncached_input == prompt`) and a
+            // continuation leg hits the implicit cache (or a trailing frame in
+            // the same leg omits `cachedContentTokenCount`), `pinned_input +
+            // pinned_cached` would double-count the same prefix tokens. Cap the
+            // reconstructed prompt total at the largest upstream prompt seen
+            // across frames so cache-read upgrades shift tokens from uncached to
+            // cached instead of inflating `promptTokenCount`.
+            let pinned_prompt = pinned_input
+                .saturating_add(pinned_cached)
+                .min(self.max_prompt_tokens);
+            let pinned_cached = pinned_cached.min(pinned_prompt);
             let total_thinking = self
                 .prior_legs_thinking_tokens
                 .saturating_add(self.leg.thinking_tokens);
@@ -3840,6 +3853,54 @@ mod tests {
         let usage = mapped2.usage_metadata.unwrap();
         assert_eq!(usage.cached_content_token_count, Some(800));
         assert_eq!(usage.prompt_token_count, Some(1000));
+    }
+
+    #[test]
+    fn continuation_tracker_clamps_prompt_when_cold_first_leg_hits_cache_later() {
+        let mut tracker = StreamContinuationTracker::new(Some(10_000));
+        let leg1 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"part one "}]},"finishReason":"FINISH_REASON_CONTINUATION","continuationToken":"tok-cold-1"}],"usageMetadata":{"promptTokenCount":150000,"cachedContentTokenCount":0,"thoughtsTokenCount":100,"candidatesTokenCount":200}}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = tracker.record_frame(leg1);
+        assert!(matches!(
+            tracker.evaluate_leg_end(None),
+            LegEndAction::Continue {
+                is_mid_stream_retry: false,
+                ..
+            }
+        ));
+
+        let leg2 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"part two"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":151000,"cachedContentTokenCount":148000,"thoughtsTokenCount":50,"candidatesTokenCount":300}}}"#,
+            None,
+        )
+        .unwrap();
+        let mapped2 = tracker.record_frame(leg2);
+        let usage = mapped2.usage_metadata.unwrap();
+        assert_eq!(usage.cached_content_token_count, Some(148_000));
+        assert_eq!(usage.prompt_token_count, Some(151_000));
+        assert_eq!(usage.total_token_count, Some(151_650));
+
+        // Intra-leg frame omitting `cachedContentTokenCount` after an earlier
+        // cache-bearing frame must also stay bounded by `max_prompt_tokens`.
+        let mut single_leg = StreamContinuationTracker::new(None);
+        let f1 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":150000,"cachedContentTokenCount":148000,"candidatesTokenCount":10}}}"#,
+            None,
+        )
+        .unwrap();
+        let _ = single_leg.record_frame(f1);
+        let f2 = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"b"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":150000,"candidatesTokenCount":25}}}"#,
+            None,
+        )
+        .unwrap();
+        let mapped_f2 = single_leg.record_frame(f2);
+        let single_usage = mapped_f2.usage_metadata.unwrap();
+        assert_eq!(single_usage.cached_content_token_count, Some(148_000));
+        assert_eq!(single_usage.prompt_token_count, Some(150_000));
     }
 
     #[test]

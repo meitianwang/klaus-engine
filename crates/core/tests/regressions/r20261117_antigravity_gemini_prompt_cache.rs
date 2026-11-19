@@ -47,10 +47,17 @@ const GEMINI_MODEL: &str = "gemini-cache-stability-fixture";
 #[derive(Clone)]
 enum ScriptedReply {
     Text(&'static str),
+    TextWithPromptTokens(&'static str, u64),
     ToolCall {
         id: &'static str,
         name: &'static str,
         args: Value,
+    },
+    ToolCallWithPromptTokens {
+        id: &'static str,
+        name: &'static str,
+        args: Value,
+        prompt_tokens: u64,
     },
 }
 
@@ -104,15 +111,36 @@ impl GeminiClient for ScriptedGeminiClient {
             .unwrap()
             .pop_front()
             .unwrap_or(ScriptedReply::Text("done"));
-        let parts = match reply {
-            ScriptedReply::Text(text) => json!([{ "text": text }]),
-            ScriptedReply::ToolCall { id, name, args } => json!([{
-                "functionCall": {
-                    "id": id,
-                    "name": name,
-                    "args": args,
-                }
-            }]),
+        let (parts, prompt_tokens) = match reply {
+            ScriptedReply::Text(text) => (json!([{ "text": text }]), 256u64),
+            ScriptedReply::TextWithPromptTokens(text, tokens) => {
+                (json!([{ "text": text }]), tokens)
+            }
+            ScriptedReply::ToolCall { id, name, args } => (
+                json!([{
+                    "functionCall": {
+                        "id": id,
+                        "name": name,
+                        "args": args,
+                    }
+                }]),
+                256u64,
+            ),
+            ScriptedReply::ToolCallWithPromptTokens {
+                id,
+                name,
+                args,
+                prompt_tokens,
+            } => (
+                json!([{
+                    "functionCall": {
+                        "id": id,
+                        "name": name,
+                        "args": args,
+                    }
+                }]),
+                prompt_tokens,
+            ),
         };
         let response: GenerateContentResponse = runtime_codec::decode_text(&RuntimeString::from(
             json!({
@@ -122,8 +150,9 @@ impl GeminiClient for ScriptedGeminiClient {
                     "finishReason": "STOP"
                 }],
                 "usageMetadata": {
-                    "promptTokenCount": 256,
-                    "candidatesTokenCount": 8
+                    "promptTokenCount": prompt_tokens,
+                    "candidatesTokenCount": 8,
+                    "totalTokenCount": prompt_tokens + 8
                 }
             })
             .to_string(),
@@ -139,6 +168,16 @@ fn start_antigravity_gemini_session(
     context_window: u64,
     model_messages: Option<Value>,
 ) -> (tempfile::TempDir, Arc<Session>) {
+    start_antigravity_gemini_session_with_cap(client, tools, context_window, None, model_messages)
+}
+
+fn start_antigravity_gemini_session_with_cap(
+    client: Arc<ScriptedGeminiClient>,
+    tools: Vec<Arc<dyn Tool>>,
+    context_window: u64,
+    auto_compact_token_limit: Option<u64>,
+    model_messages: Option<Value>,
+) -> (tempfile::TempDir, Arc<Session>) {
     let directory = tempfile::tempdir().unwrap();
     let provider = GeminiProvider::new(GeminiProviderOptions {
         default_model: Some(GEMINI_MODEL.into()),
@@ -146,6 +185,7 @@ fn start_antigravity_gemini_session(
         capabilities: Some(ModelCapabilities {
             context_window: Some(context_window),
             max_output_tokens: Some(1_024),
+            auto_compact_token_limit,
             tools: Some(true),
             model_messages: model_messages
                 .map(|value| runtime_json::parse(&RuntimeString::from(value.to_string())).unwrap()),
@@ -638,7 +678,12 @@ async fn antigravity_gemini_keeps_deferred_tools_out_of_declarations_and_invokes
 }
 
 #[tokio::test]
-async fn large_deferred_catalog_stays_deferred_without_mutating_declarations() {
+async fn large_deferred_catalog_stays_deferred_while_keeping_direct_tools_and_avoiding_compaction_thrash(
+) {
+    // 1. A 1M-window Antigravity Gemini model with a 256k auto-compaction cap and
+    //    bulky deferred plugin/connector tools keeps `Direct` tools + `call_mcp_tool`
+    //    statically visible, leaves the entire `Deferred` catalog out of
+    //    `functionDeclarations`, and preserves `wire["tools"]` across `tool_search`.
     let bulk_desc = "Plugin schema description payload ".repeat(160);
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         create_read_tool(),
@@ -662,7 +707,13 @@ async fn large_deferred_catalog_stays_deferred_without_mutating_declarations() {
         },
         ScriptedReply::Text("design ready"),
     ]);
-    let (_dir, session) = start_antigravity_gemini_session(client.clone(), tools, 1_048_576, None);
+    let (_dir, session) = start_antigravity_gemini_session_with_cap(
+        client.clone(),
+        tools,
+        1_048_576,
+        Some(256_000),
+        None,
+    );
     let res = session
         .run(
             Input::Text("Open the design canvas.".into()),
@@ -689,4 +740,73 @@ async fn large_deferred_catalog_stays_deferred_without_mutating_declarations() {
         "activating deferred tools via tool_search must not mutate functionDeclarations"
     );
     session.dispose().await;
+
+    // 2. Even if workspace instructions + surfaced schemas push the post-compaction
+    //    baseline prefill (`290_000`) above the soft `256_000` `autoCompactTokenLimit`
+    //    (while well below the 1M usable window), consecutive tool steps within the
+    //    64k floor-growth window must NOT loop through repeated compactions on every step.
+    let thrash_dir = tempfile::tempdir().unwrap();
+    let target_file = thrash_dir.path().join("format.md");
+    std::fs::write(&target_file, "# Format rules\n").unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    let thrash_client = ScriptedGeminiClient::new(vec![
+        // Step 1 crosses effective limit (~260k) -> triggers initial compaction before Step 2.
+        ScriptedReply::ToolCallWithPromptTokens {
+            id: "read-1",
+            name: "read",
+            args: json!({ "path": target_path }),
+            prompt_tokens: 270_000,
+        },
+        // Compaction summary response #1.
+        ScriptedReply::TextWithPromptTokens(
+            "# Handoff Checkpoint\n- Initial summary checkpoint.",
+            271_000,
+        ),
+        // Post-compaction Step 2: baseline prefill itself is 290_000 (> 256_000).
+        ScriptedReply::ToolCallWithPromptTokens {
+            id: "read-2",
+            name: "read",
+            args: json!({ "path": target_path }),
+            prompt_tokens: 290_000,
+        },
+        // Step 3: 292_000 (< 290_000 + 64_000 = 354_000) -> MUST NOT re-compact!
+        ScriptedReply::ToolCallWithPromptTokens {
+            id: "read-3",
+            name: "read",
+            args: json!({ "path": target_path }),
+            prompt_tokens: 292_000,
+        },
+        // Step 4: finishes cleanly without any extra compaction calls.
+        ScriptedReply::TextWithPromptTokens("completed without compaction loop", 294_000),
+    ]);
+    // Without `tool_search` in the pool, `mcp__heavy__schema` (~195k UTF-8 tokens,
+    // ~290k provider BPE tokens) stays in the fixed `tools` prefix across compaction.
+    let heavy_schema = "Schema field definition. ".repeat(16_000);
+    let (_sess_dir, thrash_session) = start_antigravity_gemini_session_with_cap(
+        thrash_client.clone(),
+        vec![
+            create_read_tool(),
+            demo_mcp_tool("heavy", "schema", &heavy_schema),
+        ],
+        1_048_576,
+        Some(256_000),
+        None,
+    );
+    let thrash_res = thrash_session
+        .run(
+            Input::Text("Read format rules and finish.".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(thrash_res.error.is_none(), "{:?}", thrash_res.error);
+    assert_eq!(thrash_res.final_text, "completed without compaction loop");
+    let thrash_calls = thrash_client.taken();
+    assert_eq!(
+        thrash_calls.len(),
+        5,
+        "expected 4 foreground steps + 1 compaction summary (no every-step compaction loop), got {} calls",
+        thrash_calls.len()
+    );
+    thrash_session.dispose().await;
 }

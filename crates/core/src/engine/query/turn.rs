@@ -2082,15 +2082,26 @@ async fn run_turn(
             .context_window
             .as_ref()
             .map_or(estimate, |state| state.sample(estimate));
-        let status = crate::context::compact::policy::context_window_status(
-            &config,
-            active,
-            shared
-                .params
-                .context_window
-                .as_ref()
-                .and_then(|state| state.prefill()),
-        );
+        let prefill_tokens = shared
+            .params
+            .context_window
+            .as_ref()
+            .and_then(|state| state.prefill());
+        let status =
+            crate::context::compact::policy::context_window_status(&config, active, prefill_tokens);
+        let post_turn_explicit_reached = config.post_turn_compact_threshold_percent > 0
+            && u128::from(active) * 100
+                >= u128::from(status.full_context_window_limit)
+                    * u128::from(config.post_turn_compact_threshold_percent);
+        let turn_end_should_compact = status.turn_end_compaction_threshold_reached
+            && (post_turn_explicit_reached
+                || !soft_auto_compact_deferred_by_floor(
+                    &config,
+                    &status,
+                    prefix_tokens,
+                    prefill_tokens,
+                    &messages,
+                ));
         let pending_input = shared.params.message_queue.as_ref().is_some_and(|queue| {
             queue
                 .admitted_snapshot()
@@ -2100,7 +2111,7 @@ async fn run_turn(
         if !config.compaction_disabled
             && config.auto_compaction
             && config.post_turn_compact_threshold_percent > 0
-            && status.turn_end_compaction_threshold_reached
+            && turn_end_should_compact
             && !pending_input
             && !signal.is_cancelled()
         {
@@ -2600,17 +2611,23 @@ async fn run_turn_compaction_check(
             .reanchor(spend, active);
     }
     let config = shared.config();
-    let status = crate::context::compact::policy::context_window_status(
-        &config,
-        active,
-        shared
-            .params
-            .context_window
-            .as_ref()
-            .and_then(|state| state.prefill()),
-    );
+    let prefill_tokens = shared
+        .params
+        .context_window
+        .as_ref()
+        .and_then(|state| state.prefill());
+    let status =
+        crate::context::compact::policy::context_window_status(&config, active, prefill_tokens);
     if !migrated && !config.compaction_disabled && config.auto_compaction {
-        if !status.token_limit_reached {
+        let should_compact = status.token_limit_reached
+            && !soft_auto_compact_deferred_by_floor(
+                &config,
+                &status,
+                prefix_tokens,
+                prefill_tokens,
+                messages,
+            );
+        if !should_compact {
             // Arm the background checkpoint summary while there is still lead
             // room before the automatic-compaction boundary.
             maybe_arm_compaction_precompute(
@@ -3636,7 +3653,7 @@ async fn finish_turn_compact(
             output(message).await;
         }
     }
-    persist_compaction(shared, &mut candidate, source_ids, before).await;
+    persist_compaction(shared, &mut candidate, source_ids, before, prefix_tokens).await;
     if shared.params.on_compaction.is_none() {
         if let Some(window) = &shared.params.context_window {
             window
@@ -3811,6 +3828,82 @@ async fn consume_precomputed_compaction(
     }
 }
 
+const SOFT_AUTO_COMPACT_MAX_FLOOR_GROWTH_TOKENS: u64 = 64_000;
+
+/// Non-removable baseline of the active `AutoCompactScope::Total` window when
+/// governed by a catalog `model_auto_compact_token_limit` ceiling (with no
+/// explicit caller `autoCompactWindow` override). After a compaction boundary,
+/// `prefill_tokens` (`get_or_insert` on the first post-compaction response) is
+/// the provider's exact token count for the compacted baseline.
+fn total_scope_window_floor(
+    config: &crate::schemas::config::ResolvedConfig,
+    prefix_tokens: u64,
+    prefill_tokens: Option<u64>,
+    messages: &[Message],
+) -> Option<u64> {
+    if config.auto_compact_window.is_some() || config.model_auto_compact_token_limit.is_none() {
+        return None;
+    }
+    let has_boundary = messages
+        .iter()
+        .any(|message| matches!(message, Message::CompactBoundary(_)));
+    let observed_floor = if has_boundary {
+        prefill_tokens.unwrap_or(0)
+    } else {
+        0
+    };
+    Some(prefix_tokens.max(observed_floor))
+}
+
+fn effective_total_auto_compact_limit(
+    status: &crate::context::compact::policy::ContextWindowTokenStatus,
+    floor: u64,
+) -> u64 {
+    let min_growth =
+        (status.auto_compact_scope_limit / 4).min(SOFT_AUTO_COMPACT_MAX_FLOOR_GROWTH_TOKENS);
+    status
+        .auto_compact_scope_limit
+        .max(floor.saturating_add(min_growth))
+        .min(status.full_context_window_limit)
+}
+
+/// Prevent back-to-back soft-limit compaction thrashing when the non-compactable
+/// request floor already consumes more than 75% of (or exceeds) the soft
+/// `auto_compact_scope_limit` while the model's usable context window still has
+/// headroom. Never defers once `full_context_window_limit_reached` is true.
+fn soft_auto_compact_deferred_by_floor(
+    config: &crate::schemas::config::ResolvedConfig,
+    status: &crate::context::compact::policy::ContextWindowTokenStatus,
+    prefix_tokens: u64,
+    prefill_tokens: Option<u64>,
+    messages: &[Message],
+) -> bool {
+    if status.full_context_window_limit_reached
+        || config.auto_compact_scope != crate::schemas::config::AutoCompactScope::Total
+    {
+        return false;
+    }
+    let Some(floor) = total_scope_window_floor(config, prefix_tokens, prefill_tokens, messages)
+    else {
+        return false;
+    };
+    if status.active_context_tokens < effective_total_auto_compact_limit(status, floor) {
+        return true;
+    }
+    if let Some(last_boundary) = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::CompactBoundary(_)))
+    {
+        let has_assistant_since_boundary = messages[last_boundary + 1..]
+            .iter()
+            .any(|message| matches!(message, Message::Assistant(_)));
+        if !has_assistant_since_boundary {
+            return true;
+        }
+    }
+    false
+}
+
 /// Arm one background checkpoint summary while the context is inside the
 /// precompute lead window but has not reached the compaction boundary. The
 /// background pass never emits user-visible events on its own. Enabled by
@@ -3833,15 +3926,27 @@ fn maybe_arm_compaction_precompute(
     let Some(registry) = shared.params.precompute.as_ref() else {
         return;
     };
+    let prefill_tokens = shared
+        .params
+        .context_window
+        .as_ref()
+        .and_then(|state| state.prefill());
     let (scope_tokens, scope_limit) = match config.auto_compact_scope {
-        crate::schemas::config::AutoCompactScope::Total => (
-            status
-                .auto_compact_scope_tokens
-                .saturating_sub(prefix_tokens),
-            status
-                .auto_compact_scope_limit
-                .saturating_sub(prefix_tokens),
-        ),
+        crate::schemas::config::AutoCompactScope::Total => {
+            let floor = total_scope_window_floor(config, prefix_tokens, prefill_tokens, messages)
+                .unwrap_or(prefix_tokens);
+            let limit = if total_scope_window_floor(config, prefix_tokens, prefill_tokens, messages)
+                .is_some()
+            {
+                effective_total_auto_compact_limit(status, floor)
+            } else {
+                status.auto_compact_scope_limit
+            };
+            (
+                status.auto_compact_scope_tokens.saturating_sub(floor),
+                limit.saturating_sub(floor),
+            )
+        }
         crate::schemas::config::AutoCompactScope::BodyAfterPrefix => (
             status.auto_compact_scope_tokens,
             status.auto_compact_scope_limit,
