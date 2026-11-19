@@ -12926,7 +12926,6 @@ fn openai_reasoning_dialect_from_init(
         Some("qwen") => OpenAiReasoningDialect::Qwen,
         Some("managedQwen") => OpenAiReasoningDialect::ManagedQwen,
         Some("qoder") => OpenAiReasoningDialect::Qoder,
-        Some("llamaCpp") => OpenAiReasoningDialect::LlamaCpp,
         Some("legacyTokens") => OpenAiReasoningDialect::LegacyTokens,
         _ => OpenAiReasoningDialect::OpenAi,
     }

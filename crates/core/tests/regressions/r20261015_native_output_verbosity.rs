@@ -203,7 +203,6 @@ async fn output_detail_is_omitted_for_other_protocols_and_dialects() {
         (OpenAiApi::Responses, OpenAiReasoningDialect::ManagedQwen),
         (OpenAiApi::Responses, OpenAiReasoningDialect::Qwen),
         (OpenAiApi::Responses, OpenAiReasoningDialect::Qoder),
-        (OpenAiApi::Responses, OpenAiReasoningDialect::LlamaCpp),
         (OpenAiApi::Responses, OpenAiReasoningDialect::LegacyTokens),
     ] {
         let body = capture(

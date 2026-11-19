@@ -784,7 +784,7 @@ mod tests {
                 model("gpt-image-2.5", json!({ "supportsToolCall": null, "tags": ["text-to-image"] })),
                 model("seedance-2.5", json!({ "supportsToolCall": null, "videoGeneration": {} })),
                 model("hunyuan-image-v3.0", json!({ "supportsToolCall": null, "tags": [] })),
-                // The user's own local model: a llama-server on 127.0.0.1.
+                // A user's own self-hosted model endpoint on the loopback interface.
                 model("custom-local:local_model", json!({ "local": true })),
                 model("retired", json!({ "disabled": true })),
             ] }

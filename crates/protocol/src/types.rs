@@ -1379,7 +1379,7 @@ pub struct ModelCapabilitiesInit {
     pub media_input_mime_types: Vec<RuntimeString>,
     /// OpenAI-compatible reasoning wire dialect: `openai` (default), `deepseek`,
     /// `qwen` (Chat Completions thinking switch), `managedQwen`, `qoder`
-    /// (the local bridge), `llamaCpp`, or `legacyTokens`
+    /// (the local bridge), or `legacyTokens`
     /// (a gateway that reads the pre-2024 `max_tokens` output cap and ignores
     /// `max_completion_tokens`). Selects effort spelling, thinking-off signaling,
     /// the output-cap field name, and managed-budget behavior. An unrecognized

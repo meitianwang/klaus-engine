@@ -482,9 +482,6 @@ pub enum OpenAiReasoningDialect {
     /// The local Qoder bridge accepts an explicit `none` for detached requests
     /// that disable thinking. Unspecified intent retains its composer default.
     Qoder,
-    /// llama.cpp chat templates consume standard effort names and accept `none`
-    /// to disable reasoning explicitly.
-    LlamaCpp,
     /// A gateway that still reads the pre-2024 OpenAI output cap. Vocabulary
     /// matches OpenAI, but the cap goes out as `max_tokens`: such a gateway
     /// silently IGNORES `max_completion_tokens`, which is worse than a rejection
@@ -511,7 +508,6 @@ impl OpenAiReasoningDialect {
             OpenAiReasoningDialect::OpenAi
             | OpenAiReasoningDialect::Qwen
             | OpenAiReasoningDialect::Qoder
-            | OpenAiReasoningDialect::LlamaCpp
             | OpenAiReasoningDialect::LegacyTokens => match level {
                 EffortLevel::None => "none",
                 EffortLevel::Minimal => "minimal",
@@ -1152,14 +1148,6 @@ fn build_chat_params_with_identity(
     }
     if dialect == OpenAiReasoningDialect::Qoder
         && matches!(req.thinking, Some(ThinkingConfig::Disabled))
-    {
-        obj.insert("reasoning_effort", vs("none"));
-    }
-    if dialect == OpenAiReasoningDialect::LlamaCpp
-        && !matches!(
-            req.thinking,
-            Some(ThinkingConfig::Adaptive | ThinkingConfig::Enabled { .. })
-        )
     {
         obj.insert("reasoning_effort", vs("none"));
     }
@@ -7787,12 +7775,11 @@ mod tests {
     #[test]
     fn every_other_dialect_keeps_the_modern_cap_field() {
         // Guard the default: only LegacyTokens opts into the old spelling, so the
-        // other four dialects must still emit `max_completion_tokens`.
+        // other three dialects must still emit `max_completion_tokens`.
         for dialect in [
             OpenAiReasoningDialect::OpenAi,
             OpenAiReasoningDialect::DeepSeek,
             OpenAiReasoningDialect::Qoder,
-            OpenAiReasoningDialect::LlamaCpp,
         ] {
             let params = build_chat_params_caps(
                 &base_req(),
@@ -10188,8 +10175,10 @@ mod tests {
             is_meta: None,
         })];
 
-        let mut audio_caps = ModelCapabilities::default();
-        audio_caps.media_input_mime_types = vec!["audio/wav".into()];
+        let audio_caps = ModelCapabilities {
+            media_input_mime_types: vec!["audio/wav".into()],
+            ..Default::default()
+        };
         let provider = OpenAIProvider::new(OpenAIProviderOptions {
             api: Some(OpenAiApi::Responses),
             default_model: Some("gpt-6.2-sol".into()),
@@ -11721,20 +11710,6 @@ mod tests {
         );
         assert_eq!(wire["reasoning_effort"], vs("high"));
         assert_eq!(wire["max_completion_tokens"], Value::from(20_000));
-    }
-
-    #[test]
-    fn llama_cpp_explicitly_disables_or_spells_declared_reasoning() {
-        let mut request = base_req();
-        let caps = caps_with_levels(&[EffortLevel::Low, EffortLevel::Medium, EffortLevel::Xhigh]);
-        request.thinking = None;
-        request.effort = Some(EffortValue::Level(EffortLevel::High));
-        let disabled = build_chat_params_caps(&request, &caps, OpenAiReasoningDialect::LlamaCpp);
-        assert_eq!(disabled["reasoning_effort"], json!("none"));
-
-        request.thinking = Some(ThinkingConfig::Adaptive);
-        let enabled = build_chat_params_caps(&request, &caps, OpenAiReasoningDialect::LlamaCpp);
-        assert_eq!(enabled["reasoning_effort"], json!("medium"));
     }
 
     #[test]
