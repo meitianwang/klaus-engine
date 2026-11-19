@@ -83,6 +83,7 @@ pub(crate) fn unsupported_native_tools(status: Option<u16>, message: &str) -> bo
             "additional_tools",
             "tool_addition",
             "tool_removal",
+            "namespace",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -147,6 +148,14 @@ mod tests {
         assert!(unsupported_native_tools(
             Some(400),
             "additional_tools is not supported for this model"
+        ));
+        assert!(unsupported_native_tools(
+            Some(400),
+            "tools.0.type: 'namespace' is not supported"
+        ));
+        assert!(unsupported_native_tools(
+            Some(400),
+            "Invalid value: 'namespace'. Supported values are: 'function' and 'custom'."
         ));
         // Same needles without a validation phrase stay ordinary errors.
         assert!(!unsupported_native_tools(

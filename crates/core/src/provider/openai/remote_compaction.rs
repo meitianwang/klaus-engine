@@ -320,6 +320,7 @@ impl OpenAIProvider {
             self.reasoning_dialect,
             function_tools,
             false,
+            false,
         )?;
         if self.uses_responses_backend_format() {
             adapt_codex_responses_params(&mut body);

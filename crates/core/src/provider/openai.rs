@@ -44,10 +44,11 @@ use crate::sync_ext::MutexExt;
 use crate::types::abort::AbortSignal;
 use crate::types::errors::{ProviderError, ProviderErrorKind};
 use crate::types::provider::{
-    ModelCapabilities, ModelProvider, ModelRequest, ModelStopReason, ModelStream, ModelStreamEvent,
-    ProviderCapabilities, ProviderInfo, ProviderToolCallKind, SystemPromptPart, ThinkingConfig,
-    ToolChoice, ToolInputFormat, ToolSpec, ToolSpecFormat, ToolSpecGrammarSyntax, ToolSpecKind,
-    WebSearchAction, WebSearchContextSize,
+    internal_tool_name, ModelCapabilities, ModelProvider, ModelRequest, ModelStopReason,
+    ModelStream, ModelStreamEvent, ProviderCapabilities, ProviderInfo, ProviderToolCallKind,
+    SystemPromptPart, ThinkingConfig, ToolChoice, ToolInputFormat, ToolSpec, ToolSpecFormat,
+    ToolSpecGrammarSyntax, ToolSpecKind, WebSearchAction, WebSearchContextSize,
+    DEFAULT_TOOL_NAMESPACE,
 };
 
 mod approval_classifier;
@@ -181,6 +182,7 @@ fn validate_exact_tool_choice(
 fn responses_forced_choice(
     name: &RuntimeString,
     tools: &[ToolSpec],
+    namespaces: bool,
 ) -> Result<Value, ProviderError> {
     if tools
         .iter()
@@ -194,10 +196,24 @@ fn responses_forced_choice(
 
     match tools.iter().find(|tool| &tool.name == name) {
         Some(tool) if tool.kind == ToolSpecKind::Freeform => {
-            Ok(vobj([("type", vs("custom")), ("name", vs(name.clone()))]))
+            let (wire_name, namespace) = responses_wire_call_identity(name, tools, namespaces);
+            let mut choice = Map::new();
+            choice.insert("type", vs("custom"));
+            choice.insert("name", vs(wire_name));
+            if let Some(namespace) = namespace {
+                choice.insert("namespace", vs(namespace));
+            }
+            Ok(Value::Object(choice))
         }
         Some(tool) if tool.kind == ToolSpecKind::Function => {
-            Ok(vobj([("type", vs("function")), ("name", vs(name.clone()))]))
+            let (wire_name, namespace) = responses_wire_call_identity(name, tools, namespaces);
+            let mut choice = Map::new();
+            choice.insert("type", vs("function"));
+            choice.insert("name", vs(wire_name));
+            if let Some(namespace) = namespace {
+                choice.insert("namespace", vs(namespace));
+            }
+            Ok(Value::Object(choice))
         }
         Some(_) => Err(invalid_openai_tool_choice(
             "OpenAI Responses",
@@ -236,7 +252,7 @@ fn validate_responses_request_choice(request: &ModelRequest) -> Option<ProviderE
         Some(ToolChoice::Tool { name }) => name,
         _ => return None,
     };
-    responses_forced_choice(forced_name, &request.tools).err()
+    responses_forced_choice(forced_name, &request.tools, true).err()
 }
 
 fn validate_chat_request_choice(request: &ModelRequest) -> Option<ProviderError> {
@@ -1729,15 +1745,17 @@ fn build_responses_params(
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
 ) -> Result<Value, ProviderError> {
-    build_responses_params_with_tool_mode(req, caps, dialect, false, true)
+    build_responses_params_with_tool_mode(req, caps, dialect, false, true, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_responses_params_with_tool_mode(
     req: &ModelRequest,
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
     function_tools: bool,
     tool_batches_allowed: bool,
+    tool_namespaces_allowed: bool,
 ) -> Result<Value, ProviderError> {
     let structured = req.output_schema.is_some();
     let native_search = !function_tools
@@ -1813,19 +1831,24 @@ fn build_responses_params_with_tool_mode(
     let (stable_parts, volatile_parts) = split_system_for_cache(&req.system);
     let instructions = join_system_parts(stable_parts);
     let profile = openai_behavior_profile(&req.model);
+    // Namespace grouping rides every non-function-tools Responses list; the
+    // learning layer can refuse it per endpoint and model, and the downgrade
+    // rebuild then re-renders the same inventory flat.
+    let namespaces = tool_namespaces_allowed && !function_tools;
+    let grouping = if namespaces {
+        ResponsesToolGrouping::TopLevel
+    } else {
+        ResponsesToolGrouping::Flat
+    };
     let mut tools: Vec<Value> = if batch_tools {
         Vec::new()
-    } else {
+    } else if function_tools {
         effective_tools
             .iter()
-            .map(|tool| {
-                if function_tools {
-                    to_responses_function_tool(tool)
-                } else {
-                    to_responses_tool(tool)
-                }
-            })
+            .map(to_responses_function_tool)
             .collect()
+    } else {
+        grouped_responses_tools(&effective_tools, grouping)
     };
 
     // Native server web search: the hosted `web_search` built-in tool. OpenAI
@@ -1927,12 +1950,18 @@ fn build_responses_params_with_tool_mode(
         } else {
             "system"
         },
+        namespaces,
     )?;
     if batch_tools {
         // The initial batch is always the first input item and stays
         // byte-identical for the lifetime of the cache epoch.
         if let Value::Array(items) = &mut input {
             let frozen = normalize_batch_kinds(req.frozen_tools.as_ref().expect("checked above"));
+            let batch_grouping = if namespaces {
+                ResponsesToolGrouping::Batch
+            } else {
+                ResponsesToolGrouping::Flat
+            };
             items.insert(
                 0,
                 vobj([
@@ -1940,7 +1969,7 @@ fn build_responses_params_with_tool_mode(
                     ("role", vs("developer")),
                     (
                         "tools",
-                        Value::Array(frozen.iter().map(to_responses_tool).collect()),
+                        Value::Array(grouped_responses_tools(&frozen, batch_grouping)),
                     ),
                 ]),
             );
@@ -1994,7 +2023,7 @@ fn build_responses_params_with_tool_mode(
     if let Some(tc) = &req.tool_choice {
         obj.insert(
             "tool_choice",
-            to_responses_tool_choice(tc, &effective_tools, function_tools)?,
+            to_responses_tool_choice(tc, &effective_tools, function_tools, namespaces)?,
         );
     }
     let mut text = Map::new();
@@ -2126,6 +2155,183 @@ fn to_responses_tool(t: &ToolSpec) -> Value {
     }
 }
 
+/// How a Responses tool declaration list groups namespaced tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponsesToolGrouping {
+    /// Flat entries only; namespaces were refused or never applied.
+    Flat,
+    /// Top-level list: ungrouped tools stay flat entries, grouped tools ride
+    /// one namespace entry per group at the group's first position.
+    TopLevel,
+    /// Cumulative batch: ungrouped tools collect into the default `functions`
+    /// namespace entry, grouped tools into their own namespace entries.
+    Batch,
+}
+
+pub(super) fn responses_namespace_description(name: &RuntimeString) -> RuntimeString {
+    if name.try_to_utf8().as_deref() == Ok(DEFAULT_TOOL_NAMESPACE) {
+        return RuntimeString::default();
+    }
+    RuntimeString::from("Tools in the ")
+        .concat(name)
+        .concat(&RuntimeString::from(" namespace."))
+}
+
+fn responses_namespace_entry(name: RuntimeString, children: Vec<Value>) -> Value {
+    vobj([
+        ("type", vs("namespace")),
+        ("name", vs(name.clone())),
+        ("description", vs(responses_namespace_description(&name))),
+        ("tools", Value::Array(children)),
+    ])
+}
+
+/// A namespaced child declaration: identical to the flat rendering except the
+/// model-facing name is the namespace-relative short name.
+pub(super) fn responses_namespace_child(spec: &ToolSpec) -> Value {
+    let tool = match spec.kind {
+        ToolSpecKind::Freeform => {
+            let mut tool = Map::new();
+            tool.insert("type", vs("custom"));
+            tool.insert("name", vs(spec.wire_short_name()));
+            tool.insert("description", vs(spec.description.clone()));
+            if let Some(format) = &spec.format {
+                tool.insert("format", responses_custom_format(format));
+            }
+            tool
+        }
+        _ => {
+            let mut tool = Map::new();
+            tool.insert("type", vs("function"));
+            tool.insert("name", vs(spec.wire_short_name()));
+            tool.insert("description", vs(spec.description.clone()));
+            tool.insert("parameters", spec.input_schema.clone());
+            tool.insert("strict", Value::Bool(false));
+            tool
+        }
+    };
+    Value::Object(tool)
+}
+
+/// Render a tool declaration list, collecting namespaced specs into namespace
+/// entries at each group's first position. Ungrouped specs are flat entries
+/// in [`ResponsesToolGrouping::TopLevel`] and default-namespace children in
+/// [`ResponsesToolGrouping::Batch`]. Search declarations always stay flat, in
+/// list order. The output is deterministic for a deterministic spec order.
+pub(super) fn grouped_responses_tools(
+    specs: &[ToolSpec],
+    grouping: ResponsesToolGrouping,
+) -> Vec<Value> {
+    if grouping == ResponsesToolGrouping::Flat {
+        return specs.iter().map(to_responses_tool).collect();
+    }
+    enum Slot {
+        Inline(Value),
+        Default,
+        Named(RuntimeString),
+    }
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut default_children: Vec<Value> = Vec::new();
+    let mut named_children: HashMap<RuntimeString, Vec<Value>> = HashMap::new();
+    for spec in specs {
+        if spec.kind == ToolSpecKind::ToolSearch {
+            slots.push(Slot::Inline(to_responses_tool(spec)));
+            continue;
+        }
+        match &spec.namespace {
+            None => {
+                if grouping == ResponsesToolGrouping::Batch {
+                    if default_children.is_empty() {
+                        slots.push(Slot::Default);
+                    }
+                    default_children.push(responses_namespace_child(spec));
+                } else {
+                    slots.push(Slot::Inline(to_responses_tool(spec)));
+                }
+            }
+            Some(namespace) => {
+                let bucket = named_children.entry(namespace.clone()).or_default();
+                if bucket.is_empty() {
+                    slots.push(Slot::Named(namespace.clone()));
+                }
+                bucket.push(responses_namespace_child(spec));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Slot::Inline(value) => out.push(value),
+            Slot::Default => out.push(responses_namespace_entry(
+                RuntimeString::from(DEFAULT_TOOL_NAMESPACE),
+                std::mem::take(&mut default_children),
+            )),
+            Slot::Named(namespace) => {
+                let children = named_children.remove(&namespace).unwrap_or_default();
+                out.push(responses_namespace_entry(namespace, children));
+            }
+        }
+    }
+    out
+}
+
+/// Split an internal MCP tool name (`mcp__{server}__{tool}`) into its wire
+/// namespace and short name. Used as the replay fallback when the declaring
+/// spec is no longer in the request inventory; rejoining always reconstructs
+/// the original internal name.
+pub(super) fn split_mcp_internal_name(
+    name: &RuntimeString,
+) -> Option<(RuntimeString, RuntimeString)> {
+    let text = name.try_to_utf8().ok()?;
+    let rest = text.strip_prefix("mcp__")?;
+    let (server, short) = rest.split_once("__")?;
+    if server.is_empty() || short.is_empty() {
+        return None;
+    }
+    Some((
+        RuntimeString::from(format!("mcp__{server}")),
+        RuntimeString::from(short),
+    ))
+}
+
+/// The wire identity of a call against a namespaced tool: the short name plus
+/// its namespace entry. Flat mode (or an ungrouped tool) keeps the internal
+/// name and no namespace field.
+fn responses_wire_call_identity(
+    name: &RuntimeString,
+    tools: &[ToolSpec],
+    namespaces: bool,
+) -> (RuntimeString, Option<RuntimeString>) {
+    if !namespaces {
+        return (name.clone(), None);
+    }
+    if let Some(spec) = tools
+        .iter()
+        .find(|tool| &tool.name == name && tool.namespace.is_some())
+    {
+        return (spec.wire_short_name(), spec.namespace.clone());
+    }
+    if let Some((namespace, short)) = split_mcp_internal_name(name) {
+        return (short, Some(namespace));
+    }
+    (name.clone(), None)
+}
+
+/// Rejoin a streamed call item's optional namespace with its short name into
+/// the internal registry name.
+fn responses_call_internal_name(item: &Value) -> RuntimeString {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .cloned()
+        .unwrap_or_default();
+    let namespace = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .and_then(|namespace| namespace.try_to_utf8().ok());
+    internal_tool_name(namespace.as_deref(), &diagnostic_string(&name))
+}
+
 fn responses_custom_format(format: &ToolSpecFormat) -> Value {
     match format {
         ToolSpecFormat::Text => vobj([("type", vs("text"))]),
@@ -2210,8 +2416,12 @@ fn custom_tool_input_string(input: &Value) -> RuntimeString {
     runtime_json::stringify(input)
 }
 
-fn responses_tool_search_output(native_tool_output: Value) -> Value {
-    let tools = native_tool_output
+fn responses_tool_search_output(
+    native_tool_output: Value,
+    tools: &[ToolSpec],
+    namespaces: bool,
+) -> Value {
+    let rendered = native_tool_output
         .as_object()
         .and_then(|output| output.get("tools"))
         .and_then(Value::as_array)
@@ -2222,7 +2432,70 @@ fn responses_tool_search_output(native_tool_output: Value) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    vobj([("tools", Value::Array(tools))])
+    if !namespaces {
+        return vobj([("tools", Value::Array(rendered))]);
+    }
+    // Grouped projection: every materialized definition rides its namespace
+    // entry (ungrouped hits collect into the default group), mirroring how the
+    // declarations themselves are grouped on this endpoint.
+    let mut slots: Vec<RuntimeString> = Vec::new();
+    let mut groups: HashMap<RuntimeString, Vec<Value>> = HashMap::new();
+    for entry in rendered {
+        if entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "namespace")
+        {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .cloned()
+                .unwrap_or_else(|| RuntimeString::from(DEFAULT_TOOL_NAMESPACE));
+            let bucket = groups.entry(name.clone()).or_default();
+            if bucket.is_empty() {
+                slots.push(name);
+            }
+            if let Some(children) = entry.get("tools").and_then(Value::as_array) {
+                bucket.extend(children.iter().cloned());
+            }
+            continue;
+        }
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .cloned()
+            .unwrap_or_default();
+        let resolved = tools
+            .iter()
+            .find(|spec| spec.name == name)
+            .and_then(|spec| spec.namespace.clone())
+            .or_else(|| split_mcp_internal_name(&name).map(|(namespace, _)| namespace));
+        let (group, child) = match resolved {
+            Some(namespace) => {
+                let short = tools
+                    .iter()
+                    .find(|spec| spec.name == name)
+                    .map(|spec| spec.wire_short_name())
+                    .or_else(|| split_mcp_internal_name(&name).map(|(_, short)| short))
+                    .unwrap_or_else(|| name.clone());
+                let mut child = entry.clone();
+                child["name"] = vs(short);
+                (namespace, child)
+            }
+            None => (RuntimeString::from(DEFAULT_TOOL_NAMESPACE), entry),
+        };
+        let bucket = groups.entry(group.clone()).or_default();
+        if bucket.is_empty() {
+            slots.push(group);
+        }
+        bucket.push(child);
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(slots.len());
+    for name in slots {
+        let children = groups.remove(&name).unwrap_or_default();
+        out.push(responses_namespace_entry(name, children));
+    }
+    vobj([("tools", Value::Array(out))])
 }
 
 fn to_responses_loadable_tool(tool: &Value) -> Option<Value> {
@@ -2296,6 +2569,7 @@ fn to_responses_tool_choice(
     tc: &ToolChoice,
     tools: &[ToolSpec],
     function_tools: bool,
+    namespaces: bool,
 ) -> Result<Value, ProviderError> {
     match tc {
         ToolChoice::Auto => Ok(vs("auto")),
@@ -2309,7 +2583,7 @@ fn to_responses_tool_choice(
             }
             Ok(vobj([("type", vs("function")), ("name", vs(name.clone()))]))
         }
-        ToolChoice::Tool { name } => responses_forced_choice(name, tools),
+        ToolChoice::Tool { name } => responses_forced_choice(name, tools, namespaces),
     }
 }
 
@@ -2328,9 +2602,18 @@ pub(crate) fn to_responses_input_with_profile(
     tools: &[ToolSpec],
     profile: &ProviderBehaviorProfile,
 ) -> Value {
-    project_responses_input(messages, tools, profile, None, false, &[], "developer")
-        .expect("native tool projection is infallible")
-        .0
+    project_responses_input(
+        messages,
+        tools,
+        profile,
+        None,
+        false,
+        &[],
+        "developer",
+        false,
+    )
+    .expect("native tool projection is infallible")
+    .0
 }
 
 fn responses_function_tool_input(
@@ -2419,6 +2702,9 @@ const TOOLS_REMOVAL_NOTICE: &str = "The following tools are no longer available.
 /// Capability tag for the endpoint/model-scoped refusal learning of the
 /// cumulative tool-batch protocol.
 const ADDITIONAL_TOOLS_CAPABILITY: &str = "additional_tools";
+/// Capability tag for the endpoint/model-scoped refusal learning of grouped
+/// namespace tool declarations.
+const TOOL_NAMESPACES_CAPABILITY: &str = "tool_namespaces";
 
 /// Stable uuid of a persisted message, used as a batch anchor.
 fn responses_message_uuid(message: &Message) -> Option<RuntimeString> {
@@ -2441,6 +2727,7 @@ fn flush_tool_batches(
     pending: &mut Vec<usize>,
     events: &[crate::types::provider::ToolInventoryEvent],
     role: &str,
+    grouping: ResponsesToolGrouping,
 ) {
     if pending.is_empty() {
         return;
@@ -2486,12 +2773,13 @@ fn flush_tool_batches(
             )));
         }
         out.push(vobj([("role", vs(role)), ("content", vs(notice))]));
+        let added_specs: Vec<ToolSpec> = added.iter().map(|spec| (*spec).clone()).collect();
         out.push(vobj([
             ("type", vs("additional_tools")),
             ("role", vs("developer")),
             (
                 "tools",
-                Value::Array(added.iter().map(|spec| to_responses_tool(spec)).collect()),
+                Value::Array(grouped_responses_tools(&added_specs, grouping)),
             ),
         ]));
     }
@@ -2522,6 +2810,7 @@ fn project_responses_input(
     function_tools: bool,
     inventory_events: &[crate::types::provider::ToolInventoryEvent],
     notification_role: &str,
+    namespaces: bool,
 ) -> Result<(Value, bool), ProviderError> {
     let mut out: Vec<Value> = Vec::new();
     let mut tool_use_kinds: HashMap<RuntimeString, ProviderToolCallKind> = HashMap::new();
@@ -2530,6 +2819,11 @@ fn project_responses_input(
     let mut anchored: HashMap<RuntimeString, Vec<usize>> = HashMap::new();
     let mut pending_batches: Vec<usize> = Vec::new();
     let mut matched_events: HashSet<usize> = HashSet::new();
+    let batch_grouping = if namespaces {
+        ResponsesToolGrouping::Batch
+    } else {
+        ResponsesToolGrouping::Flat
+    };
     for (index, event) in inventory_events.iter().enumerate() {
         match &event.anchor_uuid {
             Some(uuid) => {
@@ -2620,11 +2914,17 @@ fn project_responses_input(
                             };
                             tool_use_kinds.insert(tu.id.clone(), kind);
                             match kind {
-                                ProviderToolCallKind::Function => out.push(vobj([
-                                    ("type", vs("function_call")),
-                                    ("call_id", vs(tu.id.clone())),
-                                    ("name", vs(tu.name.clone())),
-                                    (
+                                ProviderToolCallKind::Function => {
+                                    let (wire_name, namespace) =
+                                        responses_wire_call_identity(&tu.name, tools, namespaces);
+                                    let mut item = Map::new();
+                                    item.insert("type", vs("function_call"));
+                                    item.insert("call_id", vs(tu.id.clone()));
+                                    item.insert("name", vs(wire_name));
+                                    if let Some(namespace) = namespace {
+                                        item.insert("namespace", vs(namespace));
+                                    }
+                                    item.insert(
                                         "arguments",
                                         vs(runtime_json::stringify(&if function_tools {
                                             responses_function_tool_input(
@@ -2633,14 +2933,22 @@ fn project_responses_input(
                                         } else {
                                             tu.input.clone()
                                         })),
-                                    ),
-                                ])),
-                                ProviderToolCallKind::Custom => out.push(vobj([
-                                    ("type", vs("custom_tool_call")),
-                                    ("call_id", vs(tu.id.clone())),
-                                    ("name", vs(tu.name.clone())),
-                                    ("input", vs(inferred_custom_tool_input(tu, tools))),
-                                ])),
+                                    );
+                                    out.push(Value::Object(item));
+                                }
+                                ProviderToolCallKind::Custom => {
+                                    let (wire_name, namespace) =
+                                        responses_wire_call_identity(&tu.name, tools, namespaces);
+                                    let mut item = Map::new();
+                                    item.insert("type", vs("custom_tool_call"));
+                                    item.insert("call_id", vs(tu.id.clone()));
+                                    item.insert("name", vs(wire_name));
+                                    if let Some(namespace) = namespace {
+                                        item.insert("namespace", vs(namespace));
+                                    }
+                                    item.insert("input", vs(inferred_custom_tool_input(tu, tools)));
+                                    out.push(Value::Object(item));
+                                }
                                 ProviderToolCallKind::ToolSearch => out.push(vobj([
                                     ("type", vs("tool_search_call")),
                                     ("call_id", vs(tu.id.clone())),
@@ -2689,6 +2997,8 @@ fn project_responses_input(
                     ProviderToolCallKind::ToolSearch => {
                         let filtered = responses_tool_search_output(
                             tr.native_tool_output.clone().unwrap_or(Value::Null),
+                            tools,
+                            namespaces,
                         );
                         out.push(vobj([
                             ("type", vs("tool_search_output")),
@@ -2754,6 +3064,7 @@ fn project_responses_input(
                 &mut pending_batches,
                 inventory_events,
                 notification_role,
+                batch_grouping,
             );
         }
     }
@@ -2767,6 +3078,7 @@ fn project_responses_input(
         &mut pending_batches,
         inventory_events,
         notification_role,
+        batch_grouping,
     );
     // The fallible request builder rejects an instruction trapped behind
     // unanswered calls; never fabricate outputs or lower it to a user role.
@@ -4459,10 +4771,10 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     let name = if kind == ProviderToolCallKind::ToolSearch {
                         "tool_search".into()
                     } else {
-                        item.get("name")
-                            .and_then(Value::as_str)
-                            .cloned()
-                            .unwrap_or_default()
+                        // A namespaced declaration answers with the short name
+                        // plus its namespace; rejoin both into the internal
+                        // registry name before dispatch and persistence.
+                        responses_call_internal_name(item)
                     };
                     let entry = state.calls.entry(key).or_insert(ResponsesCall {
                         call_id,
@@ -4705,10 +5017,10 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     let name = if kind == ProviderToolCallKind::ToolSearch {
                         "tool_search".into()
                     } else {
-                        item.get("name")
-                            .and_then(Value::as_str)
-                            .cloned()
-                            .unwrap_or_default()
+                        // A namespaced declaration answers with the short name
+                        // plus its namespace; rejoin both into the internal
+                        // registry name before dispatch and persistence.
+                        responses_call_internal_name(item)
                     };
                     let entry = state.calls.entry(key).or_insert(ResponsesCall {
                         call_id: call_id.clone(),
@@ -6106,6 +6418,8 @@ impl OpenAIProvider {
         }
         let tool_batches_allowed =
             !native_tool_support.disabled_for(&url, &req.model, ADDITIONAL_TOOLS_CAPABILITY);
+        let tool_namespaces_allowed =
+            !native_tool_support.disabled_for(&url, &req.model, TOOL_NAMESPACES_CAPABILITY);
         let reasoning_dialect = self.reasoning_dialect;
         let affinity_format = self.session_affinity_format(&req, &capabilities);
         let review_effort = self.review_effort.clone();
@@ -6155,7 +6469,7 @@ impl OpenAIProvider {
                 };
                 return;
             }
-            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, function_tools, tool_batches_allowed) {
+            let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, function_tools, tool_batches_allowed, tool_namespaces_allowed) {
                 Ok(mut body) => {
                     retain_scoped_responses_context(&mut body, compatibility.as_ref(), &req.model);
                     // The codex-subscription backend rejects some standard
@@ -6637,6 +6951,11 @@ impl ModelProvider for OpenAIProvider {
                     &self.endpoint("/responses"),
                     &request.model,
                     ADDITIONAL_TOOLS_CAPABILITY,
+                ),
+                !self.native_tool_support.disabled_for(
+                    &self.endpoint("/responses"),
+                    &request.model,
+                    TOOL_NAMESPACES_CAPABILITY,
                 ),
             )
             .map_err(|error| error.message)?;
@@ -7752,16 +8071,17 @@ mod tests {
         let tools = vec![function.clone(), freeform.clone(), native_search.clone()];
 
         assert_eq!(
-            responses_forced_choice(&RuntimeString::from("read"), &tools).unwrap(),
+            responses_forced_choice(&RuntimeString::from("read"), &tools, false).unwrap(),
             json!({ "type": "function", "name": "read" })
         );
         assert_eq!(
-            responses_forced_choice(&RuntimeString::from("apply_patch"), &tools).unwrap(),
+            responses_forced_choice(&RuntimeString::from("apply_patch"), &tools, false).unwrap(),
             json!({ "type": "custom", "name": "apply_patch" })
         );
 
         let native_search_error =
-            responses_forced_choice(&RuntimeString::from("tool_search"), &tools).unwrap_err();
+            responses_forced_choice(&RuntimeString::from("tool_search"), &tools, false)
+                .unwrap_err();
         assert_eq!(native_search_error.kind, ProviderErrorKind::InvalidRequest);
         assert_eq!(native_search_error.status, Some(400));
         assert_eq!(native_search_error.retry_after_ms, None);
@@ -7772,7 +8092,7 @@ mod tests {
         );
 
         let missing_error =
-            responses_forced_choice(&RuntimeString::from("missing"), &tools).unwrap_err();
+            responses_forced_choice(&RuntimeString::from("missing"), &tools, false).unwrap_err();
         assert_eq!(missing_error.kind, ProviderErrorKind::InvalidRequest);
         assert_eq!(missing_error.status, Some(400));
         assert_eq!(
@@ -7799,7 +8119,7 @@ mod tests {
             ],
         ] {
             let duplicate_error =
-                responses_forced_choice(&RuntimeString::from("shared"), &duplicate_tools)
+                responses_forced_choice(&RuntimeString::from("shared"), &duplicate_tools, false)
                     .unwrap_err();
             assert_eq!(
                 duplicate_error.message,
@@ -7817,7 +8137,8 @@ mod tests {
         assert_eq!(
             responses_forced_choice(
                 &RuntimeString::from("shared"),
-                &[shared_function.clone(), shared_freeform.clone()]
+                &[shared_function.clone(), shared_freeform.clone()],
+                false
             )
             .unwrap(),
             json!({ "type": "function", "name": "shared" })
@@ -7826,6 +8147,7 @@ mod tests {
             responses_forced_choice(
                 &RuntimeString::from("shared"),
                 &[shared_freeform, shared_function],
+                false
             )
             .unwrap(),
             json!({ "type": "custom", "name": "shared" })
@@ -8138,6 +8460,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             false,
             true,
+            false,
         )
         .unwrap();
         let again = build_responses_params_with_tool_mode(
@@ -8146,6 +8469,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             false,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(body, again, "batch assembly must be deterministic");
@@ -8245,6 +8569,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             false,
             true,
+            false,
         )
         .unwrap();
         assert!(native_tool_loading::contains_tool_batches(&body));
@@ -9918,6 +10243,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(body["reasoning"]["effort"], json!("high"));
@@ -10747,7 +11073,7 @@ mod tests {
 
     #[test]
     fn tool_search_output_rebuilds_only_loadable_function_tools() {
-        let output = responses_tool_search_output(native_search_output_fixture());
+        let output = responses_tool_search_output(native_search_output_fixture(), &[], false);
         assert_eq!(
             output["tools"],
             json!([
@@ -10761,15 +11087,19 @@ mod tests {
 
     #[test]
     fn tool_search_output_uses_nullish_schema_and_validates_namespace_children_by_fields() {
-        let output = responses_tool_search_output(json!({"tools":[
-            {"kind":"custom","name":"drop-top-level","description":"Drop","inputSchema":{"type":"object"}},
-            {"name":"malformed","description":"Malformed","inputSchema":"bad","parameters":{"type":"object"}},
-            {"name":"fallback","description":"Fallback","inputSchema":null,"parameters":{"type":"object","properties":{"q":{"type":"string"}}}},
-            {"type":"namespace","name":"mixed","description":42,"tools":[
-                {"kind":"custom","name":"accepted_child","description":"Accepted child","inputSchema":{"type":"object"}},
-                {"kind":"function","name":"missing_schema","description":"Missing schema"}
-            ]}
-        ]}));
+        let output = responses_tool_search_output(
+            json!({"tools":[
+                {"kind":"custom","name":"drop-top-level","description":"Drop","inputSchema":{"type":"object"}},
+                {"name":"malformed","description":"Malformed","inputSchema":"bad","parameters":{"type":"object"}},
+                {"name":"fallback","description":"Fallback","inputSchema":null,"parameters":{"type":"object","properties":{"q":{"type":"string"}}}},
+                {"type":"namespace","name":"mixed","description":42,"tools":[
+                    {"kind":"custom","name":"accepted_child","description":"Accepted child","inputSchema":{"type":"object"}},
+                    {"kind":"function","name":"missing_schema","description":"Missing schema"}
+                ]}
+            ]}),
+            &[],
+            false,
+        );
         assert_eq!(
             output["tools"],
             json!([
@@ -10780,8 +11110,213 @@ mod tests {
             ])
         );
         assert_eq!(
-            responses_tool_search_output(json!("invalid"))["tools"],
+            responses_tool_search_output(json!("invalid"), &[], false)["tools"],
             json!([])
+        );
+    }
+
+    fn namespaced_function_spec(name: &str, namespace: &str, description: &str) -> ToolSpec {
+        ToolSpec {
+            namespace: Some(namespace.into()),
+            ..function_spec(name, description, required_string_schema("value"))
+        }
+    }
+
+    fn namespace_projection_specs() -> Vec<ToolSpec> {
+        vec![
+            function_spec("read", "Read.", required_string_schema("path")),
+            namespaced_function_spec(
+                "mcp__calendar__create_event",
+                "mcp__calendar",
+                "Create an event.",
+            ),
+            namespaced_function_spec(
+                "mcp__calendar__list_events",
+                "mcp__calendar",
+                "List events.",
+            ),
+            namespaced_function_spec("mcp__notion__search_pages", "mcp__notion", "Search pages."),
+        ]
+    }
+
+    #[test]
+    fn namespace_projection_groups_top_level_declarations() {
+        let specs = namespace_projection_specs();
+        let grouped = grouped_responses_tools(&specs, ResponsesToolGrouping::TopLevel);
+        assert_eq!(
+            required_string_schema("path"),
+            json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"],
+                "additionalProperties":false
+            })
+        );
+        assert_eq!(
+            Value::Array(grouped),
+            json!([
+                {"type":"function","name":"read","description":"Read.",
+                 "parameters":{"type":"object","properties":{"path":{"type":"string"}},
+                               "required":["path"],"additionalProperties":false},
+                 "strict":false},
+                {"type":"namespace","name":"mcp__calendar",
+                 "description":"Tools in the mcp__calendar namespace.","tools":[
+                    {"type":"function","name":"create_event","description":"Create an event.",
+                     "parameters":{"type":"object","properties":{"value":{"type":"string"}},
+                                   "required":["value"],"additionalProperties":false},
+                     "strict":false},
+                    {"type":"function","name":"list_events","description":"List events.",
+                     "parameters":{"type":"object","properties":{"value":{"type":"string"}},
+                                   "required":["value"],"additionalProperties":false},
+                     "strict":false}
+                ]},
+                {"type":"namespace","name":"mcp__notion",
+                 "description":"Tools in the mcp__notion namespace.","tools":[
+                    {"type":"function","name":"search_pages","description":"Search pages.",
+                     "parameters":{"type":"object","properties":{"value":{"type":"string"}},
+                                   "required":["value"],"additionalProperties":false},
+                     "strict":false}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn namespace_projection_wraps_ungrouped_tools_in_the_default_namespace_for_batches() {
+        let mut specs = namespace_projection_specs();
+        specs.push(ToolSpec {
+            name: "tool_search".into(),
+            description: "Search tools.".into(),
+            input_schema: required_string_schema("query"),
+            kind: ToolSpecKind::ToolSearch,
+            format: None,
+            namespace: None,
+        });
+        let grouped = grouped_responses_tools(&specs, ResponsesToolGrouping::Batch);
+        // The default group sits at the first ungrouped position; the search
+        // declaration stays a flat sibling in list order.
+        assert_eq!(grouped.len(), 4);
+        assert_eq!(grouped[0]["type"], json!("namespace"));
+        assert_eq!(grouped[0]["name"], json!("functions"));
+        assert_eq!(grouped[0]["description"], json!(""));
+        assert_eq!(grouped[0]["tools"][0]["name"], json!("read"));
+        assert_eq!(grouped[1]["name"], json!("mcp__calendar"));
+        assert_eq!(grouped[2]["name"], json!("mcp__notion"));
+        assert_eq!(grouped[3]["type"], json!("tool_search"));
+        assert_eq!(grouped[3]["execution"], json!("client"));
+    }
+
+    #[test]
+    fn namespace_projection_flat_mode_keeps_internal_names() {
+        let specs = namespace_projection_specs();
+        let flat = grouped_responses_tools(&specs, ResponsesToolGrouping::Flat);
+        let names: Vec<Value> = flat.iter().map(|tool| tool["name"].clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                vs("read"),
+                vs("mcp__calendar__create_event"),
+                vs("mcp__calendar__list_events"),
+                vs("mcp__notion__search_pages")
+            ]
+        );
+    }
+
+    #[test]
+    fn namespaced_call_names_rejoin_to_internal_registry_names() {
+        let namespaced = json!({
+            "type":"function_call","call_id":"c1",
+            "name":"create_event","namespace":"mcp__calendar","arguments":"{}"
+        });
+        assert_eq!(
+            responses_call_internal_name(&namespaced),
+            RuntimeString::from("mcp__calendar__create_event")
+        );
+        let default_group = json!({
+            "type":"function_call","call_id":"c2","name":"read","namespace":"functions"
+        });
+        assert_eq!(
+            responses_call_internal_name(&default_group),
+            RuntimeString::from("read")
+        );
+        let flat = json!({"type":"function_call","call_id":"c3","name":"read"});
+        assert_eq!(
+            responses_call_internal_name(&flat),
+            RuntimeString::from("read")
+        );
+    }
+
+    #[test]
+    fn namespaced_replay_uses_short_names_and_namespace_field() {
+        let specs = namespace_projection_specs();
+        let internal = RuntimeString::from("mcp__calendar__create_event");
+        let (short, namespace) = responses_wire_call_identity(&internal, &specs, true);
+        assert_eq!(short, RuntimeString::from("create_event"));
+        assert_eq!(namespace, Some(RuntimeString::from("mcp__calendar")));
+        // A removed tool still round-trips through the registry prefix rule.
+        let (short, namespace) = responses_wire_call_identity(&internal, &[], true);
+        assert_eq!(short, RuntimeString::from("create_event"));
+        assert_eq!(namespace, Some(RuntimeString::from("mcp__calendar")));
+        // Flat mode keeps the internal name and omits the namespace.
+        let (name, namespace) = responses_wire_call_identity(&internal, &specs, false);
+        assert_eq!(name, internal);
+        assert_eq!(namespace, None);
+        // Ungrouped tools never gain a namespace.
+        let (name, namespace) =
+            responses_wire_call_identity(&RuntimeString::from("read"), &specs, true);
+        assert_eq!(name, RuntimeString::from("read"));
+        assert_eq!(namespace, None);
+    }
+
+    #[test]
+    fn namespace_downgrade_flattens_declarations_and_replayed_calls() {
+        let mut body = json!({
+            "tools": [
+                {"type":"namespace","name":"mcp__calendar","description":"Tools in the mcp__calendar namespace.","tools":[
+                    {"type":"function","name":"create_event","description":"Create.","strict":false,"parameters":{"type":"object"}}
+                ]}
+            ],
+            "input": [
+                {"type":"additional_tools","role":"developer","tools":[
+                    {"type":"namespace","name":"functions","description":"","tools":[
+                        {"type":"function","name":"read","description":"Read.","strict":false,"parameters":{"type":"object"}}
+                    ]}
+                ]},
+                {"type":"function_call","call_id":"c1","name":"create_event","namespace":"mcp__calendar","arguments":"{}"}
+            ]
+        });
+        assert!(native_tool_loading::contains_tool_namespaces(&body));
+        native_tool_loading::flatten_tool_namespaces(&mut body);
+        assert!(!native_tool_loading::contains_tool_namespaces(&body));
+        assert_eq!(body["tools"][0]["name"], vs("mcp__calendar__create_event"));
+        assert_eq!(body["input"][0]["tools"][0]["name"], vs("read"));
+        assert_eq!(body["input"][1]["name"], vs("mcp__calendar__create_event"));
+        assert!(body["input"][1].get("namespace").is_none());
+    }
+
+    #[test]
+    fn tool_search_output_groups_materialized_hits_into_namespaces() {
+        let output = responses_tool_search_output(
+            json!({"tools":[
+                {"name":"read","description":"Read","inputSchema":{"type":"object"}},
+                {"name":"mcp__calendar__create_event","description":"Create","inputSchema":{"type":"object"}}
+            ]}),
+            &[],
+            true,
+        );
+        assert_eq!(
+            output["tools"],
+            json!([
+                {"type":"namespace","name":"functions","description":"","tools":[
+                    {"type":"function","name":"read","description":"Read","strict":false,
+                     "defer_loading":true,"parameters":{"type":"object"}}
+                ]},
+                {"type":"namespace","name":"mcp__calendar",
+                 "description":"Tools in the mcp__calendar namespace.","tools":[
+                    {"type":"function","name":"create_event","description":"Create","strict":false,
+                     "defer_loading":true,"parameters":{"type":"object"}}
+                ]}
+            ])
         );
     }
 
@@ -12848,6 +13383,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             true,
             false,
+            false,
         )
         .expect("function mode");
         assert!(body["tools"]
@@ -12901,6 +13437,7 @@ mod tests {
                 OpenAiReasoningDialect::OpenAi,
                 true,
                 false,
+                false,
             )
             .expect("choice");
             assert_eq!(body["tool_choice"], expected);
@@ -12919,6 +13456,7 @@ mod tests {
             OpenAiReasoningDialect::OpenAi,
             true,
             false,
+            false,
         )
         .expect("switch to functions");
         assert_eq!(
@@ -12932,6 +13470,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
             false,
         )
         .expect_err("removed raw schema");
@@ -12947,6 +13486,7 @@ mod tests {
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
             true,
+            false,
             false,
         )
         .expect_err("raw history cannot invent another required field");
