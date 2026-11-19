@@ -87,6 +87,105 @@ pub(crate) fn native_deferred_tools_default(provider: &str, model: &RuntimeStrin
     models.contains(&exact)
 }
 
+/// Normalize a model id for offline capability lookups: drop the 1M-context
+/// suffix, a trailing `-latest`, and a trailing dated `-YYYYMMDD` suffix.
+fn normalize_capability_model_id(model: &str) -> &str {
+    let exact = model.strip_suffix("[1m]").unwrap_or(model);
+    let exact = exact.strip_suffix("-latest").unwrap_or(exact);
+    if exact.len() > 9 {
+        let (stem, suffix) = exact.split_at(exact.len() - 9);
+        if suffix.starts_with('-') && suffix[1..].chars().all(|c| c.is_ascii_digit()) {
+            return stem;
+        }
+    }
+    exact
+}
+
+/// Claude models that accept system messages and inline tool changes after the
+/// conversation started (exact declarations override; no version inference).
+fn claude_mid_convo_model(model: &str) -> bool {
+    matches!(
+        normalize_capability_model_id(model),
+        "claude-opus-4-8"
+            | "claude-opus-5"
+            | "claude-opus-5-5"
+            | "claude-sonnet-5-5"
+            | "claude-haiku-5-5"
+            | "claude-fable-5"
+            | "claude-fable-5-1"
+            | "claude-fable-5-2"
+            | "claude-mythos-5"
+            | "claude-mythos-5-1"
+            | "claude-mythos-5-2"
+    )
+}
+
+/// OpenAI Responses models that accept cumulative tool batch items. Older
+/// generations namespace tools loaded after the initial declaration and reject
+/// replayed calls without the namespace, so they stay on the eager inventory.
+fn openai_additional_tools_model(model: &str) -> bool {
+    matches!(
+        normalize_capability_model_id(model),
+        "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-6-astra"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
+            | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
+            | "gpt-6.2-astra"
+            | "gpt-6.2-sol"
+    )
+}
+
+fn openai_mid_convo_model(model: &str) -> bool {
+    let normalized = normalize_capability_model_id(model);
+    matches!(
+        normalized,
+        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-pro" | "gpt-5.5"
+    ) || openai_additional_tools_model(model)
+}
+
+/// Offline mid-conversation system-message facts. Exact declarations override
+/// these compatibility defaults; unlisted models keep the collapsed behavior.
+pub(crate) fn mid_convo_system_messages_default(provider: &str, model: &RuntimeString) -> bool {
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    match provider {
+        "anthropic" => claude_mid_convo_model(&model),
+        "openai" => openai_mid_convo_model(&model),
+        _ => false,
+    }
+}
+
+/// Offline inline tool-change facts (Anthropic wire): frozen top-level tool
+/// list plus in-place addition/removal blocks in system messages.
+pub(crate) fn mid_convo_tool_changes_default(provider: &str, model: &RuntimeString) -> bool {
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    provider == "anthropic" && claude_mid_convo_model(&model)
+}
+
+/// Offline cumulative tool-batch facts (OpenAI Responses wire).
+pub(crate) fn additional_tools_default(provider: &str, model: &RuntimeString) -> bool {
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    provider == "openai" && openai_additional_tools_model(&model)
+}
+
+/// Offline facts for the explicit prompt-cache options parameter: only the
+/// generations that bill cache writes accept it; older models reject it.
+pub(crate) fn explicit_prompt_cache_mode_default(provider: &str, model: &RuntimeString) -> bool {
+    let Ok(model) = model.try_to_utf8() else {
+        return false;
+    };
+    provider == "openai" && openai_additional_tools_model(&model)
+}
+
 /// Environment variable naming the remote catalog document URL. Unset means
 /// the engine never fetches — the disk cache and built-ins still apply.
 pub const MODEL_CATALOG_URL_ENV: &str = "KLAUS_MODEL_CATALOG_URL";
@@ -113,6 +212,17 @@ pub struct CapabilityOverrides {
     pub vision: Option<bool>,
     pub image_limits: Option<ImageLimits>,
     pub max_media_blocks: Option<NonZeroU32>,
+    pub mid_convo_system_messages: Option<bool>,
+    pub mid_convo_tool_changes: Option<bool>,
+    pub additional_tools: Option<bool>,
+    pub cache_control_on_tools: Option<bool>,
+    pub cache_scope_supported: Option<bool>,
+    pub cache_ttl_1h: Option<bool>,
+    pub long_cache_retention: Option<bool>,
+    pub explicit_prompt_cache_mode: Option<bool>,
+    pub prompt_cache_key_mode: Option<RuntimeString>,
+    pub session_affinity_format: Option<RuntimeString>,
+    pub cache_control_format: Option<RuntimeString>,
 }
 
 impl CapabilityOverrides {
@@ -199,6 +309,39 @@ impl RuntimeEncode for CapabilityOverrides {
         if let Some(value) = &self.max_media_blocks {
             object.field("maxMediaBlocks", value)?;
         }
+        if let Some(value) = &self.mid_convo_system_messages {
+            object.field("midConvoSystemMessages", value)?;
+        }
+        if let Some(value) = &self.mid_convo_tool_changes {
+            object.field("midConvoToolChanges", value)?;
+        }
+        if let Some(value) = &self.additional_tools {
+            object.field("additionalTools", value)?;
+        }
+        if let Some(value) = &self.cache_control_on_tools {
+            object.field("cacheControlOnTools", value)?;
+        }
+        if let Some(value) = &self.cache_scope_supported {
+            object.field("cacheScopeSupported", value)?;
+        }
+        if let Some(value) = &self.cache_ttl_1h {
+            object.field("cacheTtl1h", value)?;
+        }
+        if let Some(value) = &self.long_cache_retention {
+            object.field("longCacheRetention", value)?;
+        }
+        if let Some(value) = &self.explicit_prompt_cache_mode {
+            object.field("explicitPromptCacheMode", value)?;
+        }
+        if let Some(value) = &self.prompt_cache_key_mode {
+            object.field("promptCacheKeyMode", value)?;
+        }
+        if let Some(value) = &self.session_affinity_format {
+            object.field("sessionAffinityFormat", value)?;
+        }
+        if let Some(value) = &self.cache_control_format {
+            object.field("cacheControlFormat", value)?;
+        }
         out.emit(RuntimeJson::Object(object.finish()))
     }
 }
@@ -221,6 +364,17 @@ impl RuntimeDecode for CapabilityOverrides {
                 vision: object.optional("vision", &[])?,
                 image_limits: object.optional("imageLimits", &[])?,
                 max_media_blocks: object.optional("maxMediaBlocks", &[])?,
+                mid_convo_system_messages: object.optional("midConvoSystemMessages", &[])?,
+                mid_convo_tool_changes: object.optional("midConvoToolChanges", &[])?,
+                additional_tools: object.optional("additionalTools", &[])?,
+                cache_control_on_tools: object.optional("cacheControlOnTools", &[])?,
+                cache_scope_supported: object.optional("cacheScopeSupported", &[])?,
+                cache_ttl_1h: object.optional("cacheTtl1h", &[])?,
+                long_cache_retention: object.optional("longCacheRetention", &[])?,
+                explicit_prompt_cache_mode: object.optional("explicitPromptCacheMode", &[])?,
+                prompt_cache_key_mode: object.optional("promptCacheKeyMode", &[])?,
+                session_affinity_format: object.optional("sessionAffinityFormat", &[])?,
+                cache_control_format: object.optional("cacheControlFormat", &[])?,
             })
         })
     }
@@ -452,6 +606,40 @@ impl ModelCatalog {
             .rev()
             .find(|entry| entry.match_kind == CatalogMatch::Exact && entry.matches(provider, model))
             .and_then(|entry| entry.overrides.native_deferred_tools)
+    }
+
+    /// Wire-capability overrides of the exact catalog entry, if any.
+    fn wire_capability_overrides(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::types::provider::WireCapabilityPolicy {
+        use crate::types::provider::WireCapabilityPolicy;
+        let found = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .document
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.match_kind == CatalogMatch::Exact && entry.matches(provider, model))
+            .map(|entry| entry.overrides.clone());
+        let mut policy = WireCapabilityPolicy::default();
+        if let Some(overrides) = found {
+            policy.mid_convo_system_messages = overrides.mid_convo_system_messages;
+            policy.mid_convo_tool_changes = overrides.mid_convo_tool_changes;
+            policy.additional_tools = overrides.additional_tools;
+            policy.cache_control_on_tools = overrides.cache_control_on_tools;
+            policy.cache_scope_supported = overrides.cache_scope_supported;
+            policy.cache_ttl_1h = overrides.cache_ttl_1h;
+            policy.long_cache_retention = overrides.long_cache_retention;
+            policy.explicit_prompt_cache_mode = overrides.explicit_prompt_cache_mode;
+            policy.prompt_cache_key_mode = overrides.prompt_cache_key_mode;
+            policy.session_affinity_format = overrides.session_affinity_format;
+            policy.cache_control_format = overrides.cache_control_format;
+        }
+        policy
     }
 
     /// The configured remote source, when any.
@@ -953,6 +1141,9 @@ impl ModelProvider for CapturedModelProvider {
         }
         req.bind_media_capabilities(capabilities);
         req.native_deferred_tools = metadata.native_deferred_tools;
+        req.wire_caps = Some(
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata),
+        );
         self.inner.stream(req, signal)
     }
 
@@ -1126,6 +1317,36 @@ impl ModelProvider for CatalogModelProvider {
                 .catalog
                 .native_deferred_tools(&provider, &model)
                 .or(metadata.native_deferred_tools);
+            let wire = self.catalog.wire_capability_overrides(&provider, &model);
+            metadata.mid_convo_system_messages = wire
+                .mid_convo_system_messages
+                .or(metadata.mid_convo_system_messages);
+            metadata.mid_convo_tool_changes = wire
+                .mid_convo_tool_changes
+                .or(metadata.mid_convo_tool_changes);
+            metadata.additional_tools = wire.additional_tools.or(metadata.additional_tools);
+            metadata.cache_control_on_tools = wire
+                .cache_control_on_tools
+                .or(metadata.cache_control_on_tools);
+            metadata.cache_scope_supported = wire
+                .cache_scope_supported
+                .or(metadata.cache_scope_supported);
+            metadata.cache_ttl_1h = wire.cache_ttl_1h.or(metadata.cache_ttl_1h);
+            metadata.long_cache_retention = wire
+                .long_cache_retention
+                .or(metadata.long_cache_retention);
+            metadata.explicit_prompt_cache_mode = wire
+                .explicit_prompt_cache_mode
+                .or(metadata.explicit_prompt_cache_mode);
+            metadata.prompt_cache_key_mode = wire
+                .prompt_cache_key_mode
+                .or(metadata.prompt_cache_key_mode);
+            metadata.session_affinity_format = wire
+                .session_affinity_format
+                .or(metadata.session_affinity_format);
+            metadata.cache_control_format = wire
+                .cache_control_format
+                .or(metadata.cache_control_format);
         }
         metadata
     }

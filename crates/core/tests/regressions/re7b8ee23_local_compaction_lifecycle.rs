@@ -195,6 +195,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         }],
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        wire_caps: None,
         tool_choice: Some(ToolChoice::Auto),
         max_output_tokens: 7_777,
         task_budget: None,

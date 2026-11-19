@@ -568,6 +568,7 @@ impl TypedMemoryStore {
             tools: Vec::new(),
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
+            wire_caps: None,
             tool_choice: None,
             max_output_tokens: 256,
             task_budget: None,

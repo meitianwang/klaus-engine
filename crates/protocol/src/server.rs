@@ -12705,6 +12705,17 @@ fn model_capabilities_from_init(init: Option<&ModelCapabilitiesInit>) -> ModelCa
         image_limits: init.image_limits,
         max_media_blocks: init.max_media_blocks,
         media_input_mime_types: init.media_input_mime_types.clone(),
+        mid_convo_system_messages: init.mid_convo_system_messages,
+        mid_convo_tool_changes: init.mid_convo_tool_changes,
+        additional_tools: init.additional_tools,
+        cache_control_on_tools: init.cache_control_on_tools,
+        cache_scope_supported: init.cache_scope_supported,
+        cache_ttl_1h: init.cache_ttl_1h,
+        long_cache_retention: init.long_cache_retention,
+        explicit_prompt_cache_mode: init.explicit_prompt_cache_mode,
+        prompt_cache_key_mode: init.prompt_cache_key_mode.clone(),
+        session_affinity_format: init.session_affinity_format.clone(),
+        cache_control_format: init.cache_control_format.clone(),
     }
 }
 

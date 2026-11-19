@@ -4413,6 +4413,17 @@ pub struct ModelCapabilitiesInitSchema {
     pub max_media_blocks: Option<std::num::NonZeroU32>,
     pub reasoning_dialect: Option<String>,
     pub gemini_thinking: Option<ModelGeminiThinkingInitSchema>,
+    pub mid_convo_system_messages: Option<bool>,
+    pub mid_convo_tool_changes: Option<bool>,
+    pub additional_tools: Option<bool>,
+    pub cache_control_on_tools: Option<bool>,
+    pub cache_scope_supported: Option<bool>,
+    pub cache_ttl_1h: Option<bool>,
+    pub long_cache_retention: Option<bool>,
+    pub explicit_prompt_cache_mode: Option<bool>,
+    pub prompt_cache_key_mode: Option<String>,
+    pub session_affinity_format: Option<String>,
+    pub cache_control_format: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

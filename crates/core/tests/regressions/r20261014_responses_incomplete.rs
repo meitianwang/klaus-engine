@@ -152,6 +152,7 @@ fn model_request() -> ModelRequest {
         tools: vec![],
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        wire_caps: None,
         tool_choice: None,
         max_output_tokens: 1_000,
         task_budget: None,

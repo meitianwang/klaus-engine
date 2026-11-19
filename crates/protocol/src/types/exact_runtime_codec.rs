@@ -992,6 +992,17 @@ impl_runtime_struct!(ModelCapabilitiesInit, deny_unknown: true, {
     media_input_mime_types => "mediaInputMimeTypes": default_empty,
     reasoning_dialect => "reasoningDialect": optional,
     gemini_thinking => "geminiThinking": optional,
+    mid_convo_system_messages => "midConvoSystemMessages": optional,
+    mid_convo_tool_changes => "midConvoToolChanges": optional,
+    additional_tools => "additionalTools": optional,
+    cache_control_on_tools => "cacheControlOnTools": optional,
+    cache_scope_supported => "cacheScopeSupported": optional,
+    cache_ttl_1h => "cacheTtl1h": optional,
+    long_cache_retention => "longCacheRetention": optional,
+    explicit_prompt_cache_mode => "explicitPromptCacheMode": optional,
+    prompt_cache_key_mode => "promptCacheKeyMode": optional,
+    session_affinity_format => "sessionAffinityFormat": optional,
+    cache_control_format => "cacheControlFormat": optional,
 });
 
 impl_runtime_struct!(EffortCapabilityInit, deny_unknown: true, {

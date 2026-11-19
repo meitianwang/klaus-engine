@@ -717,6 +717,60 @@ impl RuntimeDecode for CacheTtl {
     }
 }
 
+/// Frozen per-source/model wire capability policy bound at the provider send
+/// boundary. Carries the catalog-resolved overrides for wire-shape decisions
+/// (in-place tool changes, cumulative tool batches, cache breakpoints and
+/// routing). Internal only: ordinary decoded requests leave it unset, and
+/// providers fall back to host-declared capabilities and offline defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireCapabilityPolicy {
+    /// Model accepts system messages after the conversation started
+    /// (precondition of the in-place tool-change transports).
+    pub mid_convo_system_messages: Option<bool>,
+    /// Anthropic wire: model accepts inline tool addition/removal blocks, so
+    /// the top-level tool list can stay frozen for the whole session.
+    pub mid_convo_tool_changes: Option<bool>,
+    /// OpenAI Responses wire: model accepts cumulative tool batch items, so
+    /// every tool is declared in place and the top-level list is omitted.
+    pub additional_tools: Option<bool>,
+    /// Anthropic wire: put a cache breakpoint on the last tool definition.
+    pub cache_control_on_tools: Option<bool>,
+    /// Cross-session shared cache scope marker (first-party only by default).
+    pub cache_scope_supported: Option<bool>,
+    /// One-hour cache marker TTL (long retention on the Anthropic wire).
+    pub cache_ttl_1h: Option<bool>,
+    /// OpenAI wires: 24h prompt-cache retention field.
+    pub long_cache_retention: Option<bool>,
+    /// OpenAI wires: explicit prompt-cache options field (generations that
+    /// bill cache writes and accept the parameter).
+    pub explicit_prompt_cache_mode: Option<bool>,
+    /// Prompt-cache routing key policy: "auto" | "enabled" | "disabled".
+    pub prompt_cache_key_mode: Option<RuntimeString>,
+    /// Session affinity header format: "openai" | "openai_nosession" | "openrouter".
+    pub session_affinity_format: Option<RuntimeString>,
+    /// Explicit cache marker format on OpenAI-compatible chat wires: "anthropic".
+    pub cache_control_format: Option<RuntimeString>,
+}
+
+impl WireCapabilityPolicy {
+    /// Project the wire-capability fields of a resolved capability set.
+    pub fn from_capabilities(capabilities: &ModelCapabilities) -> Self {
+        Self {
+            mid_convo_system_messages: capabilities.mid_convo_system_messages,
+            mid_convo_tool_changes: capabilities.mid_convo_tool_changes,
+            additional_tools: capabilities.additional_tools,
+            cache_control_on_tools: capabilities.cache_control_on_tools,
+            cache_scope_supported: capabilities.cache_scope_supported,
+            cache_ttl_1h: capabilities.cache_ttl_1h,
+            long_cache_retention: capabilities.long_cache_retention,
+            explicit_prompt_cache_mode: capabilities.explicit_prompt_cache_mode,
+            prompt_cache_key_mode: capabilities.prompt_cache_key_mode.clone(),
+            session_affinity_format: capabilities.session_affinity_format.clone(),
+            cache_control_format: capabilities.cache_control_format.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
     /// Native-only capability binding; decoded requests must rebind their model.
@@ -736,6 +790,9 @@ pub struct ModelRequest {
     /// Frozen source/model policy bound at the provider send boundary. Internal
     /// only: ordinary decoded requests leave it unset.
     pub native_deferred_tools: Option<bool>,
+    /// Catalog-resolved wire capability policy for this request's source/model.
+    /// Internal only: ordinary decoded requests leave it unset.
+    pub wire_caps: Option<WireCapabilityPolicy>,
     pub deferred_tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
@@ -904,6 +961,7 @@ impl RuntimeDecode for ModelRequest {
                 tools: object.required("tools", &[])?,
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
+                wire_caps: None,
                 tool_choice: object.optional("toolChoice", &[])?,
                 max_output_tokens: object.required("maxOutputTokens", &[])?,
                 task_budget: object.optional("taskBudget", &[])?,
@@ -1797,6 +1855,38 @@ pub struct ModelCapabilities {
     /// Exact native audio/video MIME types accepted as model input. Empty
     /// means unsupported; this does not declare media generation capabilities.
     pub media_input_mime_types: Vec<RuntimeString>,
+    /// Model accepts system messages after the conversation started. `None`
+    /// keeps the offline compatibility baseline for the wire.
+    pub mid_convo_system_messages: Option<bool>,
+    /// Anthropic wire: model accepts inline tool addition/removal blocks.
+    /// `None` keeps the offline compatibility baseline.
+    pub mid_convo_tool_changes: Option<bool>,
+    /// OpenAI Responses wire: model accepts cumulative tool batch items.
+    /// `None` keeps the offline compatibility baseline.
+    pub additional_tools: Option<bool>,
+    /// Anthropic wire: cache breakpoint on the last tool definition.
+    /// `None` keeps the wire default (on).
+    pub cache_control_on_tools: Option<bool>,
+    /// Cross-session shared cache scope marker. `None` keeps the wire default
+    /// (first-party endpoints only).
+    pub cache_scope_supported: Option<bool>,
+    /// One-hour cache marker TTL. `None` keeps the wire default.
+    pub cache_ttl_1h: Option<bool>,
+    /// OpenAI wires: 24h prompt-cache retention field. `None` keeps the wire
+    /// default (on).
+    pub long_cache_retention: Option<bool>,
+    /// OpenAI wires: explicit prompt-cache options field. `None` keeps the
+    /// offline compatibility baseline.
+    pub explicit_prompt_cache_mode: Option<bool>,
+    /// Prompt-cache routing key policy: "auto" | "enabled" | "disabled".
+    /// `None` means "auto".
+    pub prompt_cache_key_mode: Option<RuntimeString>,
+    /// Session affinity header format: "openai" | "openai_nosession" |
+    /// "openrouter". `None` keeps endpoint auto-detection.
+    pub session_affinity_format: Option<RuntimeString>,
+    /// Explicit cache marker format on OpenAI-compatible chat wires:
+    /// "anthropic". `None` keeps endpoint auto-detection.
+    pub cache_control_format: Option<RuntimeString>,
 }
 
 impl ModelCapabilities {
@@ -1973,6 +2063,39 @@ impl RuntimeEncode for ModelCapabilities {
         if let Some(value) = &self.max_media_blocks {
             object.field("maxMediaBlocks", value)?;
         }
+        if let Some(value) = &self.mid_convo_system_messages {
+            object.field("midConvoSystemMessages", value)?;
+        }
+        if let Some(value) = &self.mid_convo_tool_changes {
+            object.field("midConvoToolChanges", value)?;
+        }
+        if let Some(value) = &self.additional_tools {
+            object.field("additionalTools", value)?;
+        }
+        if let Some(value) = &self.cache_control_on_tools {
+            object.field("cacheControlOnTools", value)?;
+        }
+        if let Some(value) = &self.cache_scope_supported {
+            object.field("cacheScopeSupported", value)?;
+        }
+        if let Some(value) = &self.cache_ttl_1h {
+            object.field("cacheTtl1h", value)?;
+        }
+        if let Some(value) = &self.long_cache_retention {
+            object.field("longCacheRetention", value)?;
+        }
+        if let Some(value) = &self.explicit_prompt_cache_mode {
+            object.field("explicitPromptCacheMode", value)?;
+        }
+        if let Some(value) = &self.prompt_cache_key_mode {
+            object.field("promptCacheKeyMode", value)?;
+        }
+        if let Some(value) = &self.session_affinity_format {
+            object.field("sessionAffinityFormat", value)?;
+        }
+        if let Some(value) = &self.cache_control_format {
+            object.field("cacheControlFormat", value)?;
+        }
         if !self.media_input_mime_types.is_empty() {
             object.field("mediaInputMimeTypes", &self.media_input_mime_types)?;
         }
@@ -2055,6 +2178,17 @@ impl RuntimeDecode for ModelCapabilities {
                 image_limits: object.optional("imageLimits", &[])?,
                 max_media_blocks: object.optional("maxMediaBlocks", &[])?,
                 media_input_mime_types: object.defaulted("mediaInputMimeTypes", &[], Vec::new)?,
+                mid_convo_system_messages: object.optional("midConvoSystemMessages", &[])?,
+                mid_convo_tool_changes: object.optional("midConvoToolChanges", &[])?,
+                additional_tools: object.optional("additionalTools", &[])?,
+                cache_control_on_tools: object.optional("cacheControlOnTools", &[])?,
+                cache_scope_supported: object.optional("cacheScopeSupported", &[])?,
+                cache_ttl_1h: object.optional("cacheTtl1h", &[])?,
+                long_cache_retention: object.optional("longCacheRetention", &[])?,
+                explicit_prompt_cache_mode: object.optional("explicitPromptCacheMode", &[])?,
+                prompt_cache_key_mode: object.optional("promptCacheKeyMode", &[])?,
+                session_affinity_format: object.optional("sessionAffinityFormat", &[])?,
+                cache_control_format: object.optional("cacheControlFormat", &[])?,
             })
         })
     }

@@ -4308,6 +4308,7 @@ mod tests {
             tools: vec![],
             native_deferred_tools: None,
             deferred_tools: vec![],
+            wire_caps: None,
             tool_choice: None,
             max_output_tokens: 1024,
             task_budget: None,

@@ -377,6 +377,7 @@ impl Session {
             tools,
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
+            wire_caps: None,
             tool_choice: None,
             max_output_tokens: config.max_output_tokens.unwrap_or(20_000),
             task_budget: None,

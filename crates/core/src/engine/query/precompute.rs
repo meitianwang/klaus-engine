@@ -113,6 +113,7 @@ struct NativeCandidate {
     tools: Vec<crate::types::provider::ToolSpec>,
     native_deferred_tools: Option<bool>,
     deferred_tools: Vec<crate::types::provider::ToolSpec>,
+    wire_caps: Option<crate::types::provider::WireCapabilityPolicy>,
 }
 
 fn history_hash(messages: &[Message]) -> Option<[u8; 32]> {
@@ -221,6 +222,7 @@ impl PrecomputeRegistry {
                 tools: arm.request.tools.clone(),
                 native_deferred_tools: arm.request.native_deferred_tools,
                 deferred_tools: arm.request.deferred_tools.clone(),
+                wire_caps: arm.request.wire_caps.clone(),
             })
         } else {
             None
@@ -406,6 +408,7 @@ impl PrecomputeRegistry {
                         && request.tools == native.tools
                         && request.deferred_tools == native.deferred_tools
                         && request.native_deferred_tools == native.native_deferred_tools
+                        && request.wire_caps == native.wire_caps
                         && messages_now.len() >= native.prefix_len
                         && history_hash(&messages_now[..native.prefix_len])
                             == Some(native.prefix_hash)
@@ -901,6 +904,7 @@ mod tests {
                 tools: Vec::new(),
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
+                wire_caps: None,
                 tool_choice: None,
                 max_output_tokens: 100,
                 task_budget: None,

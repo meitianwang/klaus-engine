@@ -254,6 +254,17 @@ fn merge_review_catalog_metadata(
     catalog.one_million_context |= declared.one_million_context;
     catalog.task_budgets |= declared.task_budgets;
     catalog.fast_mode |= declared.fast_mode;
+    catalog.mid_convo_system_messages = declared.mid_convo_system_messages.or(catalog.mid_convo_system_messages);
+    catalog.mid_convo_tool_changes = declared.mid_convo_tool_changes.or(catalog.mid_convo_tool_changes);
+    catalog.additional_tools = declared.additional_tools.or(catalog.additional_tools);
+    catalog.cache_control_on_tools = declared.cache_control_on_tools.or(catalog.cache_control_on_tools);
+    catalog.cache_scope_supported = declared.cache_scope_supported.or(catalog.cache_scope_supported);
+    catalog.cache_ttl_1h = declared.cache_ttl_1h.or(catalog.cache_ttl_1h);
+    catalog.long_cache_retention = declared.long_cache_retention.or(catalog.long_cache_retention);
+    catalog.explicit_prompt_cache_mode = declared.explicit_prompt_cache_mode.or(catalog.explicit_prompt_cache_mode);
+    catalog.prompt_cache_key_mode = declared.prompt_cache_key_mode.or(catalog.prompt_cache_key_mode);
+    catalog.session_affinity_format = declared.session_affinity_format.or(catalog.session_affinity_format);
+    catalog.cache_control_format = declared.cache_control_format.or(catalog.cache_control_format);
     catalog
 }
 

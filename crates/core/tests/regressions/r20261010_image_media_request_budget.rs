@@ -90,6 +90,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
         tools: vec![],
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        wire_caps: None,
         tool_choice: None,
         max_output_tokens: 64,
         task_budget: None,

@@ -156,6 +156,7 @@ fn request(model: &str, round: usize) -> ModelRequest {
         tools: vec![],
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        wire_caps: None,
         tool_choice: None,
         max_output_tokens: 128,
         task_budget: None,

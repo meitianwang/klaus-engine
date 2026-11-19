@@ -153,6 +153,7 @@ pub(crate) fn test_request() -> ClassifierRequest {
             tools: Vec::new(),
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
+            wire_caps: None,
             tool_choice: Some(ToolChoice::None),
             max_output_tokens: 16_384,
             task_budget: None,

@@ -1387,6 +1387,29 @@ pub struct ModelCapabilitiesInit {
     pub reasoning_dialect: Option<RuntimeString>,
     /// Gemini thinking wire dialect (level vs budget).
     pub gemini_thinking: Option<GeminiThinkingInit>,
+    /// Model accepts system messages after the conversation started. Absent
+    /// keeps the engine's offline compatibility baseline.
+    pub mid_convo_system_messages: Option<bool>,
+    /// Anthropic wire: model accepts inline tool addition/removal blocks.
+    pub mid_convo_tool_changes: Option<bool>,
+    /// OpenAI Responses wire: model accepts cumulative tool batch items.
+    pub additional_tools: Option<bool>,
+    /// Anthropic wire: cache breakpoint on the last tool definition.
+    pub cache_control_on_tools: Option<bool>,
+    /// Cross-session shared cache scope marker.
+    pub cache_scope_supported: Option<bool>,
+    /// One-hour cache marker TTL (long retention on the Anthropic wire).
+    pub cache_ttl_1h: Option<bool>,
+    /// OpenAI wires: 24h prompt-cache retention field.
+    pub long_cache_retention: Option<bool>,
+    /// OpenAI wires: explicit prompt-cache options field.
+    pub explicit_prompt_cache_mode: Option<bool>,
+    /// Prompt-cache routing key policy: "auto" | "enabled" | "disabled".
+    pub prompt_cache_key_mode: Option<RuntimeString>,
+    /// Session affinity header format: "openai" | "openai_nosession" | "openrouter".
+    pub session_affinity_format: Option<RuntimeString>,
+    /// Explicit cache marker format on OpenAI-compatible chat wires: "anthropic".
+    pub cache_control_format: Option<RuntimeString>,
 }
 
 /// Declared reasoning-effort ladder: which levels the model honors.

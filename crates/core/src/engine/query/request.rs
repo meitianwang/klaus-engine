@@ -461,6 +461,7 @@ pub(super) fn prepare_with_inference(
         // `Shared::prepare`, which owns the exposure/surfaced state.
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        wire_caps: None,
         tool_choice,
         max_output_tokens,
         task_budget: config.task_budget_tokens,
