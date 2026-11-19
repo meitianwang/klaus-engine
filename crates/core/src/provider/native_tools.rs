@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::runtime_values::RuntimeString;
 
-type LearnedNativeTools = Arc<Mutex<HashSet<(String, RuntimeString)>>>;
+type LearnedNativeTools = Arc<Mutex<HashSet<(String, RuntimeString, String)>>>;
 
 #[derive(Clone)]
 pub(crate) struct NativeToolSupport(LearnedNativeTools);
@@ -23,17 +23,34 @@ impl Default for NativeToolSupport {
 
 impl NativeToolSupport {
     pub(crate) fn disabled(&self, endpoint: &str, model: &RuntimeString) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains(&(endpoint.to_owned(), model.clone()))
+        self.disabled_for(endpoint, model, "")
     }
 
     pub(crate) fn disable(&self, endpoint: &str, model: &RuntimeString) {
+        self.disable_for(endpoint, model, "")
+    }
+
+    /// Capability-scoped learning: refusing one native tool protocol (say
+    /// deferred loading) must not disable an unrelated one (say inline tool
+    /// changes) on the same endpoint and model. The empty capability is the
+    /// legacy scope and keeps its exact pre-existing semantics.
+    pub(crate) fn disabled_for(
+        &self,
+        endpoint: &str,
+        model: &RuntimeString,
+        capability: &str,
+    ) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert((endpoint.to_owned(), model.clone()));
+            .contains(&(endpoint.to_owned(), model.clone(), capability.to_owned()))
+    }
+
+    pub(crate) fn disable_for(&self, endpoint: &str, model: &RuntimeString, capability: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((endpoint.to_owned(), model.clone(), capability.to_owned()));
     }
 }
 
@@ -64,6 +81,8 @@ pub(crate) fn unsupported_native_tools(status: Option<u16>, message: &str) -> bo
             "tool_search",
             "execution",
             "additional_tools",
+            "tool_addition",
+            "tool_removal",
         ]
         .iter()
         .any(|needle| message.contains(needle))
@@ -83,6 +102,57 @@ mod tests {
         assert!(learned.disabled("https://gateway.example/v1/responses", &"model-a".into()));
         assert!(!learned.disabled("https://gateway.example/v1/responses", &"model-b".into()));
         assert!(!learned.disabled("https://other.example/v1/responses", &"model-a".into()));
+    }
+
+    #[test]
+    fn capability_scopes_learn_independently() {
+        let learned = NativeToolSupport::default();
+        learned.disable_for(
+            "https://gateway.example/cap-scope",
+            &"model-c".into(),
+            "inline-tools",
+        );
+        assert!(learned.disabled_for(
+            "https://gateway.example/cap-scope",
+            &"model-c".into(),
+            "inline-tools"
+        ));
+        // A refusal of one protocol leaves the legacy scope and other
+        // capabilities on the same endpoint/model untouched.
+        assert!(!learned.disabled("https://gateway.example/cap-scope", &"model-c".into()));
+        assert!(!learned.disabled_for(
+            "https://gateway.example/cap-scope",
+            &"model-c".into(),
+            "deferred-tools"
+        ));
+        learned.disable("https://gateway.example/cap-legacy", &"model-c".into());
+        assert!(learned.disabled("https://gateway.example/cap-legacy", &"model-c".into()));
+        assert!(!learned.disabled_for(
+            "https://gateway.example/cap-legacy",
+            &"model-c".into(),
+            "inline-tools"
+        ));
+    }
+
+    #[test]
+    fn inline_tool_block_refusals_downgrade() {
+        assert!(unsupported_native_tools(
+            Some(400),
+            "unknown block type: tool_addition"
+        ));
+        assert!(unsupported_native_tools(
+            Some(422),
+            "tool_removal is not permitted in messages"
+        ));
+        assert!(unsupported_native_tools(
+            Some(400),
+            "additional_tools is not supported for this model"
+        ));
+        // Same needles without a validation phrase stay ordinary errors.
+        assert!(!unsupported_native_tools(
+            Some(400),
+            "tool_addition quota exceeded"
+        ));
     }
 
     #[test]
