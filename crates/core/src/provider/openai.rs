@@ -1085,6 +1085,119 @@ fn emulate_structured_output(
 
 // ---- Chat Completions request building ----
 
+/// Unified three-state prompt-cache retention across the OpenAI wires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheRetention {
+    Short,
+    Long,
+    None,
+}
+
+fn cache_retention_of(req: &ModelRequest) -> CacheRetention {
+    if req.skip_cache_write == Some(true) {
+        CacheRetention::None
+    } else if req.cache_ttl == Some(crate::types::provider::CacheTtl::OneHour) {
+        CacheRetention::Long
+    } else {
+        CacheRetention::Short
+    }
+}
+
+/// Truncate a cache-routing key to 64 Unicode code points without splitting a
+/// surrogate pair.
+fn clamp_cache_key_64(value: &RuntimeString) -> RuntimeString {
+    let units = value.as_utf16();
+    let mut end = 0;
+    let mut points = 0;
+    while end < units.len() && points < 64 {
+        let unit = units[end];
+        if (0xD800..0xDC00).contains(&unit) && end + 1 < units.len() {
+            end += 2;
+        } else {
+            end += 1;
+        }
+        points += 1;
+    }
+    if end >= units.len() {
+        return value.clone();
+    }
+    value.slice_utf16(..end)
+}
+
+fn long_cache_retention_enabled(req: &ModelRequest, caps: &ModelCapabilities) -> bool {
+    req.wire_caps
+        .as_ref()
+        .and_then(|policy| policy.long_cache_retention)
+        .or(caps.long_cache_retention)
+        .unwrap_or_else(|| super::model_catalog::long_cache_retention_default("openai"))
+}
+
+fn explicit_prompt_cache_mode_enabled(req: &ModelRequest, caps: &ModelCapabilities) -> bool {
+    req.wire_caps
+        .as_ref()
+        .and_then(|policy| policy.explicit_prompt_cache_mode)
+        .or(caps.explicit_prompt_cache_mode)
+        .unwrap_or_else(|| {
+            super::model_catalog::explicit_prompt_cache_mode_default("openai", &req.model)
+        })
+}
+
+fn prompt_cache_key_mode_of(req: &ModelRequest, caps: &ModelCapabilities) -> RuntimeString {
+    req.wire_caps
+        .as_ref()
+        .and_then(|policy| policy.prompt_cache_key_mode.clone())
+        .or_else(|| caps.prompt_cache_key_mode.clone())
+        .unwrap_or_else(|| RuntimeString::from("auto"))
+}
+
+/// Emit the prompt-cache routing and billing fields for one OpenAI-wire body.
+/// The key gate is endpoint-granular: the Responses face sends whenever the
+/// retention is not none; the Chat face only for the first-party endpoint or a
+/// long retention the model generation can express. Explicit-key-mode
+/// generations bill cache writes and take `prompt_cache_options` instead of the
+/// retention string.
+fn apply_openai_cache_fields(
+    obj: &mut Map,
+    req: &ModelRequest,
+    caps: &ModelCapabilities,
+    is_responses: bool,
+    first_party_endpoint: bool,
+) {
+    let retention = cache_retention_of(req);
+    let long_ok = long_cache_retention_enabled(req, caps);
+    let explicit_mode = explicit_prompt_cache_mode_enabled(req, caps);
+    let mode = prompt_cache_key_mode_of(req, caps);
+    if retention != CacheRetention::None && mode != "disabled" {
+        let auto_ok = if is_responses {
+            true
+        } else {
+            first_party_endpoint || (retention == CacheRetention::Long && long_ok)
+        };
+        if mode == "enabled" || auto_ok {
+            if let Some(key) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
+                obj.insert("prompt_cache_key", vs(clamp_cache_key_64(key)));
+            }
+        }
+    }
+    match retention {
+        CacheRetention::None => {
+            if explicit_mode {
+                obj.insert("prompt_cache_options", vobj([("mode", vs("explicit"))]));
+            }
+        }
+        CacheRetention::Long => {
+            if explicit_mode {
+                if long_ok {
+                    obj.insert("prompt_cache_options", vobj([("ttl", vs("30m"))]));
+                }
+            } else if long_ok {
+                obj.insert("prompt_cache_retention", vs("24h"));
+            }
+        }
+        CacheRetention::Short => {}
+    }
+}
+
 #[cfg(test)]
 fn build_chat_params(req: &ModelRequest) -> Value {
     build_chat_params_with_identity(
@@ -1093,6 +1206,7 @@ fn build_chat_params(req: &ModelRequest) -> Value {
         None,
         &ModelCapabilities::default(),
         OpenAiReasoningDialect::OpenAi,
+        false,
     )
 }
 
@@ -1103,7 +1217,7 @@ fn build_chat_params_caps(
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
 ) -> Value {
-    build_chat_params_with_identity(req, None, None, caps, dialect)
+    build_chat_params_with_identity(req, None, None, caps, dialect, false)
 }
 
 fn build_chat_params_with_identity(
@@ -1112,6 +1226,7 @@ fn build_chat_params_with_identity(
     request_id: Option<&str>,
     caps: &ModelCapabilities,
     dialect: OpenAiReasoningDialect,
+    first_party_cache_endpoint: bool,
 ) -> Value {
     let structured = req.output_schema.is_some();
     let qwen_thinking =
@@ -1195,9 +1310,7 @@ fn build_chat_params_with_identity(
             ]),
         );
     }
-    if let Some(ck) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
-        obj.insert("prompt_cache_key", vs(ck.clone()));
-    }
+    apply_openai_cache_fields(&mut obj, req, caps, false, first_party_cache_endpoint);
     if let Some(identity) = identity {
         obj.insert("session_id", vs(identity.session_id.clone()));
         if let Some(request_id) = request_id {
@@ -1803,9 +1916,7 @@ fn build_responses_params_with_tool_mode(
     if !text.is_empty() {
         obj.insert("text", Value::Object(text));
     }
-    if let Some(ck) = req.cache_domain.as_ref().or(req.cache_key.as_ref()) {
-        obj.insert("prompt_cache_key", vs(ck.clone()));
-    }
+    apply_openai_cache_fields(&mut obj, req, caps, true, false);
     let mut body = Value::Object(obj);
     native_tool_loading::apply_policy(&mut body, req, native_search);
     Ok(body)
@@ -1871,6 +1982,10 @@ fn adapt_codex_responses_params(body: &mut Value) {
         return;
     };
     obj.remove("max_output_tokens");
+    // The subscription backend only carries the routing key; the billing-mode
+    // and retention fields are official-API surface.
+    obj.remove("prompt_cache_retention");
+    obj.remove("prompt_cache_options");
 }
 
 fn to_responses_function_tool(t: &ToolSpec) -> Value {
@@ -5615,6 +5730,7 @@ impl OpenAIProvider {
         let provider_id = diagnostic_string(&self.info.name);
         let capabilities = self.capabilities_for(&req.model);
         let reasoning_dialect = self.reasoning_dialect;
+        let first_party_cache_endpoint = self.request_base_url.contains("api.openai.com");
         let review_effort = self.review_effort.clone();
         let review_stream = self.retry.retry_class_policy
             == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview);
@@ -5641,7 +5757,7 @@ impl OpenAIProvider {
                 .as_ref()
                 .and_then(OpenAICompatibilityOptions::request_identity);
             let request_id = identity.map(|_| random_request_id());
-            let mut body = build_chat_params_with_identity(&req, identity, request_id.as_deref(), &capabilities, reasoning_dialect);
+            let mut body = build_chat_params_with_identity(&req, identity, request_id.as_deref(), &capabilities, reasoning_dialect, first_party_cache_endpoint);
             if let Err(error) = apply_review_effort_body(&mut body, review_effort.as_ref(), reasoning_dialect, false) { yield ModelStreamEvent::Error { error }; return; }
             if let Some(enabled) = bridge_fast_mode {
                 body["fast_mode"] = Value::Bool(enabled);
@@ -6390,6 +6506,7 @@ impl ModelProvider for OpenAIProvider {
                 None,
                 &capabilities,
                 self.reasoning_dialect,
+                self.request_base_url.contains("api.openai.com"),
             )
         };
         apply_review_effort_body(
@@ -8004,6 +8121,142 @@ mod tests {
         assert_eq!(input.len(), 6);
     }
 
+    #[test]
+    fn openai_cache_field_matrix() {
+        use crate::types::provider::CacheTtl;
+        // Responses face, long retention, pre-billing generation: routing key
+        // plus the day-long retention string.
+        let mut request = base_req();
+        request.cache_ttl = Some(CacheTtl::OneHour);
+        request.cache_domain = Some(RuntimeString::from("domain-key"));
+        let body = build_responses_params(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        assert_eq!(body["prompt_cache_key"], json!("domain-key"));
+        assert_eq!(body["prompt_cache_retention"], json!("24h"));
+        assert!(body.get("prompt_cache_options").is_none());
+
+        // The codex adapter keeps the key and strips the billing fields.
+        let mut codex = body.clone();
+        adapt_codex_responses_params(&mut codex);
+        assert_eq!(codex["prompt_cache_key"], json!("domain-key"));
+        assert!(codex.get("prompt_cache_retention").is_none());
+        assert!(codex.get("prompt_cache_options").is_none());
+
+        // Responses face, long retention, write-billing generation: the
+        // options object replaces the retention string.
+        let mut billing = base_req();
+        billing.model = "gpt-5.6-sol".into();
+        billing.cache_ttl = Some(CacheTtl::OneHour);
+        billing.cache_key = Some(RuntimeString::from("k"));
+        let body = build_responses_params(
+            &billing,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        assert_eq!(body["prompt_cache_options"], vobj([("ttl", vs("30m"))]));
+        assert!(body.get("prompt_cache_retention").is_none());
+
+        // Retention none: no routing key; the billing generation declares the
+        // explicit mode, the older generation sends nothing at all.
+        let mut none_billing = base_req();
+        none_billing.model = "gpt-5.6-sol".into();
+        none_billing.skip_cache_write = Some(true);
+        none_billing.cache_key = Some(RuntimeString::from("k"));
+        let body = build_responses_params(
+            &none_billing,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(
+            body["prompt_cache_options"],
+            vobj([("mode", vs("explicit"))])
+        );
+
+        let mut none_legacy = base_req();
+        none_legacy.skip_cache_write = Some(true);
+        none_legacy.cache_key = Some(RuntimeString::from("k"));
+        let body = build_responses_params(
+            &none_legacy,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+
+        // Chat face auto gate: a third-party endpoint stays silent on the
+        // default retention; first-party sends; long retention unlocks the
+        // third-party key too.
+        let mut chat = base_req();
+        chat.cache_key = Some(RuntimeString::from("ck"));
+        let third = build_chat_params_with_identity(
+            &chat,
+            None,
+            None,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            false,
+        );
+        assert!(third.get("prompt_cache_key").is_none());
+        let first = build_chat_params_with_identity(
+            &chat,
+            None,
+            None,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            true,
+        );
+        assert_eq!(first["prompt_cache_key"], json!("ck"));
+        chat.cache_ttl = Some(CacheTtl::OneHour);
+        let third_long = build_chat_params_with_identity(
+            &chat,
+            None,
+            None,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            false,
+        );
+        assert_eq!(third_long["prompt_cache_key"], json!("ck"));
+        assert_eq!(third_long["prompt_cache_retention"], json!("24h"));
+
+        // A disabled key mode silences even the first-party face.
+        let mut disabled = base_req();
+        disabled.cache_key = Some(RuntimeString::from("ck"));
+        disabled.wire_caps = Some(crate::types::provider::WireCapabilityPolicy {
+            prompt_cache_key_mode: Some(RuntimeString::from("disabled")),
+            ..Default::default()
+        });
+        let first = build_chat_params_with_identity(
+            &disabled,
+            None,
+            None,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            true,
+        );
+        assert!(first.get("prompt_cache_key").is_none());
+
+        // Keys longer than 64 code points clamp to 64.
+        let mut long_key = base_req();
+        long_key.cache_domain = Some(RuntimeString::from("k".repeat(70)));
+        let body = build_responses_params(
+            &long_key,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+        )
+        .unwrap();
+        let clamped = body["prompt_cache_key"].as_str().unwrap();
+        assert_eq!(clamped.as_utf16().len(), 64);
+    }
+
     // ---- classifier helpers ----
 
     #[test]
@@ -8492,7 +8745,19 @@ mod tests {
             v["response_format"],
             json!({ "type": "json_schema", "json_schema": { "name": "result", "schema": { "type": "object" }, "strict": true } })
         );
-        assert_eq!(v["prompt_cache_key"], json!("conv-1"));
+        // Endpoint-granular key gate: a third-party chat endpoint stays silent
+        // on the default retention and sends once the long retention the model
+        // generation can express is on.
+        assert!(v.get("prompt_cache_key").is_none());
+        let mut long = r.clone();
+        long.cache_ttl = Some(crate::types::provider::CacheTtl::OneHour);
+        let v_long = build_chat_params_caps(
+            &long,
+            &caps_with_levels(&[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High]),
+            OpenAiReasoningDialect::OpenAi,
+        );
+        assert_eq!(v_long["prompt_cache_key"], json!("conv-1"));
+        assert_eq!(v_long["prompt_cache_retention"], json!("24h"));
     }
 
     #[test]
@@ -10589,6 +10854,7 @@ mod tests {
             Some("req-1"),
             &ModelCapabilities::default(),
             OpenAiReasoningDialect::OpenAi,
+            false,
         );
         assert_eq!(compatible["session_id"], json!("klaus-session-1"));
         assert_eq!(compatible["request_id"], json!("req-1"));

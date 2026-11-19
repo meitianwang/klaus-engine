@@ -186,6 +186,12 @@ pub(crate) fn explicit_prompt_cache_mode_default(provider: &str, model: &Runtime
     provider == "openai" && openai_additional_tools_model(&model)
 }
 
+/// Offline facts for the day-long prompt-cache retention field: the OpenAI
+/// wires accept it; other providers have no equivalent field.
+pub(crate) fn long_cache_retention_default(provider: &str) -> bool {
+    provider == "openai"
+}
+
 /// Environment variable naming the remote catalog document URL. Unset means
 /// the engine never fetches — the disk cache and built-ins still apply.
 pub const MODEL_CATALOG_URL_ENV: &str = "KLAUS_MODEL_CATALOG_URL";

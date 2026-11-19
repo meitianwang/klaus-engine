@@ -20,7 +20,7 @@ fn decode<T: RuntimeDecode>(value: Value) -> Result<T, RuntimeCodecError> {
 }
 
 fn request() -> ModelRequest {
-    decode(json!({
+    let mut request: ModelRequest = decode(json!({
         "model":"fixture-model", "maxOutputTokens":256,
         "system":[
             {"name":"base", "text":"Complete the user's task.", "cacheable":true},
@@ -31,7 +31,15 @@ fn request() -> ModelRequest {
         ]}],
         "tools":[], "cacheKey":"stable-session"
     }))
-    .unwrap()
+    .unwrap();
+    // The captured wire rides a local mock endpoint. The chat-face routing-key
+    // gate stays silent on third-party endpoints by default; this regression
+    // pins key STABILITY across continuations, so declare the key explicitly.
+    request.wire_caps = Some(klaus_agent_core::types::provider::WireCapabilityPolicy {
+        prompt_cache_key_mode: Some("enabled".into()),
+        ..Default::default()
+    });
+    request
 }
 
 async fn captured(requests: Vec<ModelRequest>) -> Vec<Value> {
