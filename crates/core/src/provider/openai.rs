@@ -2008,11 +2008,8 @@ fn build_responses_params_with_tool_mode(
         Some(&req.model),
         function_tools,
         &batch_events,
-        if reasoning_model {
-            "developer"
-        } else {
-            "system"
-        },
+        req.frozen_tools.as_deref().unwrap_or_default(),
+        first_party_metadata,
         namespaces,
     )?;
     if batch_tools {
@@ -2751,7 +2748,8 @@ pub(crate) fn to_responses_input_with_profile(
         None,
         false,
         &[],
-        "developer",
+        &[],
+        false,
         false,
     )
     .expect("native tool projection is infallible")
@@ -2838,9 +2836,11 @@ fn inferred_custom_tool_input(
 
 /// Verbatim wire copy for the incremental tool-batch notice. Functional
 /// protocol text; must stay byte-stable across requests.
-const TOOLS_UPDATE_NOTICE: &str = "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+const TOOLS_UPDATE_NOTICE: &str = "This is an incremental tools update. Previously declared tools remain available for direct calls unless explicitly marked unavailable. If a tool is redefined here, its latest definition replaces the earlier one.";
 /// Verbatim wire copy introducing a tool withdrawal notice.
 const TOOLS_REMOVAL_NOTICE: &str = "The following tools are no longer available. Do not call them:";
+/// Verbatim wire copy introducing a whole-namespace withdrawal notice.
+const TOOLS_REMOVED_NAMESPACES_NOTICE: &str = "The following namespaces are no longer available. Do not call tools in them unless those tools are declared in a later update:";
 /// Capability tag for the endpoint/model-scoped refusal learning of the
 /// cumulative tool-batch protocol.
 const ADDITIONAL_TOOLS_CAPABILITY: &str = "additional_tools";
@@ -2859,33 +2859,53 @@ fn responses_message_uuid(message: &Message) -> Option<RuntimeString> {
     }
 }
 
-/// Render the held-back inventory events at a safe input boundary: a notice
-/// item, one cumulative batch item carrying every added or redefined
-/// declaration by value, then a withdrawal notice for the removed names. The
-/// notice repeats the still-unavailable set so smaller models stop re-calling
-/// withdrawn tools.
+/// A harness-authored tool-protocol notice: a developer message item with an
+/// input_text body and, on first-party surfaces, passthrough metadata naming
+/// the item kind so the backend can recognize it without text sniffing.
+fn responses_tool_notice_item(
+    text: &RuntimeString,
+    kind: &str,
+    first_party_metadata: bool,
+) -> Value {
+    let mut item = Map::new();
+    item.insert("type", vs("message"));
+    item.insert("role", vs("developer"));
+    item.insert(
+        "content",
+        Value::Array(vec![vobj([
+            ("type", vs("input_text")),
+            ("text", vs(text.clone())),
+        ])]),
+    );
+    if first_party_metadata {
+        item.insert(
+            "internal_chat_message_metadata_passthrough",
+            vobj([(
+                "content_item_kinds",
+                Value::Array(vec![vs(RuntimeString::from(kind))]),
+            )]),
+        );
+    }
+    Value::Object(item)
+}
+
+/// Render the held-back inventory events at a safe input boundary: an update
+/// hint when the batch carries namespace entries, one cumulative batch item
+/// carrying every added or redefined declaration by value, then a single
+/// withdrawal notice listing removed namespaces and removed tools in separate
+/// sections. A whole-namespace withdrawal absorbs its members.
 fn flush_tool_batches(
     out: &mut Vec<Value>,
     pending: &mut Vec<usize>,
     events: &[crate::types::provider::ToolInventoryEvent],
-    role: &str,
+    frozen: &[ToolSpec],
     grouping: ResponsesToolGrouping,
+    first_party_metadata: bool,
 ) {
     if pending.is_empty() {
         return;
     }
     let last = *pending.last().expect("pending checked");
-    let mut unavailable: Vec<RuntimeString> = Vec::new();
-    for event in &events[..=last] {
-        for name in &event.removed {
-            if !unavailable.contains(name) {
-                unavailable.push(name.clone());
-            }
-        }
-        for spec in &event.added {
-            unavailable.retain(|existing| existing != &spec.name);
-        }
-    }
     let mut added: Vec<&ToolSpec> = Vec::new();
     let mut removed: Vec<RuntimeString> = Vec::new();
     for index in pending.iter() {
@@ -2903,47 +2923,99 @@ fn flush_tool_batches(
     }
     removed.retain(|name| !added.iter().any(|spec| &spec.name == name));
     if !added.is_empty() {
-        let mut notice = RuntimeString::from(TOOLS_UPDATE_NOTICE);
-        if !unavailable.is_empty() {
-            let names = unavailable
-                .iter()
-                .map(diagnostic_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            notice = notice.concat(&RuntimeString::from(format!(
-                "\nStill unavailable: {names}."
-            )));
-        }
-        out.push(vobj([("role", vs(role)), ("content", vs(notice))]));
         let added_specs: Vec<ToolSpec> = added.iter().map(|spec| (*spec).clone()).collect();
+        let declarations = grouped_responses_tools(&added_specs, grouping);
+        let carries_namespace = declarations.iter().any(|entry| {
+            entry
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "namespace")
+        });
+        // The hint introduces namespace-shaped incremental declarations; a
+        // batch of standalone entries needs no preamble.
+        if carries_namespace {
+            out.push(responses_tool_notice_item(
+                &RuntimeString::from(TOOLS_UPDATE_NOTICE),
+                "tools.incremental_update",
+                first_party_metadata,
+            ));
+        }
         out.push(vobj([
             ("type", vs("additional_tools")),
             ("role", vs("developer")),
-            (
-                "tools",
-                Value::Array(grouped_responses_tools(&added_specs, grouping)),
-            ),
+            ("tools", Value::Array(declarations)),
         ]));
     }
     if !removed.is_empty() {
-        let list = removed
-            .iter()
-            .map(|name| format!("- {}", diagnostic_string(name)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        out.push(vobj([
-            ("role", vs(role)),
-            (
-                "content",
-                vs(RuntimeString::from(format!(
-                    "{TOOLS_REMOVAL_NOTICE}\n{list}"
-                ))),
-            ),
-        ]));
+        // Namespace attribution for the removed names: the declaring spec from
+        // the frozen baseline or any recorded addition, else the registry
+        // prefix rule.
+        let mut namespace_by_name: HashMap<RuntimeString, Option<RuntimeString>> = HashMap::new();
+        for spec in frozen {
+            namespace_by_name.insert(spec.name.clone(), spec.namespace.clone());
+        }
+        for event in &events[..=last] {
+            for spec in &event.added {
+                namespace_by_name.insert(spec.name.clone(), spec.namespace.clone());
+            }
+        }
+        // Visibility at this boundary decides whether a namespace itself is
+        // gone (no member survives) or only individual members left.
+        let visible = crate::engine::query::request::fold_tool_inventory(frozen, &events[..=last]);
+        let mut removed_namespaces: Vec<RuntimeString> = Vec::new();
+        let mut removed_tools: Vec<String> = Vec::new();
+        for name in &removed {
+            let namespace = namespace_by_name
+                .get(name)
+                .cloned()
+                .flatten()
+                .or_else(|| split_mcp_internal_name(name).map(|(namespace, _)| namespace));
+            let Some(namespace) = namespace else {
+                removed_tools.push(diagnostic_string(name));
+                continue;
+            };
+            let namespace_survives = visible
+                .iter()
+                .any(|spec| spec.namespace.as_ref() == Some(&namespace));
+            if namespace_survives {
+                let display = diagnostic_string(name);
+                let prefix = format!("{}__", diagnostic_string(&namespace));
+                let short = display
+                    .strip_prefix(prefix.as_str())
+                    .unwrap_or(display.as_str());
+                removed_tools.push(format!("{}.{}", diagnostic_string(&namespace), short));
+            } else if !removed_namespaces.contains(&namespace) {
+                removed_namespaces.push(namespace);
+            }
+        }
+        let mut body = String::new();
+        if !removed_namespaces.is_empty() {
+            body.push_str(TOOLS_REMOVED_NAMESPACES_NOTICE);
+            for namespace in &removed_namespaces {
+                body.push_str("\n- ");
+                body.push_str(&diagnostic_string(namespace));
+            }
+        }
+        if !removed_tools.is_empty() {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(TOOLS_REMOVAL_NOTICE);
+            for name in &removed_tools {
+                body.push_str("\n- ");
+                body.push_str(name);
+            }
+        }
+        out.push(responses_tool_notice_item(
+            &RuntimeString::from(body),
+            "tools.removed_definition",
+            first_party_metadata,
+        ));
     }
     pending.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_responses_input(
     messages: &[Message],
     tools: &[ToolSpec],
@@ -2951,7 +3023,8 @@ fn project_responses_input(
     current_model: Option<&RuntimeString>,
     function_tools: bool,
     inventory_events: &[crate::types::provider::ToolInventoryEvent],
-    notification_role: &str,
+    frozen_tools: &[ToolSpec],
+    first_party_metadata: bool,
     namespaces: bool,
 ) -> Result<(Value, bool), ProviderError> {
     let mut out: Vec<Value> = Vec::new();
@@ -3205,8 +3278,9 @@ fn project_responses_input(
                 &mut out,
                 &mut pending_batches,
                 inventory_events,
-                notification_role,
+                frozen_tools,
                 batch_grouping,
+                first_party_metadata,
             );
         }
     }
@@ -3219,8 +3293,9 @@ fn project_responses_input(
         &mut out,
         &mut pending_batches,
         inventory_events,
-        notification_role,
+        frozen_tools,
         batch_grouping,
+        first_party_metadata,
     );
     // The fallible request builder rejects an instruction trapped behind
     // unanswered calls; never fabricate outputs or lower it to a user role.
@@ -8663,6 +8738,15 @@ mod tests {
         assert_eq!(frozen[0]["name"], json!("read"));
         assert_eq!(frozen[1]["name"], json!("bash"));
 
+        fn item_text(item: &Value) -> String {
+            item.get("content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .map(diagnostic_string)
+                .unwrap_or_default()
+        }
         let kinds: Vec<String> = input
             .iter()
             .map(|item| {
@@ -8673,14 +8757,12 @@ mod tests {
                 {
                     return "batch".to_string();
                 }
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(diagnostic_string)
-                    .unwrap_or_default();
+                let content = item_text(item);
                 if content.starts_with(TOOLS_UPDATE_NOTICE) {
                     "notice".to_string()
-                } else if content.starts_with(TOOLS_REMOVAL_NOTICE) {
+                } else if content.starts_with(TOOLS_REMOVAL_NOTICE)
+                    || content.starts_with(TOOLS_REMOVED_NAMESPACES_NOTICE)
+                {
                     "removal".to_string()
                 } else {
                     item.get("role")
@@ -8695,45 +8777,134 @@ mod tests {
             vec![
                 "batch",     // initial frozen batch
                 "user",      // u1
-                "notice",    // incremental notice before the calculator batch
-                "batch",     // calculator
+                "batch",     // calculator; flat declarations carry no hint
                 "assistant", // a1
                 "user",      // u2
                 "removal",   // read withdrawn
                 "assistant", // a2
                 "user",      // u3
-                "notice",    // notice repeats the still-unavailable set
                 "batch",     // echo
                 "assistant", // a3
             ]
         );
 
-        // Non-reasoning request: text notices use the system role; batch items
-        // stay developer-owned.
-        assert_eq!(input[2]["role"], json!("system"));
-        assert_eq!(input[3]["role"], json!("developer"));
-        // Verbatim notice copy, with the still-unavailable suffix on the later
-        // flush because `read` was withdrawn and never restored.
-        assert_eq!(
-            input[2]["content"],
-            Value::String(RuntimeString::from(TOOLS_UPDATE_NOTICE))
+        // Incremental batches and notices are developer-owned items; the
+        // withdrawal rides a message item with an input_text body.
+        assert_eq!(input[2]["type"], json!("additional_tools"));
+        assert_eq!(input[2]["role"], json!("developer"));
+        assert!(
+            input[2].get("id").is_none(),
+            "incremental batches anchor by history, not id"
         );
+        assert_eq!(input[5]["type"], json!("message"));
+        assert_eq!(input[5]["role"], json!("developer"));
         assert_eq!(
-            input[9]["content"],
-            Value::String(RuntimeString::from(format!(
-                "{TOOLS_UPDATE_NOTICE}\nStill unavailable: read."
-            )))
-        );
-        assert_eq!(
-            input[6]["content"],
-            Value::String(RuntimeString::from(format!(
-                "{TOOLS_REMOVAL_NOTICE}\n- read"
-            )))
+            item_text(&input[5]),
+            format!("{TOOLS_REMOVAL_NOTICE}\n- read")
         );
         // Batches carry declarations by value.
-        let batch_tools = input[3]["tools"].as_array().unwrap();
+        let batch_tools = input[2]["tools"].as_array().unwrap();
         assert_eq!(batch_tools.len(), 1);
         assert_eq!(batch_tools[0]["name"], json!("calculator"));
+    }
+
+    #[test]
+    fn responses_batch_updates_carry_namespaces_hints_and_two_section_withdrawals() {
+        use crate::types::provider::ToolInventoryEvent;
+        let mut request = batch_fixture_request();
+        request.frozen_tools = Some(vec![
+            batch_spec("read"),
+            namespaced_function_spec(
+                "mcp__calendar__create_event",
+                "mcp__calendar",
+                "Create an event.",
+            ),
+        ]);
+        request.tool_inventory_events = vec![
+            ToolInventoryEvent {
+                anchor_uuid: Some("u1".into()),
+                added: vec![namespaced_function_spec(
+                    "mcp__calendar__list_events",
+                    "mcp__calendar",
+                    "List events.",
+                )],
+                removed: vec![],
+            },
+            ToolInventoryEvent {
+                anchor_uuid: Some("u2".into()),
+                added: vec![],
+                removed: vec!["mcp__calendar__create_event".into()],
+            },
+            ToolInventoryEvent {
+                anchor_uuid: Some("u3".into()),
+                added: vec![],
+                removed: vec!["mcp__calendar__list_events".into()],
+            },
+        ];
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                instructions_item: false,
+                first_party_metadata: true,
+            },
+        )
+        .unwrap();
+        let input = body.get("input").unwrap().as_array().unwrap();
+        fn item_text(item: &Value) -> String {
+            item.get("content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .map(diagnostic_string)
+                .unwrap_or_default()
+        }
+        // Initial batch groups the frozen inventory: default namespace first,
+        // then the calendar namespace with its short-named child.
+        let initial = input[0]["tools"].as_array().unwrap();
+        assert_eq!(initial.len(), 2);
+        assert_eq!(initial[0]["name"], json!("functions"));
+        assert_eq!(initial[0]["tools"][0]["name"], json!("read"));
+        assert_eq!(initial[1]["name"], json!("mcp__calendar"));
+        assert_eq!(
+            initial[1]["description"],
+            json!("Tools in the mcp__calendar namespace.")
+        );
+        assert_eq!(initial[1]["tools"][0]["name"], json!("create_event"));
+        // u1: a namespace-shaped addition is introduced by the hint and rides
+        // a namespace copy holding only the changed member.
+        assert_eq!(input[2]["type"], json!("message"));
+        assert_eq!(item_text(&input[2]), TOOLS_UPDATE_NOTICE);
+        assert_eq!(
+            input[2]["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+            json!(["tools.incremental_update"])
+        );
+        assert_eq!(input[3]["type"], json!("additional_tools"));
+        let incremental = input[3]["tools"].as_array().unwrap();
+        assert_eq!(incremental.len(), 1);
+        assert_eq!(incremental[0]["name"], json!("mcp__calendar"));
+        assert_eq!(incremental[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(incremental[0]["tools"][0]["name"], json!("list_events"));
+        // u2: the namespace survives, so the member is listed by qualified key.
+        assert_eq!(
+            item_text(&input[6]),
+            format!("{TOOLS_REMOVAL_NOTICE}\n- mcp__calendar.create_event")
+        );
+        assert_eq!(
+            input[6]["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+            json!(["tools.removed_definition"])
+        );
+        // u3: the last member leaves, so the whole namespace is withdrawn and
+        // absorbs its member listing.
+        assert_eq!(
+            item_text(&input[9]),
+            format!("{TOOLS_REMOVED_NAMESPACES_NOTICE}\n- mcp__calendar")
+        );
     }
 
     #[test]

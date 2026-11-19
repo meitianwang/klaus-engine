@@ -1354,7 +1354,7 @@ fn message_uuid(message: &Message) -> Option<RuntimeString> {
 }
 
 /// The visible inventory implied by a frozen baseline plus its recorded events.
-fn fold_tool_inventory(
+pub(crate) fn fold_tool_inventory(
     baseline: &[ToolSpec],
     events: &[crate::types::provider::ToolInventoryEvent],
 ) -> Vec<ToolSpec> {

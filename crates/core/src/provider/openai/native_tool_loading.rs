@@ -341,7 +341,10 @@ pub(super) fn rebuild_without_tool_batches(body: &mut Value) {
                 return false;
             }
             if let Some(text) = message_item_text(item) {
-                if text.starts_with(TOOLS_UPDATE_NOTICE) || text.starts_with(TOOLS_REMOVAL_NOTICE) {
+                if text.starts_with(TOOLS_UPDATE_NOTICE)
+                    || text.starts_with(TOOLS_REMOVAL_NOTICE)
+                    || text.starts_with(TOOLS_REMOVED_NAMESPACES_NOTICE)
+                {
                     return false;
                 }
             }
