@@ -346,6 +346,9 @@ pub enum ProviderToolCallKind {
     Function,
     Custom,
     ToolSearch,
+    /// A provider-native tool search the backend executed itself. The engine
+    /// records the pair without executing anything and replays it verbatim.
+    ServerToolSearch,
 }
 
 impl ProviderToolCallKind {
@@ -360,6 +363,7 @@ impl RuntimeEncode for ProviderToolCallKind {
             Self::Function => "function",
             Self::Custom => "custom",
             Self::ToolSearch => "tool_search",
+            Self::ServerToolSearch => "server_tool_search",
         };
         runtime_codec::encode_external_unit(out, tag)
     }
@@ -373,8 +377,14 @@ impl RuntimeDecode for ProviderToolCallKind {
                 RuntimeEnumVariant::new("function", &[]),
                 RuntimeEnumVariant::new("custom", &[]),
                 RuntimeEnumVariant::new("tool_search", &[]),
+                RuntimeEnumVariant::new("server_tool_search", &[]),
             ],
-            &[Self::Function, Self::Custom, Self::ToolSearch],
+            &[
+                Self::Function,
+                Self::Custom,
+                Self::ToolSearch,
+                Self::ServerToolSearch,
+            ],
         )
     }
 }
@@ -1193,6 +1203,13 @@ pub enum ModelStreamEvent {
         results: Vec<NativeSearchResult>,
         error: Option<RuntimeString>,
     },
+    /// A provider-native tool search the backend executed itself. The engine
+    /// records the call/output pair without executing anything; `payload`
+    /// carries the server's output item fields for verbatim replay.
+    ServerToolSearchOutput {
+        id: RuntimeString,
+        payload: RuntimeJson,
+    },
     /// A citation tying a span of the current assistant text to a source.
     Citation {
         citation: Citation,
@@ -1346,6 +1363,12 @@ impl RuntimeEncode for ModelStreamEvent {
                 }
                 ("web_search_result", fields)
             }
+            Self::ServerToolSearchOutput { id, payload } => {
+                let mut fields = RuntimeObjectEncoder::new();
+                fields.field("id", id)?;
+                fields.field("payload", payload)?;
+                ("server_tool_search_output", fields)
+            }
             Self::Citation { citation } => {
                 let mut fields = RuntimeObjectEncoder::new();
                 fields.field("citation", citation)?;
@@ -1424,6 +1447,7 @@ impl RuntimeDecode for ModelStreamEvent {
                 RuntimeEnumVariant::new("usage_snapshot", &[]),
                 RuntimeEnumVariant::new("text_message_completed", &[]),
                 RuntimeEnumVariant::new("context_edits_applied", &[]),
+                RuntimeEnumVariant::new("server_tool_search_output", &[]),
             ],
             |variant, object| match variant {
                 0 => Ok(Self::MessageStart {
@@ -1501,6 +1525,10 @@ impl RuntimeDecode for ModelStreamEvent {
                     cleared_tool_uses: object.required("clearedToolUses", &[])?,
                     cleared_input_tokens: object.required("clearedInputTokens", &[])?,
                     cleared_thinking_turns: object.required("clearedThinkingTurns", &[])?,
+                }),
+                18 => Ok(Self::ServerToolSearchOutput {
+                    id: object.required("id", &[])?,
+                    payload: object.required("payload", &[])?,
                 }),
                 _ => Err(RuntimeCodecError::new(
                     RuntimeCodecErrorKind::UnknownEnumVariant,

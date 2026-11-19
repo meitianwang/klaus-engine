@@ -13,6 +13,7 @@ ToolSpec {
             definition: RuntimeString("start: WORD"),
         },
     ),
+    namespace: None,
 }
 ToolSpec {
     name: RuntimeString("free"),
@@ -22,6 +23,7 @@ ToolSpec {
     format: Some(
         Text,
     ),
+    namespace: None,
 }
 ToolSpec {
     name: RuntimeString("fx"),
@@ -29,4 +31,5 @@ ToolSpec {
     input_schema: Object({}),
     kind: Function,
     format: None,
+    namespace: None,
 }

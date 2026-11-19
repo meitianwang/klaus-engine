@@ -524,6 +524,9 @@ async fn stream_and_dispatch_inner(
     let mut active_text_message: Option<usize> = None;
     let mut prestarted: HashMap<RuntimeString, JoinHandle<ToolCallResult>> = HashMap::new();
     let mut resolved_calls: HashMap<RuntimeString, ResolvedToolCall> = HashMap::new();
+    // Provider-executed tool-search outputs that arrived before (or without)
+    // their call resolution; attached to the recorded call for verbatim replay.
+    let mut server_search_outputs: HashMap<RuntimeString, RuntimeJson> = HashMap::new();
 
     shared.observe_fixed_prefix_pressure(req);
     if let Err(error) = shared.validate_media(req) {
@@ -1027,6 +1030,15 @@ async fn stream_and_dispatch_inner(
                     }),
                 }
             }
+            ModelStreamEvent::ServerToolSearchOutput { id, payload } => {
+                // The recorded call never executes; its provider-owned output
+                // pairs with the call block for verbatim replay.
+                if let Some(call) = resolved_calls.get_mut(&id) {
+                    call.server_output = Some(payload);
+                } else {
+                    server_search_outputs.insert(id, payload);
+                }
+            }
             ModelStreamEvent::Citation { citation } => {
                 let mut attached = false;
                 for a in assembly.iter_mut().rev() {
@@ -1101,6 +1113,8 @@ async fn stream_and_dispatch_inner(
                             if p.arguments_are_parseable()
                                 && tool.mcp_server().is_none()
                                 && call.internal_name != "advisor"
+                                && call.visible.tool_kind
+                                    != Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch)
                                 && safe_is_read_only(tool.as_ref(), &call.initial_internal_input)
                             {
                                 let _handoff = match shared.persistence_in_flight.enter() {
@@ -1141,6 +1155,9 @@ async fn stream_and_dispatch_inner(
                                 // completion within one assistant message.
                             }
                         }
+                    }
+                    if let Some(payload) = server_search_outputs.remove(&id) {
+                        call.server_output = Some(payload);
                     }
                     resolved_calls.insert(id, call);
                 }
@@ -1375,6 +1392,9 @@ async fn stream_and_dispatch_inner(
                             if let Some(detector) = loop_detector.as_deref_mut() {
                                 detector.observe_tool_call();
                             }
+                        }
+                        if let Some(payload) = server_search_outputs.remove(&id) {
+                            call.server_output = Some(payload);
                         }
                         resolved_calls.insert(id.clone(), call);
                     }

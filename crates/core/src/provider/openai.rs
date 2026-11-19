@@ -2425,6 +2425,53 @@ fn responses_call_internal_name(item: &Value) -> RuntimeString {
     internal_tool_name(namespace.as_deref(), &diagnostic_string(&name))
 }
 
+/// Record a provider-executed tool-search output for verbatim replay. The
+/// engine never runs this search; client-executed outputs are produced by the
+/// engine itself and never arrive on the response stream.
+fn record_server_tool_search_output(
+    item: &Value,
+    state: &mut ResponsesState,
+    events: &mut Vec<ModelStreamEvent>,
+) {
+    if item
+        .get("execution")
+        .and_then(Value::as_str)
+        .is_some_and(|execution| execution == "client")
+    {
+        return;
+    }
+    let Some(call_id) = item.get("call_id").and_then(Value::as_str).cloned() else {
+        return;
+    };
+    if call_id.is_empty() || !state.server_search_outputs.insert(call_id.clone()) {
+        return;
+    }
+    let payload = vobj([
+        (
+            "status",
+            item.get("status")
+                .cloned()
+                .unwrap_or_else(|| vs("completed")),
+        ),
+        (
+            "execution",
+            item.get("execution")
+                .cloned()
+                .unwrap_or_else(|| vs("server")),
+        ),
+        (
+            "tools",
+            item.get("tools")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        ),
+    ]);
+    events.push(ModelStreamEvent::ServerToolSearchOutput {
+        id: call_id,
+        payload,
+    });
+}
+
 /// A content-derived wire item id: stable across rebuilds of the same logical
 /// payload inside one conversation identity, so retried and resumed requests
 /// preserve the item's identity byte-for-byte.
@@ -2502,11 +2549,18 @@ fn map_review_responses_stop_reason(response: &Value) -> ModelStopReason {
 }
 
 fn map_responses_stop_reason(response: &Value) -> ModelStopReason {
-    // A function call left in the output means the model wants tools executed.
+    // Function calls left in the output mean the model wants tools executed.
+    // A provider-executed search is not engine work: it never holds the turn
+    // open on its own.
     if let Some(output) = response.get("output").and_then(|o| o.as_array()) {
         if output.iter().any(|o| {
             o.get("type").and_then(|t| t.as_str()).is_some_and(|kind| {
-                kind == "function_call" || kind == "custom_tool_call" || kind == "tool_search_call"
+                kind == "function_call"
+                    || kind == "custom_tool_call"
+                    || (kind == "tool_search_call"
+                        && o.get("execution")
+                            .and_then(Value::as_str)
+                            .is_some_and(|execution| execution == "client"))
             })
         }) {
             return ModelStopReason::ToolUse;
@@ -3170,6 +3224,12 @@ fn project_responses_input(
                                     ("execution", vs("client")),
                                     ("arguments", tu.input.clone()),
                                 ])),
+                                ProviderToolCallKind::ServerToolSearch => out.push(vobj([
+                                    ("type", vs("tool_search_call")),
+                                    ("call_id", vs(tu.id.clone())),
+                                    ("execution", vs("server")),
+                                    ("arguments", tu.input.clone()),
+                                ])),
                             }
                         }
                         _ => {}
@@ -3221,6 +3281,33 @@ fn project_responses_input(
                             ("status", vs("completed")),
                             ("execution", vs("client")),
                             ("tools", filtered["tools"].clone()),
+                        ]));
+                    }
+                    ProviderToolCallKind::ServerToolSearch => {
+                        // The provider's own search result replays verbatim; a
+                        // missing recorded output keeps the pair well-formed
+                        // with an empty completion.
+                        let payload = tr.native_tool_output.clone().unwrap_or(Value::Null);
+                        let status = payload
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .cloned()
+                            .unwrap_or_else(|| RuntimeString::from("completed"));
+                        let execution = payload
+                            .get("execution")
+                            .and_then(Value::as_str)
+                            .cloned()
+                            .unwrap_or_else(|| RuntimeString::from("server"));
+                        let tools_value = payload
+                            .get("tools")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Array(Vec::new()));
+                        out.push(vobj([
+                            ("type", vs("tool_search_output")),
+                            ("call_id", vs(tr.tool_use_id.clone())),
+                            ("status", vs(status)),
+                            ("execution", vs(execution)),
+                            ("tools", tools_value),
                         ]));
                     }
                 }
@@ -4615,6 +4702,9 @@ struct ResponsesState {
     // A completed output item may be repeated by an SDK/transport. A call must
     // close at most once even when the same done event is delivered twice.
     stopped_calls: HashSet<RuntimeString>,
+    // Provider-executed tool-search outputs already surfaced; an SDK or
+    // transport may repeat a completed item, and the pair records only once.
+    server_search_outputs: HashSet<RuntimeString>,
     text_messages: HashMap<RuntimeString, Option<RuntimeString>>,
     text_contents: HashMap<RuntimeString, RuntimeString>,
     completed_text_messages: HashSet<RuntimeString>,
@@ -4645,6 +4735,7 @@ impl Default for ResponsesState {
         ResponsesState {
             calls: HashMap::new(),
             stopped_calls: HashSet::new(),
+            server_search_outputs: HashSet::new(),
             text_messages: HashMap::new(),
             text_contents: HashMap::new(),
             completed_text_messages: HashSet::new(),
@@ -4715,6 +4806,9 @@ fn response_tool_start(call: &ResponsesCall) -> ModelStreamEvent {
             Some(ToolInputFormat::Raw),
         ),
         ProviderToolCallKind::ToolSearch => (Some(ProviderToolCallKind::ToolSearch), None),
+        ProviderToolCallKind::ServerToolSearch => {
+            (Some(ProviderToolCallKind::ServerToolSearch), None)
+        }
     };
     ModelStreamEvent::ToolUseStart {
         id: call.call_id.clone(),
@@ -4953,17 +5047,26 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     response_text_message(item, state, &mut events);
                     return (events, false);
                 }
+                if item_type == "tool_search_output" {
+                    record_server_tool_search_output(item, state, &mut events);
+                    return (events, false);
+                }
                 let kind = if item_type == "function_call" {
                     Some(ProviderToolCallKind::Function)
                 } else if item_type == "custom_tool_call" {
                     Some(ProviderToolCallKind::Custom)
-                } else if item_type == "tool_search_call"
-                    && item
+                } else if item_type == "tool_search_call" {
+                    if item
                         .get("execution")
                         .and_then(Value::as_str)
                         .is_some_and(|execution| execution == "client")
-                {
-                    Some(ProviderToolCallKind::ToolSearch)
+                    {
+                        Some(ProviderToolCallKind::ToolSearch)
+                    } else {
+                        // A provider-executed search: recorded verbatim in
+                        // history, never run by the engine.
+                        Some(ProviderToolCallKind::ServerToolSearch)
+                    }
                 } else {
                     None
                 };
@@ -4985,7 +5088,10 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     if state.stopped_calls.contains(&call_id) {
                         return (events, false);
                     }
-                    let name = if kind == ProviderToolCallKind::ToolSearch {
+                    let name = if matches!(
+                        kind,
+                        ProviderToolCallKind::ToolSearch | ProviderToolCallKind::ServerToolSearch
+                    ) {
                         "tool_search".into()
                     } else {
                         // A namespaced declaration answers with the short name
@@ -5013,7 +5119,11 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                             return (events, true);
                         }
                     }
-                    if kind == ProviderToolCallKind::ToolSearch && entry.input.is_empty() {
+                    if matches!(
+                        kind,
+                        ProviderToolCallKind::ToolSearch | ProviderToolCallKind::ServerToolSearch
+                    ) && entry.input.is_empty()
+                    {
                         let input = response_tool_search_input(item);
                         if input != "{}" {
                             entry.input = input.clone();
@@ -5205,15 +5315,24 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     }
                     return (events, false);
                 }
+                if item_type == "tool_search_output" {
+                    record_server_tool_search_output(item, state, &mut events);
+                    return (events, false);
+                }
                 let kind = if item_type == "custom_tool_call" {
                     Some(ProviderToolCallKind::Custom)
-                } else if item_type == "tool_search_call"
-                    && item
+                } else if item_type == "tool_search_call" {
+                    if item
                         .get("execution")
                         .and_then(Value::as_str)
                         .is_some_and(|execution| execution == "client")
-                {
-                    Some(ProviderToolCallKind::ToolSearch)
+                    {
+                        Some(ProviderToolCallKind::ToolSearch)
+                    } else {
+                        // A provider-executed search: recorded verbatim in
+                        // history, never run by the engine.
+                        Some(ProviderToolCallKind::ServerToolSearch)
+                    }
                 } else {
                     None
                 };
@@ -5231,7 +5350,10 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                     if state.stopped_calls.contains(&call_id) {
                         return (events, false);
                     }
-                    let name = if kind == ProviderToolCallKind::ToolSearch {
+                    let name = if matches!(
+                        kind,
+                        ProviderToolCallKind::ToolSearch | ProviderToolCallKind::ServerToolSearch
+                    ) {
                         "tool_search".into()
                     } else {
                         // A namespaced declaration answers with the short name
@@ -5258,10 +5380,17 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
                                 .cloned()
                                 .unwrap_or_default(),
                             ProviderToolCallKind::Custom => response_custom_input(item),
-                            ProviderToolCallKind::ToolSearch => response_tool_search_input(item),
+                            ProviderToolCallKind::ToolSearch
+                            | ProviderToolCallKind::ServerToolSearch => {
+                                response_tool_search_input(item)
+                            }
                         };
                         if !(input.is_empty()
-                            || kind == ProviderToolCallKind::ToolSearch && input == "{}")
+                            || matches!(
+                                kind,
+                                ProviderToolCallKind::ToolSearch
+                                    | ProviderToolCallKind::ServerToolSearch
+                            ) && input == "{}")
                         {
                             entry.input = input.clone();
                             events.push(ModelStreamEvent::ToolUseInputDelta {
@@ -11892,8 +12021,22 @@ mod tests {
             ModelStopReason::ToolUse
         );
         assert_eq!(
-            map_responses_stop_reason(&json!({ "output": [ { "type": "tool_search_call" } ] })),
+            map_responses_stop_reason(
+                &json!({ "output": [ { "type": "tool_search_call", "execution": "client" } ] })
+            ),
             ModelStopReason::ToolUse
+        );
+        // A provider-executed search is recorded, never run: it does not hold
+        // the turn open. A missing execution mode is treated the same way.
+        assert_eq!(
+            map_responses_stop_reason(
+                &json!({ "output": [ { "type": "tool_search_call", "execution": "server" } ] })
+            ),
+            ModelStopReason::EndTurn
+        );
+        assert_eq!(
+            map_responses_stop_reason(&json!({ "output": [ { "type": "tool_search_call" } ] })),
+            ModelStopReason::EndTurn
         );
         assert_eq!(
             map_responses_stop_reason(&json!({ "output": [] })),
@@ -12951,7 +13094,7 @@ mod tests {
                 "execution":"client","arguments":{"query":"calendar"}
             }}),
             json!({"type":"response.completed","response":{
-                "output":[{"type":"tool_search_call"}],
+                "output":[{"type":"tool_search_call","execution":"client"}],
                 "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}
             }}),
         ]);
@@ -12985,15 +13128,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_search_defaults_empty_arguments_and_ignores_non_client_items() {
+    fn tool_search_defaults_empty_arguments_and_records_non_client_items() {
         let events = map_responses_sequence(&[
             json!({"type":"response.output_item.added","item":{
                 "type":"tool_search_call","id":"server-item","call_id":"server-call",
-                "execution":"server","arguments":{"query":"ignored"}
+                "execution":"server","arguments":{"query":"server-side"}
             }}),
             json!({"type":"response.output_item.done","item":{
                 "type":"tool_search_call","id":"server-item","call_id":"server-call",
-                "execution":"server","arguments":{"query":"ignored"}
+                "execution":"server","arguments":{"query":"server-side"}
+            }}),
+            json!({"type":"response.output_item.done","item":{
+                "type":"tool_search_output","id":"server-out","call_id":"server-call",
+                "status":"completed","execution":"server",
+                "tools":[{"type":"function","name":"create_event","description":"Create",
+                          "strict":false,"defer_loading":true,"parameters":{"type":"object"}}]
             }}),
             json!({"type":"response.output_item.added","item":{
                 "type":"tool_search_call","id":"client-item","call_id":"client-call",
@@ -13007,6 +13156,29 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                ModelStreamEvent::ToolUseStart {
+                    id: "server-call".into(),
+                    name: "tool_search".into(),
+                    thought_signature: None,
+                    tool_kind: Some(ProviderToolCallKind::ServerToolSearch),
+                    input_format: None,
+                },
+                ModelStreamEvent::ToolUseInputDelta {
+                    id: "server-call".into(),
+                    partial_json: r#"{"query":"server-side"}"#.into(),
+                },
+                ModelStreamEvent::ToolUseStop {
+                    id: "server-call".into(),
+                },
+                ModelStreamEvent::ServerToolSearchOutput {
+                    id: "server-call".into(),
+                    payload: json!({
+                        "status":"completed",
+                        "execution":"server",
+                        "tools":[{"type":"function","name":"create_event","description":"Create",
+                                  "strict":false,"defer_loading":true,"parameters":{"type":"object"}}]
+                    }),
+                },
                 ModelStreamEvent::ToolUseStart {
                     id: "client-call".into(),
                     name: "tool_search".into(),
@@ -13032,6 +13204,57 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn server_executed_search_alone_does_not_hold_the_turn_open() {
+        assert!(matches!(
+            map_responses_stop_reason(
+                &json!({"output":[{"type":"tool_search_call","execution":"server"}]})
+            ),
+            ModelStopReason::EndTurn
+        ));
+        assert!(matches!(
+            map_responses_stop_reason(
+                &json!({"output":[{"type":"tool_search_call","execution":"client"}]})
+            ),
+            ModelStopReason::ToolUse
+        ));
+    }
+
+    #[test]
+    fn server_executed_tool_search_pairs_replay_verbatim() {
+        let mut request = base_req();
+        request.messages = vec![
+            assistant_provider_call(
+                "srv1",
+                "tool_search",
+                json!({"query":"calendar"}),
+                ProviderToolCallKind::ServerToolSearch,
+            ),
+            provider_result(
+                "srv1",
+                "Provider-executed tool search recorded; its results were delivered to the model directly.",
+                ProviderToolCallKind::ServerToolSearch,
+                Some(json!({
+                    "status":"completed",
+                    "execution":"server",
+                    "tools":[{"type":"function","name":"create_event","description":"Create",
+                              "strict":false,"defer_loading":true,"parameters":{"type":"object"}}]
+                })),
+            ),
+        ];
+        let body = responses_params_default(&request).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], json!("tool_search_call"));
+        assert_eq!(input[0]["call_id"], json!("srv1"));
+        assert_eq!(input[0]["execution"], json!("server"));
+        assert_eq!(input[0]["arguments"], json!({"query":"calendar"}));
+        assert_eq!(input[1]["type"], json!("tool_search_output"));
+        assert_eq!(input[1]["call_id"], json!("srv1"));
+        assert_eq!(input[1]["status"], json!("completed"));
+        assert_eq!(input[1]["execution"], json!("server"));
+        assert_eq!(input[1]["tools"][0]["name"], json!("create_event"));
     }
 
     #[test]

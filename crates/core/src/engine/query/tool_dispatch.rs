@@ -483,6 +483,45 @@ pub(super) async fn dispatch_tool_calls(
     .await)
 }
 
+/// Persist a provider-executed native tool search as a completed, non-error
+/// result. The server's own output item rides `native_tool_output` so the wire
+/// projection replays the native call/output pair verbatim; the visible text
+/// is a transcript-facing note, never a fabricated search result.
+async fn recorded_server_tool_search_result(
+    shared: &Arc<Shared>,
+    call: &ResolvedToolCall,
+    emit_started: bool,
+) -> ToolResultMessage {
+    if emit_started {
+        let _ = push_tool_call_started(shared, call).await;
+    }
+    let note = RuntimeString::from(
+        "Provider-executed tool search recorded; its results were delivered to the model directly.",
+    );
+    let persistence = record_tool_lifecycle(
+        shared,
+        call,
+        ToolLifecyclePhase::Completed,
+        None,
+        Some(false),
+        Some(note.clone()),
+    )
+    .await;
+    if let Err(error) = persistence {
+        report_tool_persistence_failure(shared, &error);
+    }
+    ToolResultMessage {
+        uuid: (shared.deps.uuid)().into(),
+        tool_use_id: call.visible.id.clone(),
+        content: vec![text_out_exact(note)],
+        is_error: false,
+        tool_kind: Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch),
+        native_tool_output: call.server_output.clone(),
+        output: None,
+        extra_user_blocks: None,
+    }
+}
+
 async fn interrupted_tool_result(
     shared: &Arc<Shared>,
     call: &ResolvedToolCall,
@@ -634,6 +673,14 @@ fn execute_tool_call_inner(
     emit_started: bool,
 ) -> Pin<Box<dyn Future<Output = ToolCallResult> + Send>> {
     Box::pin(async move {
+        // A provider-executed native tool search is recorded, never run: the
+        // engine persists the server's own output for verbatim replay and adds
+        // no execution, permission or approval semantics of its own.
+        if call.visible.tool_kind
+            == Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch)
+        {
+            return Ok(recorded_server_tool_search_result(&shared, &call, emit_started).await);
+        }
         let signal = shared.params.signal.clone();
         if signal.is_cancelled() {
             return Ok(interrupted_tool_result(&shared, &call).await);

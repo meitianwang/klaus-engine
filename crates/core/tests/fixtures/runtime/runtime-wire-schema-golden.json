@@ -14718,6 +14718,14 @@
         "wireDeserialize": "tool_search",
         "other": false,
         "rustDefault": false
+      },
+      {
+        "rustName": "ServerToolSearch",
+        "shape": "unit",
+        "wireSerialize": "server_tool_search",
+        "wireDeserialize": "server_tool_search",
+        "other": false,
+        "rustDefault": false
       }
     ]
   },

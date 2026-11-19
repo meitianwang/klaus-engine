@@ -357,6 +357,7 @@ fn event_kind(event: &ModelStreamEvent) -> &'static str {
         ModelStreamEvent::ThinkingDelta { .. } => "thinking_delta",
         ModelStreamEvent::ThinkingBlock { .. } => "thinking_block",
         ModelStreamEvent::RedactedThinkingBlock { .. } => "redacted_thinking_block",
+        ModelStreamEvent::ServerToolSearchOutput { .. } => "server_tool_search_output",
         ModelStreamEvent::ToolUseStart { .. } => "tool_use_start",
         ModelStreamEvent::ToolUseInputDelta { .. } => "tool_use_input_delta",
         ModelStreamEvent::ToolUseStop { .. } => "tool_use_stop",

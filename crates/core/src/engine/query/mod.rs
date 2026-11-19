@@ -1037,6 +1037,9 @@ struct ResolvedToolCall {
     trusted_caller: Option<RuntimeString>,
     approval_call_source: crate::types::permission::ApprovalActionCallSource,
     profile: ProviderBehaviorProfile,
+    /// Recorded output of a provider-executed native tool search. The engine
+    /// never runs such a call; it persists the pair for verbatim replay.
+    server_output: Option<RuntimeJson>,
 }
 
 impl ResolvedToolCall {
@@ -1052,6 +1055,7 @@ impl ResolvedToolCall {
             trusted_caller: None,
             approval_call_source: Default::default(),
             profile,
+            server_output: None,
         }
     }
 
@@ -1070,6 +1074,7 @@ impl ResolvedToolCall {
             trusted_caller: Some(caller),
             approval_call_source: Default::default(),
             profile,
+            server_output: None,
         }
     }
 
