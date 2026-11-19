@@ -243,9 +243,19 @@ pub(super) async fn establish(
     }
     if batched {
         learned.disable_for(&transport.url, &request.model, ADDITIONAL_TOOLS_CAPABILITY);
+        crate::observability::prefix_attribution::record_downgrade_rebuild(
+            "additional-tools",
+            &diagnostic_string(&request.model),
+            error.status,
+        );
         rebuild_without_tool_batches(&mut body);
     } else {
         learned.disable(&transport.url, &request.model);
+        crate::observability::prefix_attribution::record_downgrade_rebuild(
+            "tool-search",
+            &diagnostic_string(&request.model),
+            error.status,
+        );
     }
     apply_policy(&mut body, request, false);
     // This second attempt returns directly. Its refusal cannot recurse into

@@ -9,6 +9,7 @@
 pub mod cost_tracker;
 pub mod logger;
 pub mod otel;
+pub mod prefix_attribution;
 pub mod prefix_fingerprint;
 pub mod provider_diagnostics;
 pub(crate) mod provider_timing;

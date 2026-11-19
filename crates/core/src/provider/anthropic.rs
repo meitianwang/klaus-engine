@@ -1906,10 +1906,20 @@ async fn attempt_with_media_remediation(
                         &ctx.hint_model,
                         INLINE_TOOLS_CAPABILITY,
                     );
+                    crate::observability::prefix_attribution::record_downgrade_rebuild(
+                        "inline-tools",
+                        &diagnostic_string(&ctx.hint_model),
+                        raw.status,
+                    );
                     continue;
                 }
                 if defer_stripped {
                     ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
+                    crate::observability::prefix_attribution::record_downgrade_rebuild(
+                        "defer-loading",
+                        &diagnostic_string(&ctx.hint_model),
+                        raw.status,
+                    );
                     continue;
                 }
             }
@@ -3664,10 +3674,10 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
         }
         if let Some(messages) = body.get("messages").and_then(Value::as_array) {
             for message in messages {
-                if !message
+                if message
                     .get("role")
                     .and_then(Value::as_str)
-                    .is_some_and(|role| role == "system")
+                    .is_none_or(|role| role != "system")
                 {
                     continue;
                 }
@@ -3683,9 +3693,7 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
                         {
                             if let Some(name) = definition.get("name").and_then(Value::as_str) {
                                 folded.retain(|tool| {
-                                    tool.get("name")
-                                        .and_then(Value::as_str)
-                                        .map_or(true, |tool_name| tool_name != name)
+                                    tool.get("name").and_then(Value::as_str) != Some(name)
                                 });
                             }
                             folded.push(definition.clone());
@@ -3698,9 +3706,7 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
                             .and_then(Value::as_str)
                         {
                             folded.retain(|tool| {
-                                tool.get("name")
-                                    .and_then(Value::as_str)
-                                    .map_or(true, |tool_name| tool_name != name)
+                                tool.get("name").and_then(Value::as_str) != Some(name)
                             });
                         }
                     }
@@ -3713,10 +3719,10 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages.iter_mut() {
-            if !message
+            if message
                 .get("role")
                 .and_then(Value::as_str)
-                .is_some_and(|role| role == "system")
+                .is_none_or(|role| role != "system")
             {
                 continue;
             }

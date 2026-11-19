@@ -192,10 +192,27 @@ impl RequestTiming {
     /// layer serializes for the wire anyway.
     pub(crate) fn record_prefix(&mut self, request: &ModelRequest) {
         let fingerprint = super::prefix_fingerprint::PrefixFingerprint::of(request);
+        let attribution = super::prefix_attribution::attribute(
+            request
+                .cache_domain
+                .as_ref()
+                .or(request.cache_key.as_ref())
+                .map(crate::provider::util::diagnostic_string)
+                .as_deref(),
+            request.cache_ttl == Some(crate::types::provider::CacheTtl::OneHour),
+            &fingerprint,
+        );
         if let (Some(fields), Value::Object(prefix)) =
             (self.fields.as_object_mut(), fingerprint.fields())
         {
             for (key, value) in prefix {
+                fields.insert(key, value);
+            }
+        }
+        if let (Some(fields), Value::Object(attribution)) =
+            (self.fields.as_object_mut(), attribution)
+        {
+            for (key, value) in attribution {
                 fields.insert(key, value);
             }
         }

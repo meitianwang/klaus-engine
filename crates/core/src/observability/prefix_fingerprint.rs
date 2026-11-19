@@ -104,6 +104,26 @@ pub struct PrefixFingerprint {
     /// id, and a key that changes per request defeats routing on the wires that
     /// use it.
     pub cache_key_hash: Option<String>,
+    /// The request's model. A switch re-signs thinking blocks and moves every
+    /// wire-derived setting, so attribution treats it as an epoch boundary.
+    pub model: String,
+    /// Digest of the frozen top-level baseline, when the request rides an
+    /// in-place tool-change transport. Under that transport the baseline, not
+    /// the live inventory, is what the cached prefix carries.
+    pub frozen_tools_hash: Option<String>,
+    /// Count and digest of the recorded inventory-change stream. These move
+    /// WITHOUT busting the frozen prefix; the digests exist so attribution can
+    /// tell a stream append from a top-level change.
+    pub inventory_events: usize,
+    pub inventory_events_hash: String,
+    /// Setting-segment digests: each covers one wire-setting family so a moved
+    /// digest names its own reason (effort, thinking, retention, deferred
+    /// loading, negotiated wire capabilities).
+    pub effort_hash: String,
+    pub thinking_hash: String,
+    pub retention_hash: String,
+    pub defer_hash: String,
+    pub wire_caps_hash: String,
 }
 
 impl PrefixFingerprint {
@@ -127,6 +147,28 @@ impl PrefixFingerprint {
                 .cache_key
                 .as_ref()
                 .map(|key| short_hex(&Sha256::digest(key.to_node_utf8()))),
+            model: crate::provider::util::diagnostic_string(&request.model),
+            frozen_tools_hash: request
+                .frozen_tools
+                .as_ref()
+                .map(|frozen| digest_tools(frozen).1),
+            inventory_events: request.tool_inventory_events.len(),
+            inventory_events_hash: digest_inventory_events(&request.tool_inventory_events),
+            effort_hash: debug_hash(&request.effort),
+            thinking_hash: debug_hash(&request.thinking),
+            retention_hash: debug_hash(&(request.cache_ttl, request.skip_cache_write)),
+            defer_hash: {
+                let mut hasher = Sha256::new();
+                update(
+                    &mut hasher,
+                    format!("{:?}", request.native_deferred_tools).as_bytes(),
+                );
+                for tool in &request.deferred_tools {
+                    feed(&mut hasher, tool);
+                }
+                finish(&hasher)
+            },
+            wire_caps_hash: debug_hash(&request.wire_caps),
         }
     }
 
@@ -143,8 +185,42 @@ impl PrefixFingerprint {
             "prefixHistoryHash": self.history_hash,
             "prefixHistoryPrefixHash": self.history_prefix_hash,
             "prefixCacheKeyHash": self.cache_key_hash,
+            "prefixModel": self.model,
+            "prefixFrozenToolsHash": self.frozen_tools_hash,
+            "prefixInventoryEvents": self.inventory_events,
+            "prefixInventoryEventsHash": self.inventory_events_hash,
+            "prefixEffortHash": self.effort_hash,
+            "prefixThinkingHash": self.thinking_hash,
+            "prefixRetentionHash": self.retention_hash,
+            "prefixDeferHash": self.defer_hash,
+            "prefixWireCapsHash": self.wire_caps_hash,
         })
     }
+}
+
+/// Digest of one setting family via its debug shape. Advisory attribution only
+/// compares digests within one binary generation, so the debug spelling is a
+/// stable-enough canonical form without a codec bound on every settings type.
+fn debug_hash<T: std::fmt::Debug>(value: &T) -> String {
+    short_hex(&Sha256::digest(format!("{:?}", value).as_bytes()))
+}
+
+fn digest_inventory_events(events: &[crate::types::provider::ToolInventoryEvent]) -> String {
+    let mut hasher = Sha256::new();
+    for event in events {
+        if let Some(anchor) = &event.anchor_uuid {
+            feed_text(&mut hasher, anchor);
+        }
+        for name in &event.removed {
+            update(&mut hasher, b"-");
+            feed_text(&mut hasher, name);
+        }
+        for spec in &event.added {
+            update(&mut hasher, b"+");
+            feed(&mut hasher, spec);
+        }
+    }
+    finish(&hasher)
 }
 
 fn digest_tools(tools: &[ToolSpec]) -> (usize, String) {
@@ -389,14 +465,14 @@ fn short_hex(digest: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::runtime_values::RuntimeJson;
     use crate::schemas::content::{ImageBlock, TextBlock};
     use crate::schemas::message::UserMessage;
     use crate::types::provider::{CacheScope, ToolSpecKind};
 
-    fn request() -> ModelRequest {
+    pub(crate) fn request() -> ModelRequest {
         ModelRequest {
             supports_image_detail_original: false,
             model_verbosity: None,

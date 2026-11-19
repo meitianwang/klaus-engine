@@ -1338,6 +1338,67 @@ pub(super) async fn resolve_system_prompt(s: &SystemPromptResolvable) -> Vec<Sys
     }
 }
 
+/// Stable uuid of a persisted message, used as the announcement anchor of a
+/// recorded tool-inventory change.
+fn message_uuid(message: &Message) -> Option<RuntimeString> {
+    match message {
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::Assistant(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::System(m) => Some(m.uuid.clone()),
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+    }
+}
+
+/// The visible inventory implied by a frozen baseline plus its recorded events.
+fn fold_tool_inventory(
+    baseline: &[ToolSpec],
+    events: &[crate::types::provider::ToolInventoryEvent],
+) -> Vec<ToolSpec> {
+    let mut state: Vec<ToolSpec> = baseline.to_vec();
+    for event in events {
+        for name in &event.removed {
+            state.retain(|spec| &spec.name != name);
+        }
+        for spec in &event.added {
+            match state.iter_mut().find(|slot| slot.name == spec.name) {
+                Some(slot) => *slot = spec.clone(),
+                None => state.push(spec.clone()),
+            }
+        }
+    }
+    state
+}
+
+/// Added/redefined and removed declarations between the implied inventory and
+/// the request's actual visible list. `None` when they already agree.
+fn tool_inventory_diff(
+    expected: &[ToolSpec],
+    actual: &[ToolSpec],
+) -> Option<(Vec<ToolSpec>, Vec<RuntimeString>)> {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    for spec in actual {
+        match expected
+            .iter()
+            .find(|candidate| candidate.name == spec.name)
+        {
+            Some(previous) if previous == spec => {}
+            _ => added.push(spec.clone()),
+        }
+    }
+    for spec in expected {
+        if !actual.iter().any(|candidate| candidate.name == spec.name) {
+            removed.push(spec.name.clone());
+        }
+    }
+    if added.is_empty() && removed.is_empty() {
+        None
+    } else {
+        Some((added, removed))
+    }
+}
+
 #[cfg(test)]
 mod context_policy_tests {
     use super::*;
@@ -1410,66 +1471,5 @@ mod context_policy_tests {
             adaptive_context_management(Some(&config), Some(&state)),
             Some(config)
         );
-    }
-}
-
-/// Stable uuid of a persisted message, used as the announcement anchor of a
-/// recorded tool-inventory change.
-fn message_uuid(message: &Message) -> Option<RuntimeString> {
-    match message {
-        Message::User(m) => Some(m.uuid.clone()),
-        Message::Assistant(m) => Some(m.uuid.clone()),
-        Message::ToolResult(m) => Some(m.uuid.clone()),
-        Message::System(m) => Some(m.uuid.clone()),
-        Message::CompactBoundary(m) => Some(m.uuid.clone()),
-    }
-}
-
-/// The visible inventory implied by a frozen baseline plus its recorded events.
-fn fold_tool_inventory(
-    baseline: &[ToolSpec],
-    events: &[crate::types::provider::ToolInventoryEvent],
-) -> Vec<ToolSpec> {
-    let mut state: Vec<ToolSpec> = baseline.to_vec();
-    for event in events {
-        for name in &event.removed {
-            state.retain(|spec| &spec.name != name);
-        }
-        for spec in &event.added {
-            match state.iter_mut().find(|slot| slot.name == spec.name) {
-                Some(slot) => *slot = spec.clone(),
-                None => state.push(spec.clone()),
-            }
-        }
-    }
-    state
-}
-
-/// Added/redefined and removed declarations between the implied inventory and
-/// the request's actual visible list. `None` when they already agree.
-fn tool_inventory_diff(
-    expected: &[ToolSpec],
-    actual: &[ToolSpec],
-) -> Option<(Vec<ToolSpec>, Vec<RuntimeString>)> {
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    for spec in actual {
-        match expected
-            .iter()
-            .find(|candidate| candidate.name == spec.name)
-        {
-            Some(previous) if previous == spec => {}
-            _ => added.push(spec.clone()),
-        }
-    }
-    for spec in expected {
-        if !actual.iter().any(|candidate| candidate.name == spec.name) {
-            removed.push(spec.name.clone());
-        }
-    }
-    if added.is_empty() && removed.is_empty() {
-        None
-    } else {
-        Some((added, removed))
     }
 }
