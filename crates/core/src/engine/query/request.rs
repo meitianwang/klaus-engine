@@ -462,6 +462,8 @@ pub(super) fn prepare_with_inference(
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
         wire_caps: None,
+        frozen_tools: None,
+        tool_inventory_events: Vec::new(),
         tool_choice,
         max_output_tokens,
         task_budget: config.task_budget_tokens,
@@ -691,6 +693,7 @@ impl Shared {
         if capabilities.tools {
             prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
         }
+        self.attach_frozen_tool_projection(&mut prepared.request, messages);
         self.observe_approval_context(
             messages,
             canonical_system_prompt,
@@ -797,6 +800,84 @@ impl Shared {
             return Vec::new();
         }
         render_tool_specs_for_behavior(&internal, profile)
+    }
+
+    /// Maintain the frozen tool-inventory epoch for transports that announce
+    /// inventory changes in the message stream, and attach the projection to
+    /// the request. The baseline is re-captured whenever the persisted history
+    /// stops extending it (compaction, migration, restore), the model changes,
+    /// or the oversized-inventory latch flips; recorded events are byte-frozen
+    /// so replays stay identical within an epoch.
+    pub(super) fn attach_frozen_tool_projection(
+        &self,
+        request: &mut ModelRequest,
+        messages: &[Message],
+    ) {
+        if !self.inline_tool_change_projection_capable(&request.model) {
+            return;
+        }
+        let oversized = self
+            .oversized_inventory_deferred
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut state = self.tool_freeze.lock_recover();
+        let need_rebase = match state.as_ref() {
+            None => true,
+            Some(epoch) => {
+                epoch.model != request.model
+                    || epoch.oversized != oversized
+                    || messages.len() < epoch.prefix_len
+                    || super::precompute::history_hash(&messages[..epoch.prefix_len])
+                        != Some(epoch.prefix_hash)
+            }
+        };
+        if need_rebase {
+            let Some(prefix_hash) = super::precompute::history_hash(messages) else {
+                return;
+            };
+            *state = Some(super::ToolFreezeEpoch {
+                model: request.model.clone(),
+                specs: request.tools.clone(),
+                prefix_len: messages.len(),
+                prefix_hash,
+                oversized,
+                events: Vec::new(),
+            });
+        }
+        let epoch = state.as_mut().expect("epoch just established");
+        let expected = fold_tool_inventory(&epoch.specs, &epoch.events);
+        if let Some((added, removed)) = tool_inventory_diff(&expected, &request.tools) {
+            epoch
+                .events
+                .push(crate::types::provider::ToolInventoryEvent {
+                    anchor_uuid: messages.last().and_then(message_uuid),
+                    added,
+                    removed,
+                });
+        }
+        request.frozen_tools = Some(epoch.specs.clone());
+        request.tool_inventory_events = epoch.events.clone();
+    }
+
+    /// Whether the current model could ride an in-place tool-change transport
+    /// (Anthropic inline blocks or Responses cumulative batches). Resolution
+    /// order: catalog-merged metadata, then the offline compatibility list.
+    fn inline_tool_change_projection_capable(&self, model: &RuntimeString) -> bool {
+        let Some(bundle) = self.bundle() else {
+            return false;
+        };
+        let Ok(provider_name) = bundle.provider.info().name.try_to_utf8() else {
+            return false;
+        };
+        let metadata = bundle.provider.model_metadata(model);
+        let sys = metadata.mid_convo_system_messages.unwrap_or_else(|| {
+            crate::provider::model_catalog::mid_convo_system_messages_default(&provider_name, model)
+        });
+        let changes = metadata.mid_convo_tool_changes.unwrap_or_else(|| {
+            crate::provider::model_catalog::mid_convo_tool_changes_default(&provider_name, model)
+        }) || metadata.additional_tools.unwrap_or_else(|| {
+            crate::provider::model_catalog::additional_tools_default(&provider_name, model)
+        });
+        sys && changes
     }
 
     /// Budget the rendered prefix, rather than a tool count or a model-name
@@ -1329,5 +1410,66 @@ mod context_policy_tests {
             adaptive_context_management(Some(&config), Some(&state)),
             Some(config)
         );
+    }
+}
+
+/// Stable uuid of a persisted message, used as the announcement anchor of a
+/// recorded tool-inventory change.
+fn message_uuid(message: &Message) -> Option<RuntimeString> {
+    match message {
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::Assistant(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::System(m) => Some(m.uuid.clone()),
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+    }
+}
+
+/// The visible inventory implied by a frozen baseline plus its recorded events.
+fn fold_tool_inventory(
+    baseline: &[ToolSpec],
+    events: &[crate::types::provider::ToolInventoryEvent],
+) -> Vec<ToolSpec> {
+    let mut state: Vec<ToolSpec> = baseline.to_vec();
+    for event in events {
+        for name in &event.removed {
+            state.retain(|spec| &spec.name != name);
+        }
+        for spec in &event.added {
+            match state.iter_mut().find(|slot| slot.name == spec.name) {
+                Some(slot) => *slot = spec.clone(),
+                None => state.push(spec.clone()),
+            }
+        }
+    }
+    state
+}
+
+/// Added/redefined and removed declarations between the implied inventory and
+/// the request's actual visible list. `None` when they already agree.
+fn tool_inventory_diff(
+    expected: &[ToolSpec],
+    actual: &[ToolSpec],
+) -> Option<(Vec<ToolSpec>, Vec<RuntimeString>)> {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    for spec in actual {
+        match expected
+            .iter()
+            .find(|candidate| candidate.name == spec.name)
+        {
+            Some(previous) if previous == spec => {}
+            _ => added.push(spec.clone()),
+        }
+    }
+    for spec in expected {
+        if !actual.iter().any(|candidate| candidate.name == spec.name) {
+            removed.push(spec.name.clone());
+        }
+    }
+    if added.is_empty() && removed.is_empty() {
+        None
+    } else {
+        Some((added, removed))
     }
 }

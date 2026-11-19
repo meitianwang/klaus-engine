@@ -771,6 +771,18 @@ impl WireCapabilityPolicy {
     }
 }
 
+/// One recorded change of the session's visible tool inventory, anchored to the
+/// message after which the wire should announce it. `added` carries the exact
+/// declarations frozen at record time so replays stay byte-identical; a
+/// redefinition is an addition under an existing name and suppresses its own
+/// removal. Anchors that no longer exist (compacted away) flush at the end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInventoryEvent {
+    pub anchor_uuid: Option<RuntimeString>,
+    pub added: Vec<ToolSpec>,
+    pub removed: Vec<RuntimeString>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRequest {
     /// Native-only capability binding; decoded requests must rebind their model.
@@ -793,6 +805,13 @@ pub struct ModelRequest {
     /// Catalog-resolved wire capability policy for this request's source/model.
     /// Internal only: ordinary decoded requests leave it unset.
     pub wire_caps: Option<WireCapabilityPolicy>,
+    /// Frozen baseline of the visible tool inventory for transports that keep
+    /// the top-level tool list byte-stable and announce changes in the message
+    /// stream. Internal only: ordinary decoded requests leave it unset.
+    pub frozen_tools: Option<Vec<ToolSpec>>,
+    /// Recorded inventory changes since `frozen_tools`, in order, anchored to
+    /// message uuids. Internal only: ordinary decoded requests leave it unset.
+    pub tool_inventory_events: Vec<ToolInventoryEvent>,
     pub deferred_tools: Vec<ToolSpec>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
@@ -962,6 +981,8 @@ impl RuntimeDecode for ModelRequest {
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 wire_caps: None,
+                frozen_tools: None,
+                tool_inventory_events: Vec::new(),
                 tool_choice: object.optional("toolChoice", &[])?,
                 max_output_tokens: object.required("maxOutputTokens", &[])?,
                 task_budget: object.optional("taskBudget", &[])?,

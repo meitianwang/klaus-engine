@@ -1141,9 +1141,8 @@ impl ModelProvider for CapturedModelProvider {
         }
         req.bind_media_capabilities(capabilities);
         req.native_deferred_tools = metadata.native_deferred_tools;
-        req.wire_caps = Some(
-            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata),
-        );
+        req.wire_caps =
+            Some(crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata));
         self.inner.stream(req, signal)
     }
 
@@ -1332,9 +1331,8 @@ impl ModelProvider for CatalogModelProvider {
                 .cache_scope_supported
                 .or(metadata.cache_scope_supported);
             metadata.cache_ttl_1h = wire.cache_ttl_1h.or(metadata.cache_ttl_1h);
-            metadata.long_cache_retention = wire
-                .long_cache_retention
-                .or(metadata.long_cache_retention);
+            metadata.long_cache_retention =
+                wire.long_cache_retention.or(metadata.long_cache_retention);
             metadata.explicit_prompt_cache_mode = wire
                 .explicit_prompt_cache_mode
                 .or(metadata.explicit_prompt_cache_mode);
@@ -1344,9 +1342,8 @@ impl ModelProvider for CatalogModelProvider {
             metadata.session_affinity_format = wire
                 .session_affinity_format
                 .or(metadata.session_affinity_format);
-            metadata.cache_control_format = wire
-                .cache_control_format
-                .or(metadata.cache_control_format);
+            metadata.cache_control_format =
+                wire.cache_control_format.or(metadata.cache_control_format);
         }
         metadata
     }

@@ -688,6 +688,20 @@ impl EventQueue {
 }
 
 /// Shared state the tool-execution seams capture (all `'static` behind `Arc`).
+/// Frozen baseline of the visible tool inventory plus the changes recorded
+/// after it, for transports that keep the top-level tool list byte-stable and
+/// announce inventory changes inside the message stream. Session-local: the
+/// epoch re-baselines on history discontinuity (compaction, migration,
+/// restore), model change, or an emergency inventory shrink.
+pub(super) struct ToolFreezeEpoch {
+    pub(super) model: RuntimeString,
+    pub(super) specs: Vec<ToolSpec>,
+    pub(super) prefix_len: usize,
+    pub(super) prefix_hash: [u8; 32],
+    pub(super) oversized: bool,
+    pub(super) events: Vec<crate::types::provider::ToolInventoryEvent>,
+}
+
 struct Shared {
     persistence_in_flight: Arc<tool_tasks::QueryPersistence>,
     params: QueryParams,
@@ -703,6 +717,8 @@ struct Shared {
     tool_specs: Mutex<Arc<Vec<ToolSpec>>>,
     /// Deferred tools surfaced via `tool_search` this session.
     surfaced: Mutex<HashSet<RuntimeString>>,
+    /// Frozen tool-inventory epoch for in-place tool-change transports.
+    tool_freeze: Mutex<Option<ToolFreezeEpoch>>,
     /// Latched when an oversized tool inventory exceeds the model's input window
     /// and must fall back from eager exposure to `tool_search` deferral.
     oversized_inventory_deferred: std::sync::atomic::AtomicBool,

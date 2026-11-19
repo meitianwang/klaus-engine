@@ -6954,6 +6954,8 @@ mod tests {
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
             wire_caps: None,
+            frozen_tools: None,
+            tool_inventory_events: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1000,
             task_budget: None,

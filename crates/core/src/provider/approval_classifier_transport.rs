@@ -154,6 +154,8 @@ pub(crate) fn test_request() -> ClassifierRequest {
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
             wire_caps: None,
+            frozen_tools: None,
+            tool_inventory_events: Vec::new(),
             tool_choice: Some(ToolChoice::None),
             max_output_tokens: 16_384,
             task_budget: None,

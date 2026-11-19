@@ -92,6 +92,34 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// `scope:'global'`, sharing the cached prefix across this org's sessions.
 /// First-party only; a no-op unless a breakpoint sets the `scope` field.
 const CACHE_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
+/// Beta enabling in-place tool addition/removal blocks inside system messages.
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+/// Capability tag for the endpoint/model-scoped refusal learning of the inline
+/// tool-change protocol (distinct from the deferred-loading capability).
+const INLINE_TOOLS_CAPABILITY: &str = "inline-tools";
+/// Stable deferred placeholder anchoring the server-side scaffolding for
+/// mid-conversation tool changes inside the cached prefix from the first
+/// request on. Never activated; the model cannot see or call it.
+const DEFERRED_PLACEHOLDER_TOOL: &str = "__klaus_deferred_placeholder__";
+
+fn deferred_placeholder_tool() -> Value {
+    vobj(vec![
+        ("name", vs(DEFERRED_PLACEHOLDER_TOOL)),
+        (
+            "description",
+            vs("Reserved placeholder. Never available. Never call this."),
+        ),
+        (
+            "input_schema",
+            vobj(vec![
+                ("type", vs("object")),
+                ("properties", vobj(vec![])),
+                ("required", Value::Array(Vec::new())),
+            ]),
+        ),
+        ("defer_loading", Value::Bool(true)),
+    ])
+}
 /// Native structured-outputs beta: enables `output_config.format`, constraining
 /// the model's direct output to a schema via grammar sampling (composes with
 /// thinking). First-party + supported-model only.
@@ -567,6 +595,46 @@ impl AnthropicProvider {
             && !self.native_tool_support.disabled(&self.messages_url, model)
     }
 
+    /// Whether this request rides the inline tool-change protocol: the top-level
+    /// tool list stays frozen at its baseline and inventory changes are announced
+    /// by `tool_addition` / `tool_removal` blocks inside system messages, so tool
+    /// churn never invalidates the cached prefix. Resolution order mirrors the
+    /// deferred-loading binding: request-scoped catalog policy, then host-declared
+    /// capabilities, then the offline compatibility list.
+    fn inline_tool_changes_enabled(&self, model: &RuntimeString, req: &ModelRequest) -> bool {
+        self.vertex.is_none()
+            && self.bedrock.is_none()
+            && req
+                .frozen_tools
+                .as_ref()
+                .is_some_and(|frozen| !frozen.is_empty())
+            && !self.native_tool_support.disabled_for(
+                &self.messages_url,
+                model,
+                INLINE_TOOLS_CAPABILITY,
+            )
+            && {
+                let caps = self.capabilities_for(model);
+                let system_messages = req
+                    .wire_caps
+                    .as_ref()
+                    .and_then(|policy| policy.mid_convo_system_messages)
+                    .or(caps.mid_convo_system_messages)
+                    .unwrap_or_else(|| {
+                        super::model_catalog::mid_convo_system_messages_default("anthropic", model)
+                    });
+                let tool_changes = req
+                    .wire_caps
+                    .as_ref()
+                    .and_then(|policy| policy.mid_convo_tool_changes)
+                    .or(caps.mid_convo_tool_changes)
+                    .unwrap_or_else(|| {
+                        super::model_catalog::mid_convo_tool_changes_default("anthropic", model)
+                    });
+                system_messages && tool_changes
+            }
+    }
+
     /// The resolved model/source limits used by admission and final validation.
     pub fn image_limits_for(&self, model: &RuntimeString) -> ImageLimits {
         let native = model
@@ -726,6 +794,7 @@ impl AnthropicProvider {
             req.output_schema.is_some(),
             false,
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools),
+            self.inline_tool_changes_enabled(&req.model, req),
             self.structured_output_mode(req),
             self.requires_claude_code_identity(),
             image_limits,
@@ -876,6 +945,7 @@ impl ModelProvider for AnthropicProvider {
             request.output_schema.is_some(),
             cache_scope_enabled,
             self.native_deferred_tools_enabled(&request.model, request.native_deferred_tools),
+            self.inline_tool_changes_enabled(&request.model, &request),
             output_mode,
             self.requires_claude_code_identity(),
             image_limits,
@@ -1070,6 +1140,7 @@ impl ModelProvider for AnthropicProvider {
         let output_mode = self.structured_output_mode(&req);
         let defer_loading_supported =
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
+        let inline_tool_changes = self.inline_tool_changes_enabled(&req.model, &req);
         let native_tool_support = self.native_tool_support.clone();
 
         let s = async_stream::stream! {
@@ -1103,7 +1174,7 @@ impl ModelProvider for AnthropicProvider {
                     .is_some_and(|p| p.cache_scope == Some(CacheScope::Global));
             let params = match build_params_with_media_limits(
                 &req, structured, cache_scope_enabled, defer_loading_supported,
-                output_mode,
+                inline_tool_changes, output_mode,
                 require_claude_code_identity, image_limits, media_budget,
             ) {
                 Ok(params) => params,
@@ -1783,20 +1854,32 @@ async fn attempt_with_media_remediation(
             if !signal.is_cancelled()
                 && super::native_tools::unsupported_native_tools(raw.status, &raw.message)
             {
-                let downgraded = {
+                let (inline_rebuilt, defer_stripped) = {
                     let mut body = ctx.body.lock_recover();
-                    let mut changed = false;
-                    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-                        tools.retain(|tool| {
-                            let deferred =
-                                tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
-                            changed |= deferred;
-                            !deferred
-                        });
+                    if rebuild_without_inline_tool_blocks(&mut body) {
+                        (true, false)
+                    } else {
+                        let mut changed = false;
+                        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+                            tools.retain(|tool| {
+                                let deferred = tool.get("defer_loading").and_then(Value::as_bool)
+                                    == Some(true);
+                                changed |= deferred;
+                                !deferred
+                            });
+                        }
+                        (false, changed)
                     }
-                    changed
                 };
-                if downgraded {
+                if inline_rebuilt {
+                    ctx.native_tool_support.disable_for(
+                        &ctx.url,
+                        &ctx.hint_model,
+                        INLINE_TOOLS_CAPABILITY,
+                    );
+                    continue;
+                }
+                if defer_stripped {
                     ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
                     continue;
                 }
@@ -1958,6 +2041,11 @@ async fn attempt_once(
         }
         if ctx.emits_global {
             merge_beta_header(&mut headers, CACHE_SCOPE_BETA);
+        }
+        // Derived from the body per attempt: a downgraded rebuild stops
+        // advertising the protocol without touching the attempt context.
+        if body_declares_inline_tool_blocks(&ctx.body.lock_recover()) {
+            merge_beta_header(&mut headers, INLINE_TOOLS_BETA);
         }
         if ctx.use_native {
             merge_beta_header(&mut headers, STRUCTURED_OUTPUTS_BETA);
@@ -2902,6 +2990,7 @@ fn build_params(
         structured,
         cache_scope_enabled,
         false,
+        false,
         StructuredOutputMode {
             native: use_native_structured,
             review_tool_loop: false,
@@ -2927,6 +3016,7 @@ fn build_params_with_media_limits(
     structured: bool,
     cache_scope_enabled: bool,
     defer_loading_supported: bool,
+    inline_tool_changes: bool,
     output_mode: StructuredOutputMode,
     require_claude_code_identity: bool,
     image_limits: ImageLimits,
@@ -2937,7 +3027,23 @@ fn build_params_with_media_limits(
         .iter()
         .map(|p| vobj(vec![("type", vs("text")), ("text", vs(p.text.clone()))]))
         .collect();
-    let mut messages = to_api_messages(&req.messages, &diagnostic_string(&req.model), &req.tools);
+    // Under the inline tool-change protocol the top-level list is the frozen
+    // baseline; later inventory changes ride in the message stream instead.
+    let frozen_active = inline_tool_changes
+        && req
+            .frozen_tools
+            .as_ref()
+            .is_some_and(|frozen| !frozen.is_empty());
+    let mut messages = to_api_messages(
+        &req.messages,
+        &diagnostic_string(&req.model),
+        &req.tools,
+        if frozen_active {
+            &req.tool_inventory_events
+        } else {
+            &[]
+        },
+    );
     // Modern Claude models reject assistant message prefill (400 when the final
     // message has role="assistant"). Ensure empty-input continuations after a
     // partial assistant turn always end on a user message.
@@ -2968,7 +3074,16 @@ fn build_params_with_media_limits(
         messages = trimmed;
     }
 
-    let mut tools: Vec<Value> = req.tools.iter().map(to_api_tool).collect();
+    let mut tools: Vec<Value> = if frozen_active {
+        req.frozen_tools
+            .as_ref()
+            .expect("frozen baseline checked above")
+            .iter()
+            .map(to_api_tool)
+            .collect()
+    } else {
+        req.tools.iter().map(to_api_tool).collect()
+    };
     let mut tool_choice: Option<Value> = req.tool_choice.as_ref().map(to_api_tool_choice);
     let mut structured_replacement = false;
 
@@ -3022,7 +3137,8 @@ fn build_params_with_media_limits(
     // paying their context cost up front. Appended AFTER cache breakpoints so
     // the breakpoint stays on the last immediate tool and the cached prefix
     // does not shift. Skipped when a forced structured-output tool replaced
-    // the whole inventory.
+    // the whole inventory, and under the inline tool-change protocol where the
+    // frozen baseline already anchors the scaffolding via the placeholder.
     if defer_loading_supported && !req.deferred_tools.is_empty() && !structured_replacement {
         if tools.is_empty() {
             // Nothing immediate to bootstrap from: promote the deferred
@@ -3037,6 +3153,14 @@ fn build_params_with_media_limits(
                 tool
             }));
         }
+    }
+
+    // Frozen-inline protocol: the stable deferred placeholder keeps the
+    // server-side tool-change scaffolding inside the cached prefix from the
+    // first request on, and anchors the never-all-deferred inventory rule.
+    // Appended after the breakpoints so it never carries one.
+    if frozen_active && !structured_replacement {
+        tools.push(deferred_placeholder_tool());
     }
 
     // OAuth subscription premium-model spoof gate: lead with the verbatim Claude
@@ -3369,7 +3493,237 @@ fn strip_stale_thinking(content: &[ContentBlock]) -> Vec<ContentBlock> {
         .collect()
 }
 
-fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec]) -> Vec<Value> {
+/// Stable uuid of a persisted message, used as an announcement anchor.
+fn message_uuid_of(message: &Message) -> Option<RuntimeString> {
+    match message {
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::Assistant(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::System(m) => Some(m.uuid.clone()),
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+    }
+}
+
+/// Queue the events anchored at any message of `slice` for the next flush.
+fn collect_anchored_events(
+    slice: &[Message],
+    anchored: &std::collections::HashMap<RuntimeString, Vec<usize>>,
+    pending: &mut Vec<usize>,
+    matched: &mut std::collections::HashSet<usize>,
+) {
+    for message in slice {
+        let Some(uuid) = message_uuid_of(message) else {
+            continue;
+        };
+        if let Some(indices) = anchored.get(&uuid) {
+            for index in indices {
+                if matched.insert(*index) {
+                    pending.push(*index);
+                }
+            }
+        }
+    }
+}
+
+/// Render held-back inventory events as ONE system message: removals first
+/// (skipping names redefined by an addition in the same flush), then additions
+/// carrying their frozen declarations by value. Deterministic in the event
+/// order, so replays of the same transcript are byte-identical.
+fn flush_tool_inventory_events(
+    out: &mut Vec<Value>,
+    pending: &mut Vec<usize>,
+    events: &[crate::types::provider::ToolInventoryEvent],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut redefined: std::collections::HashSet<RuntimeString> = std::collections::HashSet::new();
+    for index in pending.iter() {
+        for spec in &events[*index].added {
+            redefined.insert(spec.name.clone());
+        }
+    }
+    let mut blocks: Vec<Value> = Vec::new();
+    for index in pending.iter() {
+        for name in &events[*index].removed {
+            if redefined.contains(name) {
+                continue;
+            }
+            blocks.push(vobj(vec![
+                ("type", vs("tool_removal")),
+                (
+                    "tool",
+                    vobj(vec![
+                        ("type", vs("tool_reference")),
+                        ("name", vs(name.clone())),
+                    ]),
+                ),
+            ]));
+        }
+    }
+    for index in pending.iter() {
+        for spec in &events[*index].added {
+            blocks.push(vobj(vec![
+                ("type", vs("tool_addition")),
+                (
+                    "tool",
+                    vobj(vec![
+                        ("type", vs("tool_definition")),
+                        ("definition", to_api_tool(spec)),
+                    ]),
+                ),
+            ]));
+        }
+    }
+    pending.clear();
+    out.push(vobj(vec![
+        ("role", vs("system")),
+        ("content", Value::Array(blocks)),
+    ]));
+}
+
+/// Whether a serialized request body carries inline tool-change artifacts
+/// (announcement blocks or the frozen-list placeholder). Drives the beta header
+/// per attempt, so a downgraded body stops advertising the protocol.
+fn body_declares_inline_tool_blocks(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "system")
+            && message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        let kind = block.get("type").and_then(Value::as_str);
+                        kind.is_some_and(|tag| tag == "tool_addition")
+                            || kind.is_some_and(|tag| tag == "tool_removal")
+                    })
+                })
+    })
+}
+
+/// Rebuild a rejected inline-tool-change request into the plain top-level
+/// inventory shape: fold every definition declared in the stream into the tool
+/// list in message order, drop the frozen placeholder, and strip the
+/// announcement blocks (keeping sibling text blocks). Returns whether the body
+/// carried inline artifacts at all. The rebuild changes the tools segment, so
+/// the cached prefix is rebuilt once; the caller records the downgrade.
+fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
+    let mut folded: Vec<Value> = Vec::new();
+    let mut found = false;
+    {
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            for tool in tools {
+                if tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == DEFERRED_PLACEHOLDER_TOOL)
+                {
+                    found = true;
+                    continue;
+                }
+                folded.push(tool.clone());
+            }
+        }
+        if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                if !message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "system")
+                {
+                    continue;
+                }
+                let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for block in blocks {
+                    let kind = block.get("type").and_then(Value::as_str);
+                    if kind.is_some_and(|tag| tag == "tool_addition") {
+                        found = true;
+                        if let Some(definition) =
+                            block.get("tool").and_then(|tool| tool.get("definition"))
+                        {
+                            if let Some(name) = definition.get("name").and_then(Value::as_str) {
+                                folded.retain(|tool| {
+                                    tool.get("name")
+                                        .and_then(Value::as_str)
+                                        .map_or(true, |tool_name| tool_name != name)
+                                });
+                            }
+                            folded.push(definition.clone());
+                        }
+                    } else if kind.is_some_and(|tag| tag == "tool_removal") {
+                        found = true;
+                        if let Some(name) = block
+                            .get("tool")
+                            .and_then(|tool| tool.get("name"))
+                            .and_then(Value::as_str)
+                        {
+                            folded.retain(|tool| {
+                                tool.get("name")
+                                    .and_then(Value::as_str)
+                                    .map_or(true, |tool_name| tool_name != name)
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        return false;
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            if !message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "system")
+            {
+                continue;
+            }
+            if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                blocks.retain(|block| {
+                    let kind = block.get("type").and_then(Value::as_str);
+                    !(kind.is_some_and(|tag| tag == "tool_addition")
+                        || kind.is_some_and(|tag| tag == "tool_removal"))
+                });
+            }
+        }
+        messages.retain(|message| {
+            let is_system = message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "system");
+            !(is_system
+                && message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| blocks.is_empty()))
+        });
+    }
+    if let Some(object) = body.as_object_mut() {
+        if folded.is_empty() {
+            object.remove("tools");
+        } else {
+            object.insert("tools", Value::Array(folded));
+        }
+    }
+    true
+}
+
+fn to_api_messages(
+    messages: &[Message],
+    target_model: &str,
+    tools: &[ToolSpec],
+    inventory_events: &[crate::types::provider::ToolInventoryEvent],
+) -> Vec<Value> {
     let behavior_profile = resolve_provider_behavior_profile(
         Some(&ProviderInfo {
             name: "anthropic".into(),
@@ -3380,6 +3734,21 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
         &RuntimeString::from(target_model),
     );
     let mut out: Vec<Value> = Vec::new();
+    // Inline tool-change announcements: events render as system-role messages
+    // carrying tool_addition/tool_removal blocks, anchored after the message
+    // recorded at capture time and held back until the next assistant message
+    // (or the end), so a block never lands between a tool call and its result.
+    let mut anchored: std::collections::HashMap<RuntimeString, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut unanchored: Vec<usize> = Vec::new();
+    for (index, event) in inventory_events.iter().enumerate() {
+        match &event.anchor_uuid {
+            Some(uuid) => anchored.entry(uuid.clone()).or_default().push(index),
+            None => unanchored.push(index),
+        }
+    }
+    let mut pending: Vec<usize> = unanchored.clone();
+    let mut matched: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut i = 0;
     while i < messages.len() {
         match &messages[i] {
@@ -3390,6 +3759,7 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
                 // in the same user turn — deferred to AFTER the whole coalesced run
                 // (results must be contiguous at the front of the user message).
                 let mut deferred: Vec<Value> = Vec::new();
+                let start = i;
                 while i < messages.len() {
                     let Message::ToolResult(tr) = &messages[i] else {
                         break;
@@ -3404,6 +3774,7 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
                 }
                 content.extend(deferred);
                 push_user_content(&mut out, content);
+                collect_anchored_events(&messages[start..i], &anchored, &mut pending, &mut matched);
                 continue;
             }
             Message::User(u) => {
@@ -3415,6 +3786,9 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
                 push_user_content(&mut out, content);
             }
             Message::Assistant(a) => {
+                // Held-back announcements flush directly before the next
+                // assistant message, never between a tool call and its result.
+                flush_tool_inventory_events(&mut out, &mut pending, inventory_events);
                 // A model switch leaves prior assistant turns carrying thinking
                 // signatures bound to their producing model; drop those first.
                 let stripped;
@@ -3463,8 +3837,18 @@ fn to_api_messages(messages: &[Message], target_model: &str, tools: &[ToolSpec])
             }
             Message::System(_) => {}
         }
+        collect_anchored_events(&messages[i..i + 1], &anchored, &mut pending, &mut matched);
         i += 1;
     }
+
+    // Announcements whose anchor never appeared (or with no anchor) flush at
+    // the end of the transcript.
+    for index in 0..inventory_events.len() {
+        if matched.insert(index) {
+            pending.push(index);
+        }
+    }
+    flush_tool_inventory_events(&mut out, &mut pending, inventory_events);
 
     // The API rejects a request whose FINAL assistant message ends in a thinking /
     // redacted_thinking block — strip the trailing run from the last assistant
@@ -4235,6 +4619,239 @@ mod tests {
         })
     }
 
+    fn inline_build(req: &ModelRequest) -> Value {
+        let params = build_params_with_media_limits(
+            req,
+            false,
+            false,
+            false,
+            true,
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            false,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("inline assembly fixture must contain valid image payloads");
+        Value::Object(params)
+    }
+
+    fn inline_spec(name: &str) -> ToolSpec {
+        function_spec(
+            name,
+            "inline fixture tool",
+            exact_json!({"type":"object","properties":{},"required":[]}),
+        )
+    }
+
+    fn assistant_text(uuid: &str, text: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            uuid: uuid.into(),
+            model: "claude-opus-4-8".into(),
+            usage: None,
+            content: vec![ContentBlock::Text(TextBlock {
+                text: text.into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+        })
+    }
+
+    fn assistant_tool_use(uuid: &str, id: &str, name: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            uuid: uuid.into(),
+            model: "claude-opus-4-8".into(),
+            usage: None,
+            content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                id: id.into(),
+                name: name.into(),
+                input: exact_json!({}),
+                thought_signature: None,
+                tool_kind: None,
+            })],
+        })
+    }
+
+    fn tool_result(uuid: &str, id: &str) -> Message {
+        Message::ToolResult(crate::schemas::message::ToolResultMessage {
+            uuid: uuid.into(),
+            tool_use_id: id.into(),
+            content: vec![OutputBlock::Text(TextBlock {
+                text: "ok".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_error: false,
+            tool_kind: None,
+            native_tool_output: None,
+            output: None,
+            extra_user_blocks: None,
+        })
+    }
+
+    #[test]
+    fn inline_tool_changes_freeze_tools_and_render_anchored_blocks() {
+        let mut req = base_req();
+        req.frozen_tools = Some(vec![inline_spec("read"), inline_spec("bash")]);
+        req.tools = vec![
+            inline_spec("read"),
+            inline_spec("bash"),
+            inline_spec("calculator"),
+        ];
+        req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![inline_spec("calculator")],
+            removed: vec![],
+        }];
+        req.messages = vec![
+            user_msg("hi"),
+            assistant_text("a1", "working"),
+            assistant_text("a2", "done"),
+        ];
+
+        let body = inline_build(&req);
+        let rebuilt = inline_build(&req);
+        assert_eq!(body, rebuilt, "assembly must be deterministic");
+
+        // Frozen list: baseline tools plus the deferred placeholder; the cache
+        // breakpoint stays on the last baseline tool, never on the placeholder.
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(
+            tools[2].get("name").unwrap(),
+            &exact_json!("__klaus_deferred_placeholder__")
+        );
+        assert_eq!(tools[2].get("defer_loading").unwrap(), &exact_json!(true));
+        assert!(tools[2].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_some());
+
+        // The anchored event renders as a system message between the anchor
+        // (u1) and the next assistant message, carrying the definition by value.
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        let announcement = &messages[1];
+        assert_eq!(announcement.get("role").unwrap(), &exact_json!("system"));
+        let blocks = announcement.get("content").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("type").unwrap(),
+            &exact_json!("tool_addition")
+        );
+        let definition = blocks[0].get("tool").unwrap().get("definition").unwrap();
+        assert_eq!(definition.get("name").unwrap(), &exact_json!("calculator"));
+    }
+
+    #[test]
+    fn inline_announcements_never_split_tool_pairs() {
+        let mut req = base_req();
+        req.frozen_tools = Some(vec![inline_spec("read")]);
+        req.tools = vec![inline_spec("read"), inline_spec("calculator")];
+        req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("a1".into()),
+            added: vec![inline_spec("calculator")],
+            removed: vec![],
+        }];
+        req.messages = vec![
+            user_msg("hi"),
+            assistant_tool_use("a1", "call-1", "read"),
+            tool_result("t1", "call-1"),
+            assistant_text("a2", "done"),
+        ];
+
+        let body = inline_build(&req);
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        // Order: user, assistant(tool_use), user(tool_result), system(announcement),
+        // assistant, plus the trailing empty-continuation nudge.
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[3].get("role").unwrap(), &exact_json!("system"));
+        assert_eq!(messages[4].get("role").unwrap(), &exact_json!("assistant"));
+        let result_blocks = messages[2].get("content").unwrap().as_array().unwrap();
+        assert_eq!(
+            result_blocks[0].get("type").unwrap(),
+            &exact_json!("tool_result")
+        );
+    }
+
+    #[test]
+    fn inline_removals_and_redefinitions_render_reference_and_value_blocks() {
+        let mut req = base_req();
+        req.frozen_tools = Some(vec![inline_spec("read"), inline_spec("calculator")]);
+        req.tools = vec![inline_spec("read")];
+        req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![],
+            removed: vec!["calculator".into()],
+        }];
+        req.messages = vec![user_msg("hi"), assistant_text("a1", "ok")];
+        let body = inline_build(&req);
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        let blocks = messages[1].get("content").unwrap().as_array().unwrap();
+        assert_eq!(blocks[0].get("type").unwrap(), &exact_json!("tool_removal"));
+        assert_eq!(
+            blocks[0].get("tool").unwrap().get("type").unwrap(),
+            &exact_json!("tool_reference")
+        );
+        assert_eq!(
+            blocks[0].get("tool").unwrap().get("name").unwrap(),
+            &exact_json!("calculator")
+        );
+
+        // A redefinition is an addition under the same name: no removal block.
+        let mut redefined = base_req();
+        redefined.frozen_tools = Some(vec![inline_spec("read")]);
+        redefined.tools = vec![inline_spec("read"), inline_spec("calculator")];
+        redefined.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![inline_spec("calculator")],
+            removed: vec!["calculator".into()],
+        }];
+        redefined.messages = vec![user_msg("hi"), assistant_text("a1", "ok")];
+        let body = inline_build(&redefined);
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        let blocks = messages[1].get("content").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("type").unwrap(),
+            &exact_json!("tool_addition")
+        );
+    }
+
+    #[test]
+    fn inline_downgrade_rebuild_folds_stream_state_into_top_level() {
+        let mut req = base_req();
+        req.frozen_tools = Some(vec![inline_spec("read"), inline_spec("bash")]);
+        req.tools = vec![inline_spec("read")];
+        req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![inline_spec("calculator")],
+            removed: vec!["bash".into()],
+        }];
+        req.messages = vec![user_msg("hi"), assistant_text("a1", "ok")];
+        let mut body = inline_build(&req);
+
+        assert!(rebuild_without_inline_tool_blocks(&mut body));
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        // bash removed, calculator folded in, placeholder dropped.
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].get("name").unwrap(), &exact_json!("read"));
+        assert_eq!(tools[1].get("name").unwrap(), &exact_json!("calculator"));
+        // Announcement blocks are gone; no empty system message remains.
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        assert!(messages.iter().all(|message| message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role != "system")));
+        // Idempotent: a second pass finds no inline artifacts.
+        assert!(!rebuild_without_inline_tool_blocks(&mut body));
+    }
+
     #[test]
     fn anthropic_compact_boundary_history() {
         for summary in ["resume summary", "compacted summary"] {
@@ -4245,7 +4862,7 @@ mod tests {
                     summary: RuntimeString::from(summary),
                 },
             )];
-            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[]);
+            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[], &[]);
             let expected_text = RuntimeString::from(format!(
                 "<system-reminder>\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nEarlier conversation summary:\n{summary}\n</system-reminder>"
             ));
@@ -4279,7 +4896,7 @@ mod tests {
         })];
 
         assert_eq!(
-            to_api_messages(&messages, "claude-opus-4-8", &[]),
+            to_api_messages(&messages, "claude-opus-4-8", &[], &[]),
             vec![exact_json!({
                 "role": "user",
                 "content": [{
@@ -4309,6 +4926,8 @@ mod tests {
             native_deferred_tools: None,
             deferred_tools: vec![],
             wire_caps: None,
+            frozen_tools: None,
+            tool_inventory_events: Vec::new(),
             tool_choice: None,
             max_output_tokens: 1024,
             task_budget: None,
@@ -4629,6 +5248,7 @@ mod tests {
             structured,
             false,
             supported,
+            false,
             StructuredOutputMode {
                 native: false,
                 review_tool_loop: false,
@@ -5415,7 +6035,7 @@ mod tests {
             })
         };
         let msgs = vec![tr("a"), tr("b")];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[]);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get("role").unwrap(), &exact_json!("user"));
         let content = out[0].get("content").unwrap().as_array().unwrap();
@@ -5446,7 +6066,7 @@ mod tests {
                 }),
             ],
         })];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[]);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[]);
         let content = out[0].get("content").unwrap().as_array().unwrap();
         // The trailing thinking block is stripped; only the text remains.
         assert_eq!(content.len(), 1);
@@ -6568,7 +7188,7 @@ mod empty_text_thinking_replay {
             ),
             tr("t1", 2),
         ];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[]);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[]);
         let blocks = out[1].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")
@@ -6593,7 +7213,7 @@ mod empty_text_thinking_replay {
             "claude-opus-5-5",
             vec![think("SIG", "reasoning text"), tool_use("t1")],
         )];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[]);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[]);
         let blocks = out[0].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")

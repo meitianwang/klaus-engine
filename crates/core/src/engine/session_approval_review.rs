@@ -1184,6 +1184,8 @@ impl ReviewerRequest for ReviewAttempt {
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 wire_caps: None,
+                frozen_tools: None,
+                tool_inventory_events: Vec::new(),
                 tool_choice: None,
                 max_output_tokens: self.setup.target.capabilities.max_output_tokens,
                 task_budget: None,

@@ -606,6 +606,7 @@ async fn run_turn(
         tools: Mutex::new(tools0),
         tool_specs: Mutex::new(specs0),
         surfaced: Mutex::new(surfaced0),
+        tool_freeze: Mutex::new(None),
         oversized_inventory_deferred: std::sync::atomic::AtomicBool::new(false),
         turn_context: Mutex::new(turn_context0),
         turn_state,

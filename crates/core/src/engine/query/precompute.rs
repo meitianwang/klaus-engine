@@ -114,9 +114,10 @@ struct NativeCandidate {
     native_deferred_tools: Option<bool>,
     deferred_tools: Vec<crate::types::provider::ToolSpec>,
     wire_caps: Option<crate::types::provider::WireCapabilityPolicy>,
+    frozen_tools: Option<Vec<crate::types::provider::ToolSpec>>,
 }
 
-fn history_hash(messages: &[Message]) -> Option<[u8; 32]> {
+pub(super) fn history_hash(messages: &[Message]) -> Option<[u8; 32]> {
     let encoded = crate::runtime_values::runtime_codec::encode_text(&messages.to_vec()).ok()?;
     let mut hash = Sha256::new();
     for unit in encoded.as_utf16() {
@@ -223,6 +224,7 @@ impl PrecomputeRegistry {
                 native_deferred_tools: arm.request.native_deferred_tools,
                 deferred_tools: arm.request.deferred_tools.clone(),
                 wire_caps: arm.request.wire_caps.clone(),
+                frozen_tools: arm.request.frozen_tools.clone(),
             })
         } else {
             None
@@ -409,6 +411,7 @@ impl PrecomputeRegistry {
                         && request.deferred_tools == native.deferred_tools
                         && request.native_deferred_tools == native.native_deferred_tools
                         && request.wire_caps == native.wire_caps
+                        && request.frozen_tools == native.frozen_tools
                         && messages_now.len() >= native.prefix_len
                         && history_hash(&messages_now[..native.prefix_len])
                             == Some(native.prefix_hash)
@@ -905,6 +908,8 @@ mod tests {
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
                 wire_caps: None,
+                frozen_tools: None,
+                tool_inventory_events: Vec::new(),
                 tool_choice: None,
                 max_output_tokens: 100,
                 task_budget: None,
