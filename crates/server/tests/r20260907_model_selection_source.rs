@@ -130,8 +130,6 @@ async fn model_selection_resolve_pins_the_source_without_requiring_credentials()
         json!({"source":"klaus", "selection":"auto", "catalog":[{"value":"klaus:retired"}]}),
         json!({"source":"custom", "selection":"custom:"}),
         json!({"source":"custom", "selection":"auto", "catalog":[{"value":"custom:forged"}]}),
-        json!({"source":"local", "selection":"auto"}),
-        json!({"source":"local", "selection":"local:on-device.gguf"}),
     ]
     .into_iter()
     .enumerate()

@@ -96,7 +96,6 @@ mod tests {
             "gpt-5.5",
             "us.anthropic.claude-opus-4:1",
             "moonshotai/kimi-k2.6",
-            "local:retired-gguf",
         ] {
             assert_eq!(ModelRef::parse(value), ModelRef::Name(value), "{value}");
         }

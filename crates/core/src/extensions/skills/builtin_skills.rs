@@ -57,7 +57,7 @@ You are answering a question about Klaus itself — the desktop app, Klaus iOS, 
 
 ## 2. Answer from the manual and live state
 - Ground the answer in what the manual actually says, not model memory. Name the manual section or exact UI path (`Settings → …`) the answer comes from.
-- Keep current product boundaries straight: Klaus uses the user's own model subscriptions or API keys (there is no Klaus model plan or built-in local GGUF runtime), and session work modes (`Plan`, `Goal`, `Orchestrate`, `Parallel`) are independent of permission modes.
+- Keep current product boundaries straight: Klaus uses the user's own model subscriptions or API keys (there is no Klaus model plan), and session work modes (`Plan`, `Goal`, `Orchestrate`, `Parallel`) are independent of permission modes.
 - If the user sent a screenshot, first state which Klaus surface, panel, or control it shows, then map it to the matching manual section and answer.
 - Answer only what was asked; skip unrelated product tours.
 - "Why did X happen / not happen for me" is a question about this installation, not only about the documented rule. When `klaus_query` is available, read the relevant live surface too (the setting or preference, model sources, scheduled tasks and runs, extensions, permissions, browser, or worktrees) — call `klaus_query { key: "<surface>" }` first to inspect its actions — and answer from what is actually configured; say so when the live state differs from the documented default.

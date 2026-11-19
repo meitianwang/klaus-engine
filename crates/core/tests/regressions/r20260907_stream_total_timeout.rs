@@ -1,6 +1,6 @@
 //! Defect: a model stream that emitted frequent events could run forever.
 //! Root cause: streamTotalTimeoutMs was configured but only the per-event idle timeout was enforced.
-//! Fixed by: 2026-09-07 local-model runtime correctness work item.
+//! Fixed by: 2026-09-07 streaming timeout work item.
 
 use futures::StreamExt;
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};

@@ -816,14 +816,6 @@ pub async fn resolve(
             pricing: None,
         }));
     }
-    // Named but retired: the on-device local model runtime no longer exists in
-    // any client. Saying so beats resolving to something the caller did not
-    // ask for.
-    if selection.starts_with("local:") {
-        return Err(format!(
-            "cannot run {selection}: the on-device local model runtime has been retired"
-        ));
-    }
     Ok(None)
 }
 
@@ -2383,17 +2375,6 @@ mod tests {
         );
         assert_eq!(resolve("auto", &root, &no_tiers()).await.unwrap(), None);
         assert_eq!(resolve("high", &root, &no_tiers()).await.unwrap(), None);
-    }
-
-    /// Named but retired: refused with the reason, never handed back for the
-    /// BYO path to answer with a different account.
-    #[tokio::test]
-    async fn a_retired_local_source_is_refused_with_its_reason() {
-        let root = std::env::temp_dir();
-        let error = resolve("local:retired-model", &root, &no_tiers())
-            .await
-            .expect_err("local is retired");
-        assert!(error.contains("retired"), "{error}");
     }
 
     /// Signed out of Qoder reads as signed out, with the command that fixes it —

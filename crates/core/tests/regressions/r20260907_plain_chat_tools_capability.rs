@@ -1,6 +1,6 @@
-//! Defect: plain-chat local models received the complete agent tool schema.
+//! Defect: plain-chat endpoints received the complete agent tool schema.
 //! Root cause: OpenAI providers reported tools=true regardless of the host-declared capability.
-//! Fixed by: 2026-09-07 local-model runtime correctness work item.
+//! Fixed by: 2026-09-07 provider capability gating work item.
 
 use async_trait::async_trait;
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};

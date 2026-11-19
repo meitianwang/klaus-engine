@@ -428,8 +428,8 @@ mod r20260907_plan_creation_guidance;
 #[path = "regressions/r20260909_windows_acl_overlap.rs"]
 mod r20260909_windows_acl_overlap;
 
-#[path = "regressions/r20260907_local_model_tools_capability.rs"]
-mod r20260907_local_model_tools_capability;
+#[path = "regressions/r20260907_plain_chat_tools_capability.rs"]
+mod r20260907_plain_chat_tools_capability;
 
 #[path = "regressions/r20260907_stream_total_timeout.rs"]
 mod r20260907_stream_total_timeout;
