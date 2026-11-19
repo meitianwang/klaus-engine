@@ -217,19 +217,30 @@ impl Session {
         let provider = self.system_prompt_provider.read_recover().clone();
         let mut parts = provider().await;
         let bundle = self.inference_snapshot();
-        let tools = self.current_tools();
-        let tools = if crate::engine::query::request::antigravity_gemini_eager_tools(
+        let pool = self.current_tools();
+        let tools = if crate::engine::query::request::antigravity_gemini_static_deferred_tools(
+            config,
+            Some(bundle.provider.info()),
+            &config.model,
+            &pool,
+            true,
+        ) {
+            crate::engine::query::request::static_deferred_visible_tool_specs(
+                &pool,
+                &config.disabled_tools,
+            )
+        } else if crate::engine::query::request::antigravity_gemini_eager_tools(
             config,
             Some(bundle.provider.info()),
             &config.model,
         ) {
-            crate::engine::query::request::eager_visible_tool_specs(&tools)
+            crate::engine::query::request::eager_visible_tool_specs(&pool)
         } else {
             let surfaced = self.surfaced_tools.lock_recover().clone();
             crate::engine::query::visible_tool_specs(
-                &tools,
+                &pool,
                 &surfaced,
-                &crate::tools::pool::to_tool_specs(&tools),
+                &crate::tools::pool::to_tool_specs(&pool),
             )
         };
         if tools.iter().any(|tool| tool.name == "advisor") {

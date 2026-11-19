@@ -346,7 +346,9 @@ fn specific_kind(signal: Option<&str>) -> Option<ProviderErrorKind> {
         Some(
             "antigravity_auth_required" | "antigravity_login_expired" | "antigravity_not_signed_in",
         ) => Some(ProviderErrorKind::Auth),
-        Some("antigravity_refresh_unavailable") => Some(ProviderErrorKind::Timeout),
+        Some("antigravity_refresh_unavailable" | "antigravity_response_timeout") => {
+            Some(ProviderErrorKind::Timeout)
+        }
         Some("antigravity_quota_exhausted") => Some(ProviderErrorKind::Quota),
         Some("antigravity_rate_limited") => Some(ProviderErrorKind::RateLimit),
         Some("antigravity_service_unavailable") => Some(ProviderErrorKind::Overloaded),

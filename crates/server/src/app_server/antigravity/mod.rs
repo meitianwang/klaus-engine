@@ -1273,6 +1273,7 @@ pub(super) fn decorate(
         client: Some(Arc::new(cloud::CloudClient::pooled(conversation_id))),
         retry: Some(RetryOptions {
             yield_to_credential_rotation: multi_account,
+            max_timeout_attempts: Some(cloud::STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS),
             ..Default::default()
         }),
         stream_admission: Some(Arc::new(move || {

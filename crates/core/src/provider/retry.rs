@@ -181,6 +181,10 @@ pub enum RetryClassPolicy {
 pub struct RetryOptions {
     /// Total attempts including the first. Default 3.
     pub max_attempts: Option<u32>,
+    /// Optional attempt cap (including the first) specifically for `Timeout`
+    /// establishment failures so long response-header timeouts stay bounded
+    /// without lowering fast HTTP/status retry limits.
+    pub max_timeout_attempts: Option<u32>,
     /// An internal request may restrict retry classes without changing normal calls.
     pub retry_class_policy: Option<RetryClassPolicy>,
     /// Base backoff in ms for the exponential schedule. Default 500.
@@ -223,6 +227,7 @@ impl fmt::Debug for RetryOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RetryOptions")
             .field("max_attempts", &self.max_attempts)
+            .field("max_timeout_attempts", &self.max_timeout_attempts)
             .field("retry_class_policy", &self.retry_class_policy)
             .field("base_delay_ms", &self.base_delay_ms)
             .field("max_delay_ms", &self.max_delay_ms)
@@ -351,7 +356,13 @@ where
                 let network_wait = classified.kind == ProviderErrorKind::Network
                     && !classified.message.contains("error decoding response body")
                     && opts.unbounded_network_retries.unwrap_or(true);
-                let attempts_exhausted = i + 1 >= max_attempts;
+                let effective_max_attempts = if classified.kind == ProviderErrorKind::Timeout {
+                    opts.max_timeout_attempts
+                        .map_or(max_attempts, |cap| cap.max(1))
+                } else {
+                    max_attempts
+                };
+                let attempts_exhausted = i + 1 >= effective_max_attempts;
                 let retryable = match opts.retry_class_policy {
                     Some(RetryClassPolicy::ApprovalReview) => match raw.status {
                         Some(status) => (500..=599).contains(&status),
@@ -385,7 +396,7 @@ where
                 if let Some(on_retry) = &opts.on_retry {
                     on_retry(RetryInfo {
                         attempt: i + 1,
-                        max_attempts,
+                        max_attempts: effective_max_attempts,
                         delay_ms,
                         error: classified.clone(),
                         network_wait: network_wait && attempts_exhausted,

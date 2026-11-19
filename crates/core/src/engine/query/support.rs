@@ -353,6 +353,11 @@ pub(super) fn find_runtime_tool(
     if let Some(tool) = tools.iter().find(|tool| tool.name() == *name) {
         return Some(Arc::clone(tool));
     }
+    if *name == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME
+        && tools.iter().any(|tool| tool.name() == "tool_search")
+    {
+        return Some(crate::tools::builtins::tool_search::create_call_mcp_tool());
+    }
     if let Some(tool) = tools
         .iter()
         .find(|tool| tool.aliases().iter().any(|alias| alias == name))

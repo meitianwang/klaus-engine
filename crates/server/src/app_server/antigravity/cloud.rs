@@ -218,7 +218,24 @@ pub(super) async fn read_body(
     Ok(bytes)
 }
 
-const ERROR_TAGS: [&str; 18] = [
+pub(super) const STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS: u32 = 10;
+const DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(75);
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration;
+}
+
+fn stream_response_header_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(override_duration) = TEST_STREAM_RESPONSE_HEADER_TIMEOUT.try_with(|value| *value) {
+        return override_duration;
+    }
+    DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT
+}
+
+const ERROR_TAGS: [&str; 19] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
     "antigravity_model_unlisted",
@@ -236,6 +253,7 @@ const ERROR_TAGS: [&str; 18] = [
     "antigravity_not_signed_in",
     "antigravity_rate_limited",
     "antigravity_service_unavailable",
+    "antigravity_response_timeout",
     "model_context_window_exceeded",
 ];
 
@@ -576,6 +594,10 @@ fn error_details(error: &GeminiApiError) -> RawProviderError {
             "{}: network transport failed while awaiting the first response byte",
             error.message
         ),
+        (None, "antigravity_response_timeout") => format!(
+            "{}: timed out awaiting initial stream response headers",
+            error.message
+        ),
         _ => error.message.clone(),
     };
     RawProviderError {
@@ -750,17 +772,32 @@ async fn send_once(
         })
         .flatten();
     let mut wire_send = super::cache_diagnostics::WireSend::new(wire_request.clone());
+    let send_future = async {
+        if method == "streamGenerateContent" {
+            match tokio::time::timeout(stream_response_header_timeout(), request.send()).await {
+                Ok(result) => Ok(result),
+                Err(_) => Err(()),
+            }
+        } else {
+            Ok(request.send().await)
+        }
+    };
     let mut response = tokio::select! {
         _ = signal.cancelled() => {
             wire_send.outcome("cancelled", None);
             return Err((api_error("antigravity_request_cancelled"), Some(used_token)));
         },
-        response = request.send() => match response {
-            Ok(response) => response,
+        outcome = send_future => match outcome {
+            Err(()) => {
+                wire_send.outcome("header_timeout", None);
+                super::egress::reset_pool(generation).await;
+                return Err((api_error("antigravity_response_timeout"), Some(used_token)));
+            }
+            Ok(Ok(response)) => response,
             // A connect error is the only reqwest stage that proves the
             // request was never uploaded; every other transport failure is
             // treated as possibly delivered and must not be replayed.
-            Err(error) => {
+            Ok(Err(error)) => {
                 let stage = if error.is_connect() {
                     super::egress::invalidate();
                     TransportStage::Connect
@@ -3884,5 +3921,138 @@ mod tests {
             synthetic.usage_metadata.unwrap().candidates_token_count,
             Some(30)
         );
+    }
+
+    #[tokio::test]
+    async fn stream_response_header_timeout_classifies_as_timeout_and_auto_retries_bounded() {
+        use futures::StreamExt;
+        use klaus_agent_core::provider::classify::classify_error;
+        use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+        use klaus_agent_core::provider::retry::{is_retryable, RetryOptions};
+        use klaus_agent_core::types::abort::AbortSignal;
+        use klaus_agent_core::types::errors::ProviderErrorKind;
+        use klaus_agent_core::types::provider::{ModelProvider, ModelRequest, ModelStreamEvent};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let classified = classify_error(&error_details(&api_error("antigravity_response_timeout")));
+        assert_eq!(classified.kind, ProviderErrorKind::Timeout);
+        assert_eq!(
+            classified
+                .code
+                .as_ref()
+                .and_then(|c| c.try_to_utf8().ok())
+                .as_deref(),
+            Some("antigravity_response_timeout")
+        );
+        assert!(is_retryable(&classified));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempt_num =
+                    accepted_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    if attempt_num < STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS as usize {
+                        // Stall without writing HTTP response headers until the client drops.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    } else {
+                        let sse = "data: {\"response\":{\"modelVersion\":\"gemini-4-carbon-high\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"recovered\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":1,\"totalTokenCount\":13}}}\n\ndata: [DONE]\n\n";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            sse.len(),
+                            sse
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        crate::app_server::antigravity::set_config_root(root.path());
+        klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_ANTIGRAVITY_API_URL",
+            format!("http://{addr}"),
+        );
+        auth::adopt(auth::Credential {
+            access_token: "fixture-tok".into(),
+            refresh_token: None,
+            expires_at: None,
+            account: Some("test@example.com".into()),
+            auth_method: "consumer".into(),
+            project: Some("fixture-project".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .await
+        .unwrap();
+        let generation = auth::generation().unwrap();
+
+        let provider = GeminiProvider::new(GeminiProviderOptions {
+            default_model: Some("gemini-4-carbon-high".into()),
+            client: Some(std::sync::Arc::new(CloudClient {
+                generation,
+                session: None,
+            })),
+            retry: Some(RetryOptions {
+                max_timeout_attempts: Some(STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS),
+                base_delay_ms: Some(1),
+                max_delay_ms: Some(5),
+                jitter: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // 1. Attempts 1..9 stall on headers (30ms timeout), automatically retry,
+        //    emit `RetryScheduled` events, and succeed on Attempt 10.
+        let req: ModelRequest =
+            klaus_agent_core::runtime_values::runtime_codec::decode_text(&RuntimeString::from(
+                serde_json::json!({
+                    "model": "gemini-4-carbon-high",
+                    "system": [],
+                    "messages": [],
+                    "tools": [],
+                    "maxOutputTokens": 64
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let events: Vec<ModelStreamEvent> = TEST_STREAM_RESPONSE_HEADER_TIMEOUT
+            .scope(std::time::Duration::from_millis(30), async {
+                provider.stream(req, AbortSignal::new()).collect().await
+            })
+            .await;
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS as usize
+        );
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|ev| matches!(ev, ModelStreamEvent::RetryScheduled { .. }))
+            .collect();
+        assert_eq!(
+            retries.len(),
+            (STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS - 1) as usize,
+            "expected 9 automatic header-timeout retries"
+        );
+        assert!(events.iter().any(
+            |ev| matches!(ev, ModelStreamEvent::TextDelta { text, .. } if text == "recovered")
+        ));
+
+        server.abort();
+        klaus_agent_core::runtime_process::remove_process_environment_var(
+            "KLAUS_ANTIGRAVITY_API_URL",
+        );
+        auth::logout().await.unwrap();
     }
 }

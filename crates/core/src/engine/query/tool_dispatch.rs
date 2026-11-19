@@ -879,7 +879,6 @@ fn execute_tool_call_body(
                 let s = s.clone();
                 Box::pin(async move {
                     let _admission = admission?;
-                    let names = expand_mcp_server_surface_group(&s, names);
                     if let Some(cb) = &s.params.on_surface_tools {
                         if let Err(error) = cb(names.clone()).await {
                             report_tool_persistence_failure(&s, &error);
@@ -1598,6 +1597,8 @@ fn tool_call_authorized(
         .as_ref()
         .is_none_or(|policy| {
             policy.allows_tool(&call.internal_name)
+                || (call.internal_name == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME
+                    && policy.allows_tool(&RuntimeString::from("tool_search")))
                 || (dependency == Some(true)
                     && call
                         .trusted_caller
@@ -1881,70 +1882,6 @@ async fn record_tool_lifecycle_progress(
         })?;
     }
     Ok(())
-}
-
-const MCP_SERVER_ATOMIC_SURFACE_CAP: usize = 32;
-
-/// When Antigravity Gemini had to fall back from eager exposure to deferred
-/// loading because the total tool inventory exceeded the model's input window,
-/// expand any activated MCP tool to its same-server siblings (up to a bounded
-/// cap) in deterministic pool order so multi-tool MCP workflows only pay one
-/// `tools`-prefix transition per server instead of one per tool.
-fn expand_mcp_server_surface_group(
-    shared: &Arc<Shared>,
-    names: Vec<RuntimeString>,
-) -> Vec<RuntimeString> {
-    if !shared
-        .oversized_inventory_deferred
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return names;
-    }
-    let config = shared.config();
-    let model = shared.turn_context.lock_recover().model.clone();
-    let provider_info = shared
-        .bundle()
-        .map(|bundle| bundle.provider.info().clone())
-        .or_else(|| shared.params.provider_info.clone());
-    if !super::request::antigravity_gemini_eager_tools(&config, provider_info.as_ref(), &model) {
-        return names;
-    }
-    let tools = shared.tools.lock_recover().clone();
-    let mut servers: Vec<RuntimeString> = Vec::new();
-    for name in &names {
-        if let Some(server) = tools
-            .iter()
-            .find(|tool| tool.name() == *name)
-            .and_then(|tool| tool.mcp_server())
-        {
-            if !servers.contains(&server) {
-                servers.push(server);
-            }
-        }
-    }
-    if servers.is_empty() {
-        return names;
-    }
-    let mut expanded = names;
-    for server in servers {
-        let siblings: Vec<RuntimeString> = tools
-            .iter()
-            .filter(|tool| {
-                tool.exposure() == crate::types::tool::ToolExposure::Deferred
-                    && tool.mcp_server().as_ref() == Some(&server)
-            })
-            .map(|tool| tool.name())
-            .collect();
-        if siblings.len() > MCP_SERVER_ATOMIC_SURFACE_CAP {
-            continue;
-        }
-        for sibling in siblings {
-            if !expanded.contains(&sibling) {
-                expanded.push(sibling);
-            }
-        }
-    }
-    expanded
 }
 
 async fn request_approval(

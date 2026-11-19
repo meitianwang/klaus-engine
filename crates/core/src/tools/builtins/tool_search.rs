@@ -1026,6 +1026,262 @@ impl Tool for ToolSearchTool {
     }
 }
 
+/// Static indirect dispatcher name used when deferred tools remain out of the
+/// wire `functionDeclarations` list across turns so the leading `tools` prefix
+/// stays invariant after `tool_search`.
+pub const CALL_MCP_TOOL_NAME: &str = "call_mcp_tool";
+
+fn build_call_mcp_tool_schema() -> JsonSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Exact deferred tool name returned by tool_search (for example mcp__server__tool)."
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Arguments object matching the target tool's inputSchema. Defaults to {} when omitted."
+            },
+            "server": {
+                "type": "string",
+                "description": "Optional MCP server name when passing a bare tool name in `name`."
+            }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+    .as_object()
+    .cloned()
+    .unwrap()
+}
+
+/// Indirect dispatcher for deferred and MCP tools discovered via `tool_search`.
+/// Routing calls through `ToolContext::invoke_tool` preserves the target tool's
+/// full input validation, hooks, permission checks, approval prompts, and
+/// lifecycle events while keeping the wire `tools` declaration list static.
+pub struct CallMcpTool {
+    input_schema: JsonSchema,
+}
+
+impl CallMcpTool {
+    fn new() -> Self {
+        Self {
+            input_schema: build_call_mcp_tool_schema(),
+        }
+    }
+}
+
+pub fn create_call_mcp_tool() -> Arc<dyn Tool> {
+    static INSTANCE: std::sync::LazyLock<Arc<dyn Tool>> =
+        std::sync::LazyLock::new(|| Arc::new(CallMcpTool::new()));
+    Arc::clone(&INSTANCE)
+}
+
+fn resolve_indirect_catalog_target(
+    raw_name: &RuntimeString,
+    server: Option<&RuntimeString>,
+    catalog: &[ToolCatalogEntry],
+) -> Option<RuntimeString> {
+    if let Some(found) = find_catalog_tool(catalog, raw_name) {
+        if found.exposure != ToolExposure::Hidden && found.name != CALL_MCP_TOOL_NAME {
+            return Some(found.name.clone());
+        }
+    }
+    if let Some(server) = server.filter(|s| !s.is_empty()) {
+        if let Ok(name_utf8) = raw_name.try_to_utf8() {
+            if !name_utf8.starts_with("mcp__") {
+                let candidate = RuntimeString::from("mcp__")
+                    .concat(server)
+                    .concat(&RuntimeString::from("__"))
+                    .concat(raw_name);
+                if let Some(found) = find_catalog_tool(catalog, &candidate) {
+                    if found.exposure != ToolExposure::Hidden && found.name != CALL_MCP_TOOL_NAME {
+                        return Some(found.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(utf8) = raw_name.try_to_utf8() {
+        let deprojected = match utf8.as_str() {
+            "app_state_query" => Some("klaus_query".to_string()),
+            "app_state_action" => Some("klaus_action".to_string()),
+            other if other.contains("host") => Some(other.replace("host", "klaus")),
+            _ => None,
+        };
+        if let Some(restored) = deprojected {
+            let candidate = RuntimeString::from(restored);
+            if let Some(found) = find_catalog_tool(catalog, &candidate) {
+                if found.exposure != ToolExposure::Hidden && found.name != CALL_MCP_TOOL_NAME {
+                    return Some(found.name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[async_trait]
+impl Tool for CallMcpTool {
+    fn static_name(&self) -> &str {
+        CALL_MCP_TOOL_NAME
+    }
+
+    fn static_description(&self) -> &str {
+        "Invoke a deferred tool discovered via tool_search by passing its exact name and arguments object."
+    }
+
+    fn static_input_schema(&self) -> &JsonSchema {
+        &self.input_schema
+    }
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _input: &Json) -> bool {
+        false
+    }
+
+    fn is_read_only(&self, _input: &Json) -> bool {
+        false
+    }
+
+    fn is_destructive(&self, _input: &Json) -> Option<bool> {
+        Some(false)
+    }
+
+    fn parse_input(&self, input: &Json) -> Result<Json, ToolError> {
+        let object = input.as_object().ok_or_else(|| {
+            ToolError::new(format!(
+                "Invalid arguments: (root): Invalid input: expected object, received {}",
+                json_input_type(input)
+            ))
+        })?;
+        let mut parsed = RuntimeObject::new();
+        match object.get("name") {
+            Some(Json::String(name)) if !trim_ecmascript_whitespace(name).is_empty() => {
+                parsed.insert("name", Json::String(trim_ecmascript_whitespace(name)));
+            }
+            Some(Json::String(_)) => {
+                return Err(ToolError::new(
+                    "Invalid arguments: name: Tool name must not be empty",
+                ));
+            }
+            Some(other) => {
+                return Err(ToolError::new(format!(
+                    "Invalid arguments: name: Invalid input: expected string, received {}",
+                    json_input_type(other)
+                )));
+            }
+            None => {
+                return Err(ToolError::new(
+                    "Invalid arguments: name: Invalid input: expected string, received undefined",
+                ));
+            }
+        }
+        match object.get("arguments") {
+            Some(value @ Json::Object(_)) => {
+                parsed.insert("arguments", value.clone());
+            }
+            Some(Json::Null) | None => {
+                parsed.insert("arguments", Json::Object(RuntimeObject::new()));
+            }
+            Some(other) => {
+                return Err(ToolError::new(format!(
+                    "Invalid arguments: arguments: Invalid input: expected object, received {}",
+                    json_input_type(other)
+                )));
+            }
+        }
+        if let Some(server) = object.get("server") {
+            match server {
+                Json::String(s) => {
+                    let trimmed = trim_ecmascript_whitespace(s);
+                    if !trimmed.is_empty() {
+                        parsed.insert("server", Json::String(trimmed));
+                    }
+                }
+                Json::Null => {}
+                other => {
+                    return Err(ToolError::new(format!(
+                        "Invalid arguments: server: Invalid input: expected string, received {}",
+                        json_input_type(other)
+                    )));
+                }
+            }
+        }
+        Ok(Json::Object(parsed))
+    }
+
+    async fn call(
+        &self,
+        input: Json,
+        ctx: &ToolContext,
+        _on_progress: Option<ToolProgress>,
+    ) -> Result<ToolResult, ToolError> {
+        let Some(invoke_tool) = &ctx.invoke_tool else {
+            return Ok(text_result(
+                RuntimeJson::Null,
+                RuntimeString::from("Indirect tool invocation is not available in this context."),
+                true,
+            ));
+        };
+        let Some(tool_catalog) = &ctx.tool_catalog else {
+            return Ok(text_result(
+                RuntimeJson::Null,
+                RuntimeString::from("Tool catalog is not available in this context."),
+                true,
+            ));
+        };
+        let obj = input
+            .as_object()
+            .ok_or_else(|| ToolError::new("Invalid arguments: expected object"))?;
+        let requested_name = obj
+            .get("name")
+            .and_then(Json::as_str)
+            .cloned()
+            .unwrap_or_default();
+        if requested_name == CALL_MCP_TOOL_NAME {
+            return Ok(text_result(
+                RuntimeJson::Null,
+                RuntimeString::from("Tool call_mcp_tool cannot invoke itself."),
+                true,
+            ));
+        }
+        let server = obj.get("server").and_then(Json::as_str);
+        let arguments = obj
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Json::Object(RuntimeObject::new()));
+
+        let catalog = tool_catalog();
+        let Some(resolved_name) =
+            resolve_indirect_catalog_target(&requested_name, server, &catalog)
+        else {
+            let msg = RuntimeString::from("Unknown tool: ")
+                .concat(&requested_name)
+                .concat(&RuntimeString::from(
+                    ". Call tool_search first to discover deferred tool names and input schemas.",
+                ));
+            return Ok(text_result(RuntimeJson::Null, msg, true));
+        };
+
+        let invoked = invoke_tool(resolved_name, arguments).await?;
+        Ok(ToolResult {
+            serializable: crate::types::tool::ToolResultSerializable {
+                output: invoked.output.unwrap_or(RuntimeJson::Null),
+                model_content: invoked.content,
+                is_error: Some(invoked.is_error),
+                mcp_meta: None,
+                extra_user_blocks: None,
+            },
+            side_effects: None,
+        })
+    }
+}
+
 /// A tool wrapper that overrides ONLY its `exposure` to `deferred`, forwarding
 /// every other behavior to the wrapped tool.
 struct DeferredTool {

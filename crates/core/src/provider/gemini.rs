@@ -1826,6 +1826,9 @@ fn to_contents_with_profile(
     tools: &[ToolSpec],
     replay_signed_parts: bool,
 ) -> Vec<Content> {
+    let indirect_deferred_dispatch = tools
+        .iter()
+        .any(|tool| tool.name == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME);
     let mut name_by_tool_use_id: HashMap<RuntimeString, RuntimeString> = HashMap::new();
     for msg in messages {
         if let Message::Assistant(a) = msg {
@@ -1871,6 +1874,31 @@ fn to_contents_with_profile(
             Message::ToolResult(tr) => {
                 // Echo the call id (= tool_use_id) and recover the name — name
                 // alone mis-pairs parallel same-name calls and 400s on Gemini 3.
+                let response = if indirect_deferred_dispatch
+                    && tr.tool_kind
+                        == Some(crate::types::provider::ProviderToolCallKind::ToolSearch)
+                {
+                    let mut fields = RuntimeObject::new();
+                    fields.insert("output", vs(text_of_output_blocks(&tr.content)));
+                    fields.insert(
+                        "invocation",
+                        vs(
+                            "Invoke matched deferred tools via call_mcp_tool with {\"name\": \"<tool_name>\", \"arguments\": {...}}.",
+                        ),
+                    );
+                    if let Some(native) = tr
+                        .native_tool_output
+                        .as_ref()
+                        .and_then(RuntimeJson::as_object)
+                    {
+                        if let Some(matched_tools) = native.get("tools") {
+                            fields.insert("tools", matched_tools.clone());
+                        }
+                    }
+                    RuntimeJson::Object(fields)
+                } else {
+                    vobj([("output", vs(text_of_output_blocks(&tr.content)))])
+                };
                 let mut parts = vec![Part {
                     function_response: Some(FunctionResponse {
                         id: tr.tool_use_id.clone(),
@@ -1878,7 +1906,7 @@ fn to_contents_with_profile(
                             .get(&tr.tool_use_id)
                             .cloned()
                             .unwrap_or_else(|| tr.tool_use_id.clone()),
-                        response: vobj([("output", vs(text_of_output_blocks(&tr.content)))]),
+                        response,
                     }),
                     ..Part::default()
                 }];

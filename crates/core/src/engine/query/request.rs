@@ -725,10 +725,33 @@ impl Shared {
         window.saturating_sub(request.max_output_tokens)
     }
 
+    pub(super) fn uses_static_deferred_tool_dispatch(&self) -> bool {
+        let config = self.config();
+        let model = self.turn_context.lock_recover().model.clone();
+        let provider_info = self
+            .bundle()
+            .map(|bundle| bundle.provider.info().clone())
+            .or_else(|| self.params.provider_info.clone());
+        let tools = self.tools.lock_recover().clone();
+        let tool_search_allowed = self
+            .params
+            .agent_tool_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows_tool(&RuntimeString::from("tool_search")));
+        antigravity_gemini_static_deferred_tools(
+            &config,
+            provider_info.as_ref(),
+            &model,
+            &tools,
+            tool_search_allowed,
+        )
+    }
+
     pub(super) fn uses_eager_tool_inventory(&self) -> bool {
         if self
             .oversized_inventory_deferred
             .load(std::sync::atomic::Ordering::Acquire)
+            || self.uses_static_deferred_tool_dispatch()
         {
             return false;
         }
@@ -743,6 +766,9 @@ impl Shared {
 
     pub(super) fn visible_tool_specs_for_step(&self) -> Vec<ToolSpec> {
         let tools = self.tools.lock_recover().clone();
+        if self.uses_static_deferred_tool_dispatch() {
+            return static_deferred_visible_tool_specs(&tools, &self.config().disabled_tools);
+        }
         if self.uses_eager_tool_inventory() {
             return eager_visible_tool_specs(&tools);
         }
@@ -759,7 +785,7 @@ impl Shared {
         &self,
         profile: &ProviderBehaviorProfile,
     ) -> Vec<ToolSpec> {
-        if self.uses_eager_tool_inventory() {
+        if self.uses_static_deferred_tool_dispatch() || self.uses_eager_tool_inventory() {
             return Vec::new();
         }
         let tools = self.tools.lock_recover().clone();
@@ -780,14 +806,15 @@ impl Shared {
         let bundle = self.bundle()?;
         if !bundle.provider.has_model_capabilities(&request.model)
             || !bundle.provider.uses_model_tool_budget(&request.model)
+            || request.tools.is_empty()
         {
             return None;
         }
-        if request.tools.is_empty() || fixed_prefix_tokens(request) <= self.input_window(request) {
+        if fixed_prefix_tokens(request) <= self.input_window(request) {
             return None;
         }
-        if self
-            .config()
+        let config = self.config();
+        if config
             .disabled_tools
             .contains(&RuntimeString::from("tool_search"))
             || self
@@ -801,13 +828,16 @@ impl Shared {
         let tools = self.tools.lock_recover().clone();
         let deferred =
             crate::tools::builtins::tool_search::defer_direct_inventory(tools.as_ref().clone());
-        let all_specs = deferred
-            .iter()
-            .map(|tool| to_tool_spec(tool.as_ref()))
-            .collect::<Vec<_>>();
-        let surfaced = self.surfaced.lock_recover();
-        let specs = visible_tool_specs(&deferred, &surfaced, &all_specs);
-        drop(surfaced);
+        let specs = if self.uses_static_deferred_tool_dispatch() {
+            static_deferred_visible_tool_specs(&deferred, &config.disabled_tools)
+        } else {
+            let all_specs = deferred
+                .iter()
+                .map(|tool| to_tool_spec(tool.as_ref()))
+                .collect::<Vec<_>>();
+            let surfaced = self.surfaced.lock_recover();
+            visible_tool_specs(&deferred, &surfaced, &all_specs)
+        };
         if render_tool_specs_for_behavior(&specs, &prepared.profile) == request.tools {
             return None;
         }
@@ -1084,10 +1114,59 @@ pub(crate) fn antigravity_gemini_eager_tools(
         && resolve_provider_behavior_profile(provider_info, model).family == Some("gemini")
 }
 
-/// Static name-sorted tool declarations for Antigravity Gemini when inventory
-/// fits within the model's input window. Exposing both `Direct` and `Deferred`
-/// tools up front in pool order keeps the leading `tools` prefix invariant even
-/// if `tool_search` is invoked mid-conversation.
+/// Whether Antigravity Gemini sessions keep `Deferred` tools out of the wire
+/// `functionDeclarations` list and route them through `tool_search` +
+/// `call_mcp_tool` instead, avoiding cold-prefill schema bloat while keeping the
+/// leading `tools` prefix invariant across mid-turn tool discovery.
+pub(crate) fn antigravity_gemini_static_deferred_tools(
+    config: &crate::schemas::config::ResolvedConfig,
+    provider_info: Option<&ProviderInfo>,
+    model: &RuntimeString,
+    tools: &[Arc<dyn Tool>],
+    tool_search_allowed: bool,
+) -> bool {
+    antigravity_gemini_eager_tools(config, provider_info, model)
+        && tool_search_allowed
+        && !config
+            .disabled_tools
+            .contains(&RuntimeString::from("tool_search"))
+        && !config.disabled_tools.contains(&RuntimeString::from(
+            crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME,
+        ))
+        && tools.iter().any(|tool| tool.name() == "tool_search")
+}
+
+/// Static name-sorted direct tool declarations plus `call_mcp_tool` so
+/// `Deferred` schemas never enter `functionDeclarations` and never shift the
+/// leading `tools` prefix when `tool_search` discovers tools or new MCP servers
+/// finish connecting.
+pub(crate) fn static_deferred_visible_tool_specs(
+    tools: &[Arc<dyn Tool>],
+    disabled_tools: &[RuntimeString],
+) -> Vec<ToolSpec> {
+    let mut visible: Vec<ToolSpec> = tools
+        .iter()
+        .filter(|tool| tool.exposure().is_model_visible(false))
+        .map(|tool| to_tool_spec(tool.as_ref()))
+        .collect();
+    let dispatcher_name =
+        RuntimeString::from(crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME);
+    if !disabled_tools.contains(&dispatcher_name)
+        && !visible.iter().any(|spec| spec.name == dispatcher_name)
+    {
+        let dispatcher = crate::tools::builtins::tool_search::create_call_mcp_tool();
+        let spec = to_tool_spec(dispatcher.as_ref());
+        let insert_at = visible
+            .iter()
+            .position(|existing| existing.name > spec.name)
+            .unwrap_or(visible.len());
+        visible.insert(insert_at, spec);
+    }
+    visible
+}
+
+/// Static name-sorted tool declarations when no `tool_search` dispatcher is
+/// present in the pool.
 pub(crate) fn eager_visible_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
     tools
         .iter()

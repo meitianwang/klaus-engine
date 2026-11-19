@@ -198,6 +198,60 @@ fn start_antigravity_gemini_session(
     (directory, session)
 }
 
+fn demo_mcp_tool_tracked(
+    server: &str,
+    name: &str,
+    description: &str,
+    invocations: Arc<Mutex<Vec<String>>>,
+) -> Arc<dyn Tool> {
+    let label = format!("{server}:{name}");
+    let call: McpToolCall = Arc::new(move |_tool, args, _progress, _sig| {
+        let invocations = Arc::clone(&invocations);
+        let label = label.clone();
+        Box::pin(async move {
+            let q = args
+                .get("q")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.try_to_utf8().ok())
+                .unwrap_or_default();
+            invocations.lock().unwrap().push(format!("{label}={q}"));
+            Ok(McpCallResult {
+                content: vec![klaus_agent_core::mcp::types::McpContentBlock {
+                    block_type: "text".into(),
+                    text: Some(format!("ack:{label}:{q}").into()),
+                    ..Default::default()
+                }],
+                is_error: Some(false),
+                structured_content: None,
+                meta: None,
+            })
+        })
+    });
+    wrap_mcp_tool(
+        server,
+        McpToolDescriptor {
+            name: name.into(),
+            description: Some(description.into()),
+            input_schema: Some(
+                runtime_json::parse(&RuntimeString::from(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "q": { "type": "string", "description": description }
+                        },
+                        "required": ["q"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+        call,
+        Some(WrapMcpToolOptions::default()),
+    )
+}
+
 fn demo_mcp_tool(server: &str, name: &str, description: &str) -> Arc<dyn Tool> {
     let call: McpToolCall = Arc::new(|_, _, _, _| Box::pin(async { Ok(McpCallResult::default()) }));
     wrap_mcp_tool(
@@ -464,10 +518,13 @@ async fn non_cacheable_mode_permission_and_orchestration_blocks_stay_out_of_gemi
 }
 
 #[tokio::test]
-async fn antigravity_gemini_keeps_deferred_tools_static_until_window_pressure_forces_group_deferral(
-) {
-    // 1. Normal window: deferred MCP tools are exposed eagerly in sorted pool
-    //    order from step 1 and `wire["tools"]` stays identical across `tool_search`.
+async fn antigravity_gemini_keeps_deferred_tools_out_of_declarations_and_invokes_via_call_mcp_tool()
+{
+    // 1. Normal window: `Deferred` MCP tools stay out of `functionDeclarations`
+    //    at step 0, `tool_search` returns their `inputSchema` inside `contents`
+    //    without mutating `wire["tools"]`, and `call_mcp_tool` invokes the
+    //    discovered MCP tools while keeping `wire["tools"]` byte-identical.
+    let invocations = Arc::new(Mutex::new(Vec::new()));
     let normal_client = ScriptedGeminiClient::new(vec![
         ScriptedReply::ToolCall {
             id: "search-1",
@@ -476,8 +533,13 @@ async fn antigravity_gemini_keeps_deferred_tools_static_until_window_pressure_fo
         },
         ScriptedReply::ToolCall {
             id: "mcp-1",
-            name: "mcp__demo__beta",
-            args: json!({ "q": "ping" }),
+            name: "call_mcp_tool",
+            args: json!({ "name": "mcp__demo__beta", "arguments": { "q": "ping" } }),
+        },
+        ScriptedReply::ToolCall {
+            id: "mcp-2",
+            name: "call_mcp_tool",
+            args: json!({ "server": "demo", "name": "alpha", "arguments": { "q": "pong" } }),
         },
         ScriptedReply::Text("done"),
     ]);
@@ -486,8 +548,8 @@ async fn antigravity_gemini_keeps_deferred_tools_static_until_window_pressure_fo
         vec![
             create_read_tool(),
             create_tool_search_tool(None),
-            demo_mcp_tool("demo", "alpha", "Alpha capability"),
-            demo_mcp_tool("demo", "beta", "Beta capability"),
+            demo_mcp_tool_tracked("demo", "alpha", "Alpha capability", invocations.clone()),
+            demo_mcp_tool_tracked("demo", "beta", "Beta capability", invocations.clone()),
         ],
         200_000,
         None,
@@ -497,24 +559,41 @@ async fn antigravity_gemini_keeps_deferred_tools_static_until_window_pressure_fo
         .await;
     assert!(normal_res.error.is_none(), "{:?}", normal_res.error);
     assert_eq!(normal_res.final_text, "done");
+    assert_eq!(
+        *invocations.lock().unwrap(),
+        vec!["demo:beta=ping".to_string(), "demo:alpha=pong".to_string()]
+    );
 
     let normal_calls = normal_client.taken();
-    assert_eq!(normal_calls.len(), 3);
+    assert_eq!(normal_calls.len(), 4);
     let step0_tool_names: Vec<&str> = normal_calls[0].wire["tools"][0]["functionDeclarations"]
         .as_array()
         .unwrap()
         .iter()
         .map(|decl| decl["name"].as_str().unwrap())
         .collect();
-    assert!(step0_tool_names.contains(&"mcp__demo__alpha"));
-    assert!(step0_tool_names.contains(&"mcp__demo__beta"));
+    assert_eq!(
+        step0_tool_names,
+        vec!["call_mcp_tool", "read", "tool_search", "update_plan"],
+        "deferred MCP tools must never bloat functionDeclarations"
+    );
     assert_eq!(normal_calls[0].wire["tools"], normal_calls[1].wire["tools"]);
     assert_eq!(normal_calls[1].wire["tools"], normal_calls[2].wire["tools"]);
+    assert_eq!(normal_calls[2].wire["tools"], normal_calls[3].wire["tools"]);
+
+    // Verify `tool_search` response on Gemini carries the matched `inputSchema`
+    // and `call_mcp_tool` guidance at the append-only tail of `contents`.
+    let step1_contents = normal_calls[1].wire["contents"].to_string();
+    assert!(step1_contents.contains("\"mcp__demo__beta\""));
+    assert!(step1_contents.contains("\"inputSchema\""));
+    assert!(step1_contents.contains("call_mcp_tool"));
+    let step2_contents = normal_calls[2].wire["contents"].to_string();
+    assert!(step2_contents.contains("ack:demo:beta:ping"));
     normal_session.dispose().await;
 
-    // 2. Oversized inventory (`fixed_prefix_tokens > input_window`): falls back
-    //    to `tool_search` deferral, and activating one MCP tool surfaces its
-    //    same-server sibling atomically in a single step.
+    // 2. Oversized direct inventory (`fixed_prefix_tokens > input_window`):
+    //    defers `Direct` tools behind `tool_search` + `call_mcp_tool` as well
+    //    and keeps `wire["tools"]` invariant across `tool_search`.
     let pad = "Long schema description padding ".repeat(80);
     let tight_client = ScriptedGeminiClient::new(vec![
         ScriptedReply::ToolCall {
@@ -550,18 +629,64 @@ async fn antigravity_gemini_keeps_deferred_tools_static_until_window_pressure_fo
         .iter()
         .map(|decl| decl["name"].as_str().unwrap())
         .collect();
-    assert_eq!(initial_decls, vec!["tool_search"]);
+    assert_eq!(initial_decls, vec!["call_mcp_tool", "tool_search"]);
+    assert_eq!(
+        tight_calls[0].wire["tools"], tight_calls[1].wire["tools"],
+        "tools prefix must remain byte-identical after tool_search under tight windows too"
+    );
+    tight_session.dispose().await;
+}
 
-    let surfaced_decls: Vec<&str> = tight_calls[1].wire["tools"][0]["functionDeclarations"]
+#[tokio::test]
+async fn large_deferred_catalog_stays_deferred_without_mutating_declarations() {
+    let bulk_desc = "Plugin schema description payload ".repeat(160);
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        create_read_tool(),
+        create_tool_search_tool(None),
+        demo_mcp_tool("design", "open", "Open design canvas"),
+        demo_mcp_tool("design", "publish", "Publish design artboard"),
+    ];
+    for idx in 0..24 {
+        tools.push(demo_mcp_tool(
+            "unused_catalog",
+            &format!("bulk_{idx:02}"),
+            &bulk_desc,
+        ));
+    }
+
+    let client = ScriptedGeminiClient::new(vec![
+        ScriptedReply::ToolCall {
+            id: "search-design",
+            name: "tool_search",
+            args: json!({ "query": "select:mcp__design__open" }),
+        },
+        ScriptedReply::Text("design ready"),
+    ]);
+    let (_dir, session) = start_antigravity_gemini_session(client.clone(), tools, 1_048_576, None);
+    let res = session
+        .run(
+            Input::Text("Open the design canvas.".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(res.error.is_none(), "{:?}", res.error);
+    let calls = client.taken();
+    assert_eq!(calls.len(), 2);
+
+    let step0_decls: Vec<&str> = calls[0].wire["tools"][0]["functionDeclarations"]
         .as_array()
         .unwrap()
         .iter()
         .map(|decl| decl["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        surfaced_decls,
-        vec!["tool_search", "mcp__demo__alpha", "mcp__demo__beta"],
-        "activating one MCP tool under budget pressure must surface its server siblings together"
+        step0_decls,
+        vec!["call_mcp_tool", "read", "tool_search", "update_plan"],
+        "direct tools and call_mcp_tool must stay visible while deferred catalogs remain out of functionDeclarations"
     );
-    tight_session.dispose().await;
+    assert_eq!(
+        calls[0].wire["tools"], calls[1].wire["tools"],
+        "activating deferred tools via tool_search must not mutate functionDeclarations"
+    );
+    session.dispose().await;
 }
