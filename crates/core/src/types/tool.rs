@@ -1748,6 +1748,14 @@ pub trait Tool: Send + Sync {
     fn static_mcp_server(&self) -> Option<&str> {
         None
     }
+
+    /// Wire grouping namespace declared by the tool itself (host-injected
+    /// dynamic tools). MCP wrapping derives its namespace from `mcp_server`
+    /// instead; tools without a grouping return `None` and land in the
+    /// provider's default group.
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        None
+    }
     /// A trusted host adapter for a task-specific capability. Native tools do
     /// not gain this authority by sharing a host capability's visible name.
     fn task_scope_host_capability(&self) -> bool {

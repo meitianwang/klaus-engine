@@ -46,6 +46,7 @@ fn apply_patch_spec() -> ToolSpec {
         .expect("schema literal must parse"),
         kind: ToolSpecKind::Freeform,
         format: Some(ToolSpecFormat::Text),
+        namespace: None,
     }
 }
 

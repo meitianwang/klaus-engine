@@ -1486,6 +1486,7 @@ mod context_policy_tests {
                 .unwrap(),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }
         }
         let baseline = vec![spec("read", "v1"), spec("bash", "run")];

@@ -176,6 +176,7 @@ struct ToolSpecWire {
     input_schema: Option<RuntimeJson>,
     kind: Option<ToolSpecKind>,
     format: Option<ToolSpecFormatWire>,
+    namespace: Option<RuntimeString>,
 }
 
 impl RuntimeDecode for ToolSpecWire {
@@ -187,6 +188,7 @@ impl RuntimeDecode for ToolSpecWire {
                 input_schema: object.optional("inputSchema", &[])?,
                 kind: object.optional("kind", &[])?,
                 format: object.optional("format", &[])?,
+                namespace: object.optional("namespace", &[])?,
             })
         })
     }
@@ -200,6 +202,11 @@ pub struct ToolSpec {
     pub input_schema: RuntimeJson,
     pub kind: ToolSpecKind,
     pub format: Option<ToolSpecFormat>,
+    /// Wire grouping namespace for providers that declare tools in namespace
+    /// entries. `None` places the tool in the provider's default group. The
+    /// model-facing short name is `name` with the `{namespace}__` prefix
+    /// stripped; calls carrying the namespace rejoin as `{namespace}__{name}`.
+    pub namespace: Option<RuntimeString>,
 }
 
 impl RuntimeEncode for ToolSpec {
@@ -213,6 +220,9 @@ impl RuntimeEncode for ToolSpec {
         }
         if let Some(format) = &self.format {
             object.field("format", format)?;
+        }
+        if let Some(namespace) = &self.namespace {
+            object.field("namespace", namespace)?;
         }
         out.emit(RuntimeJson::Object(object.finish()))
     }
@@ -262,6 +272,7 @@ impl RuntimeDecode for ToolSpec {
             input_schema,
             kind,
             format,
+            namespace: wire.namespace,
         })
     }
 }
@@ -291,7 +302,42 @@ impl ToolSpec {
     pub fn description(&self) -> &RuntimeString {
         &self.description
     }
+
+    /// The model-facing short name inside this spec's wire namespace: the
+    /// internal name with the `{namespace}__` prefix stripped when present.
+    pub fn wire_short_name(&self) -> RuntimeString {
+        let Some(namespace) = self.namespace.as_ref() else {
+            return self.name.clone();
+        };
+        let Ok(name) = self.name.try_to_utf8() else {
+            return self.name.clone();
+        };
+        let Ok(namespace) = namespace.try_to_utf8() else {
+            return self.name.clone();
+        };
+        let prefix = format!("{namespace}__");
+        match name.strip_prefix(prefix.as_str()) {
+            Some(short) if !short.is_empty() => RuntimeString::from(short),
+            _ => self.name.clone(),
+        }
+    }
 }
+
+/// Rejoin a wire namespace and short name into the internal tool name.
+/// The default namespace maps to the bare name.
+pub fn internal_tool_name(namespace: Option<&str>, name: &str) -> RuntimeString {
+    match namespace {
+        Some(namespace) if !namespace.is_empty() && namespace != DEFAULT_TOOL_NAMESPACE => {
+            RuntimeString::from(namespace)
+                .concat(&RuntimeString::from("__"))
+                .concat(&RuntimeString::from(name))
+        }
+        _ => RuntimeString::from(name),
+    }
+}
+
+/// The wire namespace that groups ungrouped first-party tools.
+pub const DEFAULT_TOOL_NAMESPACE: &str = "functions";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2787,6 +2833,7 @@ mod tests {
                 input_schema: parse(r#"{"type":"object"}"#),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }
         );
     }
@@ -2804,6 +2851,7 @@ mod tests {
                 syntax: ToolSpecGrammarSyntax::Regex,
                 definition: lone_low.clone(),
             }),
+            namespace: None,
         };
         let wire = encoded(&spec);
         assert_eq!(ToolSpec::decode_runtime(&wire).unwrap(), spec);

@@ -1796,6 +1796,7 @@ mod tests {
                 input_schema: RuntimeJson::Object(Default::default()),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }],
             native_deferred_tools: None,
             deferred_tools: Vec::new(),

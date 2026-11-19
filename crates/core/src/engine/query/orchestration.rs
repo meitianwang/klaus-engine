@@ -219,6 +219,7 @@ mod tests {
             ),
             kind: crate::types::provider::ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }]
     }
 

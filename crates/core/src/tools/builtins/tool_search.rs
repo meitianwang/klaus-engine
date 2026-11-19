@@ -1644,6 +1644,7 @@ mod tests {
                 input_schema: rjson!({ "type": "object" }),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }),
         }
     }
@@ -2501,6 +2502,7 @@ mod tests {
                 syntax: ToolSpecGrammarSyntax::Lark,
                 definition: definition.clone(),
             }),
+            namespace: None,
         });
         let tool = create_tool_search_tool(None);
         let mut ctx = mk_ctx();
@@ -2710,6 +2712,7 @@ mod tests {
             }),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         });
         let surfaced = with_catalog(&mut ctx, vec![catalog_entry]);
 
@@ -2823,6 +2826,7 @@ mod tests {
                 syntax: ToolSpecGrammarSyntax::Lark,
                 definition: rs("start: /.+/"),
             }),
+            namespace: None,
         });
         let surfaced = with_catalog(&mut ctx, vec![catalog_entry]);
 

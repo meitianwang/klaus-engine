@@ -128,6 +128,7 @@ mod tests {
             input_schema: RuntimeJson::Object(RuntimeObject::new()),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }]
     }
 

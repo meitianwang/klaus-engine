@@ -725,6 +725,7 @@ impl StructuredOutputState {
                 input_schema: schema,
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             });
             if force {
                 req.tool_choice = Some(ToolChoice::Tool {
@@ -7337,6 +7338,7 @@ mod tests {
             input_schema,
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 
@@ -7352,6 +7354,7 @@ mod tests {
             input_schema,
             kind: ToolSpecKind::Freeform,
             format,
+            namespace: None,
         }
     }
 
@@ -7405,6 +7408,7 @@ mod tests {
             input_schema,
             kind: ToolSpecKind::ToolSearch,
             format: None,
+            namespace: None,
         }
     }
 
@@ -7837,6 +7841,7 @@ mod tests {
             input_schema: schema_obj(),
             kind: ToolSpecKind::ToolSearch,
             format: None,
+            namespace: None,
         }];
         request.tool_choice = Some(ToolChoice::Tool {
             name: "tool_search".into(),
@@ -7861,6 +7866,7 @@ mod tests {
                     input_schema: schema_obj(),
                     kind: ToolSpecKind::ToolSearch,
                     format: None,
+                    namespace: None,
                 },
             ],
             vec![
@@ -7870,6 +7876,7 @@ mod tests {
                     input_schema: schema_obj(),
                     kind: ToolSpecKind::ToolSearch,
                     format: None,
+                    namespace: None,
                 },
                 function_spec("shared", "Function.", schema_obj()),
             ],
@@ -8012,6 +8019,7 @@ mod tests {
             input_schema: schema_obj(),
             kind: ToolSpecKind::ToolSearch,
             format: None,
+            namespace: None,
         }];
         responses_request.tool_choice = Some(ToolChoice::Tool {
             name: "tool_search".into(),
@@ -8079,6 +8087,7 @@ mod tests {
             input_schema: required_string_schema("target"),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 

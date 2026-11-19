@@ -64,6 +64,7 @@ fn user_tool(name: &str) -> ToolSpec {
         input_schema: runtime_json::parse(&RuntimeString::from(r#"{"type":"object"}"#)).unwrap(),
         kind: ToolSpecKind::Function,
         format: None,
+        namespace: None,
     }
 }
 

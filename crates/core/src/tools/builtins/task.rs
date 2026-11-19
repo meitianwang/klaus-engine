@@ -1616,6 +1616,7 @@ mod tests {
                 input_schema: tool.input_schema().clone(),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }],
             &profile,
         );

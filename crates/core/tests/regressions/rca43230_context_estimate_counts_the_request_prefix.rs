@@ -72,6 +72,7 @@ fn fat_prefix() -> (Vec<SystemPromptPart>, Vec<ToolSpec>) {
             input_schema: RuntimeObject::new().into(),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         })
         .collect();
     (system, tools)

@@ -11460,6 +11460,10 @@ impl Tool for DynamicToolAdapter {
         self.input_schema.clone()
     }
 
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        self.namespace.clone()
+    }
+
     fn exposure(&self) -> ToolExposure {
         self.exposure
     }

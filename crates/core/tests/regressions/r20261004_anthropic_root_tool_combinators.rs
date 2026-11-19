@@ -26,6 +26,7 @@ fn tool(schema: &Value) -> ToolSpec {
         input_schema: exact(schema),
         kind: ToolSpecKind::Function,
         format: None,
+        namespace: None,
     }
 }
 

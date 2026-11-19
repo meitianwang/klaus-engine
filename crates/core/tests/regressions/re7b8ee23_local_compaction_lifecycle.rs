@@ -192,6 +192,7 @@ fn request(messages: Vec<Message>) -> ModelRequest {
             input_schema: RuntimeJson::Object(RuntimeObject::new()),
             kind: Default::default(),
             format: None,
+            namespace: None,
         }],
         native_deferred_tools: None,
         deferred_tools: Vec::new(),

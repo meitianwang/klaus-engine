@@ -2155,6 +2155,7 @@ mod tests {
             input_schema: schema(input_schema),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 
@@ -4567,6 +4568,7 @@ mod tests {
                 input_schema: json!({ "type": "object", "properties": {} }),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }],
             &profile,
         );

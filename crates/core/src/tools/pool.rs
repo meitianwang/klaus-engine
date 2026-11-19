@@ -42,6 +42,9 @@ pub fn build_tool_pool(opts: BuildPoolOptions) -> Vec<Arc<dyn Tool>> {
 /// Project a tool into a provider-agnostic spec. The tool already carries its
 /// input schema in the normalized, provider-ready form.
 pub fn to_tool_spec(tool: &dyn Tool) -> ToolSpec {
+    let namespace = tool
+        .wire_namespace()
+        .or_else(|| tool.mcp_server().map(mcp_wire_namespace));
     match tool.input_kind() {
         ToolInputKind::JsonSchema => ToolSpec {
             name: tool.name(),
@@ -49,6 +52,7 @@ pub fn to_tool_spec(tool: &dyn Tool) -> ToolSpec {
             input_schema: tool.input_schema(),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace,
         },
         ToolInputKind::Freeform { .. } => ToolSpec {
             name: tool.name(),
@@ -56,8 +60,16 @@ pub fn to_tool_spec(tool: &dyn Tool) -> ToolSpec {
             input_schema: tool.input_schema(),
             kind: ToolSpecKind::Freeform,
             format: Some(ToolSpecFormat::Text),
+            namespace,
         },
     }
+}
+
+/// Wire namespace of an MCP-wrapped tool: the registry prefix plus the
+/// origin server, matching the `mcp__{server}__{tool}` internal name so the
+/// short name is the prefix-stripped remainder.
+pub fn mcp_wire_namespace(server: RuntimeString) -> RuntimeString {
+    RuntimeString::from("mcp__").concat(&server)
 }
 
 pub fn to_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
@@ -317,6 +329,7 @@ mod tests {
                 input_schema: crate::types::json::runtime_schema_from_static(&schema),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             }
         );
     }
@@ -341,6 +354,7 @@ mod tests {
                 input_schema: crate::types::json::runtime_schema_from_static(&JsonSchema::new()),
                 kind: ToolSpecKind::Freeform,
                 format: Some(ToolSpecFormat::Text),
+                namespace: None,
             }
         );
 

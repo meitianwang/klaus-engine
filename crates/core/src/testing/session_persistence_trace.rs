@@ -1470,6 +1470,7 @@ mod provider_behavior_tests {
             input_schema: exact_json!({ "type": "object" }),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 

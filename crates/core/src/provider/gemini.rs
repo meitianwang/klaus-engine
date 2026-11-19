@@ -3705,6 +3705,7 @@ mod tests {
             input_schema,
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 
@@ -3715,6 +3716,7 @@ mod tests {
             input_schema: open_fallback_tool_schema(),
             kind: ToolSpecKind::Freeform,
             format: Some(ToolSpecFormat::Text),
+            namespace: None,
         }
     }
 

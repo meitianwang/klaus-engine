@@ -3030,6 +3030,7 @@ fn cc_authoritative_team_create_spec() -> ToolSpec {
         ),
         kind: ToolSpecKind::Function,
         format: None,
+        namespace: None,
     }
 }
 
@@ -20267,6 +20268,7 @@ mod tests {
             input_schema: exact_json!({"type":"object","properties":{}}),
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }];
         request
     }
@@ -22258,6 +22260,7 @@ mod tests {
                 input_schema: RuntimeJson::Object(RuntimeObject::new()),
                 kind: ToolSpecKind::Function,
                 format: None,
+                namespace: None,
             })
             .collect::<Vec<_>>();
         specs.push(cc_authoritative_team_create_spec());

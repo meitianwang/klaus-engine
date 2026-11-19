@@ -554,6 +554,7 @@ pub(crate) mod tests {
             input_schema: RuntimeJson::Null,
             kind: ToolSpecKind::Function,
             format: None,
+            namespace: None,
         }
     }
 
