@@ -1472,4 +1472,44 @@ mod context_policy_tests {
             Some(config)
         );
     }
+
+    #[test]
+    fn inventory_fold_and_diff_drive_anchored_events() {
+        use crate::types::provider::{ToolInventoryEvent, ToolSpec, ToolSpecKind};
+        fn spec(name: &str, description: &str) -> ToolSpec {
+            ToolSpec {
+                name: name.into(),
+                description: description.into(),
+                input_schema: crate::runtime_values::runtime_json::parse(&RuntimeString::from(
+                    "{}",
+                ))
+                .unwrap(),
+                kind: ToolSpecKind::Function,
+                format: None,
+            }
+        }
+        let baseline = vec![spec("read", "v1"), spec("bash", "run")];
+        // A redefinition replaces in place; a removal drops the entry.
+        let events = vec![ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![spec("read", "v2")],
+            removed: vec!["bash".into()],
+        }];
+        let folded = super::fold_tool_inventory(&baseline, &events);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].name.try_to_utf8().unwrap(), "read");
+        assert_eq!(folded[0].description.try_to_utf8().unwrap(), "v2");
+
+        // The folded state agrees with the live inventory: no new event.
+        assert!(super::tool_inventory_diff(&folded, &folded).is_none());
+        // A tool that appeared live diffs as an addition.
+        let live = vec![folded[0].clone(), spec("calculator", "add")];
+        let (added, removed) = super::tool_inventory_diff(&folded, &live).expect("delta");
+        assert_eq!(added.len(), 1);
+        assert!(removed.is_empty());
+        // A tool that vanished live diffs as a removal.
+        let (added, removed) = super::tool_inventory_diff(&live, &folded).expect("delta");
+        assert!(added.is_empty());
+        assert_eq!(removed.len(), 1);
+    }
 }
