@@ -270,14 +270,12 @@ pub(super) fn normalize(value: &Value) -> Vec<Value> {
 /// Prefer the catalog's own default, then a non-max projection: legacy slugs and
 /// variant strings name several projections, and only an exact key identifies one.
 pub(super) fn prefer_canonical(candidates: Vec<&Value>) -> Option<&Value> {
-    candidates
-        .into_iter()
-        .min_by_key(|model| {
-            (
-                model["isDefault"] != true,
-                model["requestedModel"]["maxMode"] == true,
-            )
-        })
+    candidates.into_iter().min_by_key(|model| {
+        (
+            model["isDefault"] != true,
+            model["requestedModel"]["maxMode"] == true,
+        )
+    })
 }
 
 pub async fn fetch_models(force_refresh: bool) -> Result<Vec<Value>, String> {

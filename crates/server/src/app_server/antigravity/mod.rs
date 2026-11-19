@@ -1259,7 +1259,10 @@ pub(super) fn decorate(
             let details = head_generation
                 .as_deref()
                 .and_then(|generation| model_details(generation, id));
-            (id.to_owned(), catalog::output_token_defaults(details.as_ref()))
+            (
+                id.to_owned(),
+                catalog::output_token_defaults(details.as_ref()),
+            )
         })
         .collect();
     let thinking_dialects_by_model = by_model
