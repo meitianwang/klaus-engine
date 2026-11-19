@@ -12575,6 +12575,16 @@
         "flatten": false
       },
       {
+        "rustName": "meta",
+        "rustType": "Option < Meta >",
+        "wireSerialize": "meta",
+        "wireDeserialize": "meta",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
         "rustName": "ctx",
         "rustType": "Option < Context >",
         "wireSerialize": "ctx",
@@ -12693,6 +12703,30 @@
         "rustType": "Option < String >",
         "wireSerialize": "toolUseId",
         "wireDeserialize": "toolUseId",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      }
+    ]
+  },
+  "crates/core/src/store/thread_index/scan.rs::Meta": {
+    "kind": "struct",
+    "shape": "named",
+    "canEncode": false,
+    "canDecode": true,
+    "renameAllSerialize": "camelCase",
+    "renameAllDeserialize": "camelCase",
+    "denyUnknownFields": false,
+    "transparent": false,
+    "containerDefault": false,
+    "taggingKind": "external",
+    "fields": [
+      {
+        "rustName": "role",
+        "rustType": "Option < String >",
+        "wireSerialize": "role",
+        "wireDeserialize": "role",
         "default": false,
         "skipSerialize": false,
         "skipDeserialize": false,

@@ -43,13 +43,13 @@ pub(super) struct StoredAccount {
     pub needs_login: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct StoredQueue {
     accounts: Vec<StoredAccount>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct LegacyStoredCredential {
     generation: String,
