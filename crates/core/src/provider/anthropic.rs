@@ -94,13 +94,38 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const CACHE_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
 /// Beta enabling in-place tool addition/removal blocks inside system messages.
 const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+/// Beta enabling the mid-conversation tool-change block channel itself. Both
+/// announcement variants ride it: definitions carried by value additionally
+/// require [`INLINE_TOOLS_BETA`], while name-only references do not.
+const TOOL_CHANGES_BETA: &str = "mid-conversation-tool-changes-2026-07-01";
 /// Capability tag for the endpoint/model-scoped refusal learning of the inline
 /// tool-change protocol (distinct from the deferred-loading capability).
 const INLINE_TOOLS_CAPABILITY: &str = "inline-tools";
+/// Capability tag for the block channel as a whole: losing it drops both
+/// announcement variants and falls back to folding the inventory into the
+/// top-level tool list.
+const TOOL_CHANGE_BLOCKS_CAPABILITY: &str = "tool-change-blocks";
+/// Search-channel beta, first-party generation: enables the server-side
+/// pairing of deferred registrations with historical reference blocks.
+const ADVANCED_TOOL_USE_BETA: &str = "advanced-tool-use-2025-11-20";
+/// Search-channel beta, third-party generation.
+const TOOL_SEARCH_BETA: &str = "tool-search-tool-2025-10-19";
 /// Stable deferred placeholder anchoring the server-side scaffolding for
 /// mid-conversation tool changes inside the cached prefix from the first
 /// request on. Never activated; the model cannot see or call it.
 const DEFERRED_PLACEHOLDER_TOOL: &str = "__klaus_deferred_placeholder__";
+
+/// Which announcement variant the tool-change block channel renders with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolChangeMode {
+    /// No block channel: inventory changes fold into the top-level list.
+    Off,
+    /// Announcements carry full definitions inside the blocks.
+    ByValue,
+    /// Announcements carry name-only references; definitions register in the
+    /// top-level list marked `defer_loading` for the server to pair.
+    ByReference,
+}
 
 fn deferred_placeholder_tool() -> Value {
     vobj(vec![
@@ -621,13 +646,13 @@ impl AnthropicProvider {
             .map(diagnostic_string)
     }
 
-    /// Whether this request rides the inline tool-change protocol: the top-level
-    /// tool list stays frozen at its baseline and inventory changes are announced
-    /// by `tool_addition` / `tool_removal` blocks inside system messages, so tool
-    /// churn never invalidates the cached prefix. Resolution order mirrors the
-    /// deferred-loading binding: request-scoped catalog policy, then host-declared
-    /// capabilities, then the offline compatibility list.
-    fn inline_tool_changes_enabled(&self, model: &RuntimeString, req: &ModelRequest) -> bool {
+    /// Whether the mid-conversation tool-change block channel is armed: the
+    /// top-level tool list stays frozen at its baseline and inventory changes
+    /// are announced by `tool_addition` / `tool_removal` blocks inside system
+    /// messages, so tool churn never invalidates the cached prefix. Resolution
+    /// order mirrors the deferred-loading binding: request-scoped catalog
+    /// policy, then host-declared capabilities, then the offline list.
+    fn tool_change_blocks_enabled(&self, model: &RuntimeString, req: &ModelRequest) -> bool {
         self.vertex.is_none()
             && self.bedrock.is_none()
             && req
@@ -637,7 +662,7 @@ impl AnthropicProvider {
             && !self.native_tool_support.disabled_for(
                 &self.messages_url,
                 model,
-                INLINE_TOOLS_CAPABILITY,
+                TOOL_CHANGE_BLOCKS_CAPABILITY,
             )
             && {
                 let caps = self.capabilities_for(model);
@@ -659,6 +684,27 @@ impl AnthropicProvider {
                     });
                 system_messages && tool_changes
             }
+    }
+
+    /// Whether announcements may carry full definitions by value. Refusals of
+    /// the by-value surface alone drop the channel to name-only references
+    /// while keeping the block protocol itself.
+    fn inline_tool_values_enabled(&self, model: &RuntimeString) -> bool {
+        !self
+            .native_tool_support
+            .disabled_for(&self.messages_url, model, INLINE_TOOLS_CAPABILITY)
+    }
+
+    /// Resolve the announcement variant for one request.
+    fn tool_change_mode(&self, model: &RuntimeString, req: &ModelRequest) -> ToolChangeMode {
+        if !self.tool_change_blocks_enabled(model, req) {
+            return ToolChangeMode::Off;
+        }
+        if self.inline_tool_values_enabled(model) {
+            ToolChangeMode::ByValue
+        } else {
+            ToolChangeMode::ByReference
+        }
     }
 
     /// The resolved model/source limits used by admission and final validation.
@@ -820,7 +866,7 @@ impl AnthropicProvider {
             req.output_schema.is_some(),
             false,
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools),
-            self.inline_tool_changes_enabled(&req.model, req),
+            self.tool_change_mode(&req.model, req),
             self.structured_output_mode(req),
             self.requires_claude_code_identity(),
             image_limits,
@@ -971,7 +1017,7 @@ impl ModelProvider for AnthropicProvider {
             request.output_schema.is_some(),
             cache_scope_enabled,
             self.native_deferred_tools_enabled(&request.model, request.native_deferred_tools),
-            self.inline_tool_changes_enabled(&request.model, &request),
+            self.tool_change_mode(&request.model, &request),
             output_mode,
             self.requires_claude_code_identity(),
             image_limits,
@@ -1166,7 +1212,15 @@ impl ModelProvider for AnthropicProvider {
         let output_mode = self.structured_output_mode(&req);
         let defer_loading_supported =
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
-        let inline_tool_changes = self.inline_tool_changes_enabled(&req.model, &req);
+        // Search-channel beta generation: first-party surfaces ride the newer
+        // header, third-party endpoints the older one. Derived once per request
+        // from the same gate that owns the deferred registrations.
+        let tool_search_beta = defer_loading_supported.then_some(if self.is_first_party {
+            ADVANCED_TOOL_USE_BETA
+        } else {
+            TOOL_SEARCH_BETA
+        });
+        let tool_change_mode = self.tool_change_mode(&req.model, &req);
         let affinity_session_id = self.openrouter_session_affinity_id(&req);
         let native_tool_support = self.native_tool_support.clone();
 
@@ -1201,7 +1255,7 @@ impl ModelProvider for AnthropicProvider {
                     .is_some_and(|p| p.cache_scope == Some(CacheScope::Global));
             let params = match build_params_with_media_limits(
                 &req, structured, cache_scope_enabled, defer_loading_supported,
-                inline_tool_changes, output_mode,
+                tool_change_mode, output_mode,
                 require_claude_code_identity, image_limits, media_budget,
             ) {
                 Ok(params) => params,
@@ -1362,6 +1416,7 @@ impl ModelProvider for AnthropicProvider {
                 hint_messages: req.messages.clone(),
                 hint_model: req.model.clone(),
                 native_tool_support,
+                tool_search_beta,
                 emits_global: emits_global_scope,
                 affinity_session_id,
                 use_native,
@@ -1707,6 +1762,9 @@ struct AttemptCtx {
     hint_messages: Vec<Message>,
     hint_model: RuntimeString,
     native_tool_support: super::native_tools::NativeToolSupport,
+    /// Search-channel beta header to advertise while the deferred-tool
+    /// protocol is active for this request, if any.
+    tool_search_beta: Option<&'static str>,
     emits_global: bool,
     affinity_session_id: Option<String>,
     use_native: bool,
@@ -1880,47 +1938,34 @@ async fn attempt_with_media_remediation(
             ),
         }
         if let Err(raw) = &result {
-            if !signal.is_cancelled()
-                && super::native_tools::unsupported_native_tools(raw.status, &raw.message)
-            {
-                let (inline_rebuilt, defer_stripped) = {
-                    let mut body = ctx.body.lock_recover();
-                    if rebuild_without_inline_tool_blocks(&mut body) {
-                        (true, false)
-                    } else {
-                        let mut changed = false;
-                        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-                            tools.retain(|tool| {
-                                let deferred = tool.get("defer_loading").and_then(Value::as_bool)
-                                    == Some(true);
-                                changed |= deferred;
-                                !deferred
-                            });
+            if !signal.is_cancelled() {
+                // Tool-protocol refusals are classified, the offending surface
+                // is rebuilt out of the body in place, and the attempt re-runs
+                // immediately: one refusal never fails the turn.
+                if let Some((refusal, header_capability)) =
+                    classify_tool_protocol_refusal(raw.status, &raw.message)
+                {
+                    if let Some(capability) = header_capability {
+                        // A refusal naming a beta header is the most specific
+                        // signal: pin the exact surface the endpoint rejected.
+                        if capability.is_empty() {
+                            ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
+                        } else {
+                            ctx.native_tool_support.disable_for(
+                                &ctx.url,
+                                &ctx.hint_model,
+                                capability,
+                            );
                         }
-                        (false, changed)
+                        crate::observability::prefix_attribution::record_downgrade_rebuild(
+                            &format!("beta-header:{capability}"),
+                            &diagnostic_string(&ctx.hint_model),
+                            raw.status,
+                        );
                     }
-                };
-                if inline_rebuilt {
-                    ctx.native_tool_support.disable_for(
-                        &ctx.url,
-                        &ctx.hint_model,
-                        INLINE_TOOLS_CAPABILITY,
-                    );
-                    crate::observability::prefix_attribution::record_downgrade_rebuild(
-                        "inline-tools",
-                        &diagnostic_string(&ctx.hint_model),
-                        raw.status,
-                    );
-                    continue;
-                }
-                if defer_stripped {
-                    ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
-                    crate::observability::prefix_attribution::record_downgrade_rebuild(
-                        "defer-loading",
-                        &diagnostic_string(&ctx.hint_model),
-                        raw.status,
-                    );
-                    continue;
+                    if downgrade_tool_protocol_body(&ctx, refusal, raw.status) {
+                        continue;
+                    }
                 }
             }
             if !signal.is_cancelled() {
@@ -2082,9 +2127,20 @@ async fn attempt_once(
             merge_beta_header(&mut headers, CACHE_SCOPE_BETA);
         }
         // Derived from the body per attempt: a downgraded rebuild stops
-        // advertising the protocol without touching the attempt context.
-        if body_declares_inline_tool_blocks(&ctx.body.lock_recover()) {
-            merge_beta_header(&mut headers, INLINE_TOOLS_BETA);
+        // advertising the protocol without touching the attempt context. The
+        // block-channel beta rides whenever announcement blocks are present;
+        // the by-value beta only while definitions still travel in them.
+        {
+            let body = ctx.body.lock_recover();
+            if body_declares_tool_change_blocks(&body) {
+                merge_beta_header(&mut headers, TOOL_CHANGES_BETA);
+                if body_declares_inline_tool_values(&body) {
+                    merge_beta_header(&mut headers, INLINE_TOOLS_BETA);
+                }
+            }
+        }
+        if let Some(beta) = ctx.tool_search_beta {
+            merge_beta_header(&mut headers, beta);
         }
         if let Some(session) = &ctx.affinity_session_id {
             headers.insert("x-session-id".to_string(), session.clone());
@@ -3032,7 +3088,7 @@ fn build_params(
         structured,
         cache_scope_enabled,
         false,
-        false,
+        ToolChangeMode::Off,
         StructuredOutputMode {
             native: use_native_structured,
             review_tool_loop: false,
@@ -3058,7 +3114,7 @@ fn build_params_with_media_limits(
     structured: bool,
     cache_scope_enabled: bool,
     defer_loading_supported: bool,
-    inline_tool_changes: bool,
+    tool_change_mode: ToolChangeMode,
     output_mode: StructuredOutputMode,
     require_claude_code_identity: bool,
     image_limits: ImageLimits,
@@ -3069,9 +3125,9 @@ fn build_params_with_media_limits(
         .iter()
         .map(|p| vobj(vec![("type", vs("text")), ("text", vs(p.text.clone()))]))
         .collect();
-    // Under the inline tool-change protocol the top-level list is the frozen
+    // Under the tool-change block channel the top-level list is the frozen
     // baseline; later inventory changes ride in the message stream instead.
-    let frozen_active = inline_tool_changes
+    let frozen_active = tool_change_mode != ToolChangeMode::Off
         && req
             .frozen_tools
             .as_ref()
@@ -3085,6 +3141,7 @@ fn build_params_with_media_limits(
         } else {
             &[]
         },
+        tool_change_mode == ToolChangeMode::ByValue,
     );
     // Modern Claude models reject assistant message prefill (400 when the final
     // message has role="assistant"). Ensure empty-input continuations after a
@@ -3194,6 +3251,28 @@ fn build_params_with_media_limits(
                 }
                 tool
             }));
+        }
+    }
+
+    // Reference variant of the block channel: definitions announced mid-stream
+    // register at the top level marked `defer_loading` (appended after the
+    // breakpoints, so the cached prefix does not shift), and the announcement
+    // blocks carry name-only references the server pairs them with.
+    if frozen_active && tool_change_mode == ToolChangeMode::ByReference && !structured_replacement {
+        let baseline = req.frozen_tools.as_ref().expect("checked above");
+        let visible = crate::engine::query::request::fold_tool_inventory(
+            baseline,
+            &req.tool_inventory_events,
+        );
+        for spec in visible
+            .iter()
+            .filter(|spec| !baseline.iter().any(|base| base.name == spec.name))
+        {
+            let mut tool = to_api_tool(spec);
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("defer_loading".to_string(), Value::Bool(true));
+            }
+            tools.push(tool);
         }
     }
 
@@ -3568,13 +3647,16 @@ fn collect_anchored_events(
 }
 
 /// Render held-back inventory events as ONE system message: removals first
-/// (skipping names redefined by an addition in the same flush), then additions
-/// carrying their frozen declarations by value. Deterministic in the event
-/// order, so replays of the same transcript are byte-identical.
+/// (skipping names redefined by an addition in the same flush), then additions.
+/// By value the addition carries the frozen declaration inside the block; by
+/// reference it carries only the name and the definition registers in the
+/// top-level tool list instead. Deterministic in the event order, so replays
+/// of the same transcript are byte-identical.
 fn flush_tool_inventory_events(
     out: &mut Vec<Value>,
     pending: &mut Vec<usize>,
     events: &[crate::types::provider::ToolInventoryEvent],
+    by_value: bool,
 ) {
     if pending.is_empty() {
         return;
@@ -3605,16 +3687,18 @@ fn flush_tool_inventory_events(
     }
     for index in pending.iter() {
         for spec in &events[*index].added {
-            blocks.push(vobj(vec![
-                ("type", vs("tool_addition")),
-                (
-                    "tool",
-                    vobj(vec![
-                        ("type", vs("tool_definition")),
-                        ("definition", to_api_tool(spec)),
-                    ]),
-                ),
-            ]));
+            let tool = if by_value {
+                vobj(vec![
+                    ("type", vs("tool_definition")),
+                    ("definition", to_api_tool(spec)),
+                ])
+            } else {
+                vobj(vec![
+                    ("type", vs("tool_reference")),
+                    ("name", vs(spec.name.clone())),
+                ])
+            };
+            blocks.push(vobj(vec![("type", vs("tool_addition")), ("tool", tool)]));
         }
     }
     pending.clear();
@@ -3624,10 +3708,11 @@ fn flush_tool_inventory_events(
     ]));
 }
 
-/// Whether a serialized request body carries inline tool-change artifacts
-/// (announcement blocks or the frozen-list placeholder). Drives the beta header
-/// per attempt, so a downgraded body stops advertising the protocol.
-fn body_declares_inline_tool_blocks(body: &Value) -> bool {
+/// Whether a serialized request body carries tool-change announcement blocks
+/// (either variant) or the frozen-list placeholder. Drives the block-channel
+/// beta header per attempt, so a downgraded body stops advertising the
+/// protocol.
+fn body_declares_tool_change_blocks(body: &Value) -> bool {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return false;
     };
@@ -3644,6 +3729,37 @@ fn body_declares_inline_tool_blocks(body: &Value) -> bool {
                         let kind = block.get("type").and_then(Value::as_str);
                         kind.is_some_and(|tag| tag == "tool_addition")
                             || kind.is_some_and(|tag| tag == "tool_removal")
+                    })
+                })
+    })
+}
+
+/// Whether a serialized body still carries tool definitions BY VALUE inside
+/// announcement blocks. The by-value beta is advertised per attempt, so a
+/// body rebuilt into name-only references stops requesting it.
+fn body_declares_inline_tool_values(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "system")
+            && message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|tag| tag == "tool_addition")
+                            && block
+                                .get("tool")
+                                .and_then(|tool| tool.get("type"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|tag| tag == "tool_definition")
                     })
                 })
     })
@@ -3756,11 +3872,269 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
     true
 }
 
+/// Which tool-protocol surface a provider refusal targets. The variant decides
+/// what gets learned and how the body is rebuilt before the in-place retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolProtocolRefusal {
+    /// A scenario-bound rejection of THIS request's payload (for example the
+    /// definition budget was exceeded): the announcement is dropped for this
+    /// attempt only, no capability is learned, and the channel stays armed.
+    Scenario,
+    /// By-value definitions specifically were rejected; name-only reference
+    /// announcements remain usable.
+    ValueUnsupported,
+    /// The platform cannot host the tool-change blocks at all.
+    PlatformUnsupported,
+    /// The block channel itself was rejected (unknown block type or its beta).
+    BlocksUnsupported,
+    /// A deferred registration or the search channel was rejected.
+    DeferUnsupported,
+}
+
+/// Classify a provider refusal against the native tool-protocol surfaces.
+/// Returns the refusal variant plus, when the refusal named a beta header, the
+/// capability key to learn. Beta-header refusals name the header verbatim;
+/// payload refusals are matched by the platform's own rejection wording before
+/// falling back to the shared schema-refusal classifier.
+fn classify_tool_protocol_refusal(
+    status: Option<u16>,
+    message: &str,
+) -> Option<(ToolProtocolRefusal, Option<&'static str>)> {
+    if let Some(capability) = refused_beta_capability(status, message) {
+        let refusal = match capability {
+            INLINE_TOOLS_CAPABILITY => ToolProtocolRefusal::ValueUnsupported,
+            TOOL_CHANGE_BLOCKS_CAPABILITY => ToolProtocolRefusal::BlocksUnsupported,
+            _ => ToolProtocolRefusal::DeferUnsupported,
+        };
+        return Some((refusal, Some(capability)));
+    }
+    if matches!(status, Some(400 | 422)) {
+        let lower = message.to_ascii_lowercase();
+        // Wording-specific classifications only apply when the message is
+        // actually about a tool-protocol surface; a generic platform or budget
+        // error keeps its own recovery path.
+        let about_tool_surface = [
+            "tool_addition",
+            "tool_removal",
+            "tool_definition",
+            "tool_reference",
+            "defer_loading",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        if about_tool_surface {
+            if lower.contains("are not available on this platform") {
+                return Some((ToolProtocolRefusal::PlatformUnsupported, None));
+            }
+            if lower.contains("cannot yet be defined in a message")
+                || lower.contains("is already used by a")
+            {
+                return Some((ToolProtocolRefusal::ValueUnsupported, None));
+            }
+            if lower.contains("exceed") {
+                return Some((ToolProtocolRefusal::Scenario, None));
+            }
+        }
+    }
+    if !super::native_tools::unsupported_native_tools(status, message) {
+        return None;
+    }
+    // A refusal of the block channel that is not value-specific: unknown block
+    // types and channel-level validation errors land here.
+    Some((ToolProtocolRefusal::BlocksUnsupported, None))
+}
+
+/// Whether a refusal names one of the native tool-protocol beta headers.
+/// Returns the capability key to learn (empty string = the legacy
+/// deferred-loading scope).
+fn refused_beta_capability(status: Option<u16>, message: &str) -> Option<&'static str> {
+    if !matches!(status, Some(400 | 422)) {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("beta") || lower.contains("header")) {
+        return None;
+    }
+    for (header, capability) in [
+        (INLINE_TOOLS_BETA, INLINE_TOOLS_CAPABILITY),
+        (TOOL_CHANGES_BETA, TOOL_CHANGE_BLOCKS_CAPABILITY),
+        (ADVANCED_TOOL_USE_BETA, ""),
+        (TOOL_SEARCH_BETA, ""),
+    ] {
+        if lower.contains(&header.to_ascii_lowercase()) {
+            return Some(capability);
+        }
+    }
+    None
+}
+
+/// Strip every `defer_loading`-marked entry from the top-level tool list.
+/// Returns whether anything was removed.
+fn strip_defer_loading_tools(body: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            let deferred = tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
+            changed |= deferred;
+            !deferred
+        });
+    }
+    changed
+}
+
+/// Rebuild a by-value announcement body into the name-only reference variant:
+/// each definition carried inside a `tool_addition` block moves to the
+/// top-level tool list marked `defer_loading`, and the block keeps a
+/// `tool_reference` so the server pairs the two. Returns whether any
+/// definition was converted.
+fn rebuild_inline_values_as_references(body: &mut Value) -> bool {
+    let mut definitions: Vec<Value> = Vec::new();
+    let mut converted = false;
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            if message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_none_or(|role| role != "system")
+            {
+                continue;
+            }
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                if !block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_addition")
+                {
+                    continue;
+                }
+                let Some(tool) = block.get_mut("tool") else {
+                    continue;
+                };
+                if !tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_definition")
+                {
+                    continue;
+                }
+                let Some(definition) = tool.get("definition").cloned() else {
+                    continue;
+                };
+                let Some(name) = definition.get("name").and_then(Value::as_str).cloned() else {
+                    continue;
+                };
+                *tool = vobj(vec![("type", vs("tool_reference")), ("name", vs(name))]);
+                definitions.push(definition);
+                converted = true;
+            }
+        }
+    }
+    if !converted {
+        return false;
+    }
+    if let Some(object) = body.as_object_mut() {
+        if object.get("tools").is_none() {
+            object.insert("tools", Value::Array(Vec::new()));
+        }
+        if let Some(list) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            for mut definition in definitions {
+                if let Some(name) = definition.get("name").and_then(Value::as_str) {
+                    list.retain(|tool| tool.get("name").and_then(Value::as_str) != Some(name));
+                }
+                if let Some(entry) = definition.as_object_mut() {
+                    entry.insert("defer_loading", Value::Bool(true));
+                }
+                list.push(definition);
+            }
+        }
+    }
+    true
+}
+
+/// Apply the classified downgrade to the serialized body. Returns whether the
+/// body changed and the attempt should re-run.
+fn downgrade_tool_protocol_body(
+    ctx: &AttemptCtx,
+    refusal: ToolProtocolRefusal,
+    status: Option<u16>,
+) -> bool {
+    let learn = |capability: &str| {
+        if capability.is_empty() {
+            ctx.native_tool_support.disable(&ctx.url, &ctx.hint_model);
+        } else {
+            ctx.native_tool_support
+                .disable_for(&ctx.url, &ctx.hint_model, capability);
+        }
+    };
+    let record = |label: &str| {
+        crate::observability::prefix_attribution::record_downgrade_rebuild(
+            label,
+            &diagnostic_string(&ctx.hint_model),
+            status,
+        );
+    };
+    match refusal {
+        ToolProtocolRefusal::Scenario => {
+            // Strip this attempt's announcement payload only. Nothing is
+            // learned: the situation is request-bound (an oversized definition
+            // batch, a late block position), not an endpoint capability.
+            let mut body = ctx.body.lock_recover();
+            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
+                || strip_defer_loading_tools(&mut body);
+            if rebuilt {
+                record("tool-change-scenario");
+            }
+            rebuilt
+        }
+        ToolProtocolRefusal::ValueUnsupported => {
+            learn(INLINE_TOOLS_CAPABILITY);
+            let mut body = ctx.body.lock_recover();
+            if rebuild_inline_values_as_references(&mut body) {
+                record("inline-values-to-references");
+                return true;
+            }
+            // Nothing by value to convert: fall back to folding the channel.
+            learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
+            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
+                || strip_defer_loading_tools(&mut body);
+            if rebuilt {
+                record("tool-change-blocks");
+            }
+            rebuilt
+        }
+        ToolProtocolRefusal::PlatformUnsupported | ToolProtocolRefusal::BlocksUnsupported => {
+            learn(INLINE_TOOLS_CAPABILITY);
+            learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
+            let mut body = ctx.body.lock_recover();
+            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
+                || strip_defer_loading_tools(&mut body);
+            if rebuilt {
+                record("tool-change-blocks");
+            }
+            rebuilt
+        }
+        ToolProtocolRefusal::DeferUnsupported => {
+            learn("");
+            let mut body = ctx.body.lock_recover();
+            let rebuilt = strip_defer_loading_tools(&mut body);
+            if rebuilt {
+                record("defer-loading");
+            }
+            rebuilt
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn to_api_messages(
     messages: &[Message],
     target_model: &str,
     tools: &[ToolSpec],
     inventory_events: &[crate::types::provider::ToolInventoryEvent],
+    by_value: bool,
 ) -> Vec<Value> {
     let behavior_profile = resolve_provider_behavior_profile(
         Some(&ProviderInfo {
@@ -3826,7 +4200,7 @@ fn to_api_messages(
             Message::Assistant(a) => {
                 // Held-back announcements flush directly before the next
                 // assistant message, never between a tool call and its result.
-                flush_tool_inventory_events(&mut out, &mut pending, inventory_events);
+                flush_tool_inventory_events(&mut out, &mut pending, inventory_events, by_value);
                 // A model switch leaves prior assistant turns carrying thinking
                 // signatures bound to their producing model; drop those first.
                 let stripped;
@@ -3886,7 +4260,7 @@ fn to_api_messages(
             pending.push(index);
         }
     }
-    flush_tool_inventory_events(&mut out, &mut pending, inventory_events);
+    flush_tool_inventory_events(&mut out, &mut pending, inventory_events, by_value);
 
     // The API rejects a request whose FINAL assistant message ends in a thinking /
     // redacted_thinking block — strip the trailing run from the last assistant
@@ -4665,7 +5039,7 @@ mod tests {
             false,
             false,
             false,
-            true,
+            ToolChangeMode::ByValue,
             StructuredOutputMode {
                 native: false,
                 review_tool_loop: false,
@@ -4892,6 +5266,241 @@ mod tests {
         assert!(!rebuild_without_inline_tool_blocks(&mut body));
     }
 
+    fn reference_build(req: &ModelRequest) -> Value {
+        let params = build_params_with_media_limits(
+            req,
+            false,
+            false,
+            false,
+            ToolChangeMode::ByReference,
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            false,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("request assembly fixture must contain valid image payloads");
+        Value::Object(params)
+    }
+
+    fn inventory_change_request() -> ModelRequest {
+        let mut req = base_req();
+        req.frozen_tools = Some(vec![inline_spec("read"), inline_spec("bash")]);
+        req.tools = vec![inline_spec("read")];
+        req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+            anchor_uuid: Some("u1".into()),
+            added: vec![inline_spec("calculator")],
+            removed: vec!["bash".into()],
+        }];
+        req.messages = vec![user_msg("hi"), assistant_text("a1", "ok")];
+        req
+    }
+
+    #[test]
+    fn reference_mode_announces_names_and_registers_marked_definitions() {
+        let req = inventory_change_request();
+        let body = reference_build(&req);
+        // Announcements carry name-only references; no definition rides a block.
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        let system = messages
+            .iter()
+            .find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "system")
+            })
+            .expect("announcement message");
+        let blocks = system.get("content").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].get("type").unwrap(), &exact_json!("tool_removal"));
+        assert_eq!(
+            blocks[0].get("tool").unwrap().get("name").unwrap(),
+            &exact_json!("bash")
+        );
+        assert_eq!(
+            blocks[1].get("type").unwrap(),
+            &exact_json!("tool_addition")
+        );
+        assert_eq!(
+            blocks[1].get("tool").unwrap().get("type").unwrap(),
+            &exact_json!("tool_reference")
+        );
+        assert_eq!(
+            blocks[1].get("tool").unwrap().get("name").unwrap(),
+            &exact_json!("calculator")
+        );
+        assert!(blocks[1].get("tool").unwrap().get("definition").is_none());
+        // The frozen baseline stays byte-identical; the announced definition
+        // registers after it marked defer_loading, then the placeholder.
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        let names: Vec<String> = tools
+            .iter()
+            .map(|tool| diagnostic_string(tool.get("name").and_then(Value::as_str).unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "read".to_string(),
+                "bash".to_string(),
+                "calculator".to_string(),
+                DEFERRED_PLACEHOLDER_TOOL.to_string()
+            ]
+        );
+        assert_eq!(tools[2].get("defer_loading").unwrap(), &Value::Bool(true));
+        assert!(tools[0].get("defer_loading").is_none());
+        assert!(body_declares_tool_change_blocks(&body));
+        assert!(
+            !body_declares_inline_tool_values(&body),
+            "reference bodies must not advertise the by-value beta"
+        );
+    }
+
+    #[test]
+    fn by_value_bodies_advertise_both_block_betas() {
+        let req = inventory_change_request();
+        let body = inline_build(&req);
+        assert!(body_declares_tool_change_blocks(&body));
+        assert!(body_declares_inline_tool_values(&body));
+    }
+
+    #[test]
+    fn rebuild_inline_values_as_references_converts_in_place() {
+        let req = inventory_change_request();
+        let mut body = inline_build(&req);
+        assert!(rebuild_inline_values_as_references(&mut body));
+        // The announcement keeps a name-only reference...
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        let system = messages
+            .iter()
+            .find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "system")
+            })
+            .unwrap();
+        let blocks = system.get("content").unwrap().as_array().unwrap();
+        let addition = blocks
+            .iter()
+            .find(|block| {
+                block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_addition")
+            })
+            .unwrap();
+        assert_eq!(
+            addition.get("tool").unwrap().get("type").unwrap(),
+            &exact_json!("tool_reference")
+        );
+        // ...and the definition registers at the top level, marked.
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        let calculator = tools
+            .iter()
+            .find(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == "calculator")
+            })
+            .expect("converted definition registers at top level");
+        assert_eq!(calculator.get("defer_loading").unwrap(), &Value::Bool(true));
+        assert!(!body_declares_inline_tool_values(&body));
+        // Idempotent: a second pass finds nothing by value.
+        assert!(!rebuild_inline_values_as_references(&mut body));
+    }
+
+    #[test]
+    fn refused_beta_headers_map_to_their_capability_keys() {
+        assert_eq!(
+            refused_beta_capability(Some(400), "unsupported beta header inline-tools-2026-09-15"),
+            Some(INLINE_TOOLS_CAPABILITY)
+        );
+        assert_eq!(
+            refused_beta_capability(
+                Some(400),
+                "beta 'mid-conversation-tool-changes-2026-07-01' is not valid for this endpoint"
+            ),
+            Some(TOOL_CHANGE_BLOCKS_CAPABILITY)
+        );
+        assert_eq!(
+            refused_beta_capability(Some(422), "header advanced-tool-use-2025-11-20 rejected"),
+            Some("")
+        );
+        assert_eq!(
+            refused_beta_capability(Some(400), "header tool-search-tool-2025-10-19 rejected"),
+            Some("")
+        );
+        // No beta wording: an ordinary payload refusal, not a header refusal.
+        assert_eq!(
+            refused_beta_capability(Some(400), "tool_addition is not supported"),
+            None
+        );
+        // Status outside the validation family never classifies.
+        assert_eq!(
+            refused_beta_capability(Some(500), "beta inline-tools-2026-09-15 exploded"),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_protocol_refusals_classify_by_wording() {
+        let classify = |status, message: &str| {
+            classify_tool_protocol_refusal(status, message)
+                .map(|(refusal, header)| (refusal, header))
+        };
+        // Platform-wide unavailability kills the whole block channel.
+        assert_eq!(
+            classify(
+                Some(400),
+                "tool_addition blocks are not available on this platform"
+            ),
+            Some((ToolProtocolRefusal::PlatformUnsupported, None))
+        );
+        // By-value specific wording keeps the reference variant alive.
+        assert_eq!(
+            classify(
+                Some(422),
+                "tool_addition: tools cannot yet be defined in a message on this model"
+            ),
+            Some((ToolProtocolRefusal::ValueUnsupported, None))
+        );
+        assert_eq!(
+            classify(
+                Some(400),
+                "tool name in tool_addition is already used by a registered tool"
+            ),
+            Some((ToolProtocolRefusal::ValueUnsupported, None))
+        );
+        // Scenario-bound wording strips the attempt without learning.
+        assert_eq!(
+            classify(
+                Some(400),
+                "tool_addition definitions exceed the per-message budget"
+            ),
+            Some((ToolProtocolRefusal::Scenario, None))
+        );
+        // Unknown block type wording closes the channel.
+        assert_eq!(
+            classify(
+                Some(400),
+                "unknown block type: tool_removal is not supported"
+            ),
+            Some((ToolProtocolRefusal::BlocksUnsupported, None))
+        );
+        // Ordinary errors never classify, and budget wording that is not about
+        // a tool surface keeps its own recovery path.
+        assert_eq!(classify(Some(400), "invalid image payload"), None);
+        assert_eq!(classify(Some(429), "tool_addition rate limited"), None);
+        assert_eq!(
+            classify(Some(400), "input length exceeds the model context limit"),
+            None
+        );
+    }
+
     #[test]
     fn anthropic_compact_boundary_history() {
         for summary in ["resume summary", "compacted summary"] {
@@ -4902,7 +5511,7 @@ mod tests {
                     summary: RuntimeString::from(summary),
                 },
             )];
-            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[], &[]);
+            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[], &[], true);
             let expected_text = RuntimeString::from(format!(
                 "<system-reminder>\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nEarlier conversation summary:\n{summary}\n</system-reminder>"
             ));
@@ -4936,7 +5545,7 @@ mod tests {
         })];
 
         assert_eq!(
-            to_api_messages(&messages, "claude-opus-4-8", &[], &[]),
+            to_api_messages(&messages, "claude-opus-4-8", &[], &[], true),
             vec![exact_json!({
                 "role": "user",
                 "content": [{
@@ -5289,7 +5898,7 @@ mod tests {
             structured,
             false,
             supported,
-            false,
+            ToolChangeMode::Off,
             StructuredOutputMode {
                 native: false,
                 review_tool_loop: false,
@@ -6076,7 +6685,7 @@ mod tests {
             })
         };
         let msgs = vec![tr("a"), tr("b")];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[]);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get("role").unwrap(), &exact_json!("user"));
         let content = out[0].get("content").unwrap().as_array().unwrap();
@@ -6107,7 +6716,7 @@ mod tests {
                 }),
             ],
         })];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[]);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true);
         let content = out[0].get("content").unwrap().as_array().unwrap();
         // The trailing thinking block is stripped; only the text remains.
         assert_eq!(content.len(), 1);
@@ -7229,7 +7838,7 @@ mod empty_text_thinking_replay {
             ),
             tr("t1", 2),
         ];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[]);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true);
         let blocks = out[1].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")
@@ -7254,7 +7863,7 @@ mod empty_text_thinking_replay {
             "claude-opus-5-5",
             vec![think("SIG", "reasoning text"), tool_use("t1")],
         )];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[]);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true);
         let blocks = out[0].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")
