@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::engine::code_mode::protocol::{CodeModeToolKind, NestedToolMetadata, OutputContentItem};
 use crate::runtime_values::{RuntimeJson, RuntimeString};
 use crate::types::errors::CodeModeToolRejection;
-use crate::v8_platform::initialize_v8;
+use crate::v8_platform::{initialize_v8, HeapLimitWatch};
 
 use super::TaskFailureHandler;
 
@@ -192,7 +192,12 @@ fn run_runtime(
     isolate_handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
 ) {
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+    // A runaway cell script must not grow the shared engine process without
+    // bound: the heap cap turns exhaustion into a terminated script plus the
+    // heap-limit error text surfaced with the result.
+    let (mut heap_isolate, heap_watch) =
+        crate::v8_platform::heap_limited_isolate(crate::v8_platform::SCRIPT_HEAP_LIMIT_BYTES);
+    let isolate = heap_isolate.as_mut();
     let isolate_handle = isolate.thread_safe_handle();
     if isolate_handle_tx.send(isolate_handle).is_err() {
         return;
@@ -219,7 +224,7 @@ fn run_runtime(
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
-        send_result(&event_tx, HashMap::new(), Some(error_text));
+        send_result(&event_tx, HashMap::new(), Some(error_text), &heap_watch);
         return;
     }
 
@@ -228,7 +233,7 @@ fn run_runtime(
     let pending_promise = match module_loader::evaluate_main_module(scope, &config.source) {
         Ok(pending_promise) => pending_promise,
         Err(error_text) => {
-            capture_scope_send_error(scope, &event_tx, Some(error_text));
+            capture_scope_send_error(scope, &event_tx, Some(error_text), &heap_watch);
             return;
         }
     };
@@ -238,7 +243,7 @@ fn run_runtime(
             stored_value_writes,
             error_text,
         } => {
-            send_result(&event_tx, stored_value_writes, error_text);
+            send_result(&event_tx, stored_value_writes, error_text, &heap_watch);
             return;
         }
         CompletionState::Pending => {}
@@ -254,7 +259,7 @@ fn run_runtime(
                 if let Err(error_text) =
                     module_loader::resolve_tool_response(scope, &id, Ok(result))
                 {
-                    capture_scope_send_error(scope, &event_tx, Some(error_text));
+                    capture_scope_send_error(scope, &event_tx, Some(error_text), &heap_watch);
                     return;
                 }
             }
@@ -262,13 +267,13 @@ fn run_runtime(
                 if let Err(runtime_error) =
                     module_loader::resolve_tool_response(scope, &id, Err(rejection))
                 {
-                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                    capture_scope_send_error(scope, &event_tx, Some(runtime_error), &heap_watch);
                     return;
                 }
             }
             RuntimeCommand::TimeoutFired { id } => {
                 if let Err(runtime_error) = timers::invoke_timeout_callback(scope, id) {
-                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                    capture_scope_send_error(scope, &event_tx, Some(runtime_error), &heap_watch);
                     return;
                 }
             }
@@ -281,7 +286,7 @@ fn run_runtime(
                 stored_value_writes,
                 error_text,
             } => {
-                send_result(&event_tx, stored_value_writes, error_text);
+                send_result(&event_tx, stored_value_writes, error_text, &heap_watch);
                 return;
             }
             CompletionState::Pending => {}
@@ -324,20 +329,25 @@ fn capture_scope_send_error(
     scope: &mut v8::PinScope<'_, '_>,
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     error_text: Option<RuntimeString>,
+    heap_watch: &HeapLimitWatch,
 ) {
     let stored_value_writes = scope
         .get_slot::<RuntimeState>()
         .map(|state| state.stored_value_writes.clone())
         .unwrap_or_default();
 
-    send_result(event_tx, stored_value_writes, error_text);
+    send_result(event_tx, stored_value_writes, error_text, heap_watch);
 }
 
 fn send_result(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     stored_value_writes: HashMap<RuntimeString, RuntimeJson>,
     error_text: Option<RuntimeString>,
+    heap_watch: &HeapLimitWatch,
 ) {
+    // A heap-limit termination takes precedence: the generic termination
+    // text would hide the real cause from the model.
+    let error_text = heap_watch.error_text().or(error_text);
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
         error_text,

@@ -1817,9 +1817,12 @@ fn build_responses_params_with_tool_mode(
         first_party_metadata,
     } = assembly;
     // The function-tools compatibility profile marks endpoints that only
-    // accept the plain function-tool shape; they keep the top-level
-    // instructions field and never receive the developer message item form.
-    let instructions_item = instructions_item && !function_tools;
+    // accept the plain function-tool shape. Third-party compatibility
+    // endpoints keep the classic top-level instructions field. First-party
+    // OpenAI surfaces always receive the developer message item form: these
+    // backends place a top-level instructions field AFTER the input items,
+    // which reorders the prompt and defeats prompt caching.
+    let instructions_item = instructions_item && (!function_tools || first_party_metadata);
     let structured = req.output_schema.is_some();
     let native_search = !function_tools
         && req
@@ -9262,7 +9265,7 @@ mod tests {
     }
 
     #[test]
-    fn function_tools_profile_keeps_the_top_level_instructions_field() {
+    fn function_tools_profile_on_first_party_surfaces_uses_the_instructions_item() {
         let request = matrix_request("gpt-5.5");
         let body = build_responses_params_with_tool_mode(
             &request,
@@ -9277,7 +9280,35 @@ mod tests {
             },
         )
         .unwrap();
-        // The compatibility profile marks endpoints that only accept the plain
+        // First-party OpenAI surfaces place a top-level instructions field
+        // after the input items, which reorders the prompt and defeats prompt
+        // caching: even in the function-tools profile the stable prefix rides
+        // the input as an identified developer item. Tool declarations stay
+        // flat functions.
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_identified_instructions_item(&input[0], "gpt-5.5");
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["type"] == json!("function")));
+    }
+
+    #[test]
+    fn function_tools_profile_keeps_the_top_level_instructions_field_for_third_parties() {
+        let request = matrix_request("gpt-5.5");
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                instructions_item: true,
+                first_party_metadata: false,
+            },
+        )
+        .unwrap();
+        // Third-party compatibility endpoints only accept the plain
         // function-tool shape: the stable prefix stays on the top-level field,
         // no identified message item is injected, and every declaration stays
         // a flat function under its internal registry name.

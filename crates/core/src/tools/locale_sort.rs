@@ -4,7 +4,10 @@ use std::sync::{mpsc, OnceLock};
 use std::thread;
 
 use crate::runtime_values::RuntimeString;
-use crate::v8_platform::initialize_v8;
+use crate::v8_platform::{
+    heap_limited_isolate, initialize_v8, HeapLimitWatch, HeapLimitedIsolate,
+    AUX_SCRIPT_HEAP_LIMIT_BYTES,
+};
 
 const COLLATOR_BATCH_SOURCE: &str = r#"
 (() => {
@@ -32,15 +35,20 @@ const COLLATOR_BATCH_SOURCE: &str = r#"
 struct LocaleSortRuntime {
     batch_function: v8::Global<v8::Function>,
     context: v8::Global<v8::Context>,
-    isolate: v8::OwnedIsolate,
+    heap_watch: HeapLimitWatch,
+    isolate: HeapLimitedIsolate,
 }
 
 impl LocaleSortRuntime {
     fn new() -> Result<Self, String> {
         initialize_v8()?;
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        // The collator script is harness-authored but the sorted strings come
+        // from tool output: a heap cap keeps a pathological input from
+        // pressuring the shared engine process.
+        let (mut isolate, heap_watch) = heap_limited_isolate(AUX_SCRIPT_HEAP_LIMIT_BYTES);
         let (batch_function, context) = {
-            v8::scope!(let scope, &mut isolate);
+            let isolate = isolate.as_mut();
+            v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let context_global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -58,6 +66,7 @@ impl LocaleSortRuntime {
         Ok(Self {
             batch_function,
             context,
+            heap_watch,
             isolate,
         })
     }
@@ -67,11 +76,14 @@ impl LocaleSortRuntime {
         values: &[RuntimeString],
         compare_adjacent: bool,
     ) -> Result<Vec<i32>, String> {
+        // A heap-limit termination from a previous request must not poison
+        // this one; the cap re-triggers if the new input is still too large.
+        self.isolate.as_mut().cancel_terminate_execution();
         let array_len = i32::try_from(values.len())
             .map_err(|_| "locale-sort input exceeds the V8 array limit".to_string())?;
         let batch_function = &self.batch_function;
         let context = &self.context;
-        let isolate = &mut self.isolate;
+        let isolate = self.isolate.as_mut();
         v8::scope_with_context!(let scope, isolate, context);
 
         let input = v8::Array::new(scope, array_len);
@@ -89,7 +101,11 @@ impl LocaleSortRuntime {
         let compare_adjacent = v8::Boolean::new(scope, compare_adjacent);
         let result = function
             .call(scope, receiver, &[input.into(), compare_adjacent.into()])
-            .ok_or_else(|| "locale-sort function threw".to_string())?;
+            .ok_or_else(|| {
+                self.heap_watch
+                    .error_string()
+                    .unwrap_or_else(|| "locale-sort function threw".to_string())
+            })?;
         let result = v8::Local::<v8::Array>::try_from(result)
             .map_err(|_| "locale-sort function returned a non-array".to_string())?;
 

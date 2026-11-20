@@ -653,7 +653,10 @@ fn is_textual_content_type(content_type: &str) -> bool {
         || ct.contains("x-www-form-urlencoded")
 }
 
-fn extension_for_content_type(content_type: &str) -> &'static str {
+/// Extension for an explicit, meaningful content type. Generic
+/// (`application/octet-stream`) and unknown types yield `None` so byte
+/// sniffing and the URL path can still decide.
+fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
     let ct = content_type
         .split(';')
         .next()
@@ -661,17 +664,72 @@ fn extension_for_content_type(content_type: &str) -> &'static str {
         .trim()
         .to_ascii_lowercase();
     match ct.as_str() {
-        "application/pdf" => ".pdf",
-        "application/json" => ".json",
-        "text/html" => ".html",
-        "text/markdown" => ".md",
-        "text/plain" => ".txt",
-        "image/png" => ".png",
-        "image/jpeg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        _ => ".bin",
+        "application/pdf" => Some(".pdf"),
+        "application/json" => Some(".json"),
+        "text/html" => Some(".html"),
+        "text/markdown" => Some(".md"),
+        "text/plain" => Some(".txt"),
+        "image/png" => Some(".png"),
+        "image/jpeg" => Some(".jpg"),
+        "image/gif" => Some(".gif"),
+        "image/webp" => Some(".webp"),
+        _ => None,
     }
+}
+
+/// Recognize common document and image formats by their magic bytes. Servers
+/// frequently hand out PDFs and images as `application/octet-stream`; saving
+/// those under a recognizable extension keeps them readable downstream.
+fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some(".pdf");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(".png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(".jpg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(".gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP" {
+        return Some(".webp");
+    }
+    None
+}
+
+/// Last-resort extension from the URL path (before query/fragment) for
+/// formats whose leading bytes do not identify them (Office XML zips).
+fn extension_from_url(url: &str) -> Option<&'static str> {
+    let path = url.split(['#', '?']).next().unwrap_or("");
+    let segment = path.rsplit('/').next().unwrap_or("");
+    let ext = segment.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => Some(".pdf"),
+        "json" => Some(".json"),
+        "html" | "htm" => Some(".html"),
+        "md" => Some(".md"),
+        "txt" => Some(".txt"),
+        "png" => Some(".png"),
+        "jpg" | "jpeg" => Some(".jpg"),
+        "gif" => Some(".gif"),
+        "webp" => Some(".webp"),
+        "zip" => Some(".zip"),
+        "docx" => Some(".docx"),
+        "xlsx" => Some(".xlsx"),
+        "pptx" => Some(".pptx"),
+        _ => None,
+    }
+}
+
+/// Resolve the on-disk extension for a fetched binary body: declared content
+/// type first, then magic bytes, then the URL path, falling back to `.bin`.
+fn resolve_binary_extension(content_type: &str, bytes: &[u8], url: &str) -> &'static str {
+    extension_for_content_type(content_type)
+        .or_else(|| sniff_extension(bytes))
+        .or_else(|| extension_from_url(url))
+        .unwrap_or(".bin")
 }
 
 fn random_id() -> String {
@@ -700,11 +758,11 @@ fn random_id() -> String {
     )
 }
 
-async fn persist_binary(bytes: &[u8], content_type: &str) -> Option<RuntimePath> {
+async fn persist_binary(bytes: &[u8], content_type: &str, url: &str) -> Option<RuntimePath> {
     let path = std::env::temp_dir().join(format!(
         "klaus-webfetch-{}{}",
         random_id(),
-        extension_for_content_type(content_type)
+        resolve_binary_extension(content_type, bytes, url)
     ));
     match tokio::fs::write(&path, bytes).await {
         Ok(()) => Some(crate::fs::node_path::runtime_path_from_native(&path)),
@@ -1129,7 +1187,8 @@ impl WebFetchTool {
                         runtime_trim(&body)
                     }
                 } else {
-                    binary_path = persist_binary(&bytes, &content_type).await;
+                    let final_url_text = final_url.try_to_utf8().unwrap_or_default();
+                    binary_path = persist_binary(&bytes, &content_type, &final_url_text).await;
                     binary_size = Some(body_bytes);
                     let preview = runtime_trim(&NodeBufferUtf8::decode(&bytes));
                     let saved = binary_path
@@ -2389,6 +2448,109 @@ mod tests {
         .unwrap();
         assert!(native_path.exists());
         assert!(text_of(&res).contains("Binary content"));
+        let _ = std::fs::remove_file(native_path);
+    }
+
+    #[test]
+    fn binary_extension_falls_back_to_sniffing_and_url() {
+        // Declared content type wins.
+        assert_eq!(
+            resolve_binary_extension("application/pdf", b"whatever", "https://e.example/x"),
+            ".pdf"
+        );
+        assert_eq!(
+            resolve_binary_extension("image/jpeg; charset=binary", b"x", "https://e.example/x"),
+            ".jpg"
+        );
+        // Generic or unknown types sniff the leading bytes.
+        assert_eq!(
+            resolve_binary_extension(
+                "application/octet-stream",
+                b"%PDF-1.7 fake bytes",
+                "https://e.example/download"
+            ),
+            ".pdf"
+        );
+        assert_eq!(
+            resolve_binary_extension(
+                "",
+                &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00],
+                "https://e.example/x"
+            ),
+            ".png"
+        );
+        assert_eq!(
+            resolve_binary_extension("application/octet-stream", b"\xFF\xD8\xFF\xE0x", "u"),
+            ".jpg"
+        );
+        assert_eq!(
+            resolve_binary_extension("application/octet-stream", b"GIF89a...", "u"),
+            ".gif"
+        );
+        assert_eq!(
+            resolve_binary_extension(
+                "application/octet-stream",
+                b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+                "u"
+            ),
+            ".webp"
+        );
+        // Opaque zip containers use the URL path (Office XML formats).
+        assert_eq!(
+            resolve_binary_extension(
+                "application/octet-stream",
+                b"PK\x03\x04zz",
+                "https://e.example/files/report.xlsx?token=1#top"
+            ),
+            ".xlsx"
+        );
+        // Nothing to go on: keep the classic .bin.
+        assert_eq!(
+            resolve_binary_extension(
+                "application/octet-stream",
+                b"\x00\x01\x02",
+                "https://e/blob"
+            ),
+            ".bin"
+        );
+        assert_eq!(resolve_binary_extension("", b"", ""), ".bin");
+    }
+
+    #[tokio::test]
+    async fn octet_stream_pdf_is_saved_under_a_readable_extension() {
+        let (fetcher, _calls) = scripted_with_headers(vec![(
+            "https://files.example/download",
+            200,
+            vec![("content-type", "application/octet-stream")],
+            Some("%PDF-1.7 fake pdf bytes"),
+        )]);
+        let tool = create_web_fetch_tool(WebFetchToolOptions {
+            fetch_impl: Some(fetcher),
+            ..Default::default()
+        });
+        let ctx = make_ctx(".");
+        let res = tool
+            .call(
+                runtime_json!({ "url": "https://files.example/download" }),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.serializable.is_error, Some(true));
+        let path = res
+            .serializable
+            .output
+            .get("binaryPath")
+            .and_then(RuntimeJson::as_string)
+            .expect("binary path");
+        assert!(path.ends_with(".pdf"));
+        let native_path = crate::fs::node_path::project_runtime_path(
+            &RuntimePath::from(path.clone()),
+            "binaryPath",
+        )
+        .unwrap();
+        assert!(native_path.exists());
         let _ = std::fs::remove_file(native_path);
     }
 

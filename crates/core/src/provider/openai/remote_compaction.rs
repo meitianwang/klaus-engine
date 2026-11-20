@@ -320,6 +320,12 @@ impl OpenAIProvider {
             self.reasoning_dialect,
             ResponsesToolAssembly {
                 function_tools,
+                // Mirror the main request path: first-party surfaces place a
+                // top-level instructions field after the input items, so the
+                // base instructions ride the input as a developer item there.
+                // Third-party endpoints keep the classic top-level field.
+                instructions_item: true,
+                first_party_metadata: self.responses_first_party_openai(),
                 ..ResponsesToolAssembly::plain()
             },
         )?;

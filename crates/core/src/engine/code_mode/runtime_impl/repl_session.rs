@@ -38,7 +38,9 @@ use crate::runtime_values::{runtime_json, RuntimeJson, RuntimeObject, RuntimeStr
 use crate::schemas::content::OutputBlock;
 use crate::types::errors::{CodeModeToolRejection, ToolError};
 use crate::types::tool::{InvokeToolFn, InvokeToolResult};
-use crate::v8_platform::initialize_v8;
+use crate::v8_platform::{
+    heap_limited_isolate, initialize_v8, HeapLimitWatch, SCRIPT_HEAP_LIMIT_BYTES,
+};
 
 use super::isolate::value::{
     json_to_v8, runtime_string_to_v8, v8_value_to_json, v8_value_to_runtime_string,
@@ -240,7 +242,11 @@ fn run_repl_runtime(
     timer_handle: Handle,
     isolate_handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
 ) {
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+    // The persistent REPL context is where runaway model-authored scripts
+    // live the longest, so the isolate gets a hard heap cap; the watch turns
+    // a breach into an explicit error instead of generic termination text.
+    let (mut heap_isolate, heap_watch) = heap_limited_isolate(SCRIPT_HEAP_LIMIT_BYTES);
+    let isolate = heap_isolate.as_mut();
     let isolate_handle = isolate.thread_safe_handle();
     if isolate_handle_tx.send(isolate_handle).is_err() {
         return;
@@ -295,8 +301,11 @@ fn run_repl_runtime(
     }
 
     while let Ok(request) = eval_rx.recv() {
-        run_eval(scope, &command_rx, &event_tx, request);
+        run_eval(scope, &command_rx, &event_tx, request, &heap_watch);
         scope.cancel_terminate_execution();
+        // The heap flag describes ONE eval; clear it so a later interrupt is
+        // not mislabeled as a heap breach.
+        heap_watch.reset();
         // Drop commands that arrived after the eval settled so a stale
         // terminate or tool response cannot leak into the next call.
         while command_rx.try_recv().is_ok() {}
@@ -406,6 +415,7 @@ fn run_eval(
     command_rx: &std_mpsc::Receiver<ReplCommand>,
     event_tx: &tokio_mpsc::UnboundedSender<ReplEvent>,
     request: ReplEvalRequest,
+    heap_watch: &HeapLimitWatch,
 ) {
     // A terminate for THIS exec that arrived before the eval started must
     // interrupt it deterministically; stale commands are dropped.
@@ -417,7 +427,7 @@ fn run_eval(
     }
     if pre_terminated {
         call_void_global(scope, "__klausResetCapture");
-        send_done(event_tx, terminated_done(scope));
+        send_done(event_tx, terminated_done(scope, heap_watch.error_text()));
         return;
     }
     call_void_global(scope, "__klausResetCapture");
@@ -483,7 +493,7 @@ fn run_eval(
 
     let completion = script.run(&tc);
     if tc.has_terminated() {
-        send_done(event_tx, terminated_done(&mut tc));
+        send_done(event_tx, terminated_done(&mut tc, heap_watch.error_text()));
         return;
     }
     if tc.has_caught() {
@@ -541,7 +551,7 @@ fn run_eval(
         }
     }
     if terminated {
-        send_done(event_tx, terminated_done(&mut tc));
+        send_done(event_tx, terminated_done(&mut tc, heap_watch.error_text()));
         return;
     }
 
@@ -1100,7 +1110,10 @@ fn error_done_via(
     }
 }
 
-fn terminated_done(scope: &mut v8::PinScope<'_, '_>) -> ReplDone {
+fn terminated_done(
+    scope: &mut v8::PinScope<'_, '_>,
+    heap_error: Option<RuntimeString>,
+) -> ReplDone {
     if let Some(state) = scope.get_slot_mut::<ReplRuntimeState>() {
         state.pending_tool_calls.clear();
         state.pending_tool_order.clear();
@@ -1114,7 +1127,7 @@ fn terminated_done(scope: &mut v8::PinScope<'_, '_>) -> ReplDone {
         result: RuntimeJson::Null,
         result_defined: true,
         result_text: RuntimeString::from("null"),
-        error: None,
+        error: heap_error,
         terminated: true,
     }
 }
@@ -1439,11 +1452,15 @@ fn compose_outcome(
     budget_ms: u64,
 ) -> ReplExecOutcome {
     let error = if done.terminated {
-        Some(RuntimeString::from(match reason {
-            Some(TerminateReason::Budget) => timeout_message(budget_ms),
-            Some(TerminateReason::Wall) => hard_limit_message(),
-            Some(TerminateReason::Interrupt) | None => INTERRUPTED_MESSAGE.to_string(),
-        }))
+        // A heap-limit termination carries its own explanation; timeout and
+        // interrupt reasons are mapped here.
+        done.error.or_else(|| {
+            Some(RuntimeString::from(match reason {
+                Some(TerminateReason::Budget) => timeout_message(budget_ms),
+                Some(TerminateReason::Wall) => hard_limit_message(),
+                Some(TerminateReason::Interrupt) | None => INTERRUPTED_MESSAGE.to_string(),
+            }))
+        })
     } else {
         done.error
     };

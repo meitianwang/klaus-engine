@@ -65,7 +65,11 @@ fn filter_lines_exact(
     pattern: &RuntimeString,
 ) -> Result<RuntimeString, RuntimeString> {
     crate::v8_platform::initialize_v8().map_err(RuntimeString::from)?;
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+    // The filter pattern is model-authored: cap the heap so a pathological
+    // regex or subject cannot pressure the shared engine process.
+    let (mut heap_isolate, heap_watch) =
+        crate::v8_platform::heap_limited_isolate(crate::v8_platform::AUX_SCRIPT_HEAP_LIMIT_BYTES);
+    let isolate = heap_isolate.as_mut();
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
@@ -88,10 +92,16 @@ fn filter_lines_exact(
         // `RegExp::exec` surfaces the JavaScript result object: on "no match"
         // it yields the JS `null` VALUE (not an empty handle), so the presence
         // of a handle alone must not be read as a match.
-        if regex
-            .exec(&tc, subject)
-            .is_some_and(|result| !result.is_null_or_undefined())
-        {
+        let matched = regex.exec(&tc, subject);
+        if matched.is_none() {
+            if let Some(message) = heap_watch.error_text() {
+                return Err(message);
+            }
+            if tc.has_terminated() {
+                return Err(RuntimeString::from("filter execution was terminated"));
+            }
+        }
+        if matched.is_some_and(|result| !result.is_null_or_undefined()) {
             retained.push(line);
         }
     }
