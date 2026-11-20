@@ -959,7 +959,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r4")
+        RuntimeString::from("bundled-r5")
     );
 }
 
@@ -1180,7 +1180,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r4"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r5"));
 }
 
 mod store_refresh {
@@ -1245,7 +1245,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r4"
+            "bundled-r5"
         );
 
         let v1 = document("distributed-v1");
@@ -1368,7 +1368,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r4"
+            "bundled-r5"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1381,8 +1381,8 @@ mod store_refresh {
 fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
     let sol = ModelFragments::for_model(&RuntimeString::from("gpt-6.2-sol"), None);
     let astra = ModelFragments::for_model(&RuntimeString::from("gpt-6.2-astra"), None);
-    let reserve = ModelFragments::for_model(&RuntimeString::from("gpt-reserve"), None);
     let five_six = ModelFragments::for_model(&RuntimeString::from("gpt-5.6-sol"), None);
+    let five_six_terra = ModelFragments::for_model(&RuntimeString::from("gpt-5.6-terra"), None);
 
     // Each bound model resolves its own base pack instead of the generic
     // engine default, and sibling models of one generation still differ.
@@ -1391,7 +1391,7 @@ fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
     assert_ne!(astra.base_instructions(), generic);
     assert_ne!(sol.base_instructions(), astra.base_instructions());
     // Models sharing one template share one fragment.
-    assert_eq!(reserve.base_instructions(), five_six.base_instructions());
+    assert_eq!(five_six_terra.base_instructions(), five_six.base_instructions());
     assert_eq!(
         sol.resolved()
             .provenance(SLOT_BASE_INSTRUCTIONS)
