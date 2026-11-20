@@ -449,6 +449,7 @@ impl Session {
             on_tool_result_budget_records: None,
             thinking_context_cold: false,
             context_edit_state: None,
+            tool_freeze_state: None,
             padded_countdown_spend: PaddedCountdownSpend::default(),
             task_countdown_anchor: None,
             agent_type: Some("approval-review".into()),

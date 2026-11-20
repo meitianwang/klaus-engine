@@ -394,14 +394,16 @@ impl FullCompactor {
                     != RemoteCompactionSupport::Unsupported
             }) {
                 let mut request = self.summary_request(&messages, config, instructions);
-                let snapshot = self.request_snapshot();
-                request.tools = snapshot
-                    .clone()
-                    .map(|request| request.tools)
-                    .unwrap_or_default();
-                request.deferred_tools = snapshot
-                    .map(|request| request.deferred_tools)
-                    .unwrap_or_default();
+                if let Some(snapshot) = self.request_snapshot() {
+                    request.tools = snapshot.tools;
+                    request.deferred_tools = snapshot.deferred_tools;
+                    request.surfaced_deferred_names = snapshot.surfaced_deferred_names;
+                    request.native_deferred_tools = snapshot.native_deferred_tools;
+                    request.wire_caps = snapshot.wire_caps;
+                    request.frozen_tools = snapshot.frozen_tools;
+                    request.frozen_instructions = snapshot.frozen_instructions;
+                    request.tool_inventory_events = snapshot.tool_inventory_events;
+                }
                 // Native compaction has its own trigger item, supplied by the transport.
                 request.messages.pop();
                 let expected_scope = self
@@ -815,6 +817,10 @@ impl FullCompactor {
         }));
         request.tools.clear();
         request.deferred_tools.clear();
+        request.surfaced_deferred_names.clear();
+        request.frozen_tools = None;
+        request.frozen_instructions = None;
+        request.tool_inventory_events.clear();
         request.tool_choice = None;
         request.output_schema = None;
         request.web_search = None;

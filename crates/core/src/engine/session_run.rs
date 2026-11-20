@@ -1075,27 +1075,6 @@ impl Session {
             is_main_role,
             this.config.request_user_input_default,
         );
-        // Static fallback protocol: announce folded-catalog drift as one
-        // engine-generated meta message in the live history. The wire tool
-        // list stays frozen, the announcement sits at a stable history
-        // position so its bytes cache after the first send, and the
-        // history-scan ledger keeps retries idempotent. The notification is
-        // not a rollout record: a cold resume simply re-announces the
-        // current catalog on its first turn, which is the intended
-        // restoration behavior.
-        if let Some(notification) =
-            crate::engine::catalog_notification::catalog_notification_message(
-                &initial_bundle.config,
-                &this.history_snapshot(),
-                &available_tools,
-                initial_bundle
-                    .provider
-                    .native_deferred_loading_active(&turn_model),
-            )
-        {
-            index_turn_message(&this, &notification, &turn_id);
-            this.push_history(notification);
-        }
         if orchestration_enabled {
             crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
                 &mut available_tools,
@@ -1106,7 +1085,35 @@ impl Session {
             definition.retain_tools(&mut available_tools);
         }
         this.prepare_subagent_tool_inventory(&mut available_tools, &initial_bundle.config);
-        let tools = if initial_bundle.provider.capabilities(&turn_model).tools {
+        let tools_enabled = initial_bundle.provider.capabilities(&turn_model).tools;
+        let tool_search_allowed = this
+            .root_agent_definition
+            .as_ref()
+            .is_none_or(|definition| definition.allows_tool(&RuntimeString::from("tool_search")));
+        // Static fallback protocol: announce folded-catalog drift as one
+        // engine-generated meta message in the live history. The wire tool
+        // list stays frozen, the announcement sits at a stable history
+        // position so its bytes cache after the first send, and the
+        // history-scan ledger keeps retries idempotent. The notification is
+        // not a rollout record: a cold resume simply re-announces the
+        // current catalog on its first turn, which is the intended
+        // restoration behavior.
+        if tools_enabled && tool_search_allowed {
+            if let Some(notification) =
+                crate::engine::catalog_notification::catalog_notification_message(
+                    &initial_bundle.config,
+                    &this.history_snapshot(),
+                    &available_tools,
+                    initial_bundle
+                        .provider
+                        .native_deferred_loading_active(&turn_model),
+                )
+            {
+                index_turn_message(&this, &notification, &turn_id);
+                this.push_history(notification);
+            }
+        }
+        let tools = if tools_enabled {
             available_tools.clone()
         } else {
             Vec::new()
@@ -2165,6 +2172,7 @@ impl Session {
                 .turn
                 .latch_thinking_context_cold((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS),
             context_edit_state: Some(this.context_edit_state.clone()),
+            tool_freeze_state: Some(this.tool_freeze_state.clone()),
             live_model_override,
         };
         this.turn
@@ -2375,26 +2383,38 @@ impl Session {
                 params.tools = selected.tools;
                 params.tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
                 crate::planning::tools::retain_for_mode(&mut params.tools,turn_collaboration_mode,this2.meta.role.is_none()||this2.meta.role==Some(SessionRole::Main),this2.config.request_user_input_default);
+                if let Some(definition) = &this2.root_agent_definition {
+                    definition.retain_tools(&mut params.tools);
+                }
+                this2.prepare_subagent_tool_inventory(&mut params.tools, &initial_bundle.config);
                 // The reconcile pass can deliver plugin MCP tools after the
                 // initial catalog announcement; diff the ledger again so a
                 // late-arriving server is still announced while the frozen
                 // tool list stays untouched.
-                if let Some(notification) =
-                    crate::engine::catalog_notification::catalog_notification_message(
-                        &initial_bundle.config,
-                        &this2.history_snapshot(),
-                        &params.tools,
-                        initial_bundle
-                            .provider
-                            .native_deferred_loading_active(&turn_model),
-                    )
-                {
-                    index_turn_message(&this2, &notification, &turn_id);
-                    // The turn's message snapshot was taken before this
-                    // reconcile pass, so the late announcement also joins the
-                    // in-flight request at its history position.
-                    params.messages.push(notification.clone());
-                    this2.push_history(notification);
+                let tool_search_allowed = this2
+                    .root_agent_definition
+                    .as_ref()
+                    .is_none_or(|definition| {
+                        definition.allows_tool(&RuntimeString::from("tool_search"))
+                    });
+                if tool_search_allowed {
+                    if let Some(notification) =
+                        crate::engine::catalog_notification::catalog_notification_message(
+                            &initial_bundle.config,
+                            &this2.history_snapshot(),
+                            &params.tools,
+                            initial_bundle
+                                .provider
+                                .native_deferred_loading_active(&turn_model),
+                        )
+                    {
+                        index_turn_message(&this2, &notification, &turn_id);
+                        // The turn's message snapshot was taken before this
+                        // reconcile pass, so the late announcement also joins
+                        // the in-flight request at its history position.
+                        params.messages.push(notification.clone());
+                        this2.push_history(notification);
+                    }
                 }
                 if orchestration_enabled {
                     crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(

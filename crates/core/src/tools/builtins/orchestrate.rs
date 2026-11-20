@@ -269,6 +269,9 @@ impl Tool for OrchestrationPlannerGateTool {
     fn mcp_server(&self) -> Option<RuntimeString> {
         self.inner.mcp_server()
     }
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        self.inner.wire_namespace()
+    }
     fn task_scope_host_capability(&self) -> bool {
         self.inner.task_scope_host_capability()
     }
@@ -562,6 +565,9 @@ impl Tool for OrchestratedExecutorGuardTool {
     }
     fn mcp_server(&self) -> Option<RuntimeString> {
         self.inner.mcp_server()
+    }
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        self.inner.wire_namespace()
     }
     fn task_scope_host_capability(&self) -> bool {
         self.inner.task_scope_host_capability()

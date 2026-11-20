@@ -35,9 +35,15 @@ pub struct PreviousSnapshot {
     pub epoch: u64,
 }
 
-fn registry() -> &'static Mutex<HashMap<String, PreviousSnapshot>> {
-    static REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, PreviousSnapshot>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct RegistryState {
+    entries: HashMap<String, (u64, PreviousSnapshot)>,
+    next_seq: u64,
+}
+
+fn registry() -> &'static Mutex<RegistryState> {
+    static REGISTRY: std::sync::LazyLock<Mutex<RegistryState>> =
+        std::sync::LazyLock::new(|| Mutex::new(RegistryState::default()));
     &REGISTRY
 }
 
@@ -57,22 +63,34 @@ pub fn attribute(
 ) -> Value {
     let key = routing_key.unwrap_or("default").to_string();
     let now = now_ms();
-    let mut registry = registry()
+    let mut state = registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = registry.remove(&key);
+    let previous = state.entries.remove(&key).map(|(_, snapshot)| snapshot);
     let (reasons, continues_prefix, epoch) =
         classify(previous.as_ref(), current, now, retention_long);
-    if registry.len() >= MAX_ENTRIES {
-        registry.clear();
+    if state.entries.len() >= MAX_ENTRIES {
+        if let Some(oldest_key) = state
+            .entries
+            .iter()
+            .min_by_key(|(_, (seq, _))| *seq)
+            .map(|(k, _)| k.clone())
+        {
+            state.entries.remove(&oldest_key);
+        }
     }
-    registry.insert(
+    state.next_seq = state.next_seq.saturating_add(1);
+    let seq = state.next_seq;
+    state.entries.insert(
         key,
-        PreviousSnapshot {
-            fingerprint: current.clone(),
-            at_ms: now,
-            epoch,
-        },
+        (
+            seq,
+            PreviousSnapshot {
+                fingerprint: current.clone(),
+                at_ms: now,
+                epoch,
+            },
+        ),
     );
     json!({
         "prefixMissReasons": reasons,
@@ -105,9 +123,16 @@ pub(crate) fn classify(
     }
 
     // History: shrink = compaction; same count with a moved digest = in-place
-    // rewrite; growth that does not continue the previous full digest = the
-    // cached prefix itself moved.
-    let continues_prefix = prev.history_hash == current.history_prefix_hash;
+    // rewrite; growth checks exact per-prefix digests for multi-message turns
+    // (assistant tool_use + tool_result) with a 1-message fallback.
+    let continues_prefix = current.history_messages > prev.history_messages
+        && ((prev.history_messages == current.history_messages.saturating_sub(1)
+            && prev.history_hash == current.history_prefix_hash)
+            || prev
+                .history_messages
+                .checked_sub(1)
+                .and_then(|idx| current.history_prefix_hashes.get(idx))
+                .is_some_and(|prefix| prefix == &prev.history_hash));
     if current.history_messages < prev.history_messages {
         reasons.push("messages_rewritten");
         epoch += 1;
@@ -120,11 +145,16 @@ pub(crate) fn classify(
         reasons.push("history_prefix_changed");
     }
 
-    // The inventory stream moving is NOT a bust under a frozen top level: only
-    // the segment the cached prefix actually carries counts.
+    // The inventory stream and newly unlocked native-deferred registrations stay
+    // outside the cached top-level breakpoint: only baseline or immediate moves
+    // count as `tools_changed`.
     let top_level_moved = match (&prev.frozen_tools_hash, &current.frozen_tools_hash) {
         (Some(before), Some(after)) => before != after,
-        _ => prev.tools_hash != current.tools_hash,
+        _ => {
+            prev.immediate_tools_hash != current.immediate_tools_hash
+                || (prev.tools_hash != current.tools_hash
+                    && !(prev.defer_unlock_active || current.defer_unlock_active))
+        }
     };
     if top_level_moved {
         reasons.push("tools_changed");
@@ -304,5 +334,83 @@ mod tests {
         assert!(reasons.contains(&"model_changed"));
         assert!(reasons.contains(&"messages_rewritten"));
         assert_eq!(epoch, 9);
+    }
+
+    #[test]
+    fn multi_message_turn_continues_prefix_and_deferred_unlock_does_not_claim_tools_changed() {
+        let mut req1 = crate::observability::prefix_fingerprint::tests::request();
+        req1.native_deferred_tools = Some(true);
+        let fp1 = PrefixFingerprint::of(&req1);
+
+        let mut req2 = req1.clone();
+        req2.messages
+            .push(crate::schemas::message::Message::Assistant(
+                crate::schemas::message::AssistantMessage {
+                    uuid: "a-turn-2".into(),
+                    content: vec![crate::schemas::content::ContentBlock::Text(
+                        crate::schemas::content::TextBlock {
+                            text: "searching".into(),
+                            citations: None,
+                            harness_envelope: None,
+                            message_id: None,
+                            phase: None,
+                        },
+                    )],
+                    model: "claude-opus-5-5".into(),
+                    usage: None,
+                },
+            ));
+        req2.messages
+            .push(crate::schemas::message::Message::ToolResult(
+                crate::schemas::message::ToolResultMessage {
+                    uuid: "tr-turn-2".into(),
+                    tool_use_id: "call-1".into(),
+                    content: Vec::new(),
+                    is_error: false,
+                    tool_kind: None,
+                    native_tool_output: None,
+                    output: None,
+                    extra_user_blocks: None,
+                },
+            ));
+        let mut unlocked_spec = req2.tools[0].clone();
+        unlocked_spec.name = "unlocked_deferred".into();
+        req2.tools.push(unlocked_spec);
+        req2.surfaced_deferred_names = vec!["unlocked_deferred".into()];
+        let fp2 = PrefixFingerprint::of(&req2);
+
+        let previous = snapshot(fp1, 1000, 0);
+        let (reasons, continues, _) = classify(Some(&previous), &fp2, 2000, false);
+        assert!(continues, "multi-message append must continue prefix");
+        assert_eq!(reasons, vec!["likely_server_side"]);
+    }
+
+    #[test]
+    fn registry_evicts_oldest_entry_instead_of_clearing_all_sessions() {
+        let mut base = crate::observability::prefix_fingerprint::tests::request();
+        base.messages
+            .push(crate::schemas::message::Message::Assistant(
+                crate::schemas::message::AssistantMessage {
+                    uuid: "a-evict".into(),
+                    content: Vec::new(),
+                    model: "claude-opus-5-5".into(),
+                    usage: None,
+                },
+            ));
+        let fp = PrefixFingerprint::of(&base);
+        let hot_key = "attr-evict-hot";
+        let oldest_key = "attr-evict-oldest";
+        let _ = attribute(Some(oldest_key), false, &fp);
+        for i in 0..MAX_ENTRIES {
+            let _ = attribute(Some(hot_key), false, &fp);
+            let k = format!("attr-evict-fill-{i}");
+            let _ = attribute(Some(&k), false, &fp);
+        }
+        let follow = attribute(Some(hot_key), false, &fp);
+        assert_eq!(
+            follow["prefixMissReasons"],
+            serde_json::json!(["likely_server_side"]),
+            "active key must survive unrelated churn beyond MAX_ENTRIES"
+        );
     }
 }

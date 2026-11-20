@@ -283,14 +283,48 @@ impl Session {
                     .retain(|review| !removed_turns.contains(&review.turn_id));
                 self.approval_async.reset();
             }
+            let removed_messages = removed.to_vec();
             let mut next_hist = Vec::with_capacity(new_len);
             next_hist.extend_from_slice(&hist[..prefix_len]);
             next_hist.extend(new_visible);
+            let surviving_messages = next_hist.clone();
             *hist = next_hist;
             self.update_prediction_source_checkpoint(generation, None);
             let remaining_turns = count_user_turns(&hist[prefix_len..]);
             let messages = hist.len().saturating_sub(prefix_len);
             drop(hist);
+            let bundle = self.inference.read().unwrap().clone();
+            let profile = crate::provider::behavior::resolve_provider_behavior_profile(
+                Some(bundle.provider.info()),
+                &bundle.config.model,
+            );
+            let tools = self.current_tools();
+            let surviving_surfaced = crate::engine::query::surfaced_tools_from_messages(
+                &surviving_messages,
+                &profile,
+                Some(&tools),
+            );
+            let has_boundary = surviving_messages
+                .iter()
+                .any(|message| matches!(message, Message::CompactBoundary(_)));
+            let mut surfaced_guard = self.surfaced_tools.lock_recover();
+            if has_boundary {
+                let dropped_surfaced = crate::engine::query::surfaced_tools_from_messages(
+                    &removed_messages,
+                    &profile,
+                    Some(&tools),
+                );
+                for name in dropped_surfaced {
+                    if !surviving_surfaced.contains(&name) {
+                        surfaced_guard.remove(&name);
+                    }
+                }
+            } else {
+                *surfaced_guard = surviving_surfaced;
+            }
+            drop(surfaced_guard);
+            self.tool_freeze_state.clear();
+            self.precompute.clear();
             let mut prediction = crate::runtime_values::RuntimeObject::new();
             prediction.insert("generation", RuntimeJson::from(generation.to_string()));
             let mut records = vec![crate::schemas::rollout::RolloutItem::Event(
@@ -579,6 +613,7 @@ impl Session {
             _ => None,
         });
         self.file_state.clear();
+        self.tool_freeze_state.clear();
         self.refresh_workspace_instruction_cache();
         self.memory_roots
             .nested_loaded_paths()
@@ -4128,6 +4163,8 @@ impl Session {
             thinking_context_cold: self.turn.thinking_context_cold(),
             context_edit_state: (!opts.exclude_hidden_history)
                 .then(|| self.context_edit_state.clone()),
+            tool_freeze_state: (!opts.exclude_hidden_history)
+                .then(|| self.tool_freeze_state.clone()),
             padded_countdown_spend: self.turn.padded_countdown_spend(),
             task_countdown_anchor: None,
             live_model_override: None,

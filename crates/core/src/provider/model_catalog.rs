@@ -92,10 +92,12 @@ pub(crate) fn native_deferred_tools_default(provider: &str, model: &RuntimeStrin
 fn normalize_capability_model_id(model: &str) -> &str {
     let exact = model.strip_suffix("[1m]").unwrap_or(model);
     let exact = exact.strip_suffix("-latest").unwrap_or(exact);
-    if exact.len() > 9 {
-        let (stem, suffix) = exact.split_at(exact.len() - 9);
-        if suffix.starts_with('-') && suffix[1..].chars().all(|c| c.is_ascii_digit()) {
-            return stem;
+    let bytes = exact.as_bytes();
+    if bytes.len() > 9 {
+        let boundary = bytes.len() - 9;
+        // Trailing ASCII digits after `-` make `boundary` a safe UTF-8 cut.
+        if bytes[boundary] == b'-' && bytes[boundary + 1..].iter().all(u8::is_ascii_digit) {
+            return &exact[..boundary];
         }
     }
     exact
@@ -880,6 +882,19 @@ struct CapturedModelProvider {
     metadata: HashMap<RuntimeString, ModelCapabilities>,
 }
 
+impl CapturedModelProvider {
+    fn bind_captured_request_policies(&self, req: &mut ModelRequest) {
+        if let Some(capabilities) = self.capabilities.get(&req.model) {
+            req.bind_media_capabilities(capabilities);
+        }
+        let metadata = self.model_metadata(&req.model);
+        req.native_deferred_tools = req.native_deferred_tools.or(metadata.native_deferred_tools);
+        req.wire_caps.get_or_insert_with(|| {
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+        });
+    }
+}
+
 pub(crate) fn uncaptured_model_error(model: &RuntimeString) -> ProviderError {
     ProviderError {
         kind: ProviderErrorKind::InvalidRequest,
@@ -980,12 +995,13 @@ impl ModelProvider for CapturedModelProvider {
     }
     async fn compact_remote(
         &self,
-        request: ModelRequest,
+        mut request: ModelRequest,
         signal: AbortSignal,
     ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_captured_request_policies(&mut request);
         let mut result = self.inner.compact_remote(request.clone(), signal).await?;
         result.checkpoint.comp_hash = self.compaction_compatibility_hash(&request.model);
         Ok(result)
@@ -993,7 +1009,7 @@ impl ModelProvider for CapturedModelProvider {
 
     async fn compact_remote_with_usage(
         &self,
-        request: crate::types::provider::ModelRequest,
+        mut request: crate::types::provider::ModelRequest,
         signal: crate::types::abort::AbortSignal,
         idle_ms: u64,
         observer: crate::types::provider::NativeCompactionUsageObserver,
@@ -1003,6 +1019,7 @@ impl ModelProvider for CapturedModelProvider {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_captured_request_policies(&mut request);
         let model = request.model.clone();
         let mut result = self
             .inner
@@ -1014,13 +1031,14 @@ impl ModelProvider for CapturedModelProvider {
 
     async fn compact_remote_with_idle_timeout(
         &self,
-        request: ModelRequest,
+        mut request: ModelRequest,
         signal: AbortSignal,
         idle_ms: u64,
     ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_captured_request_policies(&mut request);
         let model = request.model.clone();
         let mut result = self
             .inner
@@ -1188,6 +1206,29 @@ impl ModelProvider for CapturedModelProvider {
     }
 }
 
+impl CatalogModelProvider {
+    fn bind_catalog_request_policies(&self, req: &mut ModelRequest) {
+        if req.image_limits.is_none() || req.max_media_blocks.is_none() {
+            let capabilities = self.capabilities(&req.model);
+            req.image_limits
+                .get_or_insert(capabilities.image_limits.unwrap_or_default());
+            req.max_media_blocks.get_or_insert(
+                capabilities
+                    .max_media_blocks
+                    .unwrap_or(DEFAULT_MAX_MEDIA_BLOCKS),
+            );
+        }
+        if req.native_deferred_tools.is_none() || req.wire_caps.is_none() {
+            let metadata = self.model_metadata(&req.model);
+            req.native_deferred_tools =
+                req.native_deferred_tools.or(metadata.native_deferred_tools);
+            req.wire_caps.get_or_insert_with(|| {
+                crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelProvider for CatalogModelProvider {
     fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
@@ -1259,12 +1300,13 @@ impl ModelProvider for CatalogModelProvider {
     }
     async fn compact_remote(
         &self,
-        request: ModelRequest,
+        mut request: ModelRequest,
         signal: AbortSignal,
     ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_catalog_request_policies(&mut request);
         let mut result = self.inner.compact_remote(request.clone(), signal).await?;
         result.checkpoint.comp_hash = self.compaction_compatibility_hash(&request.model);
         Ok(result)
@@ -1272,7 +1314,7 @@ impl ModelProvider for CatalogModelProvider {
 
     async fn compact_remote_with_usage(
         &self,
-        request: crate::types::provider::ModelRequest,
+        mut request: crate::types::provider::ModelRequest,
         signal: crate::types::abort::AbortSignal,
         idle_ms: u64,
         observer: crate::types::provider::NativeCompactionUsageObserver,
@@ -1282,6 +1324,7 @@ impl ModelProvider for CatalogModelProvider {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_catalog_request_policies(&mut request);
         let model = request.model.clone();
         let mut result = self
             .inner
@@ -1293,13 +1336,14 @@ impl ModelProvider for CatalogModelProvider {
 
     async fn compact_remote_with_idle_timeout(
         &self,
-        request: ModelRequest,
+        mut request: ModelRequest,
         signal: AbortSignal,
         idle_ms: u64,
     ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
         if !self.has_model_capabilities(&request.model) {
             return Err(crate::provider::native_compaction::unsupported_checkpoint());
         }
+        self.bind_catalog_request_policies(&mut request);
         let model = request.model.clone();
         let mut result = self
             .inner
@@ -1409,12 +1453,17 @@ impl ModelProvider for CatalogModelProvider {
     }
     fn stream_with_model_metadata(
         &self,
-        req: ModelRequest,
+        mut req: ModelRequest,
         metadata: ModelCapabilities,
         raw_effort: Option<RuntimeString>,
         total_attempts: u32,
         signal: AbortSignal,
     ) -> ModelStream {
+        req.native_deferred_tools = req.native_deferred_tools.or(metadata.native_deferred_tools);
+        req.wire_caps.get_or_insert_with(|| {
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+        });
+        self.bind_catalog_request_policies(&mut req);
         self.inner
             .stream_with_model_metadata(req, metadata, raw_effort, total_attempts, signal)
     }
@@ -1422,29 +1471,37 @@ impl ModelProvider for CatalogModelProvider {
     fn capabilities(&self, model: &RuntimeString) -> ProviderCapabilities {
         let base = self.inner.capabilities(model);
         let provider = self.inner.info().name.try_to_utf8().unwrap_or_default();
-        let model = match model.try_to_utf8() {
+        let model_str = match model.try_to_utf8() {
             Ok(model) => model,
             Err(_) => return base,
         };
-        self.catalog.resolve(&provider, &model, base)
+        let mut resolved = self.catalog.resolve(&provider, &model_str, base);
+        if provider == "openai" {
+            let wire = self
+                .catalog
+                .wire_capability_overrides(&provider, &model_str);
+            if wire.additional_tools.is_some() || wire.mid_convo_system_messages.is_some() {
+                let metadata = self.inner.model_metadata(model);
+                let system_messages = wire
+                    .mid_convo_system_messages
+                    .or(metadata.mid_convo_system_messages)
+                    .unwrap_or_else(|| mid_convo_system_messages_default(&provider, model));
+                let additional_tools = wire
+                    .additional_tools
+                    .or(metadata.additional_tools)
+                    .unwrap_or_else(|| additional_tools_default(&provider, model));
+                if system_messages && additional_tools {
+                    resolved.web_search = false;
+                }
+            }
+        }
+        resolved
     }
 
     fn stream(&self, mut req: ModelRequest, signal: AbortSignal) -> ModelStream {
         // A captured request already owns both policies. Only unbound direct
         // calls read current catalog facts here.
-        if req.image_limits.is_none() || req.max_media_blocks.is_none() {
-            let capabilities = self.capabilities(&req.model);
-            req.image_limits
-                .get_or_insert(capabilities.image_limits.unwrap_or_default());
-            req.max_media_blocks.get_or_insert(
-                capabilities
-                    .max_media_blocks
-                    .unwrap_or(DEFAULT_MAX_MEDIA_BLOCKS),
-            );
-        }
-        if req.native_deferred_tools.is_none() {
-            req.native_deferred_tools = self.model_metadata(&req.model).native_deferred_tools;
-        }
+        self.bind_catalog_request_policies(&mut req);
         self.inner.stream(req, signal)
     }
 
@@ -2183,5 +2240,151 @@ mod tests {
         assert!(error.contains("500"));
         assert_eq!(catalog.entry_count(), 1);
         let _ = server.await.unwrap();
+    }
+
+    #[test]
+    fn normalize_capability_model_id_handles_multibyte_utf8_models() {
+        for model in [
+            "模型",
+            "自定义模型-abc",
+            "模型名称-20261119",
+            "模型名称-20261119-latest[1m]",
+            "测试-model",
+        ] {
+            let normalized = normalize_capability_model_id(model);
+            assert!(!normalized.is_empty());
+        }
+        assert_eq!(
+            normalize_capability_model_id("模型名称-20261119"),
+            "模型名称"
+        );
+        assert_eq!(
+            normalize_capability_model_id("模型名称-20261119-latest[1m]"),
+            "模型名称"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_model_provider_binds_wire_caps_and_suppresses_batch_web_search() {
+        struct RecordingProvider {
+            info: ProviderInfo,
+            last_stream_req: Arc<std::sync::Mutex<Option<ModelRequest>>>,
+            last_compact_req: Arc<std::sync::Mutex<Option<ModelRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for RecordingProvider {
+            fn info(&self) -> &ProviderInfo {
+                &self.info
+            }
+            fn capabilities(&self, _: &RuntimeString) -> ProviderCapabilities {
+                let mut caps = base_caps();
+                caps.web_search = true;
+                caps
+            }
+            fn model_metadata(&self, _: &RuntimeString) -> ModelCapabilities {
+                ModelCapabilities {
+                    web_search: true,
+                    ..Default::default()
+                }
+            }
+            fn stream(&self, req: ModelRequest, _: AbortSignal) -> ModelStream {
+                *self.last_stream_req.lock().unwrap() = Some(req);
+                Box::pin(futures::stream::empty())
+            }
+            async fn compact_remote(
+                &self,
+                request: ModelRequest,
+                _: AbortSignal,
+            ) -> Result<crate::types::provider::RemoteCompactionResult, ProviderError> {
+                *self.last_compact_req.lock().unwrap() = Some(request);
+                Err(crate::provider::native_compaction::unsupported_checkpoint())
+            }
+        }
+
+        let last_stream = Arc::new(std::sync::Mutex::new(None));
+        let last_compact = Arc::new(std::sync::Mutex::new(None));
+        let inner: Arc<dyn ModelProvider> = Arc::new(RecordingProvider {
+            info: ProviderInfo {
+                name: "openai".into(),
+                base_url: None,
+                env_key: None,
+                default_model: "custom-batch-model".into(),
+            },
+            last_stream_req: last_stream.clone(),
+            last_compact_req: last_compact.clone(),
+        });
+        let catalog = catalog_with(vec![entry(
+            "openai",
+            "custom-batch-model",
+            CatalogMatch::Exact,
+            CapabilityOverrides {
+                native_deferred_tools: Some(true),
+                additional_tools: Some(true),
+                mid_convo_system_messages: Some(true),
+                cache_ttl_1h: Some(false),
+                web_search: Some(true),
+                ..Default::default()
+            },
+        )]);
+        let wrapped = with_model_catalog(inner, catalog);
+
+        // OpenAI batch-wire models have no hosted top-level web_search surface.
+        assert!(
+            !wrapped
+                .capabilities(&"custom-batch-model".into())
+                .web_search
+        );
+
+        let req = ModelRequest {
+            supports_image_detail_original: false,
+            model: "custom-batch-model".into(),
+            image_limits: None,
+            max_media_blocks: None,
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            native_deferred_tools: None,
+            wire_caps: None,
+            frozen_tools: None,
+            tool_inventory_events: Vec::new(),
+            frozen_instructions: None,
+            deferred_tools: Vec::new(),
+            surfaced_deferred_names: Vec::new(),
+            tool_choice: None,
+            max_output_tokens: 128,
+            task_budget: None,
+            output_schema: None,
+            web_search: None,
+            thinking: None,
+            effort: None,
+            model_verbosity: None,
+            reasoning_summary: crate::types::provider::ReasoningSummary::Auto,
+            skip_cache_write: None,
+            cache_ttl: None,
+            cache_key: None,
+            cache_domain: None,
+            context_management: None,
+            context_hints: None,
+            thinking_context: None,
+        };
+        let _ = wrapped.stream(req.clone(), AbortSignal::new());
+        let streamed = last_stream.lock().unwrap().clone().expect("streamed");
+        assert_eq!(streamed.native_deferred_tools, Some(true));
+        let wire_caps = streamed.wire_caps.expect("wire_caps bound on stream");
+        assert_eq!(wire_caps.additional_tools, Some(true));
+        assert_eq!(wire_caps.mid_convo_system_messages, Some(true));
+        assert_eq!(wire_caps.cache_ttl_1h, Some(false));
+
+        let _ = wrapped.compact_remote(req, AbortSignal::new()).await;
+        let compacted = last_compact.lock().unwrap().clone().expect("compacted");
+        assert_eq!(compacted.native_deferred_tools, Some(true));
+        assert_eq!(
+            compacted
+                .wire_caps
+                .expect("wire_caps bound on compact_remote")
+                .additional_tools,
+            Some(true)
+        );
     }
 }

@@ -4365,6 +4365,7 @@ pub struct PlanningQuestionOption {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelCapabilitiesInitSchema {
+    pub native_deferred_tools: Option<bool>,
     pub tools: Option<bool>,
     pub forced_tool_choice_with_thinking: Option<bool>,
     pub effort: Option<ModelEffortCapabilityInitSchema>,
@@ -4385,6 +4386,7 @@ pub struct ModelCapabilitiesInitSchema {
     pub default_reasoning_effort: Option<String>,
     pub multi_agent_reasoning_effort: Option<String>,
     pub effective_context_window_percent: Option<i64>,
+    pub auto_compact_token_limit: Option<u64>,
     #[serde(default)]
     pub used_fallback_model_metadata: bool,
     pub model_specialty: Option<String>,
@@ -4411,6 +4413,8 @@ pub struct ModelCapabilitiesInitSchema {
     pub max_output_tokens: Option<u64>,
     pub image_limits: Option<ModelImageLimitsInitSchema>,
     pub max_media_blocks: Option<std::num::NonZeroU32>,
+    #[serde(default)]
+    pub media_input_mime_types: Vec<String>,
     pub reasoning_dialect: Option<String>,
     pub gemini_thinking: Option<ModelGeminiThinkingInitSchema>,
     pub mid_convo_system_messages: Option<bool>,
@@ -4454,12 +4458,14 @@ pub enum ModelReasoningSummaryInitSchema {
     None,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelThinkingCapabilityInitSchema {
     #[serde(default)]
     pub adaptive: bool,
     #[serde(default)]
     pub interleaved: bool,
+    #[serde(default)]
+    pub can_disable_thinking: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -228,6 +228,9 @@ fn merge_review_catalog_metadata(
     catalog.max_output_tokens = declared.max_output_tokens.or(catalog.max_output_tokens);
     catalog.image_limits = declared.image_limits.or(catalog.image_limits);
     catalog.max_media_blocks = declared.max_media_blocks.or(catalog.max_media_blocks);
+    if !declared.media_input_mime_types.is_empty() {
+        catalog.media_input_mime_types = declared.media_input_mime_types;
+    }
     catalog.auto_review_model_override = declared
         .auto_review_model_override
         .or(catalog.auto_review_model_override);

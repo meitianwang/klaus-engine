@@ -4181,29 +4181,7 @@ async fn load_items_if_exists(file: &str) -> io::Result<Option<Vec<RolloutItem>>
 /// discovered tools). Tolerant of a malformed payload — a bad record is
 /// skipped, never fatal.
 fn surfaced_tools_from_items(items: &[RolloutItem]) -> Vec<RuntimeString> {
-    let mut out: Vec<RuntimeString> = Vec::new();
-    for item in items {
-        let RolloutItem::Event(event) = item else {
-            continue;
-        };
-        if event.event != "tools_surfaced" {
-            continue;
-        }
-        let Some(payload) = event.payload.as_ref().and_then(|p| p.as_object()) else {
-            continue;
-        };
-        let Some(names) = payload.get("names").and_then(|n| n.as_array()) else {
-            continue;
-        };
-        for name in names {
-            if let Some(name) = name.as_str() {
-                if !out.iter().any(|existing| existing == name) {
-                    out.push(name.clone());
-                }
-            }
-        }
-    }
-    out
+    crate::engine::agent::surfaced_tools_from_rollout(items)
 }
 
 /// The session id encoded in a `<createdAt>-<id>.jsonl` filename. `createdAt`

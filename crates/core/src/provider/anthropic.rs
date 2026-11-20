@@ -726,6 +726,47 @@ impl AnthropicProvider {
             })
     }
 
+    fn resolved_wire_caps(
+        &self,
+        req: &ModelRequest,
+    ) -> crate::types::provider::WireCapabilityPolicy {
+        let caps = self.capabilities_for(&req.model);
+        let mut policy = crate::types::provider::WireCapabilityPolicy::from_capabilities(&caps);
+        if let Some(bound) = &req.wire_caps {
+            macro_rules! overlay {
+                ($field:ident) => {
+                    if bound.$field.is_some() {
+                        policy.$field = bound.$field.clone();
+                    }
+                };
+            }
+            overlay!(mid_convo_system_messages);
+            overlay!(mid_convo_tool_changes);
+            overlay!(additional_tools);
+            overlay!(cache_control_on_tools);
+            overlay!(cache_scope_supported);
+            overlay!(cache_ttl_1h);
+            overlay!(long_cache_retention);
+            overlay!(explicit_prompt_cache_mode);
+            overlay!(prompt_cache_key_mode);
+            overlay!(session_affinity_format);
+            overlay!(cache_control_format);
+        }
+        policy
+    }
+
+    fn cache_scope_enabled_for(
+        &self,
+        wire_caps: &crate::types::provider::WireCapabilityPolicy,
+    ) -> bool {
+        !feature_disabled(
+            self.frozen_runtime_environment,
+            AnthropicFeatureFlag::GlobalCacheScope,
+        ) && wire_caps
+            .cache_scope_supported
+            .unwrap_or(self.is_first_party)
+    }
+
     /// Resolve the announcement variant for one request.
     fn tool_change_mode(&self, model: &RuntimeString, req: &ModelRequest) -> ToolChangeMode {
         if !self.tool_change_blocks_enabled(model, req) {
@@ -892,13 +933,15 @@ impl AnthropicProvider {
             req.max_media_blocks
                 .and_then(|value| usize::try_from(value.get()).ok()),
         );
+        let mut req = req.clone();
+        req.wire_caps = Some(self.resolved_wire_caps(&req));
         let params = build_params_with_media_limits(
-            req,
+            &req,
             req.output_schema.is_some(),
             false,
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools),
-            self.tool_change_mode(&req.model, req),
-            self.structured_output_mode(req),
+            self.tool_change_mode(&req.model, &req),
+            self.structured_output_mode(&req),
             self.requires_claude_code_identity(),
             image_limits,
             media_budget,
@@ -987,6 +1030,9 @@ impl ModelProvider for AnthropicProvider {
     ) -> ModelStream {
         let mut req = req;
         req.native_deferred_tools = metadata.native_deferred_tools;
+        req.wire_caps.get_or_insert_with(|| {
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+        });
         if let Err(error) =
             crate::provider::review_target::apply_typed_review_effort(&mut req, raw_effort.as_ref())
         {
@@ -1041,11 +1087,10 @@ impl ModelProvider for AnthropicProvider {
                 .max_media_blocks
                 .and_then(|value| usize::try_from(value.get()).ok()),
         );
-        let cache_scope_enabled = self.is_first_party
-            && !feature_disabled(
-                self.frozen_runtime_environment,
-                AnthropicFeatureFlag::GlobalCacheScope,
-            );
+        let mut request = request;
+        let wire_caps = self.resolved_wire_caps(&request);
+        let cache_scope_enabled = self.cache_scope_enabled_for(&wire_caps);
+        request.wire_caps = Some(wire_caps);
         let output_mode = self.structured_output_mode(&request);
         let mut params = build_params_with_media_limits(
             &request,
@@ -1244,6 +1289,9 @@ impl ModelProvider for AnthropicProvider {
         // clamp lives here where the per-model ceiling is known.
         let mut req = req;
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
+        let wire_caps = self.resolved_wire_caps(&req);
+        let cache_scope_enabled = self.cache_scope_enabled_for(&wire_caps);
+        req.wire_caps = Some(wire_caps);
         let output_mode = self.structured_output_mode(&req);
         let defer_loading_supported =
             self.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
@@ -1272,11 +1320,6 @@ impl ModelProvider for AnthropicProvider {
                 yield ModelStreamEvent::Error { error };
                 return;
             }
-            let cache_scope_enabled = is_first_party
-                && !feature_disabled(
-                    frozen_runtime_environment,
-                    AnthropicFeatureFlag::GlobalCacheScope,
-                );
             // A scope:'global' breakpoint is emitted only when the request carries
             // a leading run of global parts; the beta rides along only then.
             let emits_global_scope = cache_scope_enabled
@@ -1976,7 +2019,10 @@ async fn attempt_with_media_remediation(
                 if let Some((refusal, header_capability)) =
                     classify_tool_protocol_refusal(raw.status, &raw.message)
                 {
-                    if let Some(capability) = header_capability {
+                    let beta_dropped = if let Some(capability) = header_capability {
+                        let was_disabled = capability.is_empty()
+                            && ctx.tool_search_beta.is_some()
+                            && ctx.native_tool_support.disabled(&ctx.url, &ctx.hint_model);
                         // A refusal naming a beta header is the most specific
                         // signal: pin the exact surface the endpoint rejected.
                         if capability.is_empty() {
@@ -1993,8 +2039,11 @@ async fn attempt_with_media_remediation(
                             &diagnostic_string(&ctx.hint_model),
                             raw.status,
                         );
-                    }
-                    if downgrade_tool_protocol_body(ctx, refusal, raw.status) {
+                        capability.is_empty() && ctx.tool_search_beta.is_some() && !was_disabled
+                    } else {
+                        false
+                    };
+                    if downgrade_tool_protocol_body(ctx, refusal, raw.status) || beta_dropped {
                         continue;
                     }
                 }
@@ -2170,8 +2219,10 @@ async fn attempt_once(
                 }
             }
         }
-        if let Some(beta) = ctx.tool_search_beta {
-            merge_beta_header(&mut headers, beta);
+        if !ctx.native_tool_support.disabled(&ctx.url, &ctx.hint_model) {
+            if let Some(beta) = ctx.tool_search_beta {
+                merge_beta_header(&mut headers, beta);
+            }
         }
         if let Some(session) = &ctx.affinity_session_id {
             headers.insert("x-session-id".to_string(), session.clone());
@@ -3156,6 +3207,15 @@ fn build_params_with_media_limits(
         .iter()
         .map(|p| vobj(vec![("type", vs("text")), ("text", vs(p.text.clone()))]))
         .collect();
+    let profile = resolve_provider_behavior_profile(
+        Some(&ProviderInfo {
+            name: "anthropic".into(),
+            base_url: None,
+            env_key: None,
+            default_model: req.model.clone(),
+        }),
+        &req.model,
+    );
     // Under the tool-change block channel the top-level list is the frozen
     // baseline; later inventory changes ride in the message stream instead.
     let frozen_active = tool_change_mode != ToolChangeMode::Off
@@ -3163,17 +3223,37 @@ fn build_params_with_media_limits(
             .frozen_tools
             .as_ref()
             .is_some_and(|frozen| !frozen.is_empty());
+    let structured_replacement = structured_output_replaces_inventory(req, output_mode);
     // Surfaced deferred tools ride the native pairing channel (a marked
     // registration plus the historical search references), so on wires with
     // native deferred loading they leave both the immediate list and the
     // inventory-event stream.
     let is_surfaced_deferred = |name: &RuntimeString| {
-        defer_loading_supported
-            && req
-                .surfaced_deferred_names
-                .iter()
-                .any(|surfaced| surfaced == name)
+        if !defer_loading_supported {
+            return false;
+        }
+        let rendered = crate::provider::behavior::render_tool_name(name, &profile);
+        req.surfaced_deferred_names
+            .iter()
+            .any(|surfaced| surfaced == name || surfaced == &rendered)
     };
+    let marked_specs: Vec<&ToolSpec> = if defer_loading_supported && !structured_replacement {
+        req.tools
+            .iter()
+            .filter(|spec| {
+                is_surfaced_deferred(&spec.name)
+                    && !(frozen_active
+                        && req
+                            .frozen_tools
+                            .as_ref()
+                            .is_some_and(|frozen| frozen.iter().any(|base| base.name == spec.name)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let active_marked_names: std::collections::HashSet<RuntimeString> =
+        marked_specs.iter().map(|spec| spec.name.clone()).collect();
     let inventory_events: Vec<crate::types::provider::ToolInventoryEvent> = if frozen_active {
         req.tool_inventory_events
             .iter()
@@ -3197,13 +3277,14 @@ fn build_params_with_media_limits(
     } else {
         Vec::new()
     };
-    let mut messages = to_api_messages(
+    let mut messages = to_api_messages_with_marked(
         &req.messages,
         &diagnostic_string(&req.model),
         &req.tools,
         &inventory_events,
         tool_change_mode == ToolChangeMode::ByValue,
-        defer_loading_supported && !structured_output_replaces_inventory(req, output_mode),
+        defer_loading_supported && !structured_replacement,
+        Some(&active_marked_names),
     );
     // Modern Claude models reject assistant message prefill (400 when the final
     // message has role="assistant"). Ensure empty-input continuations after a
@@ -3227,35 +3308,6 @@ fn build_params_with_media_limits(
                 ])]),
             ),
         ]));
-    }
-    // Collapsed deferred tools are announced by name: a bare sorted list plus
-    // load guidance, wrapped as a system reminder on the trailing user turn.
-    // The trailing turn is the freshest bytes of the request, so the always
-    // current list costs no cached prefix, and unlocked tools drop off it as
-    // their marked registrations take over.
-    if defer_loading_supported
-        && !req.deferred_tools.is_empty()
-        && !structured_output_replaces_inventory(req, output_mode)
-    {
-        if let Some(last_user) = messages.iter_mut().rev().find(|message| {
-            message
-                .get("role")
-                .and_then(Value::as_str)
-                .is_some_and(|role| role == "user")
-        }) {
-            let mut text = RuntimeString::from("<system-reminder>\n")
-                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_HEADER));
-            for spec in &req.deferred_tools {
-                text = text.concat(&RuntimeString::from("\n")).concat(&spec.name);
-            }
-            text = text
-                .concat(&RuntimeString::from("\n\n"))
-                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE))
-                .concat(&RuntimeString::from("\n</system-reminder>"));
-            if let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut) {
-                blocks.push(vobj(vec![("type", vs("text")), ("text", vs(text))]));
-            }
-        }
     }
     // The final per-image ceiling precedes aggregate shedding. Otherwise an
     // invalid historical image could be silently discarded instead of refused.
@@ -3333,8 +3385,18 @@ fn build_params_with_media_limits(
         tools.push(build_web_search_tool(ws));
     }
 
-    let ttl = req.cache_ttl == Some(CacheTtl::OneHour);
-    apply_cache_breakpoints(
+    let ttl_1h_supported = req
+        .wire_caps
+        .as_ref()
+        .and_then(|policy| policy.cache_ttl_1h)
+        .unwrap_or(true);
+    let cache_control_on_tools = req
+        .wire_caps
+        .as_ref()
+        .and_then(|policy| policy.cache_control_on_tools)
+        .unwrap_or(true);
+    let ttl = ttl_1h_supported && req.cache_ttl == Some(CacheTtl::OneHour);
+    apply_cache_breakpoints_with_options(
         &req.system,
         &mut system,
         &mut tools,
@@ -3342,7 +3404,33 @@ fn build_params_with_media_limits(
         req.skip_cache_write.unwrap_or(false),
         ttl,
         cache_scope_enabled,
+        cache_control_on_tools,
     );
+
+    // Collapsed deferred tools are announced by name: appended AFTER cache
+    // breakpoints so the trailing user-message `cache_control` stays on the
+    // stable conversation prefix rather than shifting when tools are unlocked.
+    if defer_loading_supported && !req.deferred_tools.is_empty() && !structured_replacement {
+        if let Some(last_user) = messages.iter_mut().rev().find(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+        }) {
+            let mut text = RuntimeString::from("<system-reminder>\n")
+                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_HEADER));
+            for spec in &req.deferred_tools {
+                text = text.concat(&RuntimeString::from("\n")).concat(&spec.name);
+            }
+            text = text
+                .concat(&RuntimeString::from("\n\n"))
+                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE))
+                .concat(&RuntimeString::from("\n</system-reminder>"));
+            if let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut) {
+                blocks.push(vobj(vec![("type", vs("text")), ("text", vs(text))]));
+            }
+        }
+    }
 
     // Native deferred tool loading: folded (not-yet-unlocked) definitions
     // never ride the wire at all — the search channel announces them by name
@@ -3355,24 +3443,16 @@ fn build_params_with_media_limits(
     // tool stays unlocked. Skipped when a forced structured-output tool
     // replaced the whole inventory.
     if defer_loading_supported && !structured_replacement {
-        let marked: Vec<Value> =
-            req.tools
-                .iter()
-                .filter(|spec| {
-                    is_surfaced_deferred(&spec.name)
-                        && !(frozen_active
-                            && req.frozen_tools.as_ref().is_some_and(|frozen| {
-                                frozen.iter().any(|base| base.name == spec.name)
-                            }))
-                })
-                .map(|spec| {
-                    let mut tool = to_api_tool(spec);
-                    if let Some(object) = tool.as_object_mut() {
-                        object.insert("defer_loading", Value::Bool(true));
-                    }
-                    tool
-                })
-                .collect();
+        let marked: Vec<Value> = marked_specs
+            .iter()
+            .map(|spec| {
+                let mut tool = to_api_tool(spec);
+                if let Some(object) = tool.as_object_mut() {
+                    object.insert("defer_loading", Value::Bool(true));
+                }
+                tool
+            })
+            .collect();
         // Folded definitions are never promoted into the standing list, even
         // when it is empty: discovery belongs to the search channel, and a
         // full-definition collapse is exactly the context bloat the deferred
@@ -3578,31 +3658,47 @@ fn set_cache_control(block: &mut Value, cache_control: Value) {
 }
 
 /// Where the message-level breakpoint goes: the last markable block of the final
-/// message (or the second-to-last message on a fire-and-forget fork). Walks back
-/// past trailing thinking / redacted_thinking blocks (which can't carry it).
+/// non-system message (or earlier message when `skip` omits the final turn).
+/// Walks back past trailing thinking and inline tool-change blocks.
 fn message_cache_target(messages: &[Value], skip: bool) -> Option<(usize, usize)> {
-    let len = messages.len() as isize;
-    let target_index = if skip { len - 2 } else { len - 1 };
-    if target_index < 0 {
-        return None;
-    }
-    let ti = target_index as usize;
-    let content = messages.get(ti)?.get("content")?.as_array()?;
-    if content.is_empty() {
-        return None;
-    }
-    let mut bi = content.len() as isize - 1;
-    while bi >= 0 {
-        let t = content[bi as usize].get("type").and_then(Value::as_str);
-        if !t.is_some_and(|tag| tag == "thinking" || tag == "redacted_thinking") {
+    let candidate_limit = if skip {
+        messages.len().checked_sub(1)?
+    } else {
+        messages.len()
+    };
+    let mut idx = candidate_limit;
+    while idx > 0 {
+        idx -= 1;
+        let msg = &messages[idx];
+        if msg
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "system")
+        {
+            continue;
+        }
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut bi = content.len();
+        while bi > 0 {
+            bi -= 1;
+            let t = content[bi].get("type").and_then(Value::as_str);
+            if t.is_some_and(|tag| {
+                tag == "thinking"
+                    || tag == "redacted_thinking"
+                    || tag == "tool_addition"
+                    || tag == "tool_removal"
+            }) {
+                continue;
+            }
+            if content[bi].is_object() {
+                return Some((idx, bi));
+            }
             break;
         }
-        bi -= 1;
     }
-    if bi < 0 || !content[bi as usize].is_object() {
-        return None;
-    }
-    Some((ti, bi as usize))
+    None
 }
 
 /// Setter targets in low→high priority order (we keep the last N).
@@ -3615,7 +3711,8 @@ enum CacheTarget {
 /// Set cache breakpoints across the stable prefix (system + tools) and the
 /// conversation up to the final message, budgeted to ≤4 total; a leading run of
 /// `scope:'global'` parts reserves one always-kept breakpoint.
-fn apply_cache_breakpoints(
+#[allow(clippy::too_many_arguments)]
+fn apply_cache_breakpoints_with_options(
     parts: &[SystemPromptPart],
     system: &mut [Value],
     tools: &mut [Value],
@@ -3623,6 +3720,7 @@ fn apply_cache_breakpoints(
     skip_cache_write: bool,
     ttl: bool,
     cache_scope_enabled: bool,
+    cache_control_on_tools: bool,
 ) {
     // The leading run of global parts: one breakpoint on the LAST of them, always
     // kept (the stable prefix is the most valuable thing to pin).
@@ -3658,7 +3756,7 @@ fn apply_cache_breakpoints(
     }
 
     // After the tools array (on the last tool definition).
-    if !tools.is_empty() {
+    if cache_control_on_tools && !tools.is_empty() {
         targets.push(CacheTarget::Tool(tools.len() - 1));
     }
 
@@ -3837,6 +3935,19 @@ fn flush_tool_inventory_events(
 /// beta header per attempt, so a downgraded body stops advertising the
 /// protocol.
 fn body_declares_tool_change_blocks(body: &Value) -> bool {
+    let has_placeholder = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == DEFERRED_PLACEHOLDER_TOOL)
+            })
+        });
+    if has_placeholder {
+        return true;
+    }
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return false;
     };
@@ -3897,6 +4008,8 @@ fn body_declares_inline_tool_values(body: &Value) -> bool {
 /// the cached prefix is rebuilt once; the caller records the downgrade.
 fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
     let mut folded: Vec<Value> = Vec::new();
+    let mut stripped_ref_names: std::collections::HashSet<RuntimeString> =
+        std::collections::HashSet::new();
     let mut found = false;
     {
         if let Some(tools) = body.get("tools").and_then(Value::as_array) {
@@ -3937,6 +4050,19 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
                                 });
                             }
                             folded.push(definition.clone());
+                        } else if block
+                            .get("tool")
+                            .and_then(|tool| tool.get("type"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|tag| tag == "tool_reference")
+                        {
+                            if let Some(name) = block
+                                .get("tool")
+                                .and_then(|tool| tool.get("name"))
+                                .and_then(Value::as_str)
+                            {
+                                stripped_ref_names.insert(name.clone());
+                            }
                         }
                     } else if kind.is_some_and(|tag| tag == "tool_removal") {
                         found = true;
@@ -3956,6 +4082,19 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
     }
     if !found {
         return false;
+    }
+    if !stripped_ref_names.is_empty() {
+        for tool in folded.iter_mut() {
+            let matches_stripped = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| stripped_ref_names.contains(name));
+            if matches_stripped {
+                if let Some(object) = tool.as_object_mut() {
+                    object.remove("defer_loading");
+                }
+            }
+        }
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages.iter_mut() {
@@ -3985,6 +4124,35 @@ fn rebuild_without_inline_tool_blocks(body: &mut Value) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|blocks| blocks.is_empty()))
         });
+        let mut coalesced: Vec<Value> = Vec::with_capacity(messages.len());
+        for message in messages.drain(..) {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .and_then(|r| r.try_to_utf8().ok());
+            let same_role = role
+                .as_deref()
+                .is_some_and(|r| r == "user" || r == "assistant")
+                && coalesced
+                    .last()
+                    .and_then(|prev| prev.get("role").and_then(Value::as_str))
+                    .and_then(|r| r.try_to_utf8().ok())
+                    == role;
+            if same_role {
+                if let (Some(prev_blocks), Some(next_blocks)) = (
+                    coalesced
+                        .last_mut()
+                        .and_then(|prev| prev.get_mut("content"))
+                        .and_then(Value::as_array_mut),
+                    message.get("content").and_then(Value::as_array),
+                ) {
+                    prev_blocks.extend(next_blocks.iter().cloned());
+                    continue;
+                }
+            }
+            coalesced.push(message);
+        }
+        *messages = coalesced;
     }
     if let Some(object) = body.as_object_mut() {
         if folded.is_empty() {
@@ -4062,6 +4230,16 @@ fn classify_tool_protocol_refusal(
     }
     if !super::native_tools::unsupported_native_tools(status, message) {
         return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    let mentions_inline = ["tool_addition", "tool_removal", "tool_definition"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let mentions_defer = ["defer_loading", "tool_reference", "tool_search"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if mentions_defer && !mentions_inline {
+        return Some((ToolProtocolRefusal::DeferUnsupported, None));
     }
     // A refusal of the block channel that is not value-specific: unknown block
     // types and channel-level validation errors land here.
@@ -4288,10 +4466,10 @@ fn downgrade_tool_protocol_body(
         ToolProtocolRefusal::PlatformUnsupported | ToolProtocolRefusal::BlocksUnsupported => {
             // Learn only the surface the body actually carries: block
             // artifacts fold into the top-level list; without them the
-            // refusal can only target the deferred registrations, which
-            // convert to immediate declarations. With neither surface on
-            // the wire nothing is learned and ordinary error handling
-            // proceeds.
+            // refusal can only target the deferred registrations and
+            // tool_reference blocks, which convert to immediate/text forms.
+            // With neither surface on the wire nothing is learned and
+            // ordinary error handling proceeds.
             let mut body = ctx.body.lock_recover();
             if rebuild_without_inline_tool_blocks(&mut body) {
                 learn(INLINE_TOOLS_CAPABILITY);
@@ -4299,7 +4477,9 @@ fn downgrade_tool_protocol_body(
                 record("tool-change-blocks");
                 return true;
             }
-            if downgrade_deferred_registrations(&mut body) {
+            let references = rebuild_reference_results_as_text(&mut body);
+            let downgraded = downgrade_deferred_registrations(&mut body);
+            if references || downgraded {
                 learn("");
                 record("defer-loading");
                 return true;
@@ -4307,19 +4487,31 @@ fn downgrade_tool_protocol_body(
             false
         }
         ToolProtocolRefusal::DeferUnsupported => {
+            let beta_flipped = ctx.tool_search_beta.is_some()
+                && !ctx.native_tool_support.disabled(&ctx.url, &ctx.hint_model);
             learn("");
             let mut body = ctx.body.lock_recover();
             let references = rebuild_reference_results_as_text(&mut body);
             let downgraded = downgrade_deferred_registrations(&mut body);
-            if references || downgraded {
+            let inline_folded = if body_declares_tool_change_blocks(&body)
+                && rebuild_without_inline_tool_blocks(&mut body)
+            {
+                learn(INLINE_TOOLS_CAPABILITY);
+                learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
+                true
+            } else {
+                false
+            };
+            if references || downgraded || inline_folded || beta_flipped {
                 record("defer-loading");
             }
-            references || downgraded
+            references || downgraded || inline_folded || beta_flipped
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn to_api_messages(
     messages: &[Message],
     target_model: &str,
@@ -4327,6 +4519,27 @@ fn to_api_messages(
     inventory_events: &[crate::types::provider::ToolInventoryEvent],
     by_value: bool,
     reference_results: bool,
+) -> Vec<Value> {
+    to_api_messages_with_marked(
+        messages,
+        target_model,
+        tools,
+        inventory_events,
+        by_value,
+        reference_results,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_api_messages_with_marked(
+    messages: &[Message],
+    target_model: &str,
+    tools: &[ToolSpec],
+    inventory_events: &[crate::types::provider::ToolInventoryEvent],
+    by_value: bool,
+    reference_results: bool,
+    marked_names: Option<&std::collections::HashSet<RuntimeString>>,
 ) -> Vec<Value> {
     let behavior_profile = resolve_provider_behavior_profile(
         Some(&ProviderInfo {
@@ -4352,7 +4565,7 @@ fn to_api_messages(
         }
     }
     let mut pending: Vec<usize> = unanchored.clone();
-    let mut matched: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut matched: std::collections::HashSet<usize> = unanchored.iter().copied().collect();
     let mut i = 0;
     while i < messages.len() {
         match &messages[i] {
@@ -4368,7 +4581,12 @@ fn to_api_messages(
                     let Message::ToolResult(tr) = &messages[i] else {
                         break;
                     };
-                    content.push(tool_result_msg_block(tr, reference_results));
+                    content.push(tool_result_msg_block_with_marked(
+                        tr,
+                        reference_results,
+                        &behavior_profile,
+                        marked_names,
+                    ));
                     if let Some(extra) = &tr.extra_user_blocks {
                         for eb in extra {
                             deferred.extend(map_block(eb, tools));
@@ -4390,9 +4608,6 @@ fn to_api_messages(
                 push_user_content(&mut out, content);
             }
             Message::Assistant(a) => {
-                // Held-back announcements flush directly before the next
-                // assistant message, never between a tool call and its result.
-                flush_tool_inventory_events(&mut out, &mut pending, inventory_events, by_value);
                 // A model switch leaves prior assistant turns carrying thinking
                 // signatures bound to their producing model; drop those first.
                 let stripped;
@@ -4405,25 +4620,33 @@ fn to_api_messages(
                     &a.content
                 };
                 let content = map_blocks(blocks, tools);
-                // Coalesce consecutive assistant messages so roles alternate.
-                let merged = out.last_mut().is_some_and(|last| {
-                    if last
-                        .get("role")
-                        .and_then(Value::as_str)
-                        .is_some_and(|role| role == "assistant")
-                    {
-                        if let Some(prev) = last.get_mut("content").and_then(Value::as_array_mut) {
-                            prev.extend(content.clone());
-                            return true;
+                if !content.is_empty() {
+                    // Held-back announcements flush directly before a non-empty
+                    // assistant message, never leaving an orphan system message
+                    // between consecutive user messages.
+                    flush_tool_inventory_events(&mut out, &mut pending, inventory_events, by_value);
+                    // Coalesce consecutive assistant messages so roles alternate.
+                    let merged = out.last_mut().is_some_and(|last| {
+                        if last
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .is_some_and(|role| role == "assistant")
+                        {
+                            if let Some(prev) =
+                                last.get_mut("content").and_then(Value::as_array_mut)
+                            {
+                                prev.extend(content.clone());
+                                return true;
+                            }
                         }
+                        false
+                    });
+                    if !merged {
+                        out.push(vobj(vec![
+                            ("role", vs("assistant")),
+                            ("content", Value::Array(content)),
+                        ]));
                     }
-                    false
-                });
-                if !merged && !content.is_empty() {
-                    out.push(vobj(vec![
-                        ("role", vs("assistant")),
-                        ("content", Value::Array(content)),
-                    ]));
                 }
             }
             Message::CompactBoundary(cb) => {
@@ -4792,25 +5015,67 @@ fn map_output_block(b: &OutputBlock) -> Value {
     }
 }
 
+#[cfg(test)]
 fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Value {
+    let behavior_profile = resolve_provider_behavior_profile(
+        Some(&ProviderInfo {
+            name: "anthropic".into(),
+            base_url: None,
+            env_key: None,
+            default_model: "claude-sonnet-5-5".into(),
+        }),
+        &RuntimeString::from("claude-sonnet-5-5"),
+    );
+    tool_result_msg_block_with_marked(tr, reference_results, &behavior_profile, None)
+}
+
+fn tool_result_msg_block_with_marked(
+    tr: &ToolResultMessage,
+    reference_results: bool,
+    behavior_profile: &ProviderBehaviorProfile,
+    marked_names: Option<&std::collections::HashSet<RuntimeString>>,
+) -> Value {
     // A successful native search result replays as name-only reference blocks:
     // the server pairs each reference with the matching `defer_loading`
     // registration in the tool list and renders the definition at the
-    // reference position. Without the native channel the recorded text rides
-    // instead.
-    let references = reference_results
+    // reference position. Only tools actually marked in `tools[]` emit a
+    // `tool_reference`; absent/promoted tools fall through to full text so the
+    // wire never holds dangling references.
+    let ref_blocks: Vec<Value> = if reference_results
         && !tr.is_error
         && tr.tool_kind == Some(crate::types::provider::ProviderToolCallKind::ToolSearch)
-        && tr
-            .native_tool_output
+    {
+        tr.native_tool_output
             .as_ref()
             .and_then(|output| output.get("matched"))
             .and_then(Value::as_array)
-            .is_some_and(|matched| !matched.is_empty());
-    // On the fallback protocol the same result projects to full text: every
-    // delivered definition plus the fixed-entry invocation guidance, because
-    // a text-only result is the model's sole copy of the schema.
-    let projected = if !references && !tr.is_error {
+            .map(|matched| {
+                matched
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|name| {
+                        let rendered =
+                            crate::provider::behavior::render_tool_name(name, behavior_profile);
+                        let wire_name = match marked_names {
+                            Some(active) if active.contains(&rendered) => Some(rendered),
+                            Some(active) if active.contains(name) => Some(name.clone()),
+                            Some(_) => None,
+                            None => Some(rendered),
+                        }?;
+                        Some(vobj(vec![
+                            ("type", vs("tool_reference")),
+                            ("tool_name", vs(wire_name)),
+                        ]))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // On the fallback protocol (or when no marked reference remains active),
+    // project full text definitions + fixed-entry invocation guidance if present.
+    let projected = if ref_blocks.is_empty() && !tr.is_error {
         tr.tool_kind
             .filter(|kind| *kind == crate::types::provider::ProviderToolCallKind::ToolSearch)
             .and(tr.native_tool_output.as_ref())
@@ -4818,21 +5083,8 @@ fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Val
     } else {
         None
     };
-    let content: Vec<Value> = if references {
-        tr.native_tool_output
-            .as_ref()
-            .and_then(|output| output.get("matched"))
-            .and_then(Value::as_array)
-            .expect("checked above")
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|name| {
-                vobj(vec![
-                    ("type", vs("tool_reference")),
-                    ("tool_name", vs(name.clone())),
-                ])
-            })
-            .collect()
+    let content: Vec<Value> = if !ref_blocks.is_empty() {
+        ref_blocks
     } else if let Some(text) = projected {
         vec![vobj(vec![("type", vs("text")), ("text", vs(text))])]
     } else {
@@ -8599,6 +8851,149 @@ mod tests {
         assert!(
             msgs[1]["content"][0].get("cache_control").is_some(),
             "the breakpoint steps back to the penultimate message"
+        );
+    }
+
+    #[test]
+    fn deferred_reminder_and_system_blocks_never_steal_cache_breakpoints_and_unanchored_events_emit_once(
+    ) {
+        use crate::schemas::content::ThinkingBlock;
+        use crate::types::provider::{CacheTtl, ToolInventoryEvent, WireCapabilityPolicy};
+        let mut req = base_req();
+        req.model = "claude-sonnet-5-5".into();
+        req.cache_ttl = Some(CacheTtl::OneHour);
+        req.wire_caps = Some(WireCapabilityPolicy {
+            cache_control_on_tools: Some(false),
+            cache_ttl_1h: Some(false),
+            ..Default::default()
+        });
+        req.tools = vec![
+            inline_spec("tool_search"),
+            inline_spec("bash"),
+            inline_spec("Read"),
+        ];
+        req.deferred_tools = vec![inline_spec("write")];
+        req.surfaced_deferred_names = vec!["Read".into()];
+        let mut result_msg = search_result_message(&["read"]);
+        if let Message::ToolResult(tr) = &mut result_msg {
+            tr.tool_use_id = "call-1".into();
+        }
+        req.messages = vec![
+            user_msg("hi"),
+            assistant_tool_use("a1", "call-1", "tool_search"),
+            result_msg,
+            // Thinking-only assistant message whose model differs: stripped to empty.
+            Message::Assistant(AssistantMessage {
+                uuid: "a-empty".into(),
+                model: "gpt-5".into(),
+                usage: None,
+                content: vec![ContentBlock::Thinking(ThinkingBlock {
+                    text: "stale".into(),
+                    message_id: None,
+                    signature: Some("OLD-SIG".into()),
+                    encrypted_content: None,
+                })],
+            }),
+        ];
+        req.frozen_tools = Some(vec![inline_spec("tool_search"), inline_spec("bash")]);
+        req.tool_inventory_events = vec![ToolInventoryEvent {
+            anchor_uuid: None,
+            added: vec![inline_spec("calculator")],
+            removed: vec![],
+        }];
+
+        let body = build_params_with_media_limits(
+            &req,
+            false,
+            true,
+            true,
+            ToolChangeMode::ByValue,
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            false,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("build_params");
+
+        // 1. `cache_control_on_tools = false` keeps cache_control off tools.
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool.get("cache_control").is_none()));
+        // Rendered deferred `Read` is marked defer_loading, paired with tool_reference("Read").
+        let read_tool = tools
+            .iter()
+            .find(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == "Read")
+            })
+            .expect("Read marked tool");
+        assert_eq!(read_tool.get("defer_loading"), Some(&Value::Bool(true)));
+
+        let messages = body.get("messages").unwrap().as_array().unwrap();
+        // 2. Unanchored inventory event appears at most once (trailing system message).
+        let system_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "system")
+            })
+            .collect();
+        assert_eq!(system_msgs.len(), 1);
+        assert!(system_msgs[0]
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap()[0]
+            .get("cache_control")
+            .is_none());
+
+        // 3. Last user message carries `<system-reminder>` AFTER `cache_control` breakpoint,
+        // and `cache_ttl_1h = false` omits `"ttl": "1h"`.
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user")
+            })
+            .unwrap();
+        let user_blocks = last_user.get("content").and_then(Value::as_array).unwrap();
+        let reminder_idx = user_blocks
+            .iter()
+            .position(|b| {
+                b.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.try_to_utf8().ok())
+                    .is_some_and(|t| t.contains("<system-reminder>"))
+            })
+            .expect("reminder block");
+        assert_eq!(reminder_idx, user_blocks.len() - 1);
+        assert!(user_blocks[reminder_idx].get("cache_control").is_none());
+        let cached_block = user_blocks[reminder_idx - 1]
+            .get("cache_control")
+            .expect("cache breakpoint before reminder");
+        assert!(cached_block.get("ttl").is_none());
+
+        // 4. Matched `read` mapped to rendered `Read` in tool_reference.
+        let tool_res_block = user_blocks
+            .iter()
+            .find(|b| {
+                b.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "tool_result")
+            })
+            .unwrap();
+        assert_eq!(
+            tool_res_block["content"][0],
+            vobj(vec![
+                ("type", vs("tool_reference")),
+                ("tool_name", vs("Read")),
+            ])
         );
     }
 }

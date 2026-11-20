@@ -192,14 +192,26 @@ impl RequestTiming {
     /// layer serializes for the wire anyway.
     pub(crate) fn record_prefix(&mut self, request: &ModelRequest) {
         let fingerprint = super::prefix_fingerprint::PrefixFingerprint::of(request);
-        let attribution = super::prefix_attribution::attribute(
-            request
-                .cache_domain
+        let base_key = request
+            .cache_key
+            .as_ref()
+            .or(request.cache_domain.as_ref())
+            .map(crate::provider::util::diagnostic_string);
+        let routing_key = match (base_key, request.skip_cache_write == Some(true)) {
+            (Some(key), true) => Some(format!("{key}:skip_write")),
+            (Some(key), false) => Some(key),
+            (None, true) => Some("default:skip_write".to_string()),
+            (None, false) => None,
+        };
+        let retention_long = request.cache_ttl == Some(crate::types::provider::CacheTtl::OneHour)
+            && request
+                .wire_caps
                 .as_ref()
-                .or(request.cache_key.as_ref())
-                .map(crate::provider::util::diagnostic_string)
-                .as_deref(),
-            request.cache_ttl == Some(crate::types::provider::CacheTtl::OneHour),
+                .and_then(|caps| caps.cache_ttl_1h)
+                .unwrap_or(true);
+        let attribution = super::prefix_attribution::attribute(
+            routing_key.as_deref(),
+            retention_long,
             &fingerprint,
         );
         if let (Some(fields), Value::Object(prefix)) =
@@ -710,5 +722,85 @@ mod tests {
         assert_eq!(records.last().unwrap()["errorKind"], "network");
         let text = serde_json::to_string(&records).unwrap();
         assert!(!text.contains("private upstream body"), "{text}");
+    }
+
+    #[test]
+    fn skip_cache_write_requests_do_not_clobber_main_prefix_attribution() {
+        let user_msg = |msg_id: &str| {
+            crate::schemas::message::Message::User(crate::schemas::message::UserMessage {
+                uuid: msg_id.into(),
+                content: vec![crate::schemas::content::ContentBlock::Text(
+                    crate::schemas::content::TextBlock {
+                        text: "msg".into(),
+                        citations: None,
+                        harness_envelope: None,
+                        message_id: None,
+                        phase: None,
+                    },
+                )],
+                is_meta: None,
+                question_answer: None,
+            })
+        };
+        let mut t1 = RequestTiming::start(
+            "normal",
+            "u1",
+            &"claude-opus-5-5".into(),
+            None,
+            None,
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        let mut first_main = crate::observability::prefix_fingerprint::tests::request();
+        first_main.cache_domain = Some("shared-domain-isolation".into());
+        first_main.cache_key = Some("main-session-isolation".into());
+        first_main.messages.push(user_msg("m-1"));
+        t1.record_prefix(&first_main);
+
+        let mut t_skip = RequestTiming::start(
+            "normal",
+            "u2",
+            &"claude-opus-5-5".into(),
+            None,
+            None,
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        let mut skip_req = crate::observability::prefix_fingerprint::tests::request();
+        skip_req.cache_domain = Some("shared-domain-isolation".into());
+        skip_req.cache_key = Some("main-session-isolation".into());
+        skip_req.messages.push(user_msg("m-skip"));
+        skip_req.skip_cache_write = Some(true);
+        t_skip.record_prefix(&skip_req);
+
+        let mut t2 = RequestTiming::start(
+            "normal",
+            "u3",
+            &"claude-opus-5-5".into(),
+            None,
+            None,
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        let mut second_main = first_main.clone();
+        second_main.messages.push(user_msg("m-2"));
+        t2.record_prefix(&second_main);
+
+        assert_eq!(
+            t1.fields["prefixMissReasons"],
+            serde_json::json!(["cold_start"])
+        );
+        assert_eq!(
+            t2.fields["prefixMissReasons"],
+            serde_json::json!(["likely_server_side"]),
+            "skip_cache_write call must not replace main cache_key snapshot"
+        );
+        assert_eq!(t2.fields["prefixContinuesPrefix"], serde_json::json!(true));
     }
 }

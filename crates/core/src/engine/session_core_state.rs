@@ -1605,6 +1605,7 @@ impl Session {
             context_edit_state: Arc::new(
                 crate::context::context_editing::ContextEditState::default(),
             ),
+            tool_freeze_state: Arc::new(crate::engine::query::ToolFreezeState::default()),
             file_changes: Mutex::new(SessionFileChanges::default()),
             subagents: SessionSubagentState {
                 model_target_resolver: Mutex::new(None),
@@ -4451,7 +4452,8 @@ impl Session {
         config: &ResolvedConfig,
     ) {
         if let Some(tool) = tools.iter_mut().find(|tool| tool.name() == "task") {
-            *tool = crate::tools::builtins::task::create_task_tool(
+            let exposure = tool.exposure();
+            let mut rebuilt = crate::tools::builtins::task::create_task_tool(
                 crate::tools::builtins::task::TaskToolOptions {
                     model_catalog: config.subagent_model_catalog,
                     model_options: config.subagent_model_options.clone(),
@@ -4463,6 +4465,12 @@ impl Session {
                         .collect(),
                 },
             );
+            if rebuilt.exposure() != exposure {
+                rebuilt = crate::tools::builtins::tool_search::ExposureOverrideTool::wrap(
+                    rebuilt, exposure,
+                );
+            }
+            *tool = rebuilt;
         }
     }
 

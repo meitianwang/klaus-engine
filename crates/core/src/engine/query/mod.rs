@@ -71,6 +71,7 @@ mod support;
 pub(super) mod tool_dispatch;
 mod tool_tasks;
 pub(crate) use tool_dispatch::gate_request_images;
+#[cfg(any(test, feature = "testing"))]
 pub(crate) use tool_dispatch::tool_not_loaded_message;
 pub use tool_tasks::RetainedToolTasks;
 mod turn;
@@ -81,7 +82,10 @@ pub use request::abortable_sleep;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use request::catalog_entry;
 use request::*;
-pub(crate) use request::{finalize_instruction_system, visible_tool_specs};
+pub(crate) use request::{
+    finalize_instruction_system, surfaced_tools_from_messages, surfaced_tools_from_server_output,
+    visible_tool_specs,
+};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use result_trim::tool_result_spill_limit_from_override;
 use result_trim::*;
@@ -505,6 +509,10 @@ pub struct QueryParams {
     /// already cleared; absent on auxiliary and view-only queries.
     pub context_edit_state:
         Option<std::sync::Arc<crate::context::context_editing::ContextEditState>>,
+    /// Session-scoped frozen tool-inventory epoch for in-place tool-change
+    /// transports. Present on main and review sessions so the baseline survives
+    /// across turns until history discontinuity or explicit clear.
+    pub tool_freeze_state: Option<Arc<ToolFreezeState>>,
     /// Long-horizon token spend carried across compactions, for the padded
     /// remaining-context countdown. Zero for every other reminder mode.
     pub padded_countdown_spend: PaddedCountdownSpend,
@@ -699,12 +707,30 @@ pub(super) struct ToolFreezeEpoch {
     pub(super) specs: Vec<ToolSpec>,
     pub(super) prefix_len: usize,
     pub(super) prefix_hash: [u8; 32],
+    pub(super) compact_boundaries: usize,
+    pub(super) static_deferred_dispatch: bool,
     pub(super) oversized: bool,
     pub(super) events: Vec<crate::types::provider::ToolInventoryEvent>,
     /// Stable instruction text captured with the baseline, for transports that
     /// send base instructions as a byte-stable prefix history item that is not
     /// re-asserted while the epoch stands.
     pub(super) instructions: Option<RuntimeString>,
+}
+
+/// Session-scoped holder for [`ToolFreezeEpoch`], shared across turns of the
+/// same conversation so tool freezing and incremental change batches persist
+/// until a history discontinuity (compaction, rollback, restore) resets them.
+#[derive(Default)]
+pub(crate) struct ToolFreezeState(Mutex<Option<ToolFreezeEpoch>>);
+
+impl ToolFreezeState {
+    pub(crate) fn clear(&self) {
+        *self.0.lock_recover() = None;
+    }
+
+    pub(super) fn lock_recover(&self) -> std::sync::MutexGuard<'_, Option<ToolFreezeEpoch>> {
+        self.0.lock_recover()
+    }
 }
 
 struct Shared {
@@ -723,7 +749,7 @@ struct Shared {
     /// Deferred tools surfaced via `tool_search` this session.
     surfaced: Mutex<HashSet<RuntimeString>>,
     /// Frozen tool-inventory epoch for in-place tool-change transports.
-    tool_freeze: Mutex<Option<ToolFreezeEpoch>>,
+    tool_freeze: Arc<ToolFreezeState>,
     /// Latched when an oversized tool inventory exceeds the model's input window
     /// and must fall back from eager exposure to `tool_search` deferral.
     oversized_inventory_deferred: std::sync::atomic::AtomicBool,

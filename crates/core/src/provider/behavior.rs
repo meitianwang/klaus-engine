@@ -1653,7 +1653,10 @@ fn closed_object_schema(properties: RuntimeObject, required: &[&str]) -> Runtime
     RuntimeJson::Object(schema)
 }
 
-fn render_tool_name(name: &RuntimeString, profile: &ProviderBehaviorProfile) -> RuntimeString {
+pub(crate) fn render_tool_name(
+    name: &RuntimeString,
+    profile: &ProviderBehaviorProfile,
+) -> RuntimeString {
     let name_key = runtime_classification_key(name);
     let rendered = match profile.prompt_style {
         ProviderPromptStyle::AnthropicReminder => match name_key.as_str() {

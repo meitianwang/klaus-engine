@@ -75,19 +75,26 @@ pub(crate) fn unsupported_native_tools(status: Option<u16>, message: &str) -> bo
     ]
     .iter()
     .any(|needle| message.contains(needle));
+    let system_role_refusal = message.contains("system")
+        && (message.contains("role")
+            || message.contains("messages")
+            || message.contains("first")
+            || message.contains("middle"));
     validation
-        && ([
-            "defer_loading",
-            "tool_search",
-            "tool_reference",
-            "execution",
-            "additional_tools",
-            "tool_addition",
-            "tool_removal",
-            "namespace",
-        ]
-        .iter()
-        .any(|needle| message.contains(needle))
+        && (system_role_refusal
+            || [
+                "defer_loading",
+                "tool_search",
+                "tool_reference",
+                "execution",
+                "additional_tools",
+                "tool_addition",
+                "tool_removal",
+                "tool_definition",
+                "namespace",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
             || message.contains("extra inputs are not permitted"))
 }
 

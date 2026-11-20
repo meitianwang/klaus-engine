@@ -1287,7 +1287,16 @@ fn attach_marker_to_message(message: &mut Value, long_retention: bool) {
 /// message, the last tool entry (declaration level), and the last text part of
 /// the final user/assistant/tool message. The long retention upgrades markers
 /// to a one-hour ttl.
+#[cfg(test)]
 fn apply_anthropic_style_cache_markers(body: &mut Value, long_retention: bool) {
+    apply_anthropic_style_cache_markers_with_options(body, long_retention, true);
+}
+
+fn apply_anthropic_style_cache_markers_with_options(
+    body: &mut Value,
+    long_retention: bool,
+    cache_control_on_tools: bool,
+) {
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         if let Some(first) = messages.iter_mut().find(|message| {
             message
@@ -1306,10 +1315,12 @@ fn apply_anthropic_style_cache_markers(body: &mut Value, long_retention: bool) {
             attach_marker_to_message(last, long_retention);
         }
     }
-    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        if let Some(last) = tools.last_mut() {
-            if let Some(object) = last.as_object_mut() {
-                object.insert("cache_control", anthropic_style_marker(long_retention));
+    if cache_control_on_tools {
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            if let Some(last) = tools.last_mut() {
+                if let Some(object) = last.as_object_mut() {
+                    object.insert("cache_control", anthropic_style_marker(long_retention));
+                }
             }
         }
     }
@@ -1900,14 +1911,79 @@ fn build_responses_params_with_tool_mode(
         }
         out
     };
+    let profile = openai_behavior_profile(&req.model);
     let batch_events: Vec<crate::types::provider::ToolInventoryEvent> = if batch_tools {
+        let search_loaded: HashSet<RuntimeString> = if native_search {
+            let mut names = HashSet::new();
+            for surfaced in &req.surfaced_deferred_names {
+                names.insert(crate::provider::behavior::render_tool_name(
+                    surfaced, &profile,
+                ));
+                names.insert(surfaced.clone());
+            }
+            for message in &req.messages {
+                if let Message::ToolResult(tr) = message {
+                    if !tr.is_error
+                        && matches!(
+                            tr.tool_kind,
+                            Some(
+                                ProviderToolCallKind::ToolSearch
+                                    | ProviderToolCallKind::ServerToolSearch
+                            )
+                        )
+                    {
+                        if let Some(payload) = &tr.native_tool_output {
+                            if let Some(matched) = payload
+                                .get("matched")
+                                .and_then(crate::runtime_values::RuntimeJson::as_array)
+                            {
+                                for entry in matched {
+                                    if let Some(name) =
+                                        crate::runtime_values::RuntimeJson::as_string(entry)
+                                    {
+                                        names.insert(crate::provider::behavior::render_tool_name(
+                                            name, &profile,
+                                        ));
+                                        names.insert(name.clone());
+                                    }
+                                }
+                            }
+                            for extracted in crate::engine::query::surfaced_tools_from_server_output(
+                                payload, None, &profile,
+                            ) {
+                                names.insert(crate::provider::behavior::render_tool_name(
+                                    &extracted, &profile,
+                                ));
+                                names.insert(extracted);
+                            }
+                        }
+                    }
+                }
+            }
+            names
+        } else {
+            HashSet::new()
+        };
         req.tool_inventory_events
             .iter()
             .map(|event| crate::types::provider::ToolInventoryEvent {
                 anchor_uuid: event.anchor_uuid.clone(),
-                added: normalize_batch_kinds(&event.added),
-                removed: event.removed.clone(),
+                added: normalize_batch_kinds(
+                    &event
+                        .added
+                        .iter()
+                        .filter(|spec| !search_loaded.contains(&spec.name))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                removed: event
+                    .removed
+                    .iter()
+                    .filter(|name| !search_loaded.contains(*name))
+                    .cloned()
+                    .collect(),
             })
+            .filter(|event| !event.added.is_empty() || !event.removed.is_empty())
             .collect()
     } else {
         Vec::new()
@@ -1917,7 +1993,6 @@ fn build_responses_params_with_tool_mode(
     // its instruction authority without pretending to be human input.
     let (stable_parts, volatile_parts) = split_system_for_cache(&req.system);
     let instructions = join_system_parts(stable_parts);
-    let profile = openai_behavior_profile(&req.model);
     // Namespace grouping rides every non-function-tools Responses list; the
     // learning layer can refuse it per endpoint and model, and the downgrade
     // rebuild then re-renders the same inventory flat.
@@ -6596,9 +6671,22 @@ impl OpenAIProvider {
             let request_id = identity.map(|_| random_request_id());
             let mut body = build_chat_params_with_identity(&req, identity, request_id.as_deref(), &capabilities, reasoning_dialect, first_party_cache_endpoint);
             if anthropic_cache_markers {
-                apply_anthropic_style_cache_markers(
+                let ttl_1h_supported = req
+                    .wire_caps
+                    .as_ref()
+                    .and_then(|policy| policy.cache_ttl_1h)
+                    .or(capabilities.cache_ttl_1h)
+                    .unwrap_or(true);
+                let cache_control_on_tools = req
+                    .wire_caps
+                    .as_ref()
+                    .and_then(|policy| policy.cache_control_on_tools)
+                    .or(capabilities.cache_control_on_tools)
+                    .unwrap_or(true);
+                apply_anthropic_style_cache_markers_with_options(
                     &mut body,
-                    cache_retention_of(&req) == CacheRetention::Long,
+                    ttl_1h_supported && cache_retention_of(&req) == CacheRetention::Long,
+                    cache_control_on_tools,
                 );
             }
             if let Err(error) = apply_review_effort_body(&mut body, review_effort.as_ref(), reasoning_dialect, false) { yield ModelStreamEvent::Error { error }; return; }
@@ -7156,6 +7244,9 @@ impl ModelProvider for OpenAIProvider {
         let mut selected = self.clone();
         let mut req = req;
         req.native_deferred_tools = metadata.native_deferred_tools;
+        req.wire_caps.get_or_insert_with(|| {
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+        });
         selected.reviewer_header_model = self.reviewer_attribution_model();
 
         let model = match req.model.try_to_utf8() {
@@ -14702,5 +14793,103 @@ mod tests {
             error.code,
             Some("responses_tool_input_unrepresentable".into())
         );
+    }
+
+    #[test]
+    fn flatten_tool_namespaces_handles_tool_search_output_and_tool_choice_and_batch_dedupes() {
+        let mut body = json!({
+            "tools": [
+                {"type":"namespace","name":"mcp__calendar","description":"Tools in the mcp__calendar namespace.","tools":[
+                    {"type":"function","name":"create_event","description":"Create.","strict":false,"parameters":{"type":"object"}}
+                ]}
+            ],
+            "tool_choice": {"type":"function","namespace":"mcp__calendar","name":"create_event"},
+            "input": [
+                {"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client","tools":[
+                    {"type":"namespace","name":"mcp__calendar","description":"Tools in the mcp__calendar namespace.","tools":[
+                        {"type":"function","name":"create_event","description":"Create.","strict":false,"parameters":{"type":"object"}}
+                    ]}
+                ]}
+            ]
+        });
+        assert!(native_tool_loading::contains_tool_namespaces(&body));
+        native_tool_loading::flatten_tool_namespaces(&mut body);
+        assert!(!native_tool_loading::contains_tool_namespaces(&body));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type":"function","name":"mcp__calendar__create_event"})
+        );
+        assert_eq!(
+            body["input"][0]["tools"][0]["name"],
+            vs("mcp__calendar__create_event")
+        );
+
+        // Batch mode + native search must not re-transmit tools materialized by ToolSearch
+        // or ServerToolSearch.
+        for tool_kind in [
+            ProviderToolCallKind::ToolSearch,
+            ProviderToolCallKind::ServerToolSearch,
+        ] {
+            let mut req = batch_fixture_request();
+            req.native_deferred_tools = Some(true);
+            req.tools.push(batch_spec("tool_search"));
+            req.tools.push(batch_spec("mcp__calendar__create_event"));
+            req.surfaced_deferred_names = vec!["mcp__calendar__create_event".into()];
+            req.tool_inventory_events
+                .push(crate::types::provider::ToolInventoryEvent {
+                    anchor_uuid: Some("a3".into()),
+                    added: vec![batch_spec("mcp__calendar__create_event")],
+                    removed: vec![],
+                });
+            req.messages.push(Message::ToolResult(
+                crate::schemas::message::ToolResultMessage {
+                    uuid: "tr-search".into(),
+                    tool_use_id: "s1".into(),
+                    content: vec![],
+                    is_error: false,
+                    tool_kind: Some(tool_kind),
+                    native_tool_output: Some(json!({
+                        "matched": ["mcp__calendar__create_event"],
+                        "tools": [
+                            {"type":"function","name":"mcp__calendar__create_event","description":"Create","inputSchema":{"type":"object"}}
+                        ]
+                    })),
+                    output: None,
+                    extra_user_blocks: None,
+                },
+            ));
+            let built = responses_params_default(&req).expect("batch + native search");
+            let input = built["input"].as_array().unwrap();
+            let search_added_batches = input
+                .iter()
+                .filter(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind == "additional_tools")
+                        && runtime_json::stringify(item)
+                            .try_to_utf8()
+                            .unwrap_or_default()
+                            .contains("create_event")
+                })
+                .count();
+            assert_eq!(
+                search_added_batches, 0,
+                "{tool_kind:?}: search-materialized tools must not also emit incremental additional_tools batches"
+            );
+        }
+
+        // Anthropic-style cache helper respects cache_control_on_tools = false.
+        let mut chat = json!({
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "read"}}]
+        });
+        apply_anthropic_style_cache_markers_with_options(&mut chat, false, false);
+        assert!(chat["tools"][0].get("cache_control").is_none());
+        assert!(chat["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_some());
     }
 }

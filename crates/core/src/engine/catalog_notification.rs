@@ -41,6 +41,25 @@ pub(crate) struct CatalogDelta {
     removed: Vec<RuntimeString>,
 }
 
+#[derive(Default)]
+struct AnnouncedLedger {
+    entries: BTreeMap<RuntimeString, RuntimeString>,
+    summarized_groups: BTreeMap<RuntimeString, usize>,
+}
+
+/// Slice `history` to messages after the most recent compaction boundary, so
+/// post-compaction turns re-announce the catalog when prior announcements were
+/// compacted away.
+fn history_after_compact_boundary(history: &[Message]) -> &[Message] {
+    match history
+        .iter()
+        .rposition(|message| matches!(message, Message::CompactBoundary(_)))
+    {
+        Some(idx) => &history[idx + 1..],
+        None => history,
+    }
+}
+
 /// Build the catalog notification for this turn, when the session runs the
 /// static fallback protocol and the folded pool drifted from the announced
 /// ledger. `None` keeps the history untouched.
@@ -53,12 +72,13 @@ pub(crate) fn catalog_notification_message(
     if !static_deferred_dispatch_active(config, tools, true, native_active) {
         return None;
     }
-    let ledger = scan_ledger(history);
+    let active_history = history_after_compact_boundary(history);
+    let ledger = scan_ledger(active_history);
     let current = folded_catalog(tools);
     let delta = diff(&ledger, &current)?;
     let text = render(&delta);
     let uuid = notification_uuid(&text);
-    if history
+    if active_history
         .iter()
         .any(|message| message_uuid(message).is_some_and(|existing| existing == uuid))
     {
@@ -98,9 +118,10 @@ fn is_catalog_notification(message: &Message) -> bool {
 }
 
 /// The announced state, reconstructed from every persisted notification in
-/// order: additions and updates set an entry, removals retire it.
-fn scan_ledger(history: &[Message]) -> BTreeMap<RuntimeString, RuntimeString> {
-    let mut ledger: BTreeMap<RuntimeString, RuntimeString> = BTreeMap::new();
+/// order: additions, updates, and budget-collapsed service summaries update the
+/// ledger, while removals retire individual tools or summarized service groups.
+fn scan_ledger(history: &[Message]) -> AnnouncedLedger {
+    let mut ledger = AnnouncedLedger::default();
     for message in history
         .iter()
         .filter(|message| is_catalog_notification(message))
@@ -114,17 +135,51 @@ fn scan_ledger(history: &[Message]) -> BTreeMap<RuntimeString, RuntimeString> {
         let Ok(body) = text.text.try_to_utf8() else {
             continue;
         };
+        let summarized_additions =
+            body.contains("Now available (listed by service to fit the budget");
+        // Apply removals before additions/updates in the same notification so
+        // replacing a summarized service group with individual entries keeps
+        // those fresh entries in the ledger.
+        for line in body.lines() {
+            if let Some(name) = line.strip_prefix("- ") {
+                let target = RuntimeString::from(name.trim());
+                if ledger.summarized_groups.remove(&target).is_some() {
+                    ledger.entries.retain(|k, _| server_group(k) != target);
+                } else if ledger.entries.remove(&target).is_none() {
+                    let group = server_group(&target);
+                    if let Some(count) = ledger.summarized_groups.get_mut(&group) {
+                        if *count <= 1 {
+                            ledger.summarized_groups.remove(&group);
+                        } else {
+                            *count -= 1;
+                        }
+                    }
+                }
+            }
+        }
         for line in body.lines() {
             if let Some(entry) = line.strip_prefix("+ ") {
-                if let Some((name, description)) = split_entry(entry) {
-                    ledger.insert(name, description);
+                if summarized_additions {
+                    if let Some((group, count)) = split_summary_entry(entry) {
+                        ledger.summarized_groups.insert(group, count);
+                    }
+                } else if let Some((name, description)) = split_entry(entry) {
+                    ledger.entries.insert(name, description);
                 }
             } else if let Some(entry) = line.strip_prefix("* ") {
                 if let Some((name, description)) = split_entry(entry) {
-                    ledger.insert(name, description);
+                    if !ledger.entries.contains_key(&name) {
+                        let group = server_group(&name);
+                        if let Some(count) = ledger.summarized_groups.get_mut(&group) {
+                            if *count <= 1 {
+                                ledger.summarized_groups.remove(&group);
+                            } else {
+                                *count -= 1;
+                            }
+                        }
+                    }
+                    ledger.entries.insert(name, description);
                 }
-            } else if let Some(name) = line.strip_prefix("- ") {
-                ledger.remove(&RuntimeString::from(name.trim()));
             }
         }
     }
@@ -141,6 +196,21 @@ fn split_entry(entry: &str) -> Option<(RuntimeString, RuntimeString)> {
         RuntimeString::from(name),
         RuntimeString::from(description.trim()),
     ))
+}
+
+fn split_summary_entry(entry: &str) -> Option<(RuntimeString, usize)> {
+    let (group, rest) = entry.split_once(':')?;
+    let group = group.trim();
+    if group.is_empty() {
+        return None;
+    }
+    let count = rest
+        .trim()
+        .strip_suffix(" tools")?
+        .trim()
+        .parse::<usize>()
+        .ok()?;
+    Some((RuntimeString::from(group), count))
 }
 
 /// The folded pool as the ledger sees it: every enabled `Deferred` tool with
@@ -167,28 +237,59 @@ fn folded_catalog(tools: &[Arc<dyn Tool>]) -> BTreeMap<RuntimeString, RuntimeStr
 }
 
 fn diff(
-    ledger: &BTreeMap<RuntimeString, RuntimeString>,
+    ledger: &AnnouncedLedger,
     current: &BTreeMap<RuntimeString, RuntimeString>,
 ) -> Option<CatalogDelta> {
-    let added = current
-        .iter()
-        .filter(|(name, _)| !ledger.contains_key(*name))
-        .map(|(name, description)| (name.clone(), description.clone()))
-        .collect::<Vec<_>>();
+    let mut untracked_by_group: BTreeMap<RuntimeString, Vec<(RuntimeString, RuntimeString)>> =
+        BTreeMap::new();
+    for (name, description) in current {
+        if !ledger.entries.contains_key(name) {
+            untracked_by_group
+                .entry(server_group(name))
+                .or_default()
+                .push((name.clone(), description.clone()));
+        }
+    }
+    let mut added: Vec<(RuntimeString, RuntimeString)> = Vec::new();
+    let mut removed: Vec<RuntimeString> = Vec::new();
+    for (group, items) in &untracked_by_group {
+        match ledger.summarized_groups.get(group) {
+            Some(count) if *count == items.len() => {}
+            Some(_) => {
+                // Service membership changed: retire the stale summary bucket
+                // and emit current members so they re-sync individually or in
+                // a fresh summary.
+                removed.push(group.clone());
+                added.extend(items.iter().cloned());
+            }
+            None => added.extend(items.iter().cloned()),
+        }
+    }
+    added.sort_by(|a, b| a.0.cmp(&b.0));
+    for group in ledger.summarized_groups.keys() {
+        if !untracked_by_group.contains_key(group) {
+            removed.push(group.clone());
+        }
+    }
     let updated = current
         .iter()
         .filter(|(name, description)| {
             ledger
+                .entries
                 .get(*name)
                 .is_some_and(|announced| announced != *description)
         })
         .map(|(name, description)| (name.clone(), description.clone()))
         .collect::<Vec<_>>();
-    let removed = ledger
-        .keys()
-        .filter(|name| !current.contains_key(*name))
-        .cloned()
-        .collect::<Vec<_>>();
+    removed.extend(
+        ledger
+            .entries
+            .keys()
+            .filter(|name| !current.contains_key(*name))
+            .cloned(),
+    );
+    removed.sort();
+    removed.dedup();
     if added.is_empty() && updated.is_empty() && removed.is_empty() {
         return None;
     }
@@ -197,6 +298,34 @@ fn diff(
         updated,
         removed,
     })
+}
+
+fn render_tail_sections(
+    updated: &[(RuntimeString, RuntimeString)],
+    removed: &[RuntimeString],
+) -> RuntimeString {
+    let mut body = RuntimeString::from("");
+    if !updated.is_empty() {
+        body = body.concat(&RuntimeString::from(
+            "\n\nUpdated (re-fetch with select: before calling):",
+        ));
+        for (name, description) in updated {
+            body = body
+                .concat(&RuntimeString::from("\n* "))
+                .concat(name)
+                .concat(&RuntimeString::from(": "))
+                .concat(description);
+        }
+    }
+    if !removed.is_empty() {
+        body = body.concat(&RuntimeString::from(
+            "\n\nNo longer available (do not call):",
+        ));
+        for name in removed {
+            body = body.concat(&RuntimeString::from("\n- ")).concat(name);
+        }
+    }
+    body
 }
 
 fn render(delta: &CatalogDelta) -> RuntimeString {
@@ -213,26 +342,7 @@ fn render(delta: &CatalogDelta) -> RuntimeString {
                 .concat(description);
         }
     }
-    if !delta.updated.is_empty() {
-        body = body.concat(&RuntimeString::from(
-            "\n\nUpdated (re-fetch with select: before calling):",
-        ));
-        for (name, description) in &delta.updated {
-            body = body
-                .concat(&RuntimeString::from("\n* "))
-                .concat(name)
-                .concat(&RuntimeString::from(": "))
-                .concat(description);
-        }
-    }
-    if !delta.removed.is_empty() {
-        body = body.concat(&RuntimeString::from(
-            "\n\nNo longer available (do not call):",
-        ));
-        for name in &delta.removed {
-            body = body.concat(&RuntimeString::from("\n- ")).concat(name);
-        }
-    }
+    body = body.concat(&render_tail_sections(&delta.updated, &delta.removed));
     text = text.concat(&body);
     let oversized = text
         .try_to_utf8()
@@ -258,30 +368,21 @@ fn render(delta: &CatalogDelta) -> RuntimeString {
                 .concat(&RuntimeString::from(count.to_string()))
                 .concat(&RuntimeString::from(" tools"));
         }
+        // A resized group replaced by a fresh summary must not also carry a
+        // `- mcp__srv__*` removal in the same notification.
+        let filtered_removed: Vec<RuntimeString> = delta
+            .removed
+            .iter()
+            .filter(|name| !grouped.contains_key(*name))
+            .cloned()
+            .collect();
         let mut text =
             RuntimeString::from("<deferred-tool-catalog>\n").concat(&RuntimeString::from(GUIDANCE));
         text = text.concat(&summary);
-        if !delta.updated.is_empty() || !delta.removed.is_empty() {
-            text = text.concat(&body_after_added(&body));
-        }
+        text = text.concat(&render_tail_sections(&delta.updated, &filtered_removed));
         return text.concat(&RuntimeString::from("\n</deferred-tool-catalog>"));
     }
     text.concat(&RuntimeString::from("\n</deferred-tool-catalog>"))
-}
-
-/// The updated/removed tail of the rendered body, without the additions
-/// section (used when additions collapse into summaries).
-fn body_after_added(body: &RuntimeString) -> RuntimeString {
-    let Ok(rendered) = body.try_to_utf8() else {
-        return RuntimeString::from("");
-    };
-    let tail_start = rendered
-        .find("\n\nUpdated (")
-        .or_else(|| rendered.find("\n\nNo longer available ("));
-    match tail_start {
-        Some(index) => RuntimeString::from(rendered[index..].to_string()),
-        None => RuntimeString::from(""),
-    }
 }
 
 /// `mcp__server__tool` groups under `mcp__server__*`; everything else groups
@@ -479,8 +580,8 @@ mod tests {
             .map(|(name, description)| (name.as_str(), description.as_str()))
             .collect();
         let tools = pool(&refs);
-        let message = catalog_notification_message(&config(), &[], &tools, false).unwrap();
-        let text = notification_text(&message);
+        let first = catalog_notification_message(&config(), &[], &tools, false).unwrap();
+        let text = notification_text(&first);
         // Individual listings collapsed into per-service summary lines.
         assert!(text.contains("listed by service to fit the budget"));
         assert!(text.contains("+ mcp__srv7__*: 20 tools"));
@@ -488,5 +589,80 @@ mod tests {
         // Exact refetch and keyword search stay reachable.
         assert!(text.contains("select:"));
         assert!(text.len() < NOTIFICATION_BUDGET_BYTES + 2048);
+
+        // Repeat turn on the same oversized fleet stays silent (no bogus removal
+        // or re-emission of summarized services).
+        let mut history = vec![first.clone()];
+        assert!(
+            catalog_notification_message(&config(), &history, &tools, false).is_none(),
+            "repeat turn on oversized summarized catalog must be idempotent"
+        );
+
+        // Adding a late server announces only the new server.
+        let mut grown_refs = refs.clone();
+        grown_refs.push(("mcp__late__ping", "Ping a late server."));
+        let grown = pool(&grown_refs);
+        let added_msg = catalog_notification_message(&config(), &history, &grown, false).unwrap();
+        let added_text = notification_text(&added_msg);
+        assert!(added_text.contains("+ mcp__late__ping: Ping a late server."));
+        assert!(!added_text.contains("mcp__srv7__*"));
+        history.push(added_msg);
+        assert!(catalog_notification_message(&config(), &history, &grown, false).is_none());
+
+        // Removing an entire summarized server emits `- mcp__srv7__*` once,
+        // and the following turn is silent again.
+        let without_srv7_refs: Vec<(&str, &str)> = grown_refs
+            .iter()
+            .copied()
+            .filter(|(name, _)| !name.starts_with("mcp__srv7__"))
+            .collect();
+        let without_srv7 = pool(&without_srv7_refs);
+        let removed_msg =
+            catalog_notification_message(&config(), &history, &without_srv7, false).unwrap();
+        let removed_text = notification_text(&removed_msg);
+        assert!(removed_text.contains("- mcp__srv7__*"), "{removed_text}");
+        assert!(!removed_text.contains("Now available"), "{removed_text}");
+        history.push(removed_msg);
+        assert!(catalog_notification_message(&config(), &history, &without_srv7, false).is_none());
+
+        // Shrinking a summarized service (20 -> 19 tools) updates cleanly and settles.
+        let shrunk_refs: Vec<(&str, &str)> = refs
+            .into_iter()
+            .filter(|(name, _)| *name != "mcp__srv8__tool0")
+            .collect();
+        let shrunk_history = vec![first];
+        let shrunk_pool = pool(&shrunk_refs);
+        let shrunk_msg =
+            catalog_notification_message(&config(), &shrunk_history, &shrunk_pool, false).unwrap();
+        let shrunk_text = notification_text(&shrunk_msg);
+        assert!(shrunk_text.contains("- mcp__srv8__*"), "{shrunk_text}");
+        assert!(shrunk_text.contains("+ mcp__srv8__tool1:"), "{shrunk_text}");
+        let settled_history = vec![shrunk_history[0].clone(), shrunk_msg];
+        assert!(
+            catalog_notification_message(&config(), &settled_history, &shrunk_pool, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_boundary_triggers_reannouncement_even_with_identical_catalog() {
+        let tools = pool(&[("mcp__docs__read", "Read a document by ID.")]);
+        let first = catalog_notification_message(&config(), &[], &tools, false).unwrap();
+        let boundary = Message::CompactBoundary(crate::schemas::message::CompactBoundaryMessage {
+            uuid: "cb-1".into(),
+            summary: "Compacted summary.".into(),
+            native_compaction: None,
+        });
+        let history_after_compact = vec![first.clone(), boundary];
+        let reannounced =
+            catalog_notification_message(&config(), &history_after_compact, &tools, false)
+                .expect("post-compaction turn must re-announce the active catalog");
+        assert_eq!(notification_text(&reannounced), notification_text(&first));
+        let settled = vec![
+            history_after_compact[0].clone(),
+            history_after_compact[1].clone(),
+            reannounced,
+        ];
+        assert!(catalog_notification_message(&config(), &settled, &tools, false).is_none());
     }
 }

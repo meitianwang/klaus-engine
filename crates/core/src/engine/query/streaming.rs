@@ -73,16 +73,18 @@ fn mark_not_loaded(
     tool: Option<&Arc<dyn crate::types::tool::Tool>>,
     shared: &Arc<Shared>,
     req: &ModelRequest,
+    profile: &ProviderBehaviorProfile,
 ) {
-    let dominated =
+    let deferred =
         tool.is_some_and(|tool| tool.exposure() == crate::types::tool::ToolExposure::Deferred);
-    if dominated
+    let rendered = crate::provider::behavior::render_tool_name(&call.internal_name, profile);
+    if deferred
         && !shared.surfaced.lock_recover().contains(&call.internal_name)
-        && !req.tools.iter().any(|spec| spec.name == call.internal_name)
-        && req
+        && !req
             .tools
             .iter()
-            .any(|spec| spec.name == "tool_search")
+            .any(|spec| spec.name == call.internal_name || spec.name == rendered)
+        && req.tools.iter().any(|spec| spec.name == "tool_search")
     {
         call.not_loaded = true;
     }
@@ -1056,8 +1058,18 @@ async fn stream_and_dispatch_inner(
                 }
             }
             ModelStreamEvent::ServerToolSearchOutput { id, payload } => {
-                // The recorded call never executes; its provider-owned output
-                // pairs with the call block for verbatim replay.
+                // Record surfaced tool names right away so subsequent calls in
+                // the same assistant turn pass `mark_not_loaded`, and pair the
+                // output payload with the call block for verbatim replay.
+                let tools = shared.tools.lock_recover().clone();
+                let surfaced_names =
+                    super::surfaced_tools_from_server_output(&payload, Some(&tools), profile);
+                if !surfaced_names.is_empty() {
+                    let mut sf = shared.surfaced.lock_recover();
+                    for name in surfaced_names {
+                        sf.insert(name);
+                    }
+                }
                 if let Some(call) = resolved_calls.get_mut(&id) {
                     call.server_output = Some(payload);
                 } else {
@@ -1103,7 +1115,7 @@ async fn stream_and_dispatch_inner(
                     let mut call = ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                     let tools = shared.tools.lock_recover().clone();
                     let tool = call.bind_resolved_tool(&tools);
-                    mark_not_loaded(&mut call, tool.as_ref(), shared, req);
+                    mark_not_loaded(&mut call, tool.as_ref(), shared, req, profile);
                     let source = tool
                         .as_ref()
                         .map(|found| tool_lifecycle_source_for_tool(found.as_ref()));
@@ -1388,7 +1400,7 @@ async fn stream_and_dispatch_inner(
                             ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                         let tools = shared.tools.lock_recover().clone();
                         let tool = call.bind_resolved_tool(&tools);
-                        mark_not_loaded(&mut call, tool.as_ref(), shared, req);
+                        mark_not_loaded(&mut call, tool.as_ref(), shared, req, profile);
                         let source = tool
                             .as_ref()
                             .map(|tool| tool_lifecycle_source_for_tool(tool.as_ref()));
@@ -1645,7 +1657,8 @@ async fn stream_and_dispatch_inner(
                 let rebuilt = partial.get(&id).map(|p| {
                     let mut rebuilt =
                         ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
-                    rebuilt.bind_resolved_tool(&tools);
+                    let tool = rebuilt.bind_resolved_tool(&tools);
+                    mark_not_loaded(&mut rebuilt, tool.as_ref(), shared, req, profile);
                     rebuilt
                 });
                 let path = rebuilt.as_ref().and_then(|call| {
@@ -1657,11 +1670,13 @@ async fn stream_and_dispatch_inner(
                 });
                 match (rebuilt, path) {
                     (Some(call), Some(path))
-                        if truncated_write_mode_is_known(shared, &call, &path).await =>
+                        if !call.not_loaded
+                            && truncated_write_mode_is_known(shared, &call, &path).await =>
                     {
                         recovered.push((call.visible.id.clone(), path));
                         calls.push(call);
                     }
+                    (Some(call), _) if call.not_loaded => calls.push(call),
                     _ => dropped_kept.push(call),
                 }
             } else {

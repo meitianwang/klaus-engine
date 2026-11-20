@@ -198,10 +198,6 @@ fn parse_tool_search_input(input: &Json) -> Result<Json, ToolError> {
                     issues.push(format!(
                         "Invalid arguments: query: Invalid input: query exceeds {QUERY_MAX_BYTES} bytes"
                     ));
-                } else if query.split_whitespace().count() > QUERY_MAX_WORDS {
-                    issues.push(format!(
-                        "Invalid arguments: query: Invalid input: query exceeds {QUERY_MAX_WORDS} words"
-                    ));
                 } else if let Some(names) = query.trim().strip_prefix("select:") {
                     let count = names.split(',').filter(|n| !n.trim().is_empty()).count();
                     if count > SELECT_MAX_NAMES {
@@ -209,6 +205,10 @@ fn parse_tool_search_input(input: &Json) -> Result<Json, ToolError> {
                             "Invalid arguments: query: Invalid input: select: list exceeds {SELECT_MAX_NAMES} names"
                         ));
                     }
+                } else if query.split_whitespace().count() > QUERY_MAX_WORDS {
+                    issues.push(format!(
+                        "Invalid arguments: query: Invalid input: query exceeds {QUERY_MAX_WORDS} words"
+                    ));
                 }
             }
             parsed.insert("query", value.clone());
@@ -573,9 +573,48 @@ fn find_catalog_tool<'a>(
     if needle.is_empty() {
         return None;
     }
-    catalog
+    if let Some(exact) = catalog
         .iter()
         .find(|tool| lowercase_runtime(&tool.name) == needle)
+    {
+        return Some(exact);
+    }
+    let utf8 = needle.try_to_utf8().ok()?;
+    let (ns, short) = utf8.split_once('.')?;
+    if short.is_empty() {
+        return None;
+    }
+    if ns == crate::types::provider::DEFAULT_TOOL_NAMESPACE {
+        return catalog.iter().find(|tool| {
+            tool.spec
+                .as_ref()
+                .and_then(|spec| spec.namespace.as_ref())
+                .is_none()
+                && lowercase_runtime(&tool.name).try_to_utf8().as_deref() == Ok(short)
+        });
+    }
+    if ns.starts_with("mcp__") {
+        let joined = format!("{ns}__{short}");
+        if let Some(found) = catalog.iter().find(|tool| {
+            lowercase_runtime(&tool.name).try_to_utf8().as_deref() == Ok(joined.as_str())
+        }) {
+            return Some(found);
+        }
+    }
+    catalog.iter().find(|tool| {
+        tool.spec.as_ref().is_some_and(|spec| {
+            spec.namespace
+                .as_ref()
+                .and_then(|wns| lowercase_runtime(wns).try_to_utf8().ok())
+                .as_deref()
+                == Some(ns)
+                && (lowercase_runtime(&tool.name).try_to_utf8().as_deref() == Ok(short)
+                    || lowercase_runtime(&spec.wire_short_name())
+                        .try_to_utf8()
+                        .as_deref()
+                        == Ok(short))
+        })
+    })
 }
 
 /// Score a catalog entry: reject any missing required term, then add one point
@@ -1482,6 +1521,9 @@ impl Tool for ExposureOverrideTool {
     fn mcp_server(&self) -> Option<RuntimeString> {
         self.inner.mcp_server()
     }
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        self.inner.wire_namespace()
+    }
     fn task_scope_host_capability(&self) -> bool {
         self.inner.task_scope_host_capability()
     }
@@ -1919,6 +1961,9 @@ mod tests {
         }
         fn mcp_server(&self) -> Option<RuntimeString> {
             Some(self.mcp_server.clone())
+        }
+        fn wire_namespace(&self) -> Option<RuntimeString> {
+            Some(RuntimeString::from("custom-ns"))
         }
         fn input_schema_property_order(
             &self,
@@ -3266,6 +3311,10 @@ mod tests {
         assert_eq!(deferred.output_schema(), Some(exact_output_schema));
         assert_eq!(deferred.search_hint(), Some(exact_hint));
         assert_eq!(deferred.mcp_server(), Some(exact_server));
+        assert_eq!(
+            deferred.wire_namespace(),
+            Some(RuntimeString::from("custom-ns"))
+        );
         assert_eq!(deferred.summarize(&rjson!(null)), Some(exact_summary));
         assert_eq!(
             deferred.input_kind(),
@@ -3287,5 +3336,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*call_ids.lock().unwrap(), [call_identity]);
+    }
+
+    #[test]
+    fn select_query_allows_over_32_space_separated_comma_names() {
+        let many = (1..=40)
+            .map(|idx| format!("t{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!("select:{many}");
+        assert!(query.len() <= QUERY_MAX_BYTES);
+        assert!(query.split_whitespace().count() > QUERY_MAX_WORDS);
+        let parsed = parse_tool_search_input(&rjson!({ "query": query }))
+            .expect("select: up to SELECT_MAX_NAMES must bypass keyword word-count ceiling");
+        assert_eq!(
+            parsed
+                .get("query")
+                .and_then(Json::as_str)
+                .map(|s| s.starts_with("select:")),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn find_catalog_tool_resolves_qualified_namespace_names() {
+        let tool = create_tool_search_tool(None);
+        let mut ctx = mk_ctx();
+        let mut namespaced = entry_with_spec("probe", "probe", ToolExposure::Deferred);
+        if let Some(spec) = namespaced.spec.as_mut() {
+            spec.namespace = Some("custom_ns".into());
+        }
+        let surfaced = with_catalog(
+            &mut ctx,
+            vec![
+                entry("read", "Read files", ToolExposure::Deferred),
+                entry_with_spec("task", "spawn_agent", ToolExposure::Deferred),
+                entry(
+                    "mcp__calendar__create_event",
+                    "Create event",
+                    ToolExposure::Deferred,
+                ),
+                namespaced,
+            ],
+        );
+
+        let res = call_search(
+            &tool,
+            &ctx,
+            rjson!({ "query": "select:functions.read,mcp__calendar.create_event,custom_ns.probe,functions.spawn_agent" }),
+        )
+        .await;
+        assert_eq!(
+            res.serializable.output.get("matched"),
+            Some(&rjson!(["read", "mcp__calendar__create_event", "probe"]))
+        );
+        assert_eq!(
+            res.serializable.output.get("missing"),
+            Some(&rjson!(["functions.spawn_agent"]))
+        );
+        assert_eq!(
+            *surfaced.lock().unwrap(),
+            vec!["read", "mcp__calendar__create_event", "probe"]
+        );
     }
 }

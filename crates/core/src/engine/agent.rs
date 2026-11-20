@@ -374,7 +374,7 @@ pub enum ForkCut {
     BeforeTurn(String),
 }
 
-fn fold_retained_rollout_items<'a>(
+pub(crate) fn fold_retained_rollout_items<'a>(
     items: &'a [crate::schemas::rollout::RolloutItem],
     is_side_task: bool,
 ) -> Vec<(usize, &'a crate::schemas::rollout::RolloutItem)> {
@@ -3565,6 +3565,16 @@ impl Agent {
             .checkpoint(),
         );
         sopts.initial_approval_reviews = Some(Vec::new());
+        if sopts.initial_surfaced_tools.is_none() {
+            sopts.initial_surfaced_tools = Some(if history.is_empty() {
+                Vec::new()
+            } else {
+                surfaced_tools_from_rollout_for_role(
+                    approval_slice,
+                    resumed.meta.role == Some(SessionRole::SideTask),
+                )
+            });
+        }
         sopts.initial_history = Some(history);
         sopts.hidden_context_message_ids = None;
         sopts.session_role = Some(SessionRole::Main);
@@ -3697,10 +3707,12 @@ impl Agent {
             .prior_workflow_journal
             .clone()
             .unwrap_or_else(|| workflow_journal_from_rollout(&raw_items));
-        let initial_surfaced_tools = sopts
-            .initial_surfaced_tools
-            .clone()
-            .unwrap_or_else(|| surfaced_tools_from_rollout(&raw_items));
+        let initial_surfaced_tools = sopts.initial_surfaced_tools.clone().unwrap_or_else(|| {
+            surfaced_tools_from_rollout_for_role(
+                &raw_items,
+                meta.role == Some(SessionRole::SideTask),
+            )
+        });
         let recovery_pricing = sopts
             .pricing
             .clone()
@@ -4448,12 +4460,15 @@ fn workflow_journal_from_rollout(raw_items: &[RolloutItem]) -> Vec<WorkflowJourn
 }
 
 /// Recover the tool_search-discovered tools from a session's rollout: the union of
-/// every `tools_surfaced` event's `names`, first-seen order preserved. Tolerant of
-/// malformed payloads.
-fn surfaced_tools_from_rollout(raw_items: &[RolloutItem]) -> Vec<RuntimeString> {
+/// every retained `tools_surfaced` event's `names` (after folding any `Rollback`
+/// rewinds), first-seen order preserved. Tolerant of malformed payloads.
+pub(crate) fn surfaced_tools_from_rollout_for_role(
+    raw_items: &[RolloutItem],
+    is_side_task: bool,
+) -> Vec<RuntimeString> {
     let mut seen: HashSet<RuntimeString> = HashSet::new();
     let mut out: Vec<RuntimeString> = Vec::new();
-    for item in raw_items {
+    for (_, item) in fold_retained_rollout_items(raw_items, is_side_task) {
         let ev = match item {
             RolloutItem::Event(ev) => ev,
             _ => continue,
@@ -4476,6 +4491,10 @@ fn surfaced_tools_from_rollout(raw_items: &[RolloutItem]) -> Vec<RuntimeString> 
         }
     }
     out
+}
+
+pub(crate) fn surfaced_tools_from_rollout(raw_items: &[RolloutItem]) -> Vec<RuntimeString> {
+    surfaced_tools_from_rollout_for_role(raw_items, false)
 }
 
 /// Recover immutable billing records in rollout order. Typed records retain the

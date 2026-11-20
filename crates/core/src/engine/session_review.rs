@@ -742,6 +742,7 @@ impl Session {
             on_tool_result_budget_records: None,
             thinking_context_cold: self.turn.thinking_context_cold(),
             context_edit_state: Some(self.context_edit_state.clone()),
+            tool_freeze_state: Some(self.tool_freeze_state.clone()),
             padded_countdown_spend: self.turn.padded_countdown_spend(),
             task_countdown_anchor: None,
             live_model_override: None,

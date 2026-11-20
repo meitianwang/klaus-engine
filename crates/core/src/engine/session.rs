@@ -1384,6 +1384,7 @@ pub struct Session {
     /// provider's applied-edits reports; the running tool-use total anchors the
     /// next count-based clearing trigger so clears arrive in batches.
     pub(crate) context_edit_state: Arc<crate::context::context_editing::ContextEditState>,
+    pub(crate) tool_freeze_state: Arc<crate::engine::query::ToolFreezeState>,
     /// What this session changed on disk, served with `get_file_changes` (see
     /// [`SessionFileChanges`]). Folded live during runs and rebuilt from the
     /// rollout on resume, so reopening a thread still reports what it produced.

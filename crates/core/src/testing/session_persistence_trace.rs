@@ -174,10 +174,34 @@ async fn verify_surfaced_internal_name_resume_wiring_in(
         };
         Box::pin(futures::stream::iter(events))
     });
+    // Exercise native deferred materialization across resume: surfaced `task`
+    // advances the next request's visible tools after resume.
+    struct NativeDeferredFakeProvider(crate::testing::FakeProvider);
+    impl crate::types::provider::ModelProvider for NativeDeferredFakeProvider {
+        fn info(&self) -> &crate::types::provider::ProviderInfo {
+            self.0.info()
+        }
+        fn native_deferred_loading_active(&self, _model: &RuntimeString) -> bool {
+            true
+        }
+        fn capabilities(
+            &self,
+            model: &RuntimeString,
+        ) -> crate::types::provider::ProviderCapabilities {
+            self.0.capabilities(model)
+        }
+        fn stream(
+            &self,
+            req: ModelRequest,
+            signal: crate::types::abort::AbortSignal,
+        ) -> crate::types::provider::ModelStream {
+            self.0.stream(req, signal)
+        }
+    }
     let tools = with_deferred_tools(vec![create_task_tool(TaskToolOptions::default())], Some(0));
     let agent = Agent::new(AgentOptions {
         process_context: process_context.clone(),
-        provider: Arc::new(fake_provider()),
+        provider: Arc::new(NativeDeferredFakeProvider(fake_provider())),
         config: Some(legacy_model_config("gpt-5")),
         tools: Some(tools),
         web_fetch_page: None,

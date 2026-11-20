@@ -510,6 +510,22 @@ async fn recorded_server_tool_search_result(
     if emit_started {
         let _ = push_tool_call_started(shared, call).await;
     }
+    if let Some(payload) = &call.server_output {
+        let tools = shared.tools.lock_recover().clone();
+        let surfaced_names =
+            super::surfaced_tools_from_server_output(payload, Some(&tools), &call.profile);
+        if !surfaced_names.is_empty() {
+            if let Some(cb) = &shared.params.on_surface_tools {
+                if let Err(error) = cb(surfaced_names.clone()).await {
+                    report_tool_persistence_failure(shared, &error);
+                }
+            }
+            let mut sf = shared.surfaced.lock_recover();
+            for name in surfaced_names {
+                sf.insert(name);
+            }
+        }
+    }
     let note = RuntimeString::from(
         "Provider-executed tool search recorded; its results were delivered to the model directly.",
     );

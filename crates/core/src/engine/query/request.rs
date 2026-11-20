@@ -7,11 +7,14 @@ use super::SystemPromptResolvable;
 use super::TurnOverride;
 use crate::provider::behavior::render_provider_text_envelope;
 use crate::provider::behavior::render_system_prompt_for_behavior;
+use crate::provider::behavior::render_tool_name;
 use crate::provider::behavior::render_tool_specs_for_behavior;
+use crate::provider::behavior::resolve_internal_tool_name;
 use crate::provider::behavior::resolve_provider_behavior_profile;
 use crate::provider::behavior::ProviderBehaviorProfile;
 use crate::provider::behavior::ProviderTextEnvelopeKind;
 use crate::provider::observability::ProviderRequestMetadata;
+use crate::runtime_values::RuntimeJson;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::content::ContentBlock;
 use crate::schemas::content::HarnessEnvelope;
@@ -25,6 +28,7 @@ use crate::types::errors::ProviderError;
 use crate::types::errors::ProviderErrorKind;
 use crate::types::provider::ModelRequest;
 use crate::types::provider::ProviderInfo;
+use crate::types::provider::ProviderToolCallKind;
 use crate::types::provider::SystemPromptPart;
 use crate::types::provider::ThinkingConfig;
 use crate::types::provider::ThinkingContextPolicy;
@@ -552,6 +556,43 @@ impl Shared {
         internal_visible_tool_specs: &[ToolSpec],
         turn_override: Option<&TurnOverride>,
     ) -> PreparedModelRequest {
+        self.prepare_inner(
+            messages,
+            canonical_system_prompt,
+            max_output_tokens,
+            internal_visible_tool_specs,
+            turn_override,
+            true,
+        )
+    }
+
+    pub(super) fn prepare_without_tool_freeze(
+        &self,
+        messages: &[Message],
+        canonical_system_prompt: &[SystemPromptPart],
+        max_output_tokens: u64,
+        internal_visible_tool_specs: &[ToolSpec],
+        turn_override: Option<&TurnOverride>,
+    ) -> PreparedModelRequest {
+        self.prepare_inner(
+            messages,
+            canonical_system_prompt,
+            max_output_tokens,
+            internal_visible_tool_specs,
+            turn_override,
+            false,
+        )
+    }
+
+    fn prepare_inner(
+        &self,
+        messages: &[Message],
+        canonical_system_prompt: &[SystemPromptPart],
+        max_output_tokens: u64,
+        internal_visible_tool_specs: &[ToolSpec],
+        turn_override: Option<&TurnOverride>,
+        update_tool_freeze: bool,
+    ) -> PreparedModelRequest {
         let Some(bundle) = self.bundle() else {
             let mut prepared = prepare_model_request(
                 messages,
@@ -561,17 +602,21 @@ impl Shared {
                 internal_visible_tool_specs,
                 turn_override,
             );
-            if let Some(specs) = self.defer_oversized_inventory(&prepared) {
-                return self.prepare(
-                    messages,
-                    canonical_system_prompt,
-                    max_output_tokens,
-                    &specs,
-                    turn_override,
-                );
+            if update_tool_freeze {
+                if let Some(specs) = self.defer_oversized_inventory(&prepared) {
+                    return self.prepare_inner(
+                        messages,
+                        canonical_system_prompt,
+                        max_output_tokens,
+                        &specs,
+                        turn_override,
+                        update_tool_freeze,
+                    );
+                }
+                prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
+                prepared.request.surfaced_deferred_names =
+                    self.surfaced_deferred_request_names(messages, &prepared.profile);
             }
-            prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
-            prepared.request.surfaced_deferred_names = self.surfaced_deferred_request_names();
             self.observe_approval_context(
                 messages,
                 canonical_system_prompt,
@@ -658,6 +703,13 @@ impl Shared {
             }
         }
         prepared.request.bind_media_capabilities(&capabilities);
+        prepared.request.native_deferred_tools = prepared
+            .request
+            .native_deferred_tools
+            .or(metadata.native_deferred_tools);
+        prepared.request.wire_caps.get_or_insert_with(|| {
+            crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+        });
         prepared.request.max_output_tokens = prepared
             .request
             .max_output_tokens
@@ -678,26 +730,27 @@ impl Shared {
         crate::provider::native_media::project_history_media(
             &mut prepared.request.messages,
             messages,
-            &bundle
-                .provider
-                .model_metadata(&prepared.request.model)
-                .media_input_mime_types,
+            &metadata.media_input_mime_types,
         );
         super::tool_dispatch::gate_request_images(&mut prepared.request);
-        if let Some(specs) = self.defer_oversized_inventory(&prepared) {
-            return self.prepare(
-                messages,
-                canonical_system_prompt,
-                max_output_tokens,
-                &specs,
-                Some(&turn_override),
-            );
+        if update_tool_freeze {
+            if let Some(specs) = self.defer_oversized_inventory(&prepared) {
+                return self.prepare_inner(
+                    messages,
+                    canonical_system_prompt,
+                    max_output_tokens,
+                    &specs,
+                    Some(&turn_override),
+                    update_tool_freeze,
+                );
+            }
+            if capabilities.tools {
+                prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
+                prepared.request.surfaced_deferred_names =
+                    self.surfaced_deferred_request_names(messages, &prepared.profile);
+            }
+            self.attach_frozen_tool_projection(&mut prepared.request, messages);
         }
-        if capabilities.tools {
-            prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
-            prepared.request.surfaced_deferred_names = self.surfaced_deferred_request_names();
-        }
-        self.attach_frozen_tool_projection(&mut prepared.request, messages);
         self.observe_approval_context(
             messages,
             canonical_system_prompt,
@@ -779,48 +832,98 @@ impl Shared {
         render_tool_specs_for_behavior(&internal, profile)
     }
 
-    /// Names of already-surfaced deferred tools, in pool order. Wires with
-    /// native deferred loading render these as marked registrations paired
-    /// with the historical search references instead of immediate entries.
-    pub(super) fn surfaced_deferred_request_names(&self) -> Vec<RuntimeString> {
+    /// Names of already-surfaced deferred tools rendered for the request's
+    /// provider profile. When the history contains a compaction boundary, only
+    /// tools surfaced after the last boundary still have search references on
+    /// the wire; earlier surfaced tools stay as direct definitions instead of
+    /// orphaned `defer_loading: true` entries.
+    pub(super) fn surfaced_deferred_request_names(
+        &self,
+        messages: &[Message],
+        profile: &ProviderBehaviorProfile,
+    ) -> Vec<RuntimeString> {
         if self.uses_static_deferred_tool_dispatch() {
             return Vec::new();
         }
         let tools = self.tools.lock_recover().clone();
-        let surfaced = self.surfaced.lock_recover();
-        tools
+        let surfaced = self.surfaced.lock_recover().clone();
+        if surfaced.is_empty() {
+            return Vec::new();
+        }
+        let active_names: HashSet<RuntimeString> = match messages
             .iter()
-            .filter(|tool| {
-                tool.exposure() == crate::types::tool::ToolExposure::Deferred
-                    && surfaced.contains(&tool.name())
-            })
-            .map(|tool| tool.name())
-            .collect()
+            .rposition(|message| matches!(message, Message::CompactBoundary(_)))
+        {
+            Some(boundary_index) => {
+                let post_boundary = surfaced_tools_from_message_results(
+                    &messages[boundary_index + 1..],
+                    profile,
+                    Some(&tools),
+                );
+                surfaced.intersection(&post_boundary).cloned().collect()
+            }
+            None => surfaced,
+        };
+        if active_names.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<RuntimeString> = Vec::new();
+        let mut seen_internal: HashSet<RuntimeString> = HashSet::new();
+        for tool in tools.iter() {
+            let name = tool.name();
+            if tool.exposure() == crate::types::tool::ToolExposure::Deferred
+                && active_names.contains(&name)
+            {
+                seen_internal.insert(name.clone());
+                out.push(crate::provider::behavior::render_tool_name(&name, profile));
+            }
+        }
+        let present_names: HashSet<RuntimeString> = tools.iter().map(|tool| tool.name()).collect();
+        let mut disconnected: Vec<RuntimeString> = active_names
+            .into_iter()
+            .filter(|name| !seen_internal.contains(name) && !present_names.contains(name))
+            .collect();
+        disconnected.sort();
+        for name in disconnected {
+            out.push(crate::provider::behavior::render_tool_name(&name, profile));
+        }
+        out
     }
 
     /// Maintain the frozen tool-inventory epoch for transports that announce
     /// inventory changes in the message stream, and attach the projection to
     /// the request. The baseline is re-captured whenever the persisted history
     /// stops extending it (compaction, migration, restore), the model changes,
-    /// or the oversized-inventory latch flips; recorded events are byte-frozen
-    /// so replays stay identical within an epoch.
+    /// the static-fallback mode flips, or the oversized-inventory latch flips;
+    /// recorded events are byte-frozen so replays stay identical within an
+    /// epoch.
     pub(super) fn attach_frozen_tool_projection(
         &self,
         request: &mut ModelRequest,
         messages: &[Message],
     ) {
-        if !self.inline_tool_change_projection_capable(&request.model) {
+        if !self.inline_tool_change_projection_capable(&request.model)
+            || (request.tools.is_empty() && request.deferred_tools.is_empty())
+        {
             return;
         }
         let oversized = self
             .oversized_inventory_deferred
             .load(std::sync::atomic::Ordering::Acquire);
+        let static_deferred_dispatch = self.uses_static_deferred_tool_dispatch();
+        let compact_boundaries = messages
+            .iter()
+            .filter(|message| matches!(message, Message::CompactBoundary(_)))
+            .count();
         let mut state = self.tool_freeze.lock_recover();
         let need_rebase = match state.as_ref() {
             None => true,
             Some(epoch) => {
                 epoch.model != request.model
                     || epoch.oversized != oversized
+                    || epoch.static_deferred_dispatch != static_deferred_dispatch
+                    || epoch.compact_boundaries != compact_boundaries
+                    || (epoch.prefix_len == 0 && !messages.is_empty())
                     || messages.len() < epoch.prefix_len
                     || super::precompute::history_hash(&messages[..epoch.prefix_len])
                         != Some(epoch.prefix_hash)
@@ -835,6 +938,8 @@ impl Shared {
                 specs: request.tools.clone(),
                 prefix_len: messages.len(),
                 prefix_hash,
+                compact_boundaries,
+                static_deferred_dispatch,
                 oversized,
                 events: Vec::new(),
                 instructions: Some(crate::types::provider::stable_system_text(&request.system)),
@@ -1323,6 +1428,216 @@ fn message_uuid(message: &Message) -> Option<RuntimeString> {
         Message::System(m) => Some(m.uuid.clone()),
         Message::CompactBoundary(m) => Some(m.uuid.clone()),
     }
+}
+
+fn resolve_wire_tool_name(
+    wire_name: &RuntimeString,
+    namespace: Option<&str>,
+    tools: Option<&[Arc<dyn Tool>]>,
+    profile: &ProviderBehaviorProfile,
+) -> RuntimeString {
+    let candidate = match wire_name.try_to_utf8() {
+        Ok(raw) => crate::types::provider::internal_tool_name(namespace, &raw),
+        Err(_) => wire_name.clone(),
+    };
+    if let Some(tools) = tools {
+        if let Some(found) = tools.iter().find(|tool| {
+            let spec_ns = to_tool_spec(tool.as_ref()).namespace;
+            let ns_ok = match namespace {
+                Some(ns) if ns == crate::types::provider::DEFAULT_TOOL_NAMESPACE => {
+                    spec_ns.is_none()
+                }
+                Some(ns) => spec_ns.as_ref().is_some_and(|s| s == ns),
+                None => true,
+            };
+            ns_ok
+                && (tool.name() == *wire_name
+                    || tool.name() == candidate
+                    || render_tool_name(&tool.name(), profile) == *wire_name)
+        }) {
+            return found.name();
+        }
+    }
+    if namespace.is_none() || namespace == Some(crate::types::provider::DEFAULT_TOOL_NAMESPACE) {
+        resolve_internal_tool_name(wire_name, profile)
+    } else {
+        candidate
+    }
+}
+
+/// Extract internal tool names materialized in a `ServerToolSearch` or
+/// `tool_search` output payload (`tools` array with flat or namespaced items).
+pub(crate) fn surfaced_tools_from_server_output(
+    payload: &RuntimeJson,
+    tools: Option<&[Arc<dyn Tool>]>,
+    profile: &ProviderBehaviorProfile,
+) -> Vec<RuntimeString> {
+    let mut out: Vec<RuntimeString> = Vec::new();
+    let Some(items) = payload.get("tools").and_then(RuntimeJson::as_array) else {
+        return out;
+    };
+    let mut push_unique = |name: RuntimeString| {
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for item in items {
+        if item
+            .get("type")
+            .and_then(RuntimeJson::as_str)
+            .is_some_and(|kind| kind == "namespace")
+        {
+            let ns = item
+                .get("name")
+                .and_then(RuntimeJson::as_str)
+                .and_then(|s| s.try_to_utf8().ok());
+            if let Some(children) = item.get("tools").and_then(RuntimeJson::as_array) {
+                for child in children {
+                    if let Some(name) = child.get("name").and_then(RuntimeJson::as_string) {
+                        push_unique(resolve_wire_tool_name(name, ns.as_deref(), tools, profile));
+                    }
+                }
+            }
+        } else if let Some(name) = item.get("name").and_then(RuntimeJson::as_string) {
+            push_unique(resolve_wire_tool_name(name, None, tools, profile));
+        }
+    }
+    out
+}
+
+fn collect_bullet_tool_lines(
+    text: &str,
+    marker: &str,
+    profile: &ProviderBehaviorProfile,
+    out: &mut HashSet<RuntimeString>,
+) {
+    let Some(pos) = text.find(marker) else {
+        return;
+    };
+    let rest = &text[pos + marker.len()..];
+    let Some(after_line) = rest.find('\n').map(|idx| &rest[idx + 1..]) else {
+        return;
+    };
+    for line in after_line.lines() {
+        let trimmed = line.trim();
+        let Some(entry) = trimmed.strip_prefix("- ") else {
+            if trimmed.is_empty() {
+                continue;
+            }
+            break;
+        };
+        let raw_name = entry.split(':').next().unwrap_or("").trim();
+        if !raw_name.is_empty() {
+            out.insert(resolve_internal_tool_name(
+                &RuntimeString::from(raw_name),
+                profile,
+            ));
+        }
+    }
+}
+
+/// Extract internal tool names surfaced by successful `tool_search` and
+/// `ServerToolSearch` `ToolResult` messages in `messages`.
+pub(crate) fn surfaced_tools_from_message_results(
+    messages: &[Message],
+    profile: &ProviderBehaviorProfile,
+    tools: Option<&[Arc<dyn Tool>]>,
+) -> HashSet<RuntimeString> {
+    let mut legacy_search_ids: HashSet<RuntimeString> = HashSet::new();
+    for message in messages {
+        if let Message::Assistant(assistant) = message {
+            for block in &assistant.content {
+                if let ContentBlock::ToolUse(use_block) = block {
+                    if use_block.tool_kind == Some(ProviderToolCallKind::ToolSearch)
+                        || use_block.name == "tool_search"
+                    {
+                        legacy_search_ids.insert(use_block.id.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut found: HashSet<RuntimeString> = HashSet::new();
+    for message in messages {
+        let Message::ToolResult(tr) = message else {
+            continue;
+        };
+        if tr.is_error {
+            continue;
+        }
+        if tr.tool_kind == Some(ProviderToolCallKind::ServerToolSearch) {
+            if let Some(payload) = &tr.native_tool_output {
+                found.extend(surfaced_tools_from_server_output(payload, tools, profile));
+            }
+            continue;
+        }
+        if tr.tool_kind != Some(ProviderToolCallKind::ToolSearch)
+            && !legacy_search_ids.contains(&tr.tool_use_id)
+        {
+            continue;
+        }
+        let mut from_json = false;
+        if let Some(payload) = tr.native_tool_output.as_ref().or(tr.output.as_ref()) {
+            if let Some(matched) = payload.get("matched").and_then(RuntimeJson::as_array) {
+                for entry in matched {
+                    if let Some(name) = entry.as_string() {
+                        found.insert(resolve_internal_tool_name(name, profile));
+                        from_json = true;
+                    }
+                }
+            }
+            if !from_json {
+                let extracted = surfaced_tools_from_server_output(payload, tools, profile);
+                if !extracted.is_empty() {
+                    from_json = true;
+                    found.extend(extracted);
+                }
+            }
+        }
+        if !from_json {
+            for block in &tr.content {
+                if let OutputBlock::Text(text_block) = block {
+                    if let Ok(utf8) = text_block.text.try_to_utf8() {
+                        collect_bullet_tool_lines(
+                            &utf8,
+                            "These tools are now available:",
+                            profile,
+                            &mut found,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Extract all internal tool names surfaced in `messages`, including
+/// post-compaction retained surfaced-tools sections.
+pub(crate) fn surfaced_tools_from_messages(
+    messages: &[Message],
+    profile: &ProviderBehaviorProfile,
+    tools: Option<&[Arc<dyn Tool>]>,
+) -> HashSet<RuntimeString> {
+    let mut found = surfaced_tools_from_message_results(messages, profile, tools);
+    for message in messages {
+        let Message::User(user) = message else {
+            continue;
+        };
+        for block in &user.content {
+            if let ContentBlock::Text(text_block) = block {
+                if let Ok(utf8) = text_block.text.try_to_utf8() {
+                    collect_bullet_tool_lines(
+                        &utf8,
+                        "These tools you previously found via tool_search remain available",
+                        profile,
+                        &mut found,
+                    );
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The visible inventory implied by a frozen baseline plus its recorded events.

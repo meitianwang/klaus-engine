@@ -589,7 +589,7 @@ fn prepare_lean_summary_request(
 ) -> PreparedModelRequest {
     // Summarization neither calls tools nor benefits from a cross-model system
     // prompt prefix, so omitting both reserves the new model's window for history.
-    let mut prepared = shared.prepare(
+    let mut prepared = shared.prepare_without_tool_freeze(
         messages,
         &[],
         effective_max_output,
@@ -600,6 +600,11 @@ fn prepare_lean_summary_request(
         .request
         .messages
         .retain(|message| !crate::context::runtime_reminders::is_step(message));
+    prepared.request.deferred_tools.clear();
+    prepared.request.surfaced_deferred_names.clear();
+    prepared.request.frozen_tools = None;
+    prepared.request.frozen_instructions = None;
+    prepared.request.tool_inventory_events.clear();
     prepared
 }
 

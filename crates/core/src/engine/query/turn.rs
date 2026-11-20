@@ -30,7 +30,6 @@ use super::is_valid_runtime_json;
 use super::join_runtime_strings;
 use super::last_user_text;
 use super::persist_compaction;
-use super::prepare_model_request;
 use super::provider_meta_nudge;
 use super::provider_metadata;
 use super::query_path_dialect;
@@ -606,7 +605,7 @@ async fn run_turn(
         tools: Mutex::new(tools0),
         tool_specs: Mutex::new(specs0),
         surfaced: Mutex::new(surfaced0),
-        tool_freeze: Mutex::new(None),
+        tool_freeze: params.tool_freeze_state.clone().unwrap_or_default(),
         oversized_inventory_deferred: std::sync::atomic::AtomicBool::new(false),
         turn_context: Mutex::new(turn_context0),
         turn_state,
@@ -2538,15 +2537,13 @@ async fn run_turn_tool_result_budget(
         let mut guard = state.lock_recover();
         crate::context::tool_result_budget::settle(&mut guard, messages, &persisted);
     }
-    *prepared = prepare_model_request(
+    *prepared = shared.prepare(
         messages,
-        &shared.params,
         system_prompt,
         effective_max_output,
         tool_specs,
         Some(turn_override),
     );
-    prepared.request.deferred_tools = shared.deferred_request_specs(&prepared.profile);
     Ok(())
 }
 

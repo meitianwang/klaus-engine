@@ -116,6 +116,8 @@ struct NativeCandidate {
     surfaced_deferred_names: Vec<RuntimeString>,
     wire_caps: Option<crate::types::provider::WireCapabilityPolicy>,
     frozen_tools: Option<Vec<crate::types::provider::ToolSpec>>,
+    frozen_instructions: Option<RuntimeString>,
+    tool_inventory_events: Vec<crate::types::provider::ToolInventoryEvent>,
 }
 
 pub(super) fn history_hash(messages: &[Message]) -> Option<[u8; 32]> {
@@ -227,6 +229,8 @@ impl PrecomputeRegistry {
                 surfaced_deferred_names: arm.request.surfaced_deferred_names.clone(),
                 wire_caps: arm.request.wire_caps.clone(),
                 frozen_tools: arm.request.frozen_tools.clone(),
+                frozen_instructions: arm.request.frozen_instructions.clone(),
+                tool_inventory_events: arm.request.tool_inventory_events.clone(),
             })
         } else {
             None
@@ -415,6 +419,8 @@ impl PrecomputeRegistry {
                         && request.native_deferred_tools == native.native_deferred_tools
                         && request.wire_caps == native.wire_caps
                         && request.frozen_tools == native.frozen_tools
+                        && request.frozen_instructions == native.frozen_instructions
+                        && request.tool_inventory_events == native.tool_inventory_events
                         && messages_now.len() >= native.prefix_len
                         && history_hash(&messages_now[..native.prefix_len])
                             == Some(native.prefix_hash)
@@ -612,6 +618,10 @@ impl PrecomputeRegistry {
                 entries.remove(&entry.agent_key);
             }
         }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entries.lock().unwrap().clear();
     }
 }
 

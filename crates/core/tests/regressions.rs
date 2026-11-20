@@ -805,3 +805,6 @@ mod rd180b66_antigravity_turn_context;
 
 #[path = "regressions/r20261117_context_restoration_and_prefix_stability.rs"]
 mod r20261117_context_restoration_and_prefix_stability;
+
+#[path = "regressions/r20261119_tool_loading_and_prefix_organization.rs"]
+mod r20261119_tool_loading_and_prefix_organization;

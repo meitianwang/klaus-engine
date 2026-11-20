@@ -214,6 +214,13 @@ impl InferenceBundle {
                 return crate::provider::model_catalog::uncaptured_model_stream(&request.model);
             }
             request.bind_media_capabilities(&provider.capabilities(&request.model));
+            let metadata = provider.model_metadata(&request.model);
+            request.native_deferred_tools = request
+                .native_deferred_tools
+                .or(metadata.native_deferred_tools);
+            request.wire_caps.get_or_insert_with(|| {
+                crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
+            });
             call_model(request, signal)
         });
         if let Some(targets) = &self.targets {

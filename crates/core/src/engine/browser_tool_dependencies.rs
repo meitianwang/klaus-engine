@@ -233,6 +233,9 @@ impl Tool for BrowserToolDependency {
     fn mcp_server(&self) -> Option<RuntimeString> {
         self.inner.mcp_server()
     }
+    fn wire_namespace(&self) -> Option<RuntimeString> {
+        self.inner.wire_namespace()
+    }
     fn is_enabled(&self) -> bool {
         self.inner.is_enabled()
     }

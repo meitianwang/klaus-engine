@@ -75,6 +75,10 @@ pub struct PrefixFingerprint {
     /// surfacing mid-session inserts an entry and shifts every tool behind it.
     pub tool_count: usize,
     pub tools_hash: String,
+    /// Digest of immediate (non-surfaced-deferred) tools when native deferred
+    /// loading is enabled, matching `tools_hash` otherwise.
+    pub immediate_tools_hash: String,
+    pub defer_unlock_active: bool,
     pub system_parts: usize,
     /// Digest over the parts a provider cache breakpoint may cover (those marked
     /// cacheable), including their names and cache markers: a part that flips
@@ -99,6 +103,10 @@ pub struct PrefixFingerprint {
     /// resizing a block, a model switch stripping thinking blocks signed by its
     /// predecessor — and every byte after that point was re-sent uncached.
     pub history_prefix_hash: String,
+    /// Per-prefix digests after each message `0..history_messages`, allowing
+    /// multi-message appends (assistant tool call + tool result) to verify
+    /// prefix continuation directly.
+    pub history_prefix_hashes: Vec<String>,
     /// Digest of the request's cache-routing key, when it has one. Reported
     /// separately from the session id because a sub-agent keys on its own agent
     /// id, and a key that changes per request defeats routing on the wires that
@@ -130,22 +138,41 @@ impl PrefixFingerprint {
     /// Fingerprint a request as the engine hands it to a provider.
     pub fn of(request: &ModelRequest) -> Self {
         let (tool_count, tools_hash) = digest_tools(&request.tools);
+        let native_deferred = request.native_deferred_tools == Some(true);
+        let immediate_tools_hash = if native_deferred && !request.surfaced_deferred_names.is_empty()
+        {
+            let surfaced: std::collections::HashSet<&RuntimeString> =
+                request.surfaced_deferred_names.iter().collect();
+            let immediate: Vec<ToolSpec> = request
+                .tools
+                .iter()
+                .filter(|spec| !surfaced.contains(&spec.name))
+                .cloned()
+                .collect();
+            digest_tools(&immediate).1
+        } else {
+            tools_hash.clone()
+        };
         let (system_parts, stable_system_hash, volatile_system_hash) =
             digest_system(&request.system);
-        let (history_messages, history_hash, history_prefix_hash) =
+        let (history_messages, history_hash, history_prefix_hash, history_prefix_hashes) =
             digest_history(&request.messages);
         Self {
             tool_count,
             tools_hash,
+            immediate_tools_hash,
+            defer_unlock_active: native_deferred && !request.surfaced_deferred_names.is_empty(),
             system_parts,
             stable_system_hash,
             volatile_system_hash,
             history_messages,
             history_hash,
             history_prefix_hash,
+            history_prefix_hashes,
             cache_key_hash: request
-                .cache_key
+                .cache_domain
                 .as_ref()
+                .or(request.cache_key.as_ref())
                 .map(|key| short_hex(&Sha256::digest(key.to_node_utf8()))),
             model: crate::provider::util::diagnostic_string(&request.model),
             frozen_tools_hash: request
@@ -163,8 +190,10 @@ impl PrefixFingerprint {
                     &mut hasher,
                     format!("{:?}", request.native_deferred_tools).as_bytes(),
                 );
-                for tool in &request.deferred_tools {
-                    feed(&mut hasher, tool);
+                if !native_deferred {
+                    for tool in &request.deferred_tools {
+                        feed(&mut hasher, tool);
+                    }
                 }
                 finish(&hasher)
             },
@@ -248,20 +277,29 @@ fn digest_system(parts: &[SystemPromptPart]) -> (usize, String, String) {
     (parts.len(), finish(&stable), finish(&volatile))
 }
 
-fn digest_history(messages: &[Message]) -> (usize, String, String) {
+fn digest_history(messages: &[Message]) -> (usize, String, String, Vec<String>) {
     let mut hasher = Sha256::new();
-    let split = messages.len().saturating_sub(1);
-    for message in &messages[..split] {
+    let mut prefix_hashes = Vec::with_capacity(messages.len());
+    for message in messages {
         feed_message(&mut hasher, message);
+        prefix_hashes.push(finish(&hasher));
     }
-    // SHA-256 is a streaming hash, so the state after the leading messages IS
-    // the prefix digest: cloning it here costs one small struct copy instead of
-    // a second pass over the whole history.
-    let history_prefix_hash = finish(&hasher);
-    for message in &messages[split..] {
-        feed_message(&mut hasher, message);
-    }
-    (messages.len(), finish(&hasher), history_prefix_hash)
+    let empty_hash = finish(&Sha256::new());
+    let history_hash = prefix_hashes
+        .last()
+        .cloned()
+        .unwrap_or_else(|| empty_hash.clone());
+    let history_prefix_hash = if prefix_hashes.len() >= 2 {
+        prefix_hashes[prefix_hashes.len() - 2].clone()
+    } else {
+        empty_hash
+    };
+    (
+        messages.len(),
+        history_hash,
+        history_prefix_hash,
+        prefix_hashes,
+    )
 }
 
 /// Hash one message's identity, kind and block shapes.
