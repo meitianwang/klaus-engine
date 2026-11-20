@@ -714,6 +714,18 @@ impl AnthropicProvider {
             .disabled_for(&self.messages_url, model, INLINE_TOOLS_CAPABILITY)
     }
 
+    /// Search-channel beta generation: first-party surfaces ride the newer
+    /// header, third-party endpoints the older one. Derived from the same gate
+    /// that owns the deferred registrations.
+    fn tool_search_beta(&self, model: &RuntimeString, bound: Option<bool>) -> Option<&'static str> {
+        self.native_deferred_tools_enabled(model, bound)
+            .then_some(if self.is_first_party {
+                ADVANCED_TOOL_USE_BETA
+            } else {
+                TOOL_SEARCH_BETA
+            })
+    }
+
     /// Resolve the announcement variant for one request.
     fn tool_change_mode(&self, model: &RuntimeString, req: &ModelRequest) -> ToolChangeMode {
         if !self.tool_change_blocks_enabled(model, req) {
@@ -1234,11 +1246,7 @@ impl ModelProvider for AnthropicProvider {
         // Search-channel beta generation: first-party surfaces ride the newer
         // header, third-party endpoints the older one. Derived once per request
         // from the same gate that owns the deferred registrations.
-        let tool_search_beta = defer_loading_supported.then_some(if self.is_first_party {
-            ADVANCED_TOOL_USE_BETA
-        } else {
-            TOOL_SEARCH_BETA
-        });
+        let tool_search_beta = self.tool_search_beta(&req.model, req.native_deferred_tools);
         let tool_change_mode = self.tool_change_mode(&req.model, &req);
         let affinity_session_id = self.openrouter_session_affinity_id(&req);
         let native_tool_support = self.native_tool_support.clone();
@@ -5761,6 +5769,630 @@ mod tests {
         assert!(!serialized.contains("tool_reference"));
         // Idempotent: no reference blocks remain.
         assert!(!rebuild_reference_results_as_text(&mut body));
+    }
+
+    // ------------------------------------------------------------------
+    // Coverage matrix: every catalog model x endpoint kind, cell by cell.
+    // The lists below mirror the offline shape facts on purpose: a catalog
+    // id change without a matrix update fails the drift guard.
+    // ------------------------------------------------------------------
+
+    fn matrix_deferred_catalog() -> [&'static str; 18] {
+        [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5-latest",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-7",
+            "claude-sonnet-4-8",
+            "claude-sonnet-4-9",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-5-latest",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-4-9",
+            "claude-opus-5",
+            "claude-opus-5-5",
+        ]
+    }
+
+    fn matrix_mid_convo_catalog() -> [&'static str; 11] {
+        [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-5-2",
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-mythos-5-2",
+        ]
+    }
+
+    #[test]
+    fn catalog_drift_guard_pins_the_offline_shape_facts() {
+        use crate::provider::model_catalog;
+        for model in matrix_deferred_catalog() {
+            assert!(
+                model_catalog::native_deferred_tools_default("anthropic", &model.into()),
+                "deferred catalog drifted: {model}"
+            );
+        }
+        for model in matrix_mid_convo_catalog() {
+            assert!(
+                model_catalog::mid_convo_system_messages_default("anthropic", &model.into()),
+                "mid-convo system catalog drifted: {model}"
+            );
+            assert!(
+                model_catalog::mid_convo_tool_changes_default("anthropic", &model.into()),
+                "mid-convo tool-change catalog drifted: {model}"
+            );
+        }
+        // Models that must stay OUT of each list (guards against a list
+        // silently widening to the whole family).
+        for model in [
+            "claude-sonnet-4",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-haiku-5-5",
+            "claude-fable-5",
+            "claude-mythos-5-2",
+        ] {
+            assert!(
+                !model_catalog::native_deferred_tools_default("anthropic", &model.into()),
+                "unexpected deferred catalog member: {model}"
+            );
+        }
+        for model in ["claude-sonnet-4-5", "claude-opus-4-6", "claude-sonnet-4"] {
+            assert!(
+                !model_catalog::mid_convo_system_messages_default("anthropic", &model.into()),
+                "unexpected mid-convo catalog member: {model}"
+            );
+        }
+        // Suffix handling: the 1M marker strips for the deferred list, and
+        // normalization strips -latest / dated suffixes for mid-convo only.
+        assert!(model_catalog::native_deferred_tools_default(
+            "anthropic",
+            &"claude-sonnet-5-5[1m]".into()
+        ));
+        assert!(!model_catalog::native_deferred_tools_default(
+            "anthropic",
+            &"claude-opus-5-latest".into()
+        ));
+        assert!(model_catalog::mid_convo_system_messages_default(
+            "anthropic",
+            &"claude-opus-5-latest".into()
+        ));
+        assert!(model_catalog::mid_convo_system_messages_default(
+            "anthropic",
+            &"claude-opus-5-20260101".into()
+        ));
+    }
+
+    fn matrix_first_party() -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicProviderOptions {
+            protected_first_party_contract: true,
+            ..Default::default()
+        })
+    }
+
+    fn matrix_third_party(
+        caps: Option<crate::types::provider::ModelCapabilities>,
+    ) -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicProviderOptions {
+            base_url: Some("https://gateway.example".to_string()),
+            api_key: Some("fixture".to_string()),
+            capabilities: caps,
+            ..Default::default()
+        })
+    }
+
+    /// A third-party endpoint whose host declared the native deferred channel.
+    /// Session-level declarations bind the default model only, so the declared
+    /// cell carries the model as its default; the by-model variant declares
+    /// through `capabilities_by_model` for a non-default model.
+    fn matrix_third_party_declared(model: &str) -> AnthropicProvider {
+        let caps = crate::types::provider::ModelCapabilities {
+            native_deferred_tools: Some(true),
+            ..Default::default()
+        };
+        AnthropicProvider::new(AnthropicProviderOptions {
+            base_url: Some("https://gateway.example".to_string()),
+            api_key: Some("fixture".to_string()),
+            default_model: Some(model.to_string()),
+            capabilities: Some(caps),
+            ..Default::default()
+        })
+    }
+
+    fn matrix_vertex() -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicProviderOptions {
+            vertex: Some(VertexConfig {
+                project: "fixture-project".to_string(),
+                location: "global".to_string(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn matrix_bedrock() -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicProviderOptions {
+            bedrock: Some(BedrockConfig {
+                region: "us-east-1".to_string(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn matrix_spec(name: &str, description: &str) -> ToolSpec {
+        function_spec(
+            name,
+            description,
+            schema_of(exact_json!({ "type": "object", "properties": {} })),
+        )
+    }
+
+    fn matrix_request(model: &str, frozen: bool) -> ModelRequest {
+        let mut req = base_req();
+        req.model = RuntimeString::from(model);
+        req.messages = if frozen {
+            vec![user_msg("hi"), assistant_text("a1", "ok")]
+        } else {
+            vec![user_msg("hi")]
+        };
+        req.tools = vec![
+            matrix_spec("tool_search", "Find tools"),
+            matrix_spec("read", "Read active tool"),
+            matrix_spec("mcp__alpha__one", "Unlocked tool"),
+        ];
+        req.deferred_tools = vec![matrix_spec("mcp__alpha__two", "Folded tool")];
+        req.surfaced_deferred_names = vec!["mcp__alpha__one".into()];
+        if frozen {
+            req.frozen_tools = Some(vec![
+                matrix_spec("tool_search", "Find tools"),
+                matrix_spec("read", "Read active tool"),
+            ]);
+            req.tool_inventory_events = vec![crate::types::provider::ToolInventoryEvent {
+                anchor_uuid: Some("u1".into()),
+                added: vec![
+                    matrix_spec("calculator", "Added tool"),
+                    // A surfaced addition must never ride the block channel:
+                    // it belongs to the marked registration instead.
+                    matrix_spec("mcp__alpha__one", "Unlocked tool"),
+                ],
+                removed: vec![],
+            }];
+        }
+        req
+    }
+
+    fn matrix_params(provider: &AnthropicProvider, req: &ModelRequest) -> Value {
+        let defer = provider.native_deferred_tools_enabled(&req.model, req.native_deferred_tools);
+        let mode = provider.tool_change_mode(&req.model, req);
+        let params = build_params_with_media_limits(
+            req,
+            false,
+            false,
+            defer,
+            mode,
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            false,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("matrix body must build");
+        Value::Object(params)
+    }
+
+    fn matrix_tool<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|found| found == name)
+            })
+    }
+
+    fn matrix_last_user_text(body: &Value) -> RuntimeString {
+        let messages = body.get("messages").and_then(Value::as_array).unwrap();
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user")
+            })
+            .expect("trailing user message");
+        let mut text = RuntimeString::from("");
+        if let Some(blocks) = last_user.get("content").and_then(Value::as_array) {
+            for block in blocks {
+                if let Some(part) = block.get("text").and_then(Value::as_str) {
+                    text = text.concat(part);
+                }
+            }
+        }
+        text
+    }
+
+    /// Assert every deferred-channel invariant of one assembled body.
+    fn assert_matrix_body(body: &Value, defer: bool, blocks: bool, cell: &str) {
+        // 1. Search entry description: the static protocol text while the
+        //    native channel is armed, the registry text otherwise.
+        let search = matrix_tool(body, "tool_search")
+            .unwrap_or_else(|| panic!("{cell}: tool_search missing"));
+        let description = search.get("description").and_then(Value::as_str).unwrap();
+        if defer {
+            assert_eq!(
+                description.try_to_utf8().unwrap(),
+                TOOL_SEARCH_WIRE_DESCRIPTION,
+                "{cell}: description override"
+            );
+        } else {
+            assert_eq!(description, "Find tools", "{cell}: description leak");
+        }
+        // 2. The unlocked tool rides marked under the native channel; without
+        //    the channel it is immediate, except under the block channel where
+        //    it arrives as an in-stream addition instead of a top-level entry.
+        let one = matrix_tool(body, "mcp__alpha__one");
+        if defer {
+            let one = one.unwrap_or_else(|| panic!("{cell}: unlocked tool missing"));
+            assert_eq!(
+                one.get("defer_loading").and_then(Value::as_bool),
+                Some(true),
+                "{cell}: marked registration"
+            );
+        } else if blocks {
+            assert!(
+                one.is_none(),
+                "{cell}: unlocked tool should ride the block channel"
+            );
+        } else {
+            let one = one.unwrap_or_else(|| panic!("{cell}: unlocked tool missing"));
+            assert!(
+                one.get("defer_loading").is_none(),
+                "{cell}: unexpected mark"
+            );
+        }
+        // 3. The folded tool is zero bytes in every cell.
+        assert!(
+            matrix_tool(body, "mcp__alpha__two").is_none(),
+            "{cell}: folded definition on the wire"
+        );
+        // 4. The cache breakpoint stays on the last immediate tool of the
+        //    top-level list (the baseline tail under the block channel).
+        if defer || blocks {
+            assert!(
+                matrix_tool(body, "read")
+                    .unwrap()
+                    .get("cache_control")
+                    .is_some(),
+                "{cell}: breakpoint moved off the immediate tail"
+            );
+            if let Some(one) = one {
+                assert!(
+                    one.get("cache_control").is_none(),
+                    "{cell}: breakpoint on an appended registration"
+                );
+            }
+        } else {
+            assert!(
+                one.unwrap().get("cache_control").is_some(),
+                "{cell}: breakpoint moved off the immediate tail"
+            );
+        }
+        // 5. Placeholder scaffolding rides exactly with the block channel.
+        assert_eq!(
+            matrix_tool(body, DEFERRED_PLACEHOLDER_TOOL).is_some(),
+            blocks,
+            "{cell}: placeholder"
+        );
+        // 6. Announcement: the current folded list with load guidance, only
+        //    while the native channel is armed.
+        let tail = matrix_last_user_text(body);
+        let tail_utf8 = tail.try_to_utf8().unwrap();
+        if defer {
+            assert!(
+                tail_utf8.contains("<system-reminder>"),
+                "{cell}: announcement wrapper"
+            );
+            assert!(
+                tail_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
+                "{cell}: announcement header"
+            );
+            assert!(
+                tail_utf8.contains(DEFERRED_ANNOUNCEMENT_GUIDANCE),
+                "{cell}: announcement guidance"
+            );
+            assert!(
+                tail_utf8.contains("mcp__alpha__two"),
+                "{cell}: folded name missing"
+            );
+            assert!(
+                !tail_utf8.contains("mcp__alpha__one"),
+                "{cell}: unlocked name leaked into the announcement"
+            );
+        } else {
+            assert!(
+                !tail_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
+                "{cell}: announcement without the native channel"
+            );
+        }
+        // 7. Block channel: the plain addition announces by block; the
+        //    surfaced addition never does (it belongs to the registration).
+        let messages = body.get("messages").and_then(Value::as_array).unwrap();
+        let mut additions: Vec<RuntimeString> = Vec::new();
+        for message in messages {
+            let is_system = message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "system");
+            let Some(content) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for block in content {
+                let is_addition = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_addition");
+                if !is_addition {
+                    continue;
+                }
+                assert!(is_system, "{cell}: addition outside a system message");
+                // The by-value shape nests the definition; the reference
+                // shape carries the name directly.
+                let name = block
+                    .get("tool")
+                    .and_then(|tool| {
+                        tool.get("name")
+                            .or_else(|| tool.get("definition").and_then(|d| d.get("name")))
+                    })
+                    .and_then(Value::as_str);
+                if let Some(name) = name {
+                    additions.push(name.clone());
+                }
+            }
+        }
+        if blocks {
+            assert!(
+                additions.iter().any(|name| name == "calculator"),
+                "{cell}: block addition missing"
+            );
+            if defer {
+                assert!(
+                    !additions.iter().any(|name| name == "mcp__alpha__one"),
+                    "{cell}: surfaced tool rode the block channel"
+                );
+            } else {
+                assert!(
+                    additions.iter().any(|name| name == "mcp__alpha__one"),
+                    "{cell}: surfaced tool missing from the block channel"
+                );
+            }
+        } else {
+            assert!(additions.is_empty(), "{cell}: unexpected block additions");
+        }
+    }
+
+    #[test]
+    fn deferred_wire_matrix_covers_every_catalog_model_and_endpoint() {
+        let mut cells: Vec<(RuntimeString, bool, bool)> = Vec::new();
+        for model in matrix_deferred_catalog() {
+            let mid = matrix_mid_convo_catalog().contains(&model);
+            cells.push((model.into(), true, mid));
+        }
+        for model in matrix_mid_convo_catalog() {
+            if !matrix_deferred_catalog().contains(&model) {
+                cells.push((model.into(), false, true));
+            }
+        }
+        for model in ["claude-sonnet-4", "claude-haiku-4-5", "claude-opus-4-1"] {
+            cells.push((model.into(), false, false));
+        }
+        // Suffix variants pin the asymmetric normalization on purpose.
+        cells.push(("claude-sonnet-5-5[1m]".into(), true, true));
+        cells.push(("claude-opus-5-latest".into(), false, true));
+        cells.push(("claude-opus-5-20260101".into(), false, true));
+
+        let first_party = matrix_first_party();
+        let third_party = matrix_third_party(None);
+        let vertex = matrix_vertex();
+        let bedrock = matrix_bedrock();
+
+        for (model, expect_defer, expect_mid) in &cells {
+            let cell = model.try_to_utf8().unwrap();
+            let declared_party = matrix_third_party_declared(&cell);
+            // Gate derivations, first-party: the offline catalog arms the
+            // deferred channel and the newer search beta generation.
+            assert_eq!(
+                first_party.native_deferred_tools_enabled(model, None),
+                *expect_defer,
+                "{cell}: first-party deferred gate"
+            );
+            assert_eq!(
+                first_party.tool_search_beta(model, None),
+                expect_defer.then_some(ADVANCED_TOOL_USE_BETA),
+                "{cell}: first-party search beta"
+            );
+            // Third-party without a declaration: the catalog never arms the
+            // deferred channel, and no search beta rides.
+            assert!(
+                !third_party.native_deferred_tools_enabled(model, None),
+                "{cell}: third-party deferred leak"
+            );
+            assert_eq!(
+                third_party.tool_search_beta(model, None),
+                None,
+                "{cell}: third-party search beta leak"
+            );
+            // Third-party WITH a declaration: the channel arms and rides the
+            // older search beta generation.
+            assert!(
+                declared_party.native_deferred_tools_enabled(model, None),
+                "{cell}: declared third-party deferred gate"
+            );
+            assert_eq!(
+                declared_party.tool_search_beta(model, None),
+                Some(TOOL_SEARCH_BETA),
+                "{cell}: declared third-party search beta"
+            );
+            // A per-model declaration arms the channel for a non-default
+            // model too (the session-level declaration would not).
+            {
+                let mut by_model = std::collections::HashMap::new();
+                by_model.insert(
+                    cell.clone(),
+                    crate::types::provider::ModelCapabilities {
+                        native_deferred_tools: Some(true),
+                        ..Default::default()
+                    },
+                );
+                let per_model = AnthropicProvider::new(AnthropicProviderOptions {
+                    base_url: Some("https://gateway.example".to_string()),
+                    api_key: Some("fixture".to_string()),
+                    capabilities_by_model: Some(by_model),
+                    ..Default::default()
+                });
+                assert!(
+                    per_model.native_deferred_tools_enabled(model, None),
+                    "{cell}: by-model declaration ignored"
+                );
+                assert_eq!(
+                    per_model.tool_search_beta(model, None),
+                    Some(TOOL_SEARCH_BETA),
+                    "{cell}: by-model declaration search beta"
+                );
+            }
+            // Managed cloud endpoints: every native surface stays off.
+            assert!(
+                !vertex.native_deferred_tools_enabled(model, None),
+                "{cell}: vertex deferred leak"
+            );
+            assert!(
+                !bedrock.native_deferred_tools_enabled(model, None),
+                "{cell}: bedrock deferred leak"
+            );
+
+            for frozen in [false, true] {
+                let req = matrix_request(&cell, frozen);
+                let expect_blocks = frozen && *expect_mid;
+                // Block-channel mode: catalog mid-convo models with a frozen
+                // baseline ride by value until a refusal downgrades them.
+                let expect_mode = if expect_blocks {
+                    ToolChangeMode::ByValue
+                } else {
+                    ToolChangeMode::Off
+                };
+                assert_eq!(
+                    first_party.tool_change_mode(model, &req),
+                    expect_mode,
+                    "{cell}/frozen={frozen}: first-party mode"
+                );
+                assert_eq!(
+                    third_party.tool_change_mode(model, &req),
+                    expect_mode,
+                    "{cell}/frozen={frozen}: third-party mode"
+                );
+                assert_eq!(
+                    vertex.tool_change_mode(model, &req),
+                    ToolChangeMode::Off,
+                    "{cell}/frozen={frozen}: vertex mode leak"
+                );
+                assert_eq!(
+                    bedrock.tool_change_mode(model, &req),
+                    ToolChangeMode::Off,
+                    "{cell}/frozen={frozen}: bedrock mode leak"
+                );
+                // Full body shape, first-party.
+                let body = matrix_params(&first_party, &req);
+                assert_matrix_body(
+                    &body,
+                    *expect_defer,
+                    expect_blocks,
+                    &format!("{cell}/first-party/frozen={frozen}"),
+                );
+                // Third-party without a declaration keeps the eager shape.
+                let body = matrix_params(&third_party, &req);
+                assert_matrix_body(
+                    &body,
+                    false,
+                    expect_blocks,
+                    &format!("{cell}/third-party/frozen={frozen}"),
+                );
+                // Declared third-party matches the first-party deferred shape
+                // (only the search beta generation differs, asserted above).
+                let body = matrix_params(&declared_party, &req);
+                assert_matrix_body(
+                    &body,
+                    true,
+                    expect_blocks,
+                    &format!("{cell}/declared/frozen={frozen}"),
+                );
+                // Managed cloud endpoints: no deferred surface, no blocks.
+                let body = matrix_params(&vertex, &req);
+                assert_matrix_body(
+                    &body,
+                    false,
+                    false,
+                    &format!("{cell}/vertex/frozen={frozen}"),
+                );
+                let body = matrix_params(&bedrock, &req);
+                assert_matrix_body(
+                    &body,
+                    false,
+                    false,
+                    &format!("{cell}/bedrock/frozen={frozen}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_identity_block_coexists_with_the_deferred_channel() {
+        let provider = matrix_first_party();
+        let req = matrix_request("claude-sonnet-5-5", false);
+        let defer = provider.native_deferred_tools_enabled(&req.model, None);
+        assert!(defer);
+        let params = build_params_with_media_limits(
+            &req,
+            false,
+            false,
+            defer,
+            provider.tool_change_mode(&req.model, &req),
+            StructuredOutputMode {
+                native: false,
+                review_tool_loop: false,
+                auto_result_tool: false,
+            },
+            true,
+            ImageLimits::default(),
+            MediaBudget::for_anthropic(true, None),
+        )
+        .expect("identity body must build");
+        let body = Value::Object(params);
+        // The subscription identity block leads the system parts.
+        let system = body.get("system").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            system[0].get("text").and_then(Value::as_str).unwrap(),
+            CLAUDE_CODE_SYSTEM_IDENTITY
+        );
+        // And the deferred channel is untouched by the identity prefix.
+        assert_matrix_body(&body, true, false, "subscription-identity");
     }
 
     #[test]
