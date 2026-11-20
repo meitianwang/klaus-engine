@@ -135,7 +135,7 @@ impl ModelProvider for WriteStdinProvider {
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(search_text
-                    .contains("Prefer bash in background mode with bash_output and kill_shell"));
+                    .contains("Prefer bash in background mode with TaskOutput and TaskStop"));
                 assert!(search_text
                     .contains("only when the same live process must receive interactive input"));
                 assert!(search_text

@@ -212,7 +212,7 @@ fn build_input_schema(agent_names: &[RuntimeString], opts: &TaskToolOptions) -> 
             "agentType":null,
             "model":{"type":"string","minLength":1},
             "reasoning_effort":{"type":"string","description":"Reasoning effort override for the child. Omit to inherit the parent selection."},
-            "run_in_background":{"type":"boolean","description":"Sub-agents run in the background by default; you will be told when one completes, so do not poll for it — read its result with task_output (or its output file) once you are notified. Set to false to run this sub-agent synchronously when you need its result before you can do anything else."},
+            "run_in_background":{"type":"boolean","description":"Sub-agents run in the background by default; you will be told when one completes, so do not poll for it — read its result with TaskOutput (or its output file) once you are notified; call Yield to wait for background work. Set to false to run this sub-agent synchronously when you need its result before you can do anything else."},
             "fork_turns":{"type":"string","description":"Conversation history to inherit: all (default) or none. Positive integer strings also inherit the full conversation."},
             "peer":{"type":"string","description":"Swarm peer name to give this sub-agent (it joins your team as that peer)"},
             "persistent":{"type":"boolean","description":"Spawn a PERSISTENT teammate: a long-lived worker that runs this prompt, goes idle, then keeps processing new SendMessage messages until stopped. Requires `peer` + swarm. Always runs detached; returns an id + result file."}
@@ -550,7 +550,7 @@ fn js_agent_type_to_primitive_throws(value: &Json) -> bool {
 
 /// Compose the tool description, listing available roles when any are defined.
 fn build_description(agents: &[AgentDefinition]) -> RuntimeString {
-    let base = "Delegate a self-contained subtask to an in-process sub-agent when permitted by the current collaboration mode. Supply the goal, relevant context and expected result. Every new child requires model: choose by task complexity from the tiers or model directory advertised in the model parameter. Concrete model choices require the model-directory setting to be enabled. Do not omit model or use inherit. The model parameter defines the active selection policy and fallback boundary. Continue an existing child with followup_task where available, or the message tool's explicit turn trigger, keeping its original model. Specify owned modules or responsibility boundaries, deliverables, and dependencies or handoffs with other tasks. Independent task calls may run in parallel; sequence calls when one needs another's result. Sub-agents run in the background by default and report completion; read a finished result with task_output, and wait only when it blocks your next step. Use SendMessage for further direction and task_stop only when the agent should stop. Verify consequential changes before relying on a report. These operations execute directly in the engine and require no workflow program.";
+    let base = "Delegate a self-contained subtask to an in-process sub-agent when permitted by the current collaboration mode. Supply the goal, relevant context and expected result. Every new child requires model: choose by task complexity from the tiers or model directory advertised in the model parameter. Concrete model choices require the model-directory setting to be enabled. Do not omit model or use inherit. The model parameter defines the active selection policy and fallback boundary. Continue an existing child with followup_task where available, or the message tool's explicit turn trigger, keeping its original model. Specify owned modules or responsibility boundaries, deliverables, and dependencies or handoffs with other tasks. Independent task calls may run in parallel; sequence calls when one needs another's result. Sub-agents run in the background by default and report completion; read a finished result with TaskOutput, and call Yield to wait for background work. Use SendMessage for further direction and TaskStop only when the agent should stop. Verify consequential changes before relying on a report. These operations execute directly in the engine and require no workflow program.";
     if agents.is_empty() {
         return RuntimeString::from(base);
     }
@@ -1044,6 +1044,9 @@ pub(super) async fn dispatch_native_message_tool(
     let messages = Arc::new(Mutex::new(Vec::<Message>::new()));
     let recorded = messages.clone();
     let params = QueryParams {
+        reply_gate: Some(std::sync::Arc::new(
+            crate::types::tool::ReplyScopedGate::default(),
+        )),
         retained_tool_tasks: None,
         precompute: None,
         prepare_request_usage: None,

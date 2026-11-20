@@ -4077,6 +4077,7 @@ impl Session {
                 .map(crate::schemas::effort::EffortValue::Level)
         };
         let params = QueryParams {
+            reply_gate: None,
             multi_agent_instructions: false,
             thread_id: self.id.concat(&readonly_suffix),
             turn_id: RuntimeString::from((self.deps.uuid)()),

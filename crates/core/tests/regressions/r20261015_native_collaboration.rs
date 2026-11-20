@@ -64,6 +64,29 @@ fn receipt(request: &ModelRequest, id: &str) -> (bool, String) {
         .unwrap_or_else(|| panic!("missing native tool result {id}"))
 }
 
+/// Two tool calls inside one assistant reply (one start, one stop).
+fn paired(a: (&str, &str, Value), b: (&str, &str, Value)) -> Vec<ModelStreamEvent> {
+    let mut events = vec![ModelStreamEvent::MessageStart {
+        model: MODEL.into(),
+    }];
+    for (id, name, input) in [a, b] {
+        events.push(ModelStreamEvent::ToolUseStart {
+            id: id.into(),
+            name: name.into(),
+            thought_signature: None,
+            tool_kind: None,
+            input_format: None,
+        });
+        events.push(ModelStreamEvent::ToolUseInputDelta {
+            id: id.into(),
+            partial_json: input.to_string().into(),
+        });
+        events.push(ModelStreamEvent::ToolUseStop { id: id.into() });
+    }
+    events.push(stop(ModelStopReason::ToolUse));
+    events
+}
+
 fn spawned_id(request: &ModelRequest, call: &str) -> String {
     let (failed, text) = receipt(request, call);
     assert!(!failed, "{call}: {text}");
@@ -119,7 +142,7 @@ fn answer(text: &str) -> Vec<ModelStreamEvent> {
 }
 
 fn assert_controls(request: &ModelRequest, can_spawn: bool) {
-    for name in ["task_output", "task_stop", "SendMessage"] {
+    for name in ["TaskOutput", "TaskStop", "SendMessage"] {
         assert!(
             request.tools.iter().any(|tool| tool.name == name),
             "native control {name} must be visible without discovery"
@@ -177,24 +200,29 @@ impl NativeProvider {
             1 => {
                 let id = spawned_id(request, "root-spawn");
                 *self.worker_id.lock().unwrap() = id.clone();
-                tool(
-                    "root-wait",
-                    "task_output",
-                    json!({"task_id":id,"block":true,"timeout":10000}),
-                )
+                tool("root-wait", "Yield", json!({}))
             }
             2 => {
                 let (failed, text) = receipt(request, "root-wait");
-                assert!(!failed && text.contains("worker complete"), "{text}");
-                tool(
-                    "root-message",
-                    "SendMessage",
-                    json!({
-                        "to":"worker", "summary":"Continue existing worker", "message":"native-worker-followup"
-                    }),
+                assert!(!failed && text.contains("The wait has ended"), "{text}");
+                paired(
+                    (
+                        "root-read",
+                        "TaskOutput",
+                        json!({"task_id": self.worker_id.lock().unwrap().clone()}),
+                    ),
+                    (
+                        "root-message",
+                        "SendMessage",
+                        json!({
+                            "to":"worker", "summary":"Continue existing worker", "message":"native-worker-followup"
+                        }),
+                    ),
                 )
             }
             3 => {
+                let (failed, text) = receipt(request, "root-read");
+                assert!(!failed && text.contains("worker complete"), "{text}");
                 let (failed, text) = receipt(request, "root-message");
                 assert!(!failed && text.contains("queued"), "{text}");
                 assert_eq!(
@@ -214,30 +242,33 @@ impl NativeProvider {
             4 => {
                 let (failed, text) = receipt(request, "root-activate");
                 assert!(!failed && text.contains("resumed"), "{text}");
-                tool(
-                    "root-followup-wait",
-                    "task_output",
-                    json!({
-                        "task_id":self.worker_id.lock().unwrap().clone(), "block":true,"timeout":10000
-                    }),
-                )
+                tool("root-followup-wait", "Yield", json!({}))
             }
             5 => {
                 let (failed, text) = receipt(request, "root-followup-wait");
+                assert!(!failed && text.contains("The wait has ended"), "{text}");
+                paired(
+                    (
+                        "root-followup-read",
+                        "TaskOutput",
+                        json!({"task_id": self.worker_id.lock().unwrap().clone()}),
+                    ),
+                    (
+                        "root-blocker",
+                        "task",
+                        json!({"model": "low",
+                            "description":"main interrupt target", "prompt":"native-root-blocker",
+                            "fork_turns":"none", "run_in_background":true
+                        }),
+                    ),
+                )
+            }
+            6 => {
+                let (failed, text) = receipt(request, "root-followup-read");
                 assert!(
                     !failed && text.contains("worker followup complete"),
                     "{text}"
                 );
-                tool(
-                    "root-blocker",
-                    "task",
-                    json!({"model": "low",
-                        "description":"main interrupt target", "prompt":"native-root-blocker",
-                        "fork_turns":"none", "run_in_background":true
-                    }),
-                )
-            }
-            6 => {
                 let id = spawned_id(request, "root-blocker");
                 *self.root_blocker_id.lock().unwrap() = id.clone();
                 tool("root-stop", "task_stop", json!({"task_id":id}))
@@ -271,24 +302,29 @@ impl NativeProvider {
             1 => {
                 let id = spawned_id(request, "child-spawn");
                 *self.grandchild_id.lock().unwrap() = id.clone();
-                tool(
-                    "child-wait",
-                    "task_output",
-                    json!({"task_id":id,"block":true,"timeout":10000}),
-                )
+                tool("child-wait", "Yield", json!({}))
             }
             2 => {
                 let (failed, text) = receipt(request, "child-wait");
-                assert!(!failed && text.contains("grandchild complete"), "{text}");
-                tool(
-                    "child-message",
-                    "SendMessage",
-                    json!({
-                        "to":"grandchild", "summary":"Continue existing grandchild", "message":"native-grandchild-followup"
-                    }),
+                assert!(!failed && text.contains("The wait has ended"), "{text}");
+                paired(
+                    (
+                        "child-read",
+                        "TaskOutput",
+                        json!({"task_id": self.grandchild_id.lock().unwrap().clone()}),
+                    ),
+                    (
+                        "child-message",
+                        "SendMessage",
+                        json!({
+                            "to":"grandchild", "summary":"Continue existing grandchild", "message":"native-grandchild-followup"
+                        }),
+                    ),
                 )
             }
             3 => {
+                let (failed, text) = receipt(request, "child-read");
+                assert!(!failed && text.contains("grandchild complete"), "{text}");
                 let (failed, text) = receipt(request, "child-message");
                 assert!(!failed && text.contains("queued"), "{text}");
                 assert_eq!(
@@ -308,30 +344,33 @@ impl NativeProvider {
             4 => {
                 let (failed, text) = receipt(request, "child-activate");
                 assert!(!failed && text.contains("resumed"), "{text}");
-                tool(
-                    "child-followup-wait",
-                    "task_output",
-                    json!({
-                        "task_id":self.grandchild_id.lock().unwrap().clone(), "block":true,"timeout":10000
-                    }),
-                )
+                tool("child-followup-wait", "Yield", json!({}))
             }
             5 => {
                 let (failed, text) = receipt(request, "child-followup-wait");
+                assert!(!failed && text.contains("The wait has ended"), "{text}");
+                paired(
+                    (
+                        "child-followup-read",
+                        "TaskOutput",
+                        json!({"task_id": self.grandchild_id.lock().unwrap().clone()}),
+                    ),
+                    (
+                        "child-blocker",
+                        "task",
+                        json!({"model": "low",
+                            "description":"child interrupt target", "prompt":"native-worker-blocker",
+                            "fork_turns":"none", "run_in_background":true
+                        }),
+                    ),
+                )
+            }
+            6 => {
+                let (failed, text) = receipt(request, "child-followup-read");
                 assert!(
                     !failed && text.contains("grandchild followup complete"),
                     "{text}"
                 );
-                tool(
-                    "child-blocker",
-                    "task",
-                    json!({"model": "low",
-                        "description":"child interrupt target", "prompt":"native-worker-blocker",
-                        "fork_turns":"none", "run_in_background":true
-                    }),
-                )
-            }
-            6 => {
                 let id = spawned_id(request, "child-blocker");
                 *self.worker_blocker_id.lock().unwrap() = id.clone();
                 tool("child-stop", "task_stop", json!({"task_id":id}))

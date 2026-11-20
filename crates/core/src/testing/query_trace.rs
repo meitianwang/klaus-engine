@@ -83,6 +83,7 @@ fn query_params(
     let config = crate::schemas::config::default_config();
     let specs = to_tool_specs(&tools);
     QueryParams {
+        reply_gate: None,
         retained_tool_tasks: None,
         multi_agent_instructions: false,
         thread_id: "thread-1".into(),
@@ -315,6 +316,7 @@ fn seq_uuid() -> Arc<dyn Fn() -> String + Send + Sync> {
 
 fn make_tool_context(process_context: &RuntimeProcessContext, cwd: &str) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             crate::command_runtime::background::BackgroundCommandRegistry::new(),

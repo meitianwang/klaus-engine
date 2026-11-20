@@ -368,6 +368,7 @@ impl Session {
             }) as crate::engine::query::OnMessage
         };
         let params = QueryParams {
+            reply_gate: None,
             multi_agent_instructions: false,
             thread_id,
             turn_id: turn_id.clone(),

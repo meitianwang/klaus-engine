@@ -404,7 +404,7 @@ fn envelope_producer_cases() -> Vec<EnvelopeProducerCase> {
     const MEMORY: &str = "This memory was saved 2 days ago. It is a point-in-time note, not live state — any file paths, line numbers, or code details it cites may be out of date. Verify against the current code before relying on it as fact.";
     const LOOP: &str = "A potential loop was detected (repetitive actions). Stop and take a step back — confirm you are making real forward progress toward the user's goal. If not, change your approach rather than repeating the same tool calls or text.";
     const TOKEN: &str = "You are at ~45% of the token target for this task (450 of 1000 output tokens). Continue productive work toward the full requested outcome while work remains. The target is a minimum for productive work on the requested task, not a reason to pad the answer or invent unrequested work. If the task is complete, report the outcome with the detail the request requires.";
-    const BACKGROUND: &str = "Background task \"inspect logs\" completed. Read its result with task_output (or its output file); do not re-spawn it.";
+    const BACKGROUND: &str = "Background task \"inspect logs\" completed. Read its result with TaskOutput (or its output file); do not re-spawn it.";
     const READ: &str = "The file empty.txt exists but is empty — there is nothing to read.";
     const WRITE: &str = crate::tools::builtins::write::WRITE_REPORT_NUDGE;
     const EDITED: &str = "These files changed on disk since you last read them (edited by the user or a tool such as a formatter/linter). The shown content is current and the change was intentional — take it into account and do not revert it unless the user asks, and do not mention this notice to the user. Modified regions, by current line number:\n\nsrc/lib.rs:\n     1\tnew";
@@ -504,8 +504,8 @@ fn envelope_producer_cases() -> Vec<EnvelopeProducerCase> {
                     profile,
                 )
             }),
-            anthropic: "<system-reminder>\nBackground task \"inspect logs\" completed. Read its result with task_output (or its output file); do not re-spawn it.\n</system-reminder>",
-            openai: "# System Reminder\n\nBackground task \"inspect logs\" completed. Read its result with task_output (or its output file); do not re-spawn it.",
+            anthropic: "<system-reminder>\nBackground task \"inspect logs\" completed. Read its result with TaskOutput (or its output file); do not re-spawn it.\n</system-reminder>",
+            openai: "# System Reminder\n\nBackground task \"inspect logs\" completed. Read its result with TaskOutput (or its output file); do not re-spawn it.",
             generic: BACKGROUND,
         },
         EnvelopeProducerCase {
@@ -790,6 +790,7 @@ impl SandboxBackend for NoopSandbox {
 
 fn make_test_ctx(cwd: &str) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             crate::command_runtime::background::BackgroundCommandRegistry::new(),
@@ -3154,6 +3155,7 @@ fn compaction_excludes_protected_messages_and_restores_them_before_the_turn_user
 fn mk_params(messages: Vec<Message>, tools: Vec<Arc<dyn Tool>>) -> QueryParams {
     let specs = to_tool_specs(&tools);
     QueryParams {
+        reply_gate: None,
         retained_tool_tasks: None,
         precompute: None,
         prepare_request_usage: None,

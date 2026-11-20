@@ -397,6 +397,7 @@ fn approval_query_params(
     let update_state = Arc::clone(&state);
     let process_context = process_context.clone();
     QueryParams {
+        reply_gate: None,
         retained_tool_tasks: None,
         multi_agent_instructions: false,
         thread_id: "thread-permission".into(),
@@ -732,6 +733,7 @@ fn ctx(
     planning_read_only: bool,
 ) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             crate::command_runtime::background::BackgroundCommandRegistry::new(),

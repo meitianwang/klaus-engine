@@ -654,6 +654,7 @@ impl Session {
         let review_suffix =
             RuntimeString::from(":review:").concat(&RuntimeString::from((self.deps.uuid)()));
         let params = QueryParams {
+            reply_gate: None,
             multi_agent_instructions: false,
             thread_id: self.id.concat(&review_suffix),
             turn_id: RuntimeString::from((self.deps.uuid)()),

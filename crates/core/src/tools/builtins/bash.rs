@@ -1,6 +1,7 @@
 //! The `bash` [`Tool`]: run a shell command under the sandbox with bounded,
 //! streamed output — or, on request, launch it in the background and return a
-//! shellId the model polls with `bash_output` and stops with `kill_shell`.
+//! shellId the model reads with `TaskOutput`, waits on with `Yield`, and stops
+//! with `TaskStop`.
 //!
 //! A genuine (non-timeout/abort) failure is checked against the sandbox-denial
 //! heuristic so the model is told "the sandbox blocked this" instead of chasing
@@ -393,7 +394,7 @@ fn build_input_schema() -> JsonSchema {
                 "maximum": 9007199254740991_i64
             },
             "runInBackground": {
-                "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+                "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
                 "type": "boolean"
             },
             "sandboxPermissions": {
@@ -617,7 +618,7 @@ impl Tool for BashTool {
             .unwrap_or(false)
         {
             // When the shell exits on its own, tell the model (task-notification) so it
-            // stops polling bash_output. A model-initiated kill_shell is skipped — the
+            // stops polling TaskOutput. A model-initiated TaskStop is skipped — the
             // model already knows.
             let enqueue = ctx.enqueue_background_notice.clone();
             let initial_notice = Arc::new(std::sync::Mutex::new(
@@ -658,7 +659,7 @@ impl Tool for BashTool {
                                     .concat(&RuntimeString::from(" has finished"))
                                     .concat(&code)
                                     .concat(&RuntimeString::from(
-                                        ". Read its final output with bash_output (shellId: \"",
+                                        ". Read its final output with TaskOutput (task_id: \"",
                                     ))
                                     .concat(&r.id)
                                     .concat(&RuntimeString::from("\")."));
@@ -723,10 +724,12 @@ impl Tool for BashTool {
             let text = RuntimeString::from("Started background shell ")
                 .concat(&shell_id)
                 .concat(&RuntimeString::from(
-                    ".\nPoll its output with the bash_output tool (shellId: \"",
+                    ".\nRead its output with TaskOutput (task_id: \"",
                 ))
                 .concat(&shell_id)
-                .concat(&RuntimeString::from("\") and stop it with kill_shell."));
+                .concat(&RuntimeString::from(
+                    "\"); its result reaches you by itself when it finishes, and Yield waits for background work. Stop it with TaskStop.",
+                ));
             let text = if running {
                 observed
                     .output
@@ -1662,7 +1665,7 @@ mod tests {
                 "maximum": 9007199254740991_i64
             },
             "runInBackground": {
-                        "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+                        "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
                         "type": "boolean"
                     },
                     "sandboxPermissions": {
@@ -2334,7 +2337,7 @@ mod tests {
         assert_eq!(
             notice,
             &format!(
-                "Background shell {shell_id} has finished (exit code 0). Read its final output with bash_output (shellId: \"{shell_id}\")."
+                "Background shell {shell_id} has finished (exit code 0). Read its final output with TaskOutput (task_id: \"{shell_id}\")."
             )
         );
         assert!(!notice.contains("<system-reminder>"));

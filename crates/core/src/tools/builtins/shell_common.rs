@@ -1,5 +1,6 @@
-//! Helpers shared by the shell tool family (`bash`, `bash_output`,
-//! `exec_command`/`write_stdin`, `kill_shell`): model-facing output slicing
+//! Helpers shared by the shell tool family (`bash`,
+//! `exec_command`/`write_stdin`, and the unified `TaskOutput`/`TaskStop`
+//! controls): model-facing output slicing
 //! and the common output budget.
 
 use crate::runtime_values::{RuntimeJson, RuntimeString};

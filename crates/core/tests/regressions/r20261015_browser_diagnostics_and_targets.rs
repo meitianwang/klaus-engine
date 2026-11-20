@@ -208,6 +208,7 @@ async fn named_browser_tools_forward_typed_element_criteria_and_reference_aliase
 
 pub(super) fn make_ctx(cwd: &str, process: RuntimeProcessContext) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             klaus_agent_core::command_runtime::background::BackgroundCommandRegistry::new(),

@@ -103,6 +103,27 @@ pub fn parse_rule_strings(list: &[RuntimeString]) -> Vec<PermissionRule> {
         .collect()
 }
 
+/// Stored permission rules keep working across the background-control rename:
+/// the legacy per-kind spellings fold onto the unified surface names, so an
+/// allow/deny/ask rule written against an old name still matches calls that
+/// now dispatch under the canonical identity (and vice versa).
+fn legacy_background_rule_matches(tool_name: &RuntimeString, rule_name: &RuntimeString) -> bool {
+    fn canonical(name: &RuntimeString) -> Option<&'static str> {
+        let folded = name.try_to_utf8().ok()?.to_ascii_lowercase();
+        Some(match folded.as_str() {
+            "task_output" | "bash_output" | "taskoutput" => "TaskOutput",
+            "task_stop" | "kill_shell" | "kill_bash" | "taskstop" | "killshell" | "killbash" => {
+                "TaskStop"
+            }
+            _ => return None,
+        })
+    }
+    match (canonical(tool_name), canonical(rule_name)) {
+        (Some(tool), Some(rule)) => tool == rule,
+        _ => false,
+    }
+}
+
 /// Match a rule against a tool call. For argument-bearing rules we use plain
 /// prefix comparison (no regex → no ReDoS), stripping a trailing `*`.
 pub fn rule_matches(
@@ -114,7 +135,9 @@ pub fn rule_matches(
     if let Some(prefix) = &rule.tool_name_prefix {
         return runtime_ascii_prefix_ignore_case(tool_name, prefix);
     }
-    if !runtime_ascii_eq_ignore_case(tool_name, &rule.tool_name) {
+    if !runtime_ascii_eq_ignore_case(tool_name, &rule.tool_name)
+        && !legacy_background_rule_matches(tool_name, &rule.tool_name)
+    {
         return false;
     }
     let arg = match &rule.argument_prefix {
@@ -188,6 +211,31 @@ mod tests {
     fn matches(rule: &PermissionRule, tool: &str, command: Option<&str>) -> bool {
         let tool = RuntimeString::from(tool);
         rule_matches(rule, &tool, command)
+    }
+
+    #[test]
+    fn legacy_background_rule_names_fold_onto_the_unified_surface() {
+        // Stored rules written against the retired per-kind names keep
+        // matching calls dispatched under the canonical identities.
+        assert!(matches(&rule("task_stop", None, None), "TaskStop", None));
+        assert!(matches(&rule("kill_shell", None, None), "TaskStop", None));
+        assert!(matches(&rule("kill_bash", None, None), "TaskStop", None));
+        assert!(matches(
+            &rule("task_output", None, None),
+            "TaskOutput",
+            None
+        ));
+        assert!(matches(
+            &rule("bash_output", None, None),
+            "TaskOutput",
+            None
+        ));
+        // And the other direction: a canonical rule matches nothing that was
+        // retired, while unrelated names never cross-match.
+        assert!(matches(&rule("TaskStop", None, None), "task_stop", None));
+        assert!(!matches(&rule("task_stop", None, None), "TaskOutput", None));
+        assert!(!matches(&rule("bash", None, None), "TaskStop", None));
+        assert!(!matches(&rule("task_stop", None, None), "bash", None));
     }
 
     #[test]

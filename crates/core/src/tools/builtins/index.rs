@@ -52,7 +52,6 @@ use crate::types::tool::Tool;
 
 use super::ask_user::{create_ask_user_async_tool, create_ask_user_tool};
 use super::bash::{create_bash_tool_with, BashToolOptions};
-use super::bash_output::create_bash_output_tool;
 use super::browser::create_browser_tools;
 use super::cron_tools::create_cron_tools;
 use super::edit::create_edit_tool;
@@ -60,7 +59,6 @@ use super::file_search::create_file_search_tool;
 use super::glob::create_glob_tool;
 use super::grep::create_grep_tool;
 use super::interactive_shell::{create_exec_command_tool, create_write_stdin_tool};
-use super::kill_shell::create_kill_shell_tool;
 use super::ls::create_ls_tool;
 use super::lsp_tools::create_lsp_tools;
 use super::mcp_prompts::{create_get_mcp_prompt_tool, create_list_mcp_prompts_tool};
@@ -104,6 +102,7 @@ use super::workflow::{
 };
 use super::worktree_tools::create_worktree_tools;
 use super::write::create_write_tool;
+use super::yield_tool::create_yield_tool;
 
 /// A thunk that recomputes the live skills each turn.
 pub type SkillsThunk = Arc<dyn Fn() -> Vec<Skill> + Send + Sync>;
@@ -225,10 +224,8 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
             default_timeout_ms: Some(config.tool_timeout_ms),
             max_output_bytes: Some(config.max_aggregated_output_bytes as usize),
         }),
-        create_bash_output_tool(),
         create_exec_command_tool(),
         create_write_stdin_tool(),
-        create_kill_shell_tool(),
         create_sleep_tool(),
         // Web search uses browser-rendered Bing unless a backend is injected.
         create_web_fetch_tool(WebFetchToolOptions {
@@ -260,9 +257,11 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
         create_ask_user_async_tool(),
         // programmatic tool orchestration: JavaScript with persistent state.
         create_repl_tool(code_mode_provider(config, &opts)),
-        // background-task control (degrade to "not found" with no tasks).
+        // background-task control (degrade to "not found" with no tasks):
+        // one reader, one stopper, and the single wait primitive.
         create_task_output_tool(),
         create_task_stop_tool(),
+        create_yield_tool(),
         // MCP resources (degrade to "no resources" with no connected clients).
         create_list_mcp_resources_tool(),
         create_read_mcp_resource_tool(),
@@ -890,7 +889,7 @@ mod tests {
             },
         );
         assert!(!names(&tools).contains(&"task".to_string()));
-        for control in ["task_output", "task_stop", "SendMessage"] {
+        for control in ["TaskOutput", "TaskStop", "SendMessage"] {
             assert!(names(&tools).contains(&control.to_string()));
         }
     }
@@ -901,7 +900,7 @@ mod tests {
         config.max_sub_agent_depth = 0;
         let tools = default_builtins(&config, BuiltinsOptions::default());
         assert!(!names(&tools).contains(&"task".to_string()));
-        for control in ["task_output", "task_stop", "SendMessage"] {
+        for control in ["TaskOutput", "TaskStop", "SendMessage"] {
             assert!(names(&tools).contains(&control.to_string()));
         }
     }

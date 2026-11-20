@@ -358,6 +358,9 @@ pub struct CompactionRecord {
 
 /// The parameters that drive one turn of the loop.
 pub struct QueryParams {
+    /// Reply-scoped gate for the background-work tools; the streaming loop
+    /// marks each new assistant reply on it.
+    pub reply_gate: Option<std::sync::Arc<crate::types::tool::ReplyScopedGate>>,
     pub thread_id: RuntimeString,
     pub turn_id: RuntimeString,
     pub model: RuntimeString,

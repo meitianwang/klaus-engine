@@ -74,6 +74,7 @@ fn broad_grants() -> DurableRules {
 
 fn make_ctx(cwd: &str, process: RuntimeProcessContext) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             klaus_agent_core::command_runtime::background::BackgroundCommandRegistry::new(),

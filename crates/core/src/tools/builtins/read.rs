@@ -1113,6 +1113,7 @@ mod tests {
         vision: Option<bool>,
     ) -> ToolContext {
         ToolContext {
+            reply_gate: None,
             async_question: None,
             background_processes: Arc::new(
                 crate::command_runtime::background::BackgroundCommandRegistry::new(),

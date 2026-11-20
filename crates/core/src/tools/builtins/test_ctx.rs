@@ -55,6 +55,7 @@ impl SandboxBackend for NoopSandbox {
 /// discarding `emit`. Tests set the fields they need (public fields).
 pub fn make_ctx(cwd: &str) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             crate::command_runtime::background::BackgroundCommandRegistry::new(),

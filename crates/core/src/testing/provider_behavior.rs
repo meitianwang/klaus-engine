@@ -1450,7 +1450,7 @@ pub fn load_checked_in_manifest() -> Result<ProviderBehaviorManifest, ProviderBe
 {
     let raw = include_str!("../../tests/fixtures/provider_behavior/v1/manifest.json");
     if sha256_hex(raw.as_bytes())
-        != "17dce57f0210d2ed9bbe4ef4fbfb9803bfae584af813083ea2c531c702b0c825"
+        != "bbf6b8a6b081f7ecbd0b6ea476f6f5844b11fd7d312f493070b9ef46d8e01ace"
     {
         return Err(invalid("checked-in task manifest predecessor changed"));
     }
@@ -1523,7 +1523,7 @@ const TEAM_CREATE_LEGACY_SOURCE_CATALOG_SHA256: [&str; 12] = [
 const FIXED_BASELINE_TREE: &str = "df2949dcf5281ba0d4b83531dbffd2e16f430848";
 const LIVE_MODEL_TOKEN: &str = "$MODEL";
 const LIVE_PRELUDE_BOUNDARIES_SHA256: &str =
-    "6fba5c7a3837b27760dd81fe1742039cabfc664635f85414850fa2d6b5abb63a";
+    "694d4e49f30c9c03c0cdc24c5daf28f51718d5578231493a92fdb97e3b25b5d4";
 const LIVE_PRELUDE_BOUNDARIES_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/provider_behavior/v1/live-prelude-boundaries.json");
 const CODE_MODE_SOURCE_TASK_SHA256: &str =
@@ -4702,6 +4702,12 @@ fn expected_subagent_spec(
                 1,
             );
         }
+        // The unified background-task surface renamed the reader/stopper and
+        // added the wait primitive; adopt the current copy in the expected
+        // description so it matches the live target.
+        for (prior, current) in BACKGROUND_TASK_COPY_REWRITES {
+            description = description.replace(prior, current);
+        }
         expected["description"] = RuntimeJson::from(description);
         let properties = expected
             .pointer_mut("/inputSchema/properties")
@@ -4738,6 +4744,9 @@ fn expected_subagent_spec(
             .as_array_mut()
             .ok_or("task required fields missing")?
             .push(RuntimeJson::from("model"));
+        // Recorded schema property descriptions adopt the unified
+        // background-task copy (e.g. the run_in_background guidance).
+        migrate_baseline_background_task_copy(&mut expected);
         return Ok(Some(expected));
     }
     if !["SendMessage", "send_message", "followup_task"]
@@ -4822,6 +4831,10 @@ fn expected_subagent_spec(
         expected["description"] = RuntimeJson::from(SUBAGENT_MESSAGE_DESCRIPTION);
         expected["inputSchema"] = schema;
     }
+    // Recorded schema property descriptions adopt the unified background-task
+    // copy (e.g. the run_in_background guidance) exactly like the top-level
+    // description above.
+    migrate_baseline_background_task_copy(&mut expected);
     Ok(Some(expected))
 }
 
@@ -4845,7 +4858,10 @@ fn checked_subagent_spec_target(
     }
     let target = runtime_codec::encode_value(matches[0]).map_err(|error| error.to_string())?;
     if !target.semantic_eq_unordered(&expected) {
-        return Err("subagent runtime target/provider contract drifted".into());
+        return Err(format!(
+            "subagent runtime target/provider contract drifted for {}",
+            name.try_to_utf8().unwrap_or_default()
+        ));
     }
     Ok(Some(target))
 }
@@ -4858,6 +4874,242 @@ fn check_signed_subagent_catalog(actual: &RuntimeJson, source: &RuntimeJson) -> 
     if exact_runtime_json_sha256(actual) != exact_runtime_json_sha256(source) {
         return Err("subagent complete source catalog fields, membership or order drifted".into());
     }
+    Ok(())
+}
+
+/// Recorded tool descriptions and result copy from before the background-task
+/// surface was unified onto one reader, one stopper and one wait primitive.
+/// The pairs are applied to every recorded string node so descriptions inside
+/// tool specs and deferred-catalog announcements both adopt the current copy.
+const BACKGROUND_TASK_COPY_REWRITES: [(&str, &str); 6] = [
+    (
+        "Observe that shellId with bash_output and stop it with kill_shell.",
+        "Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
+    ),
+    (
+        "Prefer bash in background mode with bash_output and kill_shell",
+        "Prefer bash in background mode with TaskOutput and TaskStop",
+    ),
+    (
+        "Prefer bash with runInBackground plus bash_output and kill_shell",
+        "Prefer bash with runInBackground plus TaskOutput and TaskStop",
+    ),
+    (
+        "stop it with kill_shell",
+        "stop it with TaskStop",
+    ),
+    (
+        "read a finished result with task_output, and wait only when it blocks your next step. Use SendMessage for further direction and task_stop only when the agent should stop.",
+        "read a finished result with TaskOutput, and call Yield to wait for background work. Use SendMessage for further direction and TaskStop only when the agent should stop.",
+    ),
+    (
+        "read its result with task_output (or its output file) once you are notified",
+        "read its result with TaskOutput (or its output file) once you are notified; call Yield to wait for background work",
+    ),
+];
+
+/// Rewrite exact legacy internal tool identities (`task_output` / `task_stop`)
+/// on `toolName` / `name` fields to the unified names, recursively.
+fn adopt_unified_background_tool_identities(value: &mut RuntimeJson) {
+    match value {
+        RuntimeJson::Object(object) => {
+            for key in ["toolName", "name"] {
+                let renamed = object
+                    .get(key)
+                    .and_then(RuntimeJson::as_str)
+                    .and_then(|name| {
+                        if name == "task_output" {
+                            Some("TaskOutput")
+                        } else if name == "task_stop" {
+                            Some("TaskStop")
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(new_name) = renamed {
+                    *object.get_mut(key).expect("checked key") = RuntimeJson::from(new_name);
+                }
+            }
+            for child in object.values_mut() {
+                adopt_unified_background_tool_identities(child);
+            }
+        }
+        RuntimeJson::Array(items) => {
+            for item in items {
+                adopt_unified_background_tool_identities(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn migrate_baseline_background_task_copy(value: &mut RuntimeJson) {
+    match value {
+        RuntimeJson::Object(object) => {
+            for child in object.values_mut() {
+                migrate_baseline_background_task_copy(child);
+            }
+        }
+        RuntimeJson::Array(items) => {
+            for item in items {
+                migrate_baseline_background_task_copy(item);
+            }
+        }
+        RuntimeJson::String(text) => {
+            let Ok(mut rendered) = text.try_to_utf8() else {
+                return;
+            };
+            let mut changed = false;
+            for (old, new) in BACKGROUND_TASK_COPY_REWRITES {
+                if rendered.contains(old) {
+                    rendered = rendered.replace(old, new);
+                    changed = true;
+                }
+            }
+            if changed {
+                *text = RuntimeString::from(rendered);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The signed predecessor shapes of the retired per-kind background tools.
+/// Adoption is exact-match only: a recorded entry under one of the old names
+/// must equal one of these before it is renamed or dropped.
+fn background_task_predecessor_specs(name: &str) -> Vec<RuntimeJson> {
+    let raw: &[&str] = match name {
+        "bash_output" => &[
+            r#"{"description":"Return new output from a background shell since the last poll, with its status and exit code. Optionally filter lines by regex.","inputSchema":{"additionalProperties":false,"properties":{"filter":{"description":"Optional JS regex; only output lines matching it are returned","type":"string"},"shellId":{"description":"The id returned by bash when run in the background","type":"string"}},"required":["shellId"],"type":"object"},"name":"bash_output"}"#,
+        ],
+        "kill_shell" => &[
+            r#"{"description":"Kill a background shell (from bash) or an interactive session (from exec_command) by id, terminating its whole process group.","inputSchema":{"additionalProperties":false,"properties":{"shellId":{"description":"The id returned by bash (background) or exec_command (session)","type":"string"}},"required":["shellId"],"type":"object"},"name":"kill_shell"}"#,
+        ],
+        "task_output" => &[
+            r#"{"description":"Get the output (and status) of a background task by its id.","inputSchema":{"additionalProperties":false,"properties":{"block":{"default":true,"description":"Block until the task finishes","type":"boolean"},"task_id":{"description":"Identifier of the background task to read","type":"string"},"timeout":{"default":30000,"description":"Maximum milliseconds to wait","maximum":600000,"minimum":0,"type":"number"}},"required":["task_id","block","timeout"],"type":"object"},"name":"task_output"}"#,
+            r#"{"description":"Get the output (and status) of a background task by its id.","inputSchema":{"additionalProperties":false,"properties":{"block":{"description":"Block until the task finishes","type":"boolean"},"task_id":{"description":"Identifier of the background task to read","type":"string"},"timeout":{"description":"Maximum milliseconds to wait","maximum":600000,"minimum":0,"type":"number"}},"required":["task_id","block","timeout"],"type":"object"},"name":"task_output"}"#,
+        ],
+        "task_stop" => &[
+            r#"{"description":"Stop a running background task by its id.","inputSchema":{"additionalProperties":false,"properties":{"shell_id":{"description":"Deprecated alias for task_id","type":"string"},"task_id":{"description":"Identifier of the background task to terminate","type":"string"}},"type":"object"},"name":"task_stop"}"#,
+        ],
+        _ => return Vec::new(),
+    };
+    raw.iter()
+        .map(|text| {
+            runtime_json::parse(&RuntimeString::from(*text))
+                .expect("pinned background-task predecessor spec must parse")
+        })
+        .collect()
+}
+
+/// Rename the recorded reader/stopper entries onto the unified tools, drop the
+/// retired per-kind shell tools, and adopt the wait primitive — each recorded
+/// predecessor is authenticated by exact semantic match first, and the final
+/// order mirrors the live rendered catalog.
+fn migrate_baseline_background_task_tool_specs(
+    request: &mut RuntimeJson,
+    rendered_specs: &[ToolSpec],
+    context: &str,
+) -> Result<(), String> {
+    let tools = request
+        .get_mut("tools")
+        .and_then(RuntimeJson::as_array_mut)
+        .ok_or_else(|| format!("{context} tools must be an array"))?;
+    let mut staged: Vec<RuntimeJson> = Vec::with_capacity(tools.len());
+    let mut touched = false;
+    for source in tools.iter() {
+        let Some(name) = source.get("name").and_then(RuntimeJson::as_str) else {
+            staged.push(source.clone());
+            continue;
+        };
+        let name_key = name.try_to_utf8().unwrap_or_default();
+        let replacement = match name_key.as_str() {
+            "task_output" => Some("TaskOutput"),
+            "task_stop" => Some("TaskStop"),
+            "bash_output" | "kill_shell" => Some(""),
+            _ => None,
+        };
+        let Some(replacement) = replacement else {
+            staged.push(source.clone());
+            continue;
+        };
+        let predecessors = background_task_predecessor_specs(&name_key);
+        if !predecessors
+            .iter()
+            .any(|spec| spec.semantic_eq_unordered(source))
+        {
+            return Err(format!(
+                "{context} background task tool {name_key:?} predecessor raw contract drifted: {}",
+                runtime_diagnostic(&runtime_json::stringify(source))
+            ));
+        }
+        touched = true;
+        if replacement.is_empty() {
+            continue;
+        }
+        let targets: Vec<_> = rendered_specs
+            .iter()
+            .filter(|spec| spec.name == replacement)
+            .collect();
+        if targets.len() != 1 {
+            return Err(format!(
+                "{context} unified background tool {replacement:?} target cardinality drifted"
+            ));
+        }
+        staged.push(
+            runtime_codec::encode_value(targets[0])
+                .map_err(|error| format!("cannot encode {context} {replacement}: {error}"))?,
+        );
+    }
+    if !touched {
+        return Ok(());
+    }
+    // The wait primitive joins the catalogs that carried the old family.
+    let has_yield = staged.iter().any(|entry| {
+        entry
+            .get("name")
+            .and_then(RuntimeJson::as_str)
+            .is_some_and(|name| name == "Yield")
+    });
+    if !has_yield {
+        let yield_targets: Vec<_> = rendered_specs
+            .iter()
+            .filter(|spec| spec.name == "Yield")
+            .collect();
+        if yield_targets.len() == 1 {
+            staged.push(
+                runtime_codec::encode_value(yield_targets[0])
+                    .map_err(|error| format!("cannot encode {context} Yield: {error}"))?,
+            );
+        }
+    }
+    // Mirror the live catalog order. Source-only names that later validation
+    // adapts (e.g. the code-mode `code_exec` surface) are not in the live
+    // catalog; they keep their recorded neighborhood by inheriting the rank of
+    // the preceding known entry, with the original position as the tie-break.
+    let order: Vec<String> = rendered_specs
+        .iter()
+        .map(|spec| spec.name.try_to_utf8().unwrap_or_default())
+        .collect();
+    let mut indexed: Vec<(isize, usize, RuntimeJson)> = Vec::with_capacity(staged.len());
+    let mut last_rank: isize = -1;
+    for (position, entry) in staged.into_iter().enumerate() {
+        let name = entry
+            .get("name")
+            .and_then(RuntimeJson::as_str)
+            .ok_or_else(|| format!("{context} migrated tool entry lost its name"))?;
+        let name_key = name.try_to_utf8().unwrap_or_default();
+        let rank = match order.iter().position(|candidate| *candidate == name_key) {
+            Some(found) => {
+                last_rank = found as isize;
+                found as isize
+            }
+            None => last_rank,
+        };
+        indexed.push((rank, position, entry));
+    }
+    indexed.sort_by_key(|(rank, position, _)| (*rank, *position));
+    *tools = indexed.into_iter().map(|(_, _, entry)| entry).collect();
     Ok(())
 }
 
@@ -5589,7 +5841,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "8679ef076e83d316f78a2a0f8ad7117ec8567c1d090604aa4d92c7e97b64f672";
+    "aff8d23a83b22ed71883cef21245f5885fac92f50c7ff44ba4121c2ffe4a997e";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -5948,6 +6200,11 @@ fn canonicalize_signed_reference_requests(
             rendered_specs,
             &format!("baseline contract row {row_number} modelRequests[{request_index}]"),
         )?;
+        migrate_baseline_background_task_tool_specs(
+            value,
+            rendered_specs,
+            &format!("baseline contract row {row_number} modelRequests[{request_index}]"),
+        )?;
         migrate_baseline_instruction_descriptors(value, rendered_specs, profile.prompt_style)
             .map_err(|error| {
                 format!(
@@ -5956,7 +6213,9 @@ fn canonicalize_signed_reference_requests(
             })?;
         // After the rule-based instruction-descriptor migration above, whose
         // digest checks must still see the signed bytes; before the decode and
-        // per-tool comparison below, which need the live default-limit text.
+        // per-tool comparison below, which need the live default-limit text and
+        // the unified background-task copy.
+        migrate_baseline_background_task_copy(value);
         // Recorded tool catalogs captured in the previous live shape still
         // carry the predecessor limit description strings.
         migrate_baseline_tool_search_default_limit(
@@ -6308,14 +6567,18 @@ fn canonicalize_signed_reference_tool_result(
         return Ok(canonical);
     } else if runtime_eq_utf8(internal_name, "task") {
         &[("ok", true), ("text", true)]
-    } else if runtime_eq_utf8(internal_name, "task_output") {
+    } else if runtime_eq_utf8(internal_name, "task_output")
+        || runtime_eq_utf8(internal_name, "TaskOutput")
+    {
         &[
             ("task_id", true),
             ("status", true),
             ("retrieval_status", true),
             ("output", true),
         ]
-    } else if runtime_eq_utf8(internal_name, "task_stop") {
+    } else if runtime_eq_utf8(internal_name, "task_stop")
+        || runtime_eq_utf8(internal_name, "TaskStop")
+    {
         &[("task_id", true), ("task_type", true), ("message", true)]
     } else if runtime_eq_utf8(internal_name, "ListPeers") {
         let mut canonical = canonicalize_signed_reference_object(
@@ -7287,6 +7550,40 @@ fn canonicalize_fixed_ts_reference_trace(
     }
     trace.model_visible_tool_uses = canonical_visible;
 
+    // Adopt the unified background-task tool names in the recorded normalized
+    // calls: visible-to-internal resolution now yields the canonical names for
+    // the agent-control facades. Rows that carried the facade mapping also
+    // adopt the canonical identities in their recorded runtime events and side
+    // effects, which are compared against the normalized calls by identity.
+    let mut adopted_unified_identities = false;
+    for call in trace.normalized_internal_calls.iter_mut() {
+        let renamed = call
+            .get("internalName")
+            .and_then(RuntimeJson::as_str)
+            .and_then(|name| {
+                if name == "task_output" {
+                    Some("TaskOutput")
+                } else if name == "task_stop" {
+                    Some("TaskStop")
+                } else {
+                    None
+                }
+            });
+        if let Some(new_name) = renamed {
+            call.as_object_mut()
+                .expect("normalized call is an object")
+                .insert("internalName", RuntimeJson::from(new_name));
+            adopted_unified_identities = true;
+        }
+    }
+    if adopted_unified_identities {
+        for effect in trace.side_effects.iter_mut() {
+            adopt_unified_background_tool_identities(effect);
+        }
+        for event in trace.engine_events.iter_mut() {
+            adopt_unified_background_tool_identities(event);
+        }
+    }
     let canonical_normalized = normalized_calls(
         &trace.model_visible_tool_uses,
         &trace.run,
@@ -13290,7 +13587,7 @@ async fn validate_tool_result_reconstruction(
                     raw_content.push(reconstructed_text(message.clone()));
                 }
             }
-            "task_output" => {
+            "task_output" | "TaskOutput" => {
                 let task_id = require_scalar_string(input, "task_id", "task_output")?;
                 let message = format!("No background task with id {task_id}.");
                 let result = exact_json!({
@@ -13309,7 +13606,7 @@ async fn validate_tool_result_reconstruction(
                 )?;
                 raw_content.push(reconstructed_text(message));
             }
-            "task_stop" => {
+            "task_stop" | "TaskStop" => {
                 let task_id = require_scalar_string(input, "task_id", "task_stop")?;
                 let message = format!("No background task with id {task_id}.");
                 let result = exact_json!({
@@ -16078,6 +16375,7 @@ fn tool_context_with_depth(
         }) as crate::types::tool::PathsFn
     });
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             crate::command_runtime::background::BackgroundCommandRegistry::new(),
@@ -17009,7 +17307,7 @@ fn subagent_description_expectations(
     }
     static SOURCE: LazyLock<Result<ProviderBehaviorExpectations, String>> = LazyLock::new(|| {
         let bytes = include_bytes!("../../tests/fixtures/provider_behavior/v1/manifest.json");
-        if sha256_hex(bytes) != "17dce57f0210d2ed9bbe4ef4fbfb9803bfae584af813083ea2c531c702b0c825" {
+        if sha256_hex(bytes) != "bbf6b8a6b081f7ecbd0b6ea476f6f5844b11fd7d312f493070b9ef46d8e01ace" {
             return Err("subagent description source manifest drifted".into());
         }
         let manifest = load_checked_in_manifest().map_err(|error| error.to_string())?;
@@ -17051,7 +17349,7 @@ fn subagent_model_schema_expectations(
     }
     static SOURCE: LazyLock<Result<ProviderBehaviorExpectations, String>> = LazyLock::new(|| {
         let bytes = include_bytes!("../../tests/fixtures/provider_behavior/v1/manifest.json");
-        if sha256_hex(bytes) != "17dce57f0210d2ed9bbe4ef4fbfb9803bfae584af813083ea2c531c702b0c825" {
+        if sha256_hex(bytes) != "bbf6b8a6b081f7ecbd0b6ea476f6f5844b11fd7d312f493070b9ef46d8e01ace" {
             return Err("subagent model source manifest drifted".into());
         }
         let manifest = load_checked_in_manifest().map_err(|error| error.to_string())?;
@@ -19535,7 +19833,10 @@ mod tests {
             }
         }
         assert_eq!(styles.len(), 3);
-        assert_eq!(tested, 37);
+        // Rule coverage changed with the unified background-task surface: the
+        // retired shell-reader descriptors lost their rules and the two
+        // agent-control facade descriptors gained theirs.
+        assert_eq!(tested, 36);
     }
 
     #[test]
@@ -21561,7 +21862,7 @@ mod tests {
             sha256_hex(include_bytes!(
                 "../../tests/fixtures/provider_behavior/v1/manifest.json"
             )),
-            "17dce57f0210d2ed9bbe4ef4fbfb9803bfae584af813083ea2c531c702b0c825"
+            "bbf6b8a6b081f7ecbd0b6ea476f6f5844b11fd7d312f493070b9ef46d8e01ace"
         );
     }
 
@@ -22497,6 +22798,8 @@ mod tests {
         let mut source_async_question_count = 0_usize;
         let mut optional_question_insertions = 0_usize;
         let mut deferred_message_slots = 0_usize;
+        let mut background_retirements = 0_usize;
+        let mut background_yield_insertions = 0_usize;
         let mut source_request_count = 0_usize;
         let mut source_main_requests = 0_usize;
         let mut source_child_requests = 0_usize;
@@ -22568,6 +22871,27 @@ mod tests {
                             })
                             .count();
                 }
+                // The unified background-task migration retires the per-kind
+                // shell reader/stopper and inserts the wait primitive once per
+                // catalog that carried the old family.
+                let background_retired_here = tools
+                    .iter()
+                    .filter(|tool| {
+                        ["bash_output", "kill_shell"]
+                            .iter()
+                            .any(|name| runtime_json_field_eq(tool, "name", name))
+                    })
+                    .count();
+                background_retirements += background_retired_here;
+                let background_touched = background_retired_here > 0
+                    || tools.iter().any(|tool| {
+                        ["task_output", "task_stop"]
+                            .iter()
+                            .any(|name| runtime_json_field_eq(tool, "name", name))
+                    });
+                if background_touched {
+                    background_yield_insertions += 1;
+                }
                 source_team_create_count += tools
                     .iter()
                     .filter(|tool| runtime_json_field_eq(tool, "name", "TeamCreate"))
@@ -22607,6 +22931,8 @@ mod tests {
         assert_eq!(source_async_question_count, 0);
         assert_eq!(optional_question_insertions, 211);
         assert_eq!(deferred_message_slots, 281);
+        assert_eq!(background_retirements, 422);
+        assert_eq!(background_yield_insertions, 211);
 
         let traces = FIXED_TS_CONTRACT_TRACES
             .as_ref()
@@ -22783,6 +23109,8 @@ mod tests {
             source_tool_count + source_task_create_count + optional_question_insertions
                 - retired_counts.values().sum::<usize>()
                 + source_main_requests
+                - background_retirements
+                + background_yield_insertions
         );
         assert_eq!(
             migrated_async_questions,

@@ -216,6 +216,7 @@ pub(crate) fn bare_tool_context(
         run_hook: None,
         invoke_tool: None,
         advisor: None,
+        reply_gate: None,
     }
 }
 
@@ -1002,6 +1003,16 @@ impl BackgroundTaskRegistry for SessionBackgroundTaskRegistry {
         let m = self.session.subagents.background_agents.lock_recover();
         m.iter().map(|(id, e)| bg_to_handle(id, e)).collect()
     }
+    fn list_owned(
+        &self,
+        caller: Option<&RuntimeString>,
+    ) -> Vec<crate::types::tool::BackgroundTaskHandle> {
+        let m = self.session.subagents.background_agents.lock_recover();
+        m.iter()
+            .filter(|(_, e)| e.parent_agent_id.as_ref() == caller)
+            .map(|(id, e)| bg_to_handle(id, e))
+            .collect()
+    }
     fn has_pending_input(&self) -> bool {
         self.session
             .conversation
@@ -1032,6 +1043,15 @@ impl BackgroundTaskRegistry for SessionBackgroundTaskRegistry {
             .stop_ordinary_subagent(id, true)
             .unwrap_or_else(|| self.stop(id))
     }
+    fn resolve_target(
+        &self,
+        target: &RuntimeString,
+    ) -> Option<Result<RuntimeString, RuntimeString>> {
+        self.session
+            .resolve_subagent_target(target)
+            .map(|resolved| resolved.map(RuntimeString::from))
+    }
+
     fn stop(&self, id: &RuntimeString) -> bool {
         if let Some(stopped) = self.session.stop_ordinary_subagent(id, false) {
             return stopped;

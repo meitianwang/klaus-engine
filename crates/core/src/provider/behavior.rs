@@ -285,6 +285,7 @@ pub fn resolve_tool_result_envelope_kind(
         || visible_tool_name == "Task"
         || visible_tool_name == "spawn_agent"
         || visible_tool_name == "task_output"
+        || visible_tool_name == "TaskOutput"
         || visible_tool_name == "wait_agent"
     {
         return ProviderToolResultEnvelopeKind::SubagentReport;
@@ -658,13 +659,13 @@ pub const PROVIDER_TOOL_DESCRIPTION_FRAGMENTS: [ProviderToolDescriptionFragment;
     },
     ProviderToolDescriptionFragment {
         id: "wait-agent-contract",
-        tool_name: "task_output",
+        tool_name: "TaskOutput",
         styles: &[ProviderPromptStyle::OpenAiDeveloper],
         category: ToolCallContract,
     },
     ProviderToolDescriptionFragment {
         id: "interrupt-agent-contract",
-        tool_name: "task_stop",
+        tool_name: "TaskStop",
         styles: &[ProviderPromptStyle::OpenAiDeveloper],
         category: ToolCallContract,
     },
@@ -1051,12 +1052,12 @@ pub fn render_tool_description_fragments(
                     "` for a self-contained delegation. Put a short label in `task_name` and the complete brief in `message`, including goal, context, files or commands already known, and the expected shape of its report. For independent subtasks, send multiple `",
                     true,
                 ),
-                "task_output" => (
+                "TaskOutput" => (
                     "Call `",
                     "` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
                     false,
                 ),
-                "task_stop" => (
+                "TaskStop" => (
                     "Call `",
                     "` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.",
                     false,
@@ -1149,18 +1150,17 @@ fn render_tool_input_schema(
             "bash" => render_anthropic_bash_schema(schema),
             "exec_command" => render_fixed_exec_command_schema(schema),
             "write_stdin" => render_fixed_write_stdin_schema(schema),
-            "kill_shell" => render_fixed_kill_shell_schema(schema),
+            "TaskStop" => render_fixed_task_stop_schema(schema),
             _ => schema.clone(),
         },
         ProviderPromptStyle::OpenAiDeveloper => match name.as_str() {
             "task" => render_openai_spawn_agent_schema(schema),
-            "task_output" => render_openai_wait_agent_schema(schema),
-            "task_stop" => render_openai_interrupt_agent_schema(schema),
+            "TaskOutput" => render_openai_wait_agent_schema(schema),
+            "TaskStop" => render_openai_interrupt_agent_schema(schema),
             "SendMessage" => render_openai_send_message_schema(schema),
             "ListPeers" => render_openai_list_agents_schema(),
             "exec_command" => render_openai_exec_command_schema(schema),
             "write_stdin" => render_openai_write_stdin_schema(schema),
-            "kill_shell" => render_fixed_kill_shell_schema(schema),
             "tool_search" => render_openai_tool_search_schema(schema),
             _ => schema.clone(),
         },
@@ -1168,7 +1168,7 @@ fn render_tool_input_schema(
             "task" => normalize_schema_node(schema),
             "exec_command" => render_fixed_exec_command_schema(schema),
             "write_stdin" => render_fixed_write_stdin_schema(schema),
-            "kill_shell" => render_fixed_kill_shell_schema(schema),
+            "TaskStop" => render_fixed_task_stop_schema(schema),
             _ => schema.clone(),
         },
     }
@@ -1207,8 +1207,8 @@ fn render_fixed_write_stdin_schema(schema: &RuntimeJson) -> RuntimeJson {
     fixed_closed_schema(schema, &["sessionId", "input", "yieldMs"], &["sessionId"])
 }
 
-fn render_fixed_kill_shell_schema(schema: &RuntimeJson) -> RuntimeJson {
-    fixed_closed_schema(schema, &["shellId"], &["shellId"])
+fn render_fixed_task_stop_schema(schema: &RuntimeJson) -> RuntimeJson {
+    fixed_closed_schema(schema, &["task_id"], &["task_id"])
 }
 
 fn string_schema(description: &str) -> RuntimeJson {
@@ -1670,8 +1670,8 @@ pub(crate) fn render_tool_name(
         },
         ProviderPromptStyle::OpenAiDeveloper => match name_key.as_str() {
             "task" => Some("spawn_agent"),
-            "task_output" => Some("wait_agent"),
-            "task_stop" => Some("interrupt_agent"),
+            "TaskOutput" => Some("wait_agent"),
+            "TaskStop" => Some("interrupt_agent"),
             "SendMessage" => Some("send_message"),
             "ListPeers" => Some("list_agents"),
             _ => None,
@@ -1685,6 +1685,14 @@ pub fn resolve_internal_tool_name(
     visible_name: &RuntimeString,
     profile: &ProviderBehaviorProfile,
 ) -> RuntimeString {
+    // Legacy per-kind spellings resolve to the unified background-task tools
+    // in every style, matching the registry alias resolution.
+    if visible_name == "task_output" || visible_name == "bash_output" {
+        return "TaskOutput".into();
+    }
+    if visible_name == "task_stop" || visible_name == "kill_shell" {
+        return "TaskStop".into();
+    }
     match profile.prompt_style {
         ProviderPromptStyle::AnthropicReminder if visible_name == "Task" => "task".into(),
         ProviderPromptStyle::AnthropicReminder if visible_name == "Read" => "read".into(),
@@ -1693,11 +1701,9 @@ pub fn resolve_internal_tool_name(
         ProviderPromptStyle::AnthropicReminder if visible_name == "Grep" => "grep".into(),
         ProviderPromptStyle::AnthropicReminder if visible_name == "Bash" => "bash".into(),
         ProviderPromptStyle::OpenAiDeveloper if visible_name == "spawn_agent" => "task".into(),
-        ProviderPromptStyle::OpenAiDeveloper if visible_name == "wait_agent" => {
-            "task_output".into()
-        }
+        ProviderPromptStyle::OpenAiDeveloper if visible_name == "wait_agent" => "TaskOutput".into(),
         ProviderPromptStyle::OpenAiDeveloper if visible_name == "interrupt_agent" => {
-            "task_stop".into()
+            "TaskStop".into()
         }
         ProviderPromptStyle::OpenAiDeveloper
             if visible_name == "send_message" || visible_name == "followup_task" =>
@@ -2168,7 +2174,7 @@ mod tests {
         let internal = [
             to_tool_spec(find_tool(&builtins, "exec_command").unwrap().as_ref()),
             to_tool_spec(find_tool(&builtins, "write_stdin").unwrap().as_ref()),
-            to_tool_spec(find_tool(&builtins, "kill_shell").unwrap().as_ref()),
+            to_tool_spec(find_tool(&builtins, "TaskStop").unwrap().as_ref()),
         ];
         for profile in [anthropic_profile(), openai_profile(), generic_profile()] {
             let rendered = render_tool_specs_for_behavior(&internal, &profile);
@@ -2191,7 +2197,7 @@ mod tests {
             let kill_properties = object_properties(&rendered[2].input_schema);
             assert!(
                 !kill_properties.contains_key("signal"),
-                "signal leaked into {:?} kill_shell",
+                "signal leaked into {:?} TaskStop",
                 profile.prompt_style
             );
         }
@@ -2461,7 +2467,14 @@ mod tests {
 
     #[test]
     fn result_classification_keeps_apply_patch_plain_and_shell_diff_as_command() {
-        for name in ["task", "Task", "spawn_agent", "task_output", "wait_agent"] {
+        for name in [
+            "task",
+            "Task",
+            "spawn_agent",
+            "task_output",
+            "TaskOutput",
+            "wait_agent",
+        ] {
             assert_eq!(
                 resolve_tool_result_envelope_kind(&RuntimeString::from(name), false),
                 ProviderToolResultEnvelopeKind::SubagentReport,
@@ -3185,7 +3198,7 @@ mod tests {
                 }),
             ),
             full_tool_spec(
-                "task_output",
+                "TaskOutput",
                 "Read a background task.",
                 json!({
                     "type": "object",
@@ -3198,7 +3211,7 @@ mod tests {
                 }),
             ),
             full_tool_spec(
-                "task_stop",
+                "TaskStop",
                 "Stop a background task.",
                 json!({
                     "type": "object",
@@ -3720,13 +3733,13 @@ mod tests {
             ),
             (
                 "wait-agent-contract",
-                "task_output",
+                "TaskOutput",
                 false,
                 OPENAI_WAIT_AGENT_NOTE,
             ),
             (
                 "interrupt-agent-contract",
-                "task_stop",
+                "TaskStop",
                 false,
                 OPENAI_INTERRUPT_AGENT_NOTE,
             ),
@@ -4171,8 +4184,8 @@ mod tests {
         }
         for (visible, internal) in [
             ("spawn_agent", "task"),
-            ("wait_agent", "task_output"),
-            ("interrupt_agent", "task_stop"),
+            ("wait_agent", "TaskOutput"),
+            ("interrupt_agent", "TaskStop"),
             ("send_message", "SendMessage"),
             ("followup_task", "SendMessage"),
             ("list_agents", "ListPeers"),

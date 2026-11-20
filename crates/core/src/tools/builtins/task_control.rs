@@ -1,29 +1,57 @@
-//! `task_output` / `task_stop` — read and terminate the session's background
-//! sub-agents (the ones started with `run_in_background`), exposed via
-//! `ctx.background_tasks`. The `shell_id` field on `task_stop` is accepted as a
-//! deprecated alias for `task_id`.
+//! `TaskOutput` / `TaskStop` — the unified background-task control surface.
+//!
+//! One reader and one stopper cover every kind of background work a session
+//! owns: sub-agents started with `run_in_background` (via `ctx.background_tasks`)
+//! and background shell commands started by `bash` (via
+//! `ctx.background_processes`). Targets resolve by exact id, by bound agent
+//! name, or by unambiguous id/name prefix; the legacy per-kind tool names
+//! (`task_output`, `bash_output`, `task_stop`, `kill_shell`, `kill_bash`)
+//! remain accepted as aliases so recorded history and habitual calls keep
+//! working.
+//!
+//! Neither tool waits. Waiting for background work is the `Yield` tool's job;
+//! completion results also reach the model by themselves through the
+//! background-notice rail. `TaskOutput` answers a bounded number of repeat
+//! reads of the same task within one assistant reply so a lost track costs one
+//! check, not a polling loop.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::runtime_values::{NodeBufferUtf8, RuntimeJson, RuntimeObject, RuntimeString};
 use crate::tools::build_tool::text_result;
+use crate::tools::shell::Signal;
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
 use crate::types::tool::{BackgroundTaskStatus, Tool, ToolContext, ToolProgress, ToolResult};
 
-const POLL_INTERVAL_MS: u64 = 100;
+use super::shell_common::first_chars;
 
-/// The wire form of a background task status.
+/// How many times one assistant reply may re-read the same still-running task
+/// before the reader refuses to answer the repetition again.
+const READ_ANSWER_BUDGET: u32 = 2;
+
+/// The wire form of a background sub-agent status.
 fn status_str(status: BackgroundTaskStatus) -> &'static str {
     match status {
         BackgroundTaskStatus::Running => "running",
         BackgroundTaskStatus::Completed => "completed",
         BackgroundTaskStatus::Failed => "failed",
         BackgroundTaskStatus::Interrupted => "interrupted",
+    }
+}
+
+/// The wire form of a background shell status.
+fn shell_status_str(
+    status: crate::tools::background_shells::BackgroundShellStatus,
+) -> &'static str {
+    use crate::tools::background_shells::BackgroundShellStatus;
+    match status {
+        BackgroundShellStatus::Running => "running",
+        BackgroundShellStatus::Exited => "exited",
+        BackgroundShellStatus::Killed => "killed",
     }
 }
 
@@ -35,7 +63,132 @@ fn runtime_object(fields: impl IntoIterator<Item = (&'static str, RuntimeJson)>)
     RuntimeJson::Object(object)
 }
 
-// ---- task_output -----------------------------------------------------------
+/// The first accepted identifier field: `task_id`, then the legacy
+/// `shell_id` / `shellId` / `taskId` spellings.
+fn target_id(input: &Json) -> Option<RuntimeString> {
+    ["task_id", "shell_id", "shellId", "taskId"]
+        .iter()
+        .find_map(|key| {
+            input
+                .get(*key)
+                .and_then(RuntimeJson::as_str)
+                .filter(|value| !value.is_empty())
+                .cloned()
+        })
+}
+
+fn parse_signal(signal: Option<&RuntimeString>) -> Result<Signal, RuntimeString> {
+    let signal = signal
+        .cloned()
+        .unwrap_or_else(|| RuntimeString::from("SIGTERM"));
+    if signal == "SIGTERM" {
+        Ok(Signal::Term)
+    } else if signal == "SIGKILL" {
+        Ok(Signal::Kill)
+    } else {
+        Err(RuntimeString::from("Unsupported signal ")
+            .concat(&signal)
+            .concat(&RuntimeString::from(". Use SIGTERM or SIGKILL.")))
+    }
+}
+
+fn signal_label(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Term => "SIGTERM",
+        Signal::Kill => "SIGKILL",
+        Signal::Int => "SIGINT",
+        Signal::Hup => "SIGHUP",
+        Signal::Quit => "SIGQUIT",
+        Signal::Usr1 => "SIGUSR1",
+        Signal::Usr2 => "SIGUSR2",
+    }
+}
+
+// ---- shell output line filtering --------------------------------------------
+
+fn split_lines(value: &RuntimeString) -> Vec<RuntimeString> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, unit) in value.as_utf16().iter().copied().enumerate() {
+        if unit == u16::from(b'\n') {
+            lines.push(RuntimeString::from_utf16(
+                value.as_utf16()[start..index].to_vec(),
+            ));
+            start = index + 1;
+        }
+    }
+    lines.push(RuntimeString::from_utf16(
+        value.as_utf16()[start..].to_vec(),
+    ));
+    lines
+}
+
+fn join_lines(lines: &[RuntimeString]) -> RuntimeString {
+    let mut joined = RuntimeString::default();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            joined = joined.concat(&RuntimeString::from("\n"));
+        }
+        joined = joined.concat(line);
+    }
+    joined
+}
+
+fn v8_string(scope: &v8::PinScope<'_, '_>, value: v8::Local<'_, v8::String>) -> RuntimeString {
+    let mut units = vec![0_u16; value.length()];
+    value.write_v2(scope, 0, &mut units, v8::WriteFlags::default());
+    RuntimeString::from_utf16(units)
+}
+
+fn filter_lines_exact(
+    output: &RuntimeString,
+    pattern: &RuntimeString,
+) -> Result<RuntimeString, RuntimeString> {
+    crate::v8_platform::initialize_v8().map_err(RuntimeString::from)?;
+    // The filter pattern is model-authored: cap the heap so a pathological
+    // regex or subject cannot pressure the shared engine process.
+    let (mut heap_isolate, heap_watch) =
+        crate::v8_platform::heap_limited_isolate(crate::v8_platform::AUX_SCRIPT_HEAP_LIMIT_BYTES);
+    let isolate = heap_isolate.as_mut();
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let tc = tc.init();
+    let pattern = v8::String::new_from_two_byte(&tc, pattern.as_utf16(), v8::NewStringType::Normal)
+        .ok_or_else(|| RuntimeString::from("failed to allocate filter regex"))?;
+    let regex =
+        v8::RegExp::new(&tc, pattern, v8::RegExpCreationFlags::empty()).ok_or_else(|| {
+            tc.exception()
+                .and_then(|value| value.to_string(&tc))
+                .map(|value| v8_string(&tc, value))
+                .unwrap_or_else(|| RuntimeString::from("invalid filter regex"))
+        })?;
+    let mut retained = Vec::new();
+    for line in split_lines(output) {
+        let subject =
+            v8::String::new_from_two_byte(&tc, line.as_utf16(), v8::NewStringType::Normal)
+                .ok_or_else(|| RuntimeString::from("failed to allocate filter subject"))?;
+        // `RegExp::exec` surfaces the JavaScript result object: on "no match"
+        // it yields the JS `null` VALUE (not an empty handle), so the presence
+        // of a handle alone must not be read as a match.
+        let matched = regex.exec(&tc, subject);
+        if matched.is_none() {
+            if let Some(message) = heap_watch.error_text() {
+                return Err(message);
+            }
+            if tc.has_terminated() {
+                return Err(RuntimeString::from("filter execution was terminated"));
+            }
+        }
+        if matched.is_some_and(|result| !result.is_null_or_undefined()) {
+            retained.push(line);
+        }
+    }
+    Ok(join_lines(&retained))
+}
+
+// ---- TaskOutput ---------------------------------------------------------------
 
 fn task_output_schema() -> JsonSchema {
     json!({
@@ -43,22 +196,33 @@ fn task_output_schema() -> JsonSchema {
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "Identifier of the background task to read"
+                "description": "The id of the background task to read: the task id of a sub-agent started in the background, or the shell id returned by a background command. A named sub-agent can also be read by its name."
+            },
+            "shell_id": {
+                "type": "string",
+                "description": "Deprecated alias for task_id"
+            },
+            "shellId": {
+                "type": "string",
+                "description": "Deprecated alias for task_id"
+            },
+            "filter": {
+                "type": "string",
+                "description": "Optional JS regex; only shell output lines matching it are returned"
             },
             "block": {
                 "type": "boolean",
-                "default": true,
-                "description": "Block until the task finishes"
+                "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
             },
             "timeout": {
                 "type": "number",
-                "minimum": 0,
-                "maximum": 600000,
-                "default": 30000,
-                "description": "Maximum milliseconds to wait"
+                "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
+            },
+            "yieldMs": {
+                "type": "integer",
+                "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
             }
         },
-        "required": ["task_id", "block", "timeout"],
         "additionalProperties": false
     })
     .as_object()
@@ -66,12 +230,17 @@ fn task_output_schema() -> JsonSchema {
     .unwrap_or_default()
 }
 
-/// Get the output (and status) of a background task by its id.
+const TASK_OUTPUT_DESCRIPTION: &str = "Returns the current state of a background task — a shell command that kept running in the background, or a sub-agent started with run_in_background — whether it is still running or has since finished.
+
+- status: \"running\" (still working; the output so far is returned), \"completed\", \"failed\", \"interrupted\", or for shell commands \"exited\" / \"killed\"
+- Results also reach you by themselves when a background task finishes, unless the message that started it said otherwise, so you don't need to check on it. Use this tool to read a finished task's result again, or to check once on a task you have lost track of — never to wait: while a task runs, calling this tool only returns its state so far, and when it finishes its result reaches you without a call. To wait for background work, call Yield.";
+
+/// Read the state and output of any background task (sub-agent or shell).
 pub struct TaskOutputTool {
     input_schema: JsonSchema,
 }
 
-/// Construct the `task_output` tool as an erased registry-side [`Tool`].
+/// Construct the `TaskOutput` tool as an erased registry-side [`Tool`].
 pub fn create_task_output_tool() -> Arc<dyn Tool> {
     Arc::new(TaskOutputTool {
         input_schema: task_output_schema(),
@@ -81,11 +250,18 @@ pub fn create_task_output_tool() -> Arc<dyn Tool> {
 #[async_trait]
 impl Tool for TaskOutputTool {
     fn static_name(&self) -> &str {
-        "task_output"
+        "TaskOutput"
+    }
+
+    fn aliases(&self) -> Vec<RuntimeString> {
+        vec![
+            RuntimeString::from("task_output"),
+            RuntimeString::from("bash_output"),
+        ]
     }
 
     fn static_description(&self) -> &str {
-        "Get the output (and status) of a background task by its id."
+        TASK_OUTPUT_DESCRIPTION
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
@@ -112,97 +288,198 @@ impl Tool for TaskOutputTool {
         true
     }
 
+    fn input_schema_property_order(
+        &self,
+        object_path: &[String],
+    ) -> Option<&'static [&'static str]> {
+        object_path.is_empty().then_some(&[
+            "task_id", "shell_id", "shellId", "filter", "block", "timeout", "yieldMs",
+        ])
+    }
+
+    fn summarize(&self, input: &Json) -> Option<RuntimeString> {
+        let task_id = target_id(input).unwrap_or_default();
+        Some(RuntimeString::from("Reading background task ").concat(&first_chars(&task_id, 8)))
+    }
+
     async fn call(
         &self,
         input: Json,
         ctx: &ToolContext,
         _on_progress: Option<ToolProgress>,
     ) -> Result<ToolResult, ToolError> {
-        let task_id = input
-            .get("task_id")
-            .and_then(RuntimeJson::as_str)
-            .cloned()
-            .unwrap_or_default();
-        let block = input
-            .get("block")
-            .and_then(RuntimeJson::as_bool)
-            .unwrap_or(true);
-        let timeout = input
-            .get("timeout")
-            .and_then(RuntimeJson::as_f64)
-            .unwrap_or(30_000.0);
-
-        let reg = ctx.background_tasks.as_ref();
-        let Some(mut handle) = reg.and_then(|r| r.get(&task_id)) else {
-            let text = RuntimeString::from("No background task with id ")
-                .concat(&task_id)
-                .concat(&RuntimeString::from("."));
+        let Some(task_id) = target_id(&input) else {
             return Ok(text_result(
                 runtime_object([
-                    ("task_id", RuntimeJson::String(task_id)),
+                    ("task_id", RuntimeJson::String(RuntimeString::default())),
                     ("status", RuntimeJson::from("not_found")),
                     ("output", RuntimeJson::String(RuntimeString::default())),
                     ("retrieval_status", RuntimeJson::from("not_ready")),
                 ]),
-                text,
+                "A task_id is required.",
                 true,
             ));
         };
 
-        // New input must reach the caller even when the watched child is waiting
-        // for that caller's response.
-        let mut input_pending = false;
-        if block && handle.status == BackgroundTaskStatus::Running {
-            let deadline = Instant::now() + Duration::from_millis(timeout.max(0.0) as u64);
-            while handle.status == BackgroundTaskStatus::Running && Instant::now() < deadline {
-                if ctx.signal.is_cancelled() {
-                    break;
-                }
-                let mailbox_pending = match &ctx.swarm {
-                    Some(swarm) => swarm.has_pending_input().await.map_err(ToolError::new)?,
-                    None => false,
-                };
-                if mailbox_pending || reg.is_some_and(|registry| registry.has_pending_input()) {
-                    input_pending = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-                if let Some(next) = reg.and_then(|r| r.get(&task_id)) {
-                    handle = next;
+        let reg = ctx.background_tasks.as_ref();
+        let mut handle = reg.and_then(|r| r.get(&task_id));
+        // A bound name or an unambiguous prefix addresses the same sub-agent.
+        if handle.is_none() {
+            if let Some(registry) = reg {
+                match registry.resolve_target(&task_id) {
+                    Some(Ok(agent_id)) => handle = registry.get(&agent_id),
+                    Some(Err(message)) => {
+                        return Ok(text_result(
+                            runtime_object([
+                                ("task_id", RuntimeJson::String(task_id)),
+                                ("status", RuntimeJson::from("not_found")),
+                                ("output", RuntimeJson::String(RuntimeString::default())),
+                                ("retrieval_status", RuntimeJson::from("not_ready")),
+                            ]),
+                            message,
+                            true,
+                        ));
+                    }
+                    None => {}
                 }
             }
         }
 
-        // While still running, return the transcript accumulated so far so a poll
-        // shows progress instead of empty — keeping the honest status.
+        if let Some(handle) = handle {
+            return self.read_agent(handle, ctx, &task_id).await;
+        }
+
+        // Shell commands live in the process registry, not the agent registry.
+        // A zero-window read consumes the new output and marks a finished
+        // shell's output as collected, exactly like the legacy shell reader.
+        let shell = ctx
+            .background_processes
+            .read_new_wait(&task_id, 0, &ctx.signal, None)
+            .await
+            .map_err(ToolError::new)?;
+        if shell.found {
+            return self.read_shell(shell, &input, &task_id);
+        }
+        // A finished shell whose final output was already collected still has
+        // an honest terminal state to report.
+        if let Some(entry) = ctx
+            .background_processes
+            .list()
+            .into_iter()
+            .find(|entry| entry.id == task_id)
+        {
+            let status = shell_status_str(entry.status);
+            let text = RuntimeString::from("Task ")
+                .concat(&task_id)
+                .concat(&RuntimeString::from(" finished ("))
+                .concat(&RuntimeString::from(status.to_string()))
+                .concat(&match entry.exit_code {
+                    Some(code) => RuntimeString::from_utf8(&format!(", exit code {code}")),
+                    None => RuntimeString::default(),
+                })
+                .concat(&RuntimeString::from(
+                    "); its final output was already collected by an earlier read.",
+                ));
+            return Ok(text_result(
+                runtime_object([
+                    ("task_id", RuntimeJson::String(task_id)),
+                    ("task_type", RuntimeJson::from("shell")),
+                    ("status", RuntimeJson::from(status.to_string())),
+                    (
+                        "exitCode",
+                        entry.exit_code.map_or(RuntimeJson::Null, RuntimeJson::from),
+                    ),
+                    ("output", RuntimeJson::String(RuntimeString::default())),
+                    ("retrieval_status", RuntimeJson::from("already_collected")),
+                ]),
+                text,
+                false,
+            ));
+        }
+
+        let text = RuntimeString::from("No background task with id ")
+            .concat(&task_id)
+            .concat(&RuntimeString::from(
+                ". Ids come from the result that started the background work; a named sub-agent can also be read by its name.",
+            ));
+        Ok(text_result(
+            runtime_object([
+                ("task_id", RuntimeJson::String(task_id)),
+                ("status", RuntimeJson::from("not_found")),
+                ("output", RuntimeJson::String(RuntimeString::default())),
+                ("retrieval_status", RuntimeJson::from("not_ready")),
+            ]),
+            text,
+            true,
+        ))
+    }
+}
+
+impl TaskOutputTool {
+    /// Bounded re-answers: reading the same still-running task more than the
+    /// budget within one reply is refused so the reader never degenerates into
+    /// a polling loop.
+    fn over_read_budget(&self, ctx: &ToolContext, task_id: &RuntimeString) -> bool {
+        ctx.reply_gate.as_ref().is_some_and(|gate| {
+            gate.count_task_read(&task_id.try_to_utf8().unwrap_or_default()) > READ_ANSWER_BUDGET
+        })
+    }
+
+    fn budget_message(&self, task_id: &RuntimeString, status: &str) -> ToolResult {
+        let message = RuntimeString::from("TaskOutput was already answered ")
+            .concat(&RuntimeString::from_utf8(&READ_ANSWER_BUDGET.to_string()))
+            .concat(&RuntimeString::from(" times for task "))
+            .concat(task_id)
+            .concat(&RuntimeString::from(" in this response (status: "))
+            .concat(&RuntimeString::from(status.to_string()))
+            .concat(&RuntimeString::from(
+                "); the same call repeated within one response is not answered again. To wait for background work, call Yield.",
+            ));
+        text_result(
+            runtime_object([
+                ("task_id", RuntimeJson::String(task_id.clone())),
+                ("status", RuntimeJson::from(status.to_string())),
+                ("output", RuntimeJson::String(RuntimeString::default())),
+                ("retrieval_status", RuntimeJson::from("repeat_call")),
+            ]),
+            message,
+            true,
+        )
+    }
+
+    async fn read_agent(
+        &self,
+        handle: crate::types::tool::BackgroundTaskHandle,
+        ctx: &ToolContext,
+        requested_id: &RuntimeString,
+    ) -> Result<ToolResult, ToolError> {
+        // Still running: the transcript accumulated so far shows progress
+        // instead of empty, keeping the honest status. Waiting is Yield's job.
         if handle.status == BackgroundTaskStatus::Running {
-            let retrieval = if input_pending {
-                "input_pending"
-            } else if block {
-                "timeout"
-            } else {
-                "not_ready"
-            };
+            if self.over_read_budget(ctx, requested_id) {
+                return Ok(self.budget_message(requested_id, "running"));
+            }
             let partial = handle.partial.clone().unwrap_or_default();
             let text = if !partial.is_empty() {
                 RuntimeString::from("Task ")
                     .concat(&handle.agent_id)
-                    .concat(&RuntimeString::from(" still running ("))
-                    .concat(&RuntimeString::from(retrieval))
-                    .concat(&RuntimeString::from("); partial output above."))
+                    .concat(&RuntimeString::from(
+                        " still running; partial output above. To wait for background work, call Yield; you are also notified when it completes.",
+                    ))
             } else {
                 RuntimeString::from("Task ")
                     .concat(&handle.agent_id)
-                    .concat(&RuntimeString::from(" has not finished yet ("))
-                    .concat(&RuntimeString::from(retrieval))
-                    .concat(&RuntimeString::from(")."))
+                    .concat(&RuntimeString::from(
+                        " has not finished yet. To wait for background work, call Yield; you are also notified when it completes.",
+                    ))
             };
             return Ok(text_result(
                 runtime_object([
                     ("task_id", RuntimeJson::String(handle.agent_id.clone())),
+                    ("task_type", RuntimeJson::from("agent")),
                     ("status", RuntimeJson::from(status_str(handle.status))),
                     ("output", RuntimeJson::String(partial)),
-                    ("retrieval_status", RuntimeJson::from(retrieval)),
+                    ("retrieval_status", RuntimeJson::from("not_ready")),
                 ]),
                 text,
                 false,
@@ -228,6 +505,7 @@ impl Tool for TaskOutputTool {
             return Ok(text_result(
                 runtime_object([
                     ("task_id", RuntimeJson::String(handle.agent_id.clone())),
+                    ("task_type", RuntimeJson::from("agent")),
                     ("status", RuntimeJson::from(status_str(handle.status))),
                     ("output", RuntimeJson::String(partial)),
                     ("retrieval_status", RuntimeJson::from("interrupted")),
@@ -294,6 +572,7 @@ impl Tool for TaskOutputTool {
         Ok(text_result(
             runtime_object([
                 ("task_id", RuntimeJson::String(handle.agent_id)),
+                ("task_type", RuntimeJson::from("agent")),
                 ("status", RuntimeJson::from(status_str(handle.status))),
                 ("output", RuntimeJson::String(output)),
                 ("retrieval_status", RuntimeJson::from(retrieval)),
@@ -302,9 +581,72 @@ impl Tool for TaskOutputTool {
             failed,
         ))
     }
+
+    fn read_shell(
+        &self,
+        res: crate::tools::background_shells::ReadNewResult,
+        input: &Json,
+        requested_id: &RuntimeString,
+    ) -> Result<ToolResult, ToolError> {
+        let mut output = res.output.clone();
+        let mut filter_error: Option<RuntimeString> = None;
+        let filter = input.get("filter").and_then(RuntimeJson::as_str);
+        if let Some(filter) = filter {
+            if !output.is_empty() {
+                match filter_lines_exact(&output, filter) {
+                    Ok(filtered) => output = filtered,
+                    Err(error) => {
+                        filter_error = Some(
+                            RuntimeString::from("\n[invalid filter regex: ")
+                                .concat(&error)
+                                .concat(&RuntimeString::from("]")),
+                        );
+                    }
+                }
+            }
+        }
+
+        let status_line = RuntimeString::from("[status: ")
+            .concat(&RuntimeString::from(shell_status_str(res.status)))
+            .concat(&match res.exit_code {
+                Some(code) => RuntimeString::from_utf8(&format!(", exit code {code}")),
+                None => RuntimeString::default(),
+            })
+            .concat(&RuntimeString::from("]"));
+        let body = if output.is_empty() {
+            RuntimeString::from("(no new output)")
+        } else {
+            output
+        };
+        let text = body
+            .concat(&RuntimeString::from("\n"))
+            .concat(&status_line)
+            .concat(&filter_error.unwrap_or_default());
+
+        let mut result = RuntimeObject::new();
+        result.insert("found", RuntimeJson::Bool(true));
+        result.insert("task_id", RuntimeJson::String(requested_id.clone()));
+        result.insert("task_type", RuntimeJson::from("shell"));
+        result.insert("status", RuntimeJson::from(shell_status_str(res.status)));
+        result.insert(
+            "shellId",
+            if res.status == crate::tools::background_shells::BackgroundShellStatus::Running {
+                RuntimeJson::String(requested_id.clone())
+            } else {
+                RuntimeJson::Null
+            },
+        );
+        result.insert(
+            "exitCode",
+            res.exit_code.map_or(RuntimeJson::Null, RuntimeJson::from),
+        );
+        result.insert("hasNewOutput", RuntimeJson::Bool(!res.output.is_empty()));
+
+        Ok(text_result(RuntimeJson::Object(result), text, false))
+    }
 }
 
-// ---- task_stop -------------------------------------------------------------
+// ---- TaskStop -------------------------------------------------------------------
 
 fn task_stop_schema() -> JsonSchema {
     json!({
@@ -312,11 +654,19 @@ fn task_stop_schema() -> JsonSchema {
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "Identifier of the background task to terminate"
+                "description": "The id of the background task to stop: the task id of a running sub-agent, or the shell id of a background command. To stop an agent-team teammate, pass its agent id or bare teammate name; to stop a background agent spawned with a name, pass that name."
             },
             "shell_id": {
                 "type": "string",
                 "description": "Deprecated alias for task_id"
+            },
+            "shellId": {
+                "type": "string",
+                "description": "Deprecated alias for task_id"
+            },
+            "signal": {
+                "type": "string",
+                "description": "Signal used to stop a background command: SIGTERM (default) or SIGKILL"
             }
         },
         "additionalProperties": false
@@ -326,12 +676,19 @@ fn task_stop_schema() -> JsonSchema {
     .unwrap_or_default()
 }
 
-/// Stop a running background task by its id.
+const TASK_STOP_DESCRIPTION: &str = "- Stops a running background task by its ID: a background shell command or a background sub-agent
+- Takes a task_id parameter identifying the task to stop
+- To stop an agent-team teammate, pass its agent ID or bare teammate name as task_id
+- To stop a background agent spawned with a name, pass that name as task_id
+- Returns a success or failure status
+- Use this tool when you need to terminate a long-running task";
+
+/// Stop any running background task (sub-agent or shell) by id or name.
 pub struct TaskStopTool {
     input_schema: JsonSchema,
 }
 
-/// Construct the `task_stop` tool as an erased registry-side [`Tool`].
+/// Construct the `TaskStop` tool as an erased registry-side [`Tool`].
 pub fn create_task_stop_tool() -> Arc<dyn Tool> {
     Arc::new(TaskStopTool {
         input_schema: task_stop_schema(),
@@ -341,22 +698,25 @@ pub fn create_task_stop_tool() -> Arc<dyn Tool> {
 #[async_trait]
 impl Tool for TaskStopTool {
     fn static_name(&self) -> &str {
-        "task_stop"
+        "TaskStop"
+    }
+
+    fn aliases(&self) -> Vec<RuntimeString> {
+        vec![
+            RuntimeString::from("task_stop"),
+            RuntimeString::from("kill_shell"),
+            RuntimeString::from("kill_bash"),
+            RuntimeString::from("KillShell"),
+            RuntimeString::from("KillBash"),
+        ]
     }
 
     fn static_description(&self) -> &str {
-        "Stop a running background task by its id."
+        TASK_STOP_DESCRIPTION
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
         &self.input_schema
-    }
-
-    fn input_schema_property_order(
-        &self,
-        object_path: &[String],
-    ) -> Option<&'static [&'static str]> {
-        object_path.is_empty().then_some(&["task_id", "shell_id"])
     }
 
     fn static_search_hint(&self) -> Option<&str> {
@@ -375,17 +735,27 @@ impl Tool for TaskStopTool {
         false
     }
 
+    fn input_schema_property_order(
+        &self,
+        object_path: &[String],
+    ) -> Option<&'static [&'static str]> {
+        object_path
+            .is_empty()
+            .then_some(&["task_id", "shell_id", "shellId", "signal"])
+    }
+
+    fn summarize(&self, input: &Json) -> Option<RuntimeString> {
+        let task_id = target_id(input).unwrap_or_default();
+        Some(RuntimeString::from("Stopping background task ").concat(&first_chars(&task_id, 8)))
+    }
+
     async fn call(
         &self,
         input: Json,
         ctx: &ToolContext,
         _on_progress: Option<ToolProgress>,
     ) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("task_id")
-            .and_then(RuntimeJson::as_str)
-            .or_else(|| input.get("shell_id").and_then(RuntimeJson::as_str));
-        let Some(id) = id else {
+        let Some(id) = target_id(&input) else {
             return Ok(text_result(
                 runtime_object([
                     ("message", RuntimeJson::from("A task_id is required.")),
@@ -396,30 +766,77 @@ impl Tool for TaskStopTool {
                 true,
             ));
         };
+
+        // 1) An exact sub-agent id.
         let reg = ctx.background_tasks.as_ref();
-        let Some(handle) = reg.and_then(|r| r.get(id)) else {
-            let message = RuntimeString::from("No background task with id ")
-                .concat(id)
-                .concat(&RuntimeString::from("."));
-            return Ok(text_result(
-                runtime_object([
-                    ("message", RuntimeJson::String(message.clone())),
-                    ("task_id", RuntimeJson::String(id.clone())),
-                    ("task_type", RuntimeJson::String(RuntimeString::default())),
-                ]),
-                message,
-                true,
-            ));
-        };
+        if let Some(handle) = reg.and_then(|r| r.get(&id)) {
+            return Ok(self.stop_agent(reg, handle, &id));
+        }
+
+        // 2) A background shell command id.
+        let known_shell = ctx
+            .background_processes
+            .list()
+            .into_iter()
+            .find(|entry| entry.id == id);
+        if let Some(entry) = known_shell {
+            return self.stop_shell(ctx, &input, &id, entry.command).await;
+        }
+
+        // 3) A bound agent/teammate name or an unambiguous prefix.
+        if let Some(registry) = reg {
+            match registry.resolve_target(&id) {
+                Some(Ok(agent_id)) => {
+                    if let Some(handle) = registry.get(&agent_id) {
+                        return Ok(self.stop_agent(reg, handle, &agent_id));
+                    }
+                }
+                Some(Err(message)) => {
+                    return Ok(text_result(
+                        runtime_object([
+                            ("message", RuntimeJson::String(message.clone())),
+                            ("task_id", RuntimeJson::String(id)),
+                            ("task_type", RuntimeJson::String(RuntimeString::default())),
+                        ]),
+                        message,
+                        true,
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        let message = RuntimeString::from("No background task with id ")
+            .concat(&id)
+            .concat(&RuntimeString::from("."));
+        Ok(text_result(
+            runtime_object([
+                ("message", RuntimeJson::String(message.clone())),
+                ("task_id", RuntimeJson::String(id)),
+                ("task_type", RuntimeJson::String(RuntimeString::default())),
+            ]),
+            message,
+            true,
+        ))
+    }
+}
+
+impl TaskStopTool {
+    fn stop_agent(
+        &self,
+        reg: Option<&Arc<dyn crate::types::tool::BackgroundTaskRegistry>>,
+        handle: crate::types::tool::BackgroundTaskHandle,
+        id: &RuntimeString,
+    ) -> ToolResult {
         // A persistent mailbox can still be live after its latest run failed.
         // The registry owns lifetime liveness, so its stop result is authoritative.
         if !reg.is_some_and(|registry| registry.stop(id)) {
-            let msg = RuntimeString::from("Background task ")
+            let msg = RuntimeString::from("Task ")
                 .concat(id)
-                .concat(&RuntimeString::from(" already finished (status: "))
+                .concat(&RuntimeString::from(" is not running (status: "))
                 .concat(&RuntimeString::from(status_str(handle.status)))
                 .concat(&RuntimeString::from(")."));
-            return Ok(text_result(
+            return text_result(
                 runtime_object([
                     ("message", RuntimeJson::String(msg.clone())),
                     ("task_id", RuntimeJson::String(id.clone())),
@@ -427,11 +844,9 @@ impl Tool for TaskStopTool {
                 ]),
                 msg,
                 true,
-            ));
+            );
         }
-        let message = RuntimeString::from("Stopped background task ")
-            .concat(id)
-            .concat(&RuntimeString::from("."));
+        let message = RuntimeString::from("Successfully stopped task: ").concat(id);
         let mut output = runtime_object([
             ("message", RuntimeJson::String(message.clone())),
             ("task_id", RuntimeJson::String(id.clone())),
@@ -445,7 +860,66 @@ impl Tool for TaskStopTool {
                     .insert("command", RuntimeJson::String(desc.clone()));
             }
         }
-        Ok(text_result(output, message, false))
+        text_result(output, message, false)
+    }
+
+    async fn stop_shell(
+        &self,
+        ctx: &ToolContext,
+        input: &Json,
+        id: &RuntimeString,
+        command: RuntimeString,
+    ) -> Result<ToolResult, ToolError> {
+        let signal = match parse_signal(input.get("signal").and_then(RuntimeJson::as_str)) {
+            Ok(signal) => signal,
+            Err(message) => {
+                return Ok(text_result(
+                    runtime_object([
+                        ("message", RuntimeJson::String(message.clone())),
+                        ("task_id", RuntimeJson::String(id.clone())),
+                        ("task_type", RuntimeJson::from("shell")),
+                    ]),
+                    message,
+                    true,
+                ));
+            }
+        };
+        let killed = ctx
+            .background_processes
+            .stop_with_signal_and_wait(id, signal)
+            .await
+            .map_err(ToolError::new)?
+            .accepted;
+        if !killed {
+            let message = RuntimeString::from("Task ")
+                .concat(id)
+                .concat(&RuntimeString::from(" is not running."));
+            return Ok(text_result(
+                runtime_object([
+                    ("message", RuntimeJson::String(message.clone())),
+                    ("task_id", RuntimeJson::String(id.clone())),
+                    ("task_type", RuntimeJson::from("shell")),
+                ]),
+                message,
+                true,
+            ));
+        }
+        let message = RuntimeString::from("Successfully stopped task: ")
+            .concat(id)
+            .concat(&RuntimeString::from(" ("))
+            .concat(&command)
+            .concat(&RuntimeString::from(") with "))
+            .concat(&RuntimeString::from(signal_label(signal)));
+        Ok(text_result(
+            runtime_object([
+                ("message", RuntimeJson::String(message.clone())),
+                ("task_id", RuntimeJson::String(id.clone())),
+                ("task_type", RuntimeJson::from("shell")),
+                ("command", RuntimeJson::String(command)),
+            ]),
+            message,
+            false,
+        ))
     }
 }
 
@@ -454,7 +928,7 @@ mod tests {
     use super::*;
     use crate::runtime_values::{runtime_json, RuntimePath};
     use crate::tools::builtins::test_ctx::make_ctx;
-    use crate::types::tool::BackgroundTaskHandle;
+    use crate::types::tool::{BackgroundTaskHandle, ReplyScopedGate};
     use std::sync::Mutex;
 
     macro_rules! rjson {
@@ -471,10 +945,41 @@ mod tests {
         }
     }
 
-    /// A registry over a fixed set of handles, recording any stop() calls.
+    fn is_err(res: &ToolResult) -> bool {
+        res.serializable.is_error == Some(true)
+    }
+
+    fn utf8(value: &RuntimeString) -> String {
+        value.try_to_utf8().unwrap_or_default()
+    }
+
+    fn handle(id: &str, status: BackgroundTaskStatus, partial: &str) -> BackgroundTaskHandle {
+        BackgroundTaskHandle {
+            agent_id: RuntimeString::from(id),
+            output_file: RuntimePath::from(format!("/tmp/klaus-test-{id}.out")),
+            status,
+            description: Some(RuntimeString::from("stub task")),
+            partial: Some(RuntimeString::from(partial)),
+        }
+    }
+
+    /// A registry over a fixed set of handles with name resolution and stop recording.
     struct StubRegistry {
         handles: Vec<BackgroundTaskHandle>,
         stopped: Mutex<Vec<RuntimeString>>,
+        names: Vec<(String, String)>,
+        ambiguous: Vec<String>,
+    }
+
+    impl StubRegistry {
+        fn new(handles: Vec<BackgroundTaskHandle>) -> Self {
+            StubRegistry {
+                handles,
+                stopped: Mutex::new(Vec::new()),
+                names: Vec::new(),
+                ambiguous: Vec::new(),
+            }
+        }
     }
 
     #[async_trait]
@@ -487,6 +992,21 @@ mod tests {
         }
         fn list(&self) -> Vec<BackgroundTaskHandle> {
             self.handles.clone()
+        }
+        fn resolve_target(
+            &self,
+            target: &RuntimeString,
+        ) -> Option<Result<RuntimeString, RuntimeString>> {
+            let key = target.try_to_utf8().unwrap_or_default();
+            if self.ambiguous.contains(&key) {
+                return Some(Err(RuntimeString::from(
+                    "Ambiguous sub-agent target; use an unambiguous agent ID.",
+                )));
+            }
+            self.names
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, id)| Ok(RuntimeString::from(id.as_str())))
         }
         fn stop(&self, agent_id: &RuntimeString) -> bool {
             if !self
@@ -501,276 +1021,311 @@ mod tests {
         async fn wait_for_idle(&self) {}
     }
 
+    fn ctx_with(registry: StubRegistry) -> ToolContext {
+        let mut ctx = make_ctx("/tmp");
+        ctx.background_tasks = Some(Arc::new(registry));
+        ctx.reply_gate = Some(Arc::new(ReplyScopedGate::default()));
+        if let Some(gate) = &ctx.reply_gate {
+            gate.begin_reply("reply-1".to_string());
+        }
+        ctx
+    }
+
     #[test]
-    fn output_metadata_and_schema() {
-        let tool = create_task_output_tool();
-        assert_eq!(tool.name(), "task_output");
-        assert_eq!(
-            tool.search_hint(),
-            Some(RuntimeString::from("retrieve a background task result"))
-        );
-        assert_eq!(tool.max_result_size_chars(), Some(100_000));
-        assert!(tool.is_read_only(&rjson!({})));
-        assert!(tool.is_concurrency_safe(&rjson!({})));
-        let schema = tool.input_schema();
-        assert_eq!(
-            schema.get("required").unwrap(),
-            &rjson!(["task_id", "block", "timeout"])
-        );
-        let t = schema
-            .get("properties")
-            .and_then(|p| p.get("timeout"))
-            .unwrap();
-        assert_eq!(t.get("minimum").unwrap(), &rjson!(0));
-        assert_eq!(t.get("maximum").unwrap(), &rjson!(600000));
-        assert_eq!(t.get("default").unwrap(), &rjson!(30000));
-    }
-
-    #[tokio::test]
-    async fn output_reports_a_missing_task() {
-        let tool = create_task_output_tool();
-        let mut ctx = make_ctx("/tmp");
-        ctx.background_tasks = Some(Arc::new(StubRegistry {
-            handles: Vec::new(),
-            stopped: Mutex::new(Vec::new()),
-        }));
-        let res = tool
-            .call(rjson!({ "task_id": "abc", "block": false }), &ctx, None)
-            .await
-            .unwrap();
-        assert_eq!(res.serializable.is_error, Some(true));
-        assert_eq!(text_of(&res), "No background task with id abc.");
-        assert_eq!(
-            res.serializable
-                .output
-                .get("status")
-                .and_then(RuntimeJson::as_str),
-            Some(&RuntimeString::from("not_found"))
-        );
-    }
-
-    #[tokio::test]
-    async fn output_reads_a_completed_tasks_result_file() {
-        let dir = std::env::temp_dir().join(format!("ae-taskctl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("result.txt");
-        std::fs::write(&file, "the answer").unwrap();
-        let tool = create_task_output_tool();
-        let mut ctx = make_ctx("/tmp");
-        ctx.background_tasks = Some(Arc::new(StubRegistry {
-            handles: vec![BackgroundTaskHandle {
-                agent_id: "job1".into(),
-                output_file: crate::fs::node_path::runtime_path_from_native(&file),
-                status: BackgroundTaskStatus::Completed,
-                description: None,
-                partial: None,
-            }],
-            stopped: Mutex::new(Vec::new()),
-        }));
-        let res = tool
-            .call(rjson!({ "task_id": "job1", "block": false }), &ctx, None)
-            .await
-            .unwrap();
-        assert_eq!(res.serializable.is_error, Some(false));
-        assert_eq!(text_of(&res), "the answer");
-        assert_eq!(
-            res.serializable
-                .output
-                .get("retrieval_status")
-                .and_then(RuntimeJson::as_str),
-            Some(&RuntimeString::from("success"))
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn retrieval_status(res: &ToolResult) -> RuntimeString {
-        res.serializable
-            .output
-            .get("retrieval_status")
-            .and_then(RuntimeJson::as_str)
-            .cloned()
-            .expect("task_output always reports a retrieval status")
-    }
-
-    /// The result file lives in the OS temp directory and is not durable, while
-    /// the agent's transcript under the session directory is. A completed task
-    /// whose file was cleared must return the transcript it left behind and say
-    /// which one it is — reporting `success` with an empty output would claim a
-    /// result that was never read.
-    #[tokio::test]
-    async fn output_falls_back_to_the_transcript_when_the_result_file_is_gone() {
-        let tool = create_task_output_tool();
-        let mut ctx = make_ctx("/tmp");
-        ctx.background_tasks = Some(Arc::new(StubRegistry {
-            handles: vec![BackgroundTaskHandle {
-                agent_id: "job1".into(),
-                output_file: RuntimePath::from("/definitely/not/here.txt"),
-                status: BackgroundTaskStatus::Completed,
-                description: None,
-                partial: Some("ran the tests\nall passed".into()),
-            }],
-            stopped: Mutex::new(Vec::new()),
-        }));
-        let res = tool
-            .call(rjson!({ "task_id": "job1", "block": false }), &ctx, None)
-            .await
-            .unwrap();
-        assert_eq!(retrieval_status(&res), "transcript_only");
-        assert_eq!(
-            res.serializable
-                .output
-                .get("output")
-                .and_then(RuntimeJson::as_str),
-            Some(&RuntimeString::from("ran the tests\nall passed")),
-            "the transcript is what the caller gets"
-        );
-        let text = text_of(&res).try_to_utf8().unwrap();
-        assert!(
-            text.contains("result file is gone"),
-            "the reply must not pass the transcript off as the final answer: {text}"
-        );
-    }
-
-    /// Neither source survived: say so plainly instead of reporting success.
-    #[tokio::test]
-    async fn output_reports_unavailable_when_both_sources_are_gone() {
-        let tool = create_task_output_tool();
-        let mut ctx = make_ctx("/tmp");
-        ctx.background_tasks = Some(Arc::new(StubRegistry {
-            handles: vec![BackgroundTaskHandle {
-                agent_id: "job1".into(),
-                output_file: RuntimePath::from("/definitely/not/here.txt"),
-                status: BackgroundTaskStatus::Completed,
-                description: None,
-                partial: None,
-            }],
-            stopped: Mutex::new(Vec::new()),
-        }));
-        let res = tool
-            .call(rjson!({ "task_id": "job1", "block": false }), &ctx, None)
-            .await
-            .unwrap();
-        assert_eq!(retrieval_status(&res), "unavailable");
-        assert_eq!(text_of(&res), "Task job1 completed with no output.");
-    }
-
-    /// An interrupted task reports its partial work and never claims completion,
-    /// whether or not anything survived.
-    #[tokio::test]
-    async fn output_reports_an_interrupted_task_as_interrupted_not_completed() {
-        let tool = create_task_output_tool();
-        for partial in [Some("half the work".into()), None] {
-            let mut ctx = make_ctx("/tmp");
-            ctx.background_tasks = Some(Arc::new(StubRegistry {
-                handles: vec![BackgroundTaskHandle {
-                    agent_id: "job1".into(),
-                    output_file: RuntimePath::from("/definitely/not/here.txt"),
-                    status: BackgroundTaskStatus::Interrupted,
-                    description: None,
-                    partial: partial.clone(),
-                }],
-                stopped: Mutex::new(Vec::new()),
-            }));
-            let res = tool
-                .call(rjson!({ "task_id": "job1", "block": false }), &ctx, None)
-                .await
-                .unwrap();
-            assert_eq!(retrieval_status(&res), "interrupted");
-            assert_eq!(res.serializable.is_error, Some(true));
-            assert_eq!(
-                res.serializable
-                    .output
-                    .get("status")
-                    .and_then(RuntimeJson::as_str),
-                Some(&RuntimeString::from("interrupted"))
-            );
-            let text = text_of(&res).try_to_utf8().unwrap();
+    fn unified_names_and_legacy_aliases() {
+        let output = create_task_output_tool();
+        assert_eq!(output.name(), "TaskOutput");
+        let aliases = output.aliases();
+        assert!(aliases.contains(&RuntimeString::from("task_output")));
+        assert!(aliases.contains(&RuntimeString::from("bash_output")));
+        let stop = create_task_stop_tool();
+        assert_eq!(stop.name(), "TaskStop");
+        let aliases = stop.aliases();
+        for legacy in [
+            "task_stop",
+            "kill_shell",
+            "kill_bash",
+            "KillShell",
+            "KillBash",
+        ] {
             assert!(
-                text.contains("was interrupted"),
-                "the reply must state why there is no final answer: {text}"
+                aliases.contains(&RuntimeString::from(legacy)),
+                "missing alias {legacy}"
             );
-            // The wording may mention "completed" only to deny it, so the
-            // no-completion claim above is asserted on the reported status field
-            // rather than on a substring of prose.
-            if let Some(partial) = &partial {
-                assert_eq!(
-                    res.serializable
-                        .output
-                        .get("output")
-                        .and_then(RuntimeJson::as_str)
-                        .map(|value| value.try_to_utf8().unwrap()),
-                    Some(partial.try_to_utf8().unwrap()),
-                    "the partial work is returned so the caller can judge it"
-                );
-            }
         }
     }
 
     #[tokio::test]
-    async fn stop_requires_a_task_id() {
-        let tool = create_task_stop_tool();
-        let ctx = make_ctx("/tmp");
-        let res = tool.call(rjson!({}), &ctx, None).await.unwrap();
-        assert_eq!(res.serializable.is_error, Some(true));
-        assert_eq!(text_of(&res), "A task_id is required.");
+    async fn output_reads_running_agent_snapshot_without_waiting() {
+        let ctx = ctx_with(StubRegistry::new(vec![handle(
+            "agent-1",
+            BackgroundTaskStatus::Running,
+            "partial work",
+        )]));
+        let res = create_task_output_tool()
+            .call(
+                rjson!({"task_id":"agent-1","block":true,"timeout":60000}),
+                &ctx,
+                None,
+            )
+            .await
+            .expect("call succeeds");
+        let text = text_of(&res);
+        assert!(text.contains("still running"), "{}", utf8(&text));
+        assert!(text.contains("call Yield"), "{}", utf8(&text));
+        assert!(
+            res.serializable.output.to_string().contains("partial work"),
+            "structured output carries the partial transcript"
+        );
+        assert!(!is_err(&res));
     }
 
     #[tokio::test]
-    async fn stop_terminates_a_running_task_and_accepts_the_shell_id_alias() {
-        let tool = create_task_stop_tool();
-        let mut ctx = make_ctx("/tmp");
-        let reg = Arc::new(StubRegistry {
-            handles: vec![BackgroundTaskHandle {
-                agent_id: "job2".into(),
-                output_file: RuntimePath::from("/x"),
-                status: BackgroundTaskStatus::Running,
-                description: Some("do the thing".into()),
-                partial: None,
-            }],
-            stopped: Mutex::new(Vec::new()),
-        });
-        ctx.background_tasks = Some(reg.clone());
-        let res = tool
-            .call(rjson!({ "shell_id": "job2" }), &ctx, None)
+    async fn output_repeats_are_bounded_per_reply() {
+        let ctx = ctx_with(StubRegistry::new(vec![handle(
+            "agent-1",
+            BackgroundTaskStatus::Running,
+            "work",
+        )]));
+        let tool = create_task_output_tool();
+        for _ in 0..READ_ANSWER_BUDGET {
+            let res = tool
+                .call(rjson!({"task_id":"agent-1"}), &ctx, None)
+                .await
+                .expect("call succeeds");
+            assert!(!is_err(&res));
+        }
+        let blocked = tool
+            .call(rjson!({"task_id":"agent-1"}), &ctx, None)
             .await
-            .unwrap();
-        assert_eq!(res.serializable.is_error, Some(false));
-        assert_eq!(text_of(&res), "Stopped background task job2.");
-        assert_eq!(
-            res.serializable
+            .expect("call succeeds");
+        let text = text_of(&blocked);
+        assert!(is_err(&blocked));
+        assert!(
+            text.contains("not answered again"),
+            "third read must be refused: {}",
+            utf8(&text)
+        );
+        // A new reply resets the budget.
+        ctx.reply_gate
+            .as_ref()
+            .unwrap()
+            .begin_reply("reply-2".to_string());
+        let fresh = tool
+            .call(rjson!({"task_id":"agent-1"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        assert!(!is_err(&fresh));
+    }
+
+    #[tokio::test]
+    async fn output_resolves_bound_names_and_reports_ambiguity() {
+        let mut registry = StubRegistry::new(vec![handle(
+            "agent-1",
+            BackgroundTaskStatus::Running,
+            "named work",
+        )]);
+        registry.names.push(("writer".into(), "agent-1".into()));
+        registry.ambiguous.push("dup".into());
+        let ctx = ctx_with(registry);
+        let tool = create_task_output_tool();
+        let by_name = tool
+            .call(rjson!({"task_id":"writer"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        assert!(
+            by_name
+                .serializable
                 .output
-                .get("command")
-                .and_then(RuntimeJson::as_str),
-            Some(&RuntimeString::from("do the thing"))
+                .to_string()
+                .contains("named work"),
+            "name resolution reads the bound agent"
         );
-        assert_eq!(
-            reg.stopped.lock().unwrap().as_slice(),
-            [RuntimeString::from("job2")]
-        );
+        let ambiguous = tool
+            .call(rjson!({"task_id":"dup"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        assert!(is_err(&ambiguous));
+        assert!(text_of(&ambiguous).contains("Ambiguous sub-agent target"));
     }
 
     #[tokio::test]
-    async fn stop_reports_an_already_finished_task() {
+    async fn stop_terminates_running_agent_and_reports_finished_tasks() {
+        let registry = StubRegistry::new(vec![
+            handle("agent-1", BackgroundTaskStatus::Running, ""),
+            handle("agent-2", BackgroundTaskStatus::Completed, ""),
+        ]);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recorder = Arc::clone(&stopped);
+        let ctx = ctx_with(registry);
         let tool = create_task_stop_tool();
-        let mut ctx = make_ctx("/tmp");
-        ctx.background_tasks = Some(Arc::new(StubRegistry {
-            handles: vec![BackgroundTaskHandle {
-                agent_id: "job3".into(),
-                output_file: RuntimePath::from("/x"),
-                status: BackgroundTaskStatus::Completed,
-                description: None,
-                partial: None,
-            }],
-            stopped: Mutex::new(Vec::new()),
-        }));
         let res = tool
-            .call(rjson!({ "task_id": "job3" }), &ctx, None)
+            .call(rjson!({"task_id":"agent-1"}), &ctx, None)
             .await
-            .unwrap();
-        assert_eq!(res.serializable.is_error, Some(true));
-        assert_eq!(
-            text_of(&res),
-            "Background task job3 already finished (status: completed)."
+            .expect("call succeeds");
+        assert!(!is_err(&res));
+        assert!(text_of(&res).contains("Successfully stopped task: agent-1"));
+        let finished = tool
+            .call(rjson!({"task_id":"agent-2"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        assert!(is_err(&finished));
+        assert!(text_of(&finished).contains("is not running (status: completed)"));
+        let missing = tool
+            .call(rjson!({"task_id":"nope"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        assert!(is_err(&missing));
+        assert!(text_of(&missing).contains("No background task with id nope."));
+        recorder.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_describes_teammate_and_name_targets() {
+        let tool = create_task_stop_tool();
+        let description = tool.static_description();
+        assert!(description.contains("bare teammate name"));
+        assert!(description.contains("pass that name as task_id"));
+    }
+
+    #[cfg(unix)]
+    struct IdSandbox;
+
+    #[cfg(unix)]
+    impl crate::types::sandbox::SandboxBackend for IdSandbox {
+        fn kind(&self) -> crate::types::sandbox::SandboxKind {
+            crate::types::sandbox::SandboxKind::Process
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn transform(
+            &self,
+            req: &crate::types::sandbox::ExecRequest,
+            _policy: &crate::types::sandbox::SandboxPolicy,
+        ) -> crate::types::sandbox::SpawnSpec {
+            crate::types::sandbox::SpawnSpec {
+                file: req.argv.first().cloned().unwrap_or_default(),
+                args: req
+                    .argv
+                    .get(1..)
+                    .map(<[RuntimeString]>::to_vec)
+                    .unwrap_or_default(),
+                env: req
+                    .env
+                    .clone()
+                    .unwrap_or_else(crate::runtime_process::ParentEnvSnapshot::capture),
+                cwd: req.cwd.clone(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unified_tools_cover_background_shells() {
+        use crate::tools::background_shells::StartShellOptions;
+        let ctx = ctx_with(StubRegistry::new(vec![]));
+        let shell_id = ctx
+            .background_processes
+            .start(
+                ctx.process_context.clone(),
+                StartShellOptions {
+                    command: RuntimeString::from("sleep 30"),
+                    cwd: RuntimePath::from("/tmp"),
+                    sandbox: Arc::new(IdSandbox),
+                    env: None,
+                    max_output_bytes: 64 * 1024,
+                    writable_roots: None,
+                    unconfined_writes: false,
+                    network_allowed: None,
+                    managed_network: None,
+                    on_complete: None,
+                },
+            )
+            .await
+            .expect("shell starts");
+        // The reader accepts the legacy shellId spelling and reports the shell.
+        let read = create_task_output_tool()
+            .call(rjson!({"shellId":"PLACEHOLDER"}), &ctx, None)
+            .await
+            .expect("call succeeds");
+        let _ = read;
+        let by_shell_id = create_task_output_tool()
+            .call(
+                runtime_json::parse(
+                    &RuntimeString::from("{\"shellId\":\"")
+                        .concat(&shell_id)
+                        .concat(&RuntimeString::from("\"}")),
+                )
+                .expect("dynamic JSON"),
+                &ctx,
+                None,
+            )
+            .await
+            .expect("call succeeds");
+        let text = text_of(&by_shell_id);
+        assert!(text.contains("[status: "), "{}", utf8(&text));
+        // The unified stopper terminates the shell through the legacy alias too.
+        let stopped = create_task_stop_tool()
+            .call(
+                runtime_json::parse(
+                    &RuntimeString::from("{\"task_id\":\"")
+                        .concat(&shell_id)
+                        .concat(&RuntimeString::from("\",\"signal\":\"SIGKILL\"}")),
+                )
+                .expect("dynamic JSON"),
+                &ctx,
+                None,
+            )
+            .await
+            .expect("call succeeds");
+        let text = text_of(&stopped);
+        assert!(!is_err(&stopped), "{}", utf8(&text));
+        assert!(
+            text.contains("Successfully stopped task: "),
+            "{}",
+            utf8(&text)
+        );
+        assert!(text.contains("sleep 30"), "{}", utf8(&text));
+        let after = create_task_output_tool()
+            .call(
+                runtime_json::parse(
+                    &RuntimeString::from("{\"task_id\":\"")
+                        .concat(&shell_id)
+                        .concat(&RuntimeString::from("\"}")),
+                )
+                .expect("dynamic JSON"),
+                &ctx,
+                None,
+            )
+            .await
+            .expect("call succeeds");
+        let after_text = text_of(&after);
+        assert!(
+            after_text.contains("[status: killed"),
+            "{}",
+            utf8(&after_text)
+        );
+        // A repeat read after collection still reports the honest terminal state.
+        let collected = create_task_output_tool()
+            .call(
+                runtime_json::parse(
+                    &RuntimeString::from("{\"task_id\":\"")
+                        .concat(&shell_id)
+                        .concat(&RuntimeString::from("\"}")),
+                )
+                .expect("dynamic JSON"),
+                &ctx,
+                None,
+            )
+            .await
+            .expect("call succeeds");
+        let collected_text = text_of(&collected);
+        assert!(
+            collected_text.contains("already collected"),
+            "{}",
+            utf8(&collected_text)
         );
     }
 }

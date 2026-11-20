@@ -6,7 +6,6 @@
     "ask_user",
     "ask_user_async",
     "bash",
-    "bash_output",
     "CronCreate",
     "CronDelete",
     "CronList",
@@ -16,7 +15,6 @@
     "get_mcp_prompt",
     "glob",
     "grep",
-    "kill_shell",
     "list_mcp_prompts",
     "list_mcp_resources",
     "ListPeers",
@@ -30,11 +28,11 @@
     "SendMessage",
     "sleep",
     "task",
-    "task_output",
-    "task_stop",
     "TaskCreate",
     "TaskGet",
     "TaskList",
+    "TaskOutput",
+    "TaskStop",
     "TaskUpdate",
     "TaskWrite",
     "TeamCreate",
@@ -45,7 +43,8 @@
     "web_search",
     "workflow",
     "write",
-    "write_stdin"
+    "write_stdin",
+    "Yield"
   ],
   "toolMetadata": [
     {
@@ -82,14 +81,6 @@
     },
     {
       "name": "bash",
-      "exposure": "direct",
-      "inputKind": {
-        "type": "jsonSchema"
-      },
-      "searchHint": null
-    },
-    {
-      "name": "bash_output",
       "exposure": "direct",
       "inputKind": {
         "type": "jsonSchema"
@@ -162,14 +153,6 @@
     },
     {
       "name": "grep",
-      "exposure": "direct",
-      "inputKind": {
-        "type": "jsonSchema"
-      },
-      "searchHint": null
-    },
-    {
-      "name": "kill_shell",
       "exposure": "direct",
       "inputKind": {
         "type": "jsonSchema"
@@ -281,22 +264,6 @@
       "searchHint": null
     },
     {
-      "name": "task_output",
-      "exposure": "direct",
-      "inputKind": {
-        "type": "jsonSchema"
-      },
-      "searchHint": "retrieve a background task result"
-    },
-    {
-      "name": "task_stop",
-      "exposure": "direct",
-      "inputKind": {
-        "type": "jsonSchema"
-      },
-      "searchHint": "terminate a running background task"
-    },
-    {
       "name": "TaskCreate",
       "exposure": "direct",
       "inputKind": {
@@ -319,6 +286,22 @@
         "type": "jsonSchema"
       },
       "searchHint": null
+    },
+    {
+      "name": "TaskOutput",
+      "exposure": "direct",
+      "inputKind": {
+        "type": "jsonSchema"
+      },
+      "searchHint": "retrieve a background task result"
+    },
+    {
+      "name": "TaskStop",
+      "exposure": "direct",
+      "inputKind": {
+        "type": "jsonSchema"
+      },
+      "searchHint": "terminate a running background task"
     },
     {
       "name": "TaskUpdate",
@@ -407,6 +390,14 @@
         "type": "jsonSchema"
       },
       "searchHint": null
+    },
+    {
+      "name": "Yield",
+      "exposure": "direct",
+      "inputKind": {
+        "type": "jsonSchema"
+      },
+      "searchHint": "wait for your background work"
     }
   ],
   "toolSpecs": [
@@ -650,7 +641,7 @@
             "maximum": 9007199254740991
           },
           "runInBackground": {
-            "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+            "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
             "type": "boolean"
           },
           "sandboxPermissions": {
@@ -670,33 +661,6 @@
         },
         "required": [
           "command"
-        ],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "bash_output",
-      "description": "Wait for background shell output until the observation window expires or the process finishes, then return its new output, status and exit code. A live process keeps the same shellId. Optionally filter the collected lines by regex.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "shellId": {
-            "type": "string",
-            "description": "The id returned by bash when run in the background"
-          },
-          "yieldMs": {
-            "description": "Observation window in milliseconds. Empty polls wait at least 5000 ms; the default maximum is 300000 ms. Expiry does not stop the process.",
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 9007199254740991
-          },
-          "filter": {
-            "description": "Optional JS regex; only output lines matching it are returned",
-            "type": "string"
-          }
-        },
-        "required": [
-          "shellId"
         ],
         "additionalProperties": false
       }
@@ -790,13 +754,13 @@
     },
     {
       "name": "exec_command",
-      "description": "Run a command in a persistent interactive shell. Prefer bash in background mode with bash_output and kill_shell for long-running non-interactive work. Use exec_command only when the same live process must receive later input or preserve REPL/TTY state. If it stays alive, it returns a sessionId for write_stdin; stop it with kill_shell. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId.",
+      "description": "Run a command in a persistent interactive shell. Prefer bash in background mode with TaskOutput and TaskStop for long-running non-interactive work. Use exec_command only when the same live process must receive later input or preserve REPL/TTY state. If it stays alive, it returns a sessionId for write_stdin; stop it with TaskStop. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "command": {
             "type": "string",
-            "description": "The command to run. Prefer bash with runInBackground plus bash_output and kill_shell for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
+            "description": "The command to run. Prefer bash with runInBackground plus TaskOutput and TaskStop for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
           },
           "yieldMs": {
             "description": "How long to wait for it to finish before handing back a session (default 10000).",
@@ -999,31 +963,6 @@
         },
         "required": [
           "pattern"
-        ],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "kill_shell",
-      "description": "Kill a background shell (from bash) or an interactive session (from exec_command) by id, terminating its whole process group.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "shellId": {
-            "type": "string",
-            "description": "The id returned by bash (background) or exec_command (session)"
-          },
-          "signal": {
-            "type": "string",
-            "enum": [
-              "SIGTERM",
-              "SIGKILL"
-            ],
-            "description": "Signal to send; defaults to SIGTERM with SIGKILL fallback"
-          }
-        },
-        "required": [
-          "shellId"
         ],
         "additionalProperties": false
       }
@@ -1434,7 +1373,7 @@
     },
     {
       "name": "task",
-      "description": "Delegate a self-contained subtask to an in-process sub-agent when permitted by the current collaboration mode. Supply the goal, relevant context and expected result. Every new child requires model: choose by task complexity from the tiers or model directory advertised in the model parameter. Concrete model choices require the model-directory setting to be enabled. Do not omit model or use inherit. The model parameter defines the active selection policy and fallback boundary. Continue an existing child with followup_task where available, or the message tool's explicit turn trigger, keeping its original model. Specify owned modules or responsibility boundaries, deliverables, and dependencies or handoffs with other tasks. Independent task calls may run in parallel; sequence calls when one needs another's result. Sub-agents run in the background by default and report completion; read a finished result with task_output, and wait only when it blocks your next step. Use SendMessage for further direction and task_stop only when the agent should stop. Verify consequential changes before relying on a report. These operations execute directly in the engine and require no workflow program.",
+      "description": "Delegate a self-contained subtask to an in-process sub-agent when permitted by the current collaboration mode. Supply the goal, relevant context and expected result. Every new child requires model: choose by task complexity from the tiers or model directory advertised in the model parameter. Concrete model choices require the model-directory setting to be enabled. Do not omit model or use inherit. The model parameter defines the active selection policy and fallback boundary. Continue an existing child with followup_task where available, or the message tool's explicit turn trigger, keeping its original model. Specify owned modules or responsibility boundaries, deliverables, and dependencies or handoffs with other tasks. Independent task calls may run in parallel; sequence calls when one needs another's result. Sub-agents run in the background by default and report completion; read a finished result with TaskOutput, and call Yield to wait for background work. Use SendMessage for further direction and TaskStop only when the agent should stop. Verify consequential changes before relying on a report. These operations execute directly in the engine and require no workflow program.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1474,7 +1413,7 @@
           },
           "run_in_background": {
             "type": "boolean",
-            "description": "Sub-agents run in the background by default; you will be told when one completes, so do not poll for it — read its result with task_output (or its output file) once you are notified. Set to false to run this sub-agent synchronously when you need its result before you can do anything else."
+            "description": "Sub-agents run in the background by default; you will be told when one completes, so do not poll for it — read its result with TaskOutput (or its output file) once you are notified; call Yield to wait for background work. Set to false to run this sub-agent synchronously when you need its result before you can do anything else."
           },
           "fork_turns": {
             "type": "string",
@@ -1494,55 +1433,6 @@
           "prompt",
           "model"
         ],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "task_output",
-      "description": "Get the output (and status) of a background task by its id.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "task_id": {
-            "type": "string",
-            "description": "Identifier of the background task to read"
-          },
-          "block": {
-            "type": "boolean",
-            "default": true,
-            "description": "Block until the task finishes"
-          },
-          "timeout": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 600000,
-            "default": 30000,
-            "description": "Maximum milliseconds to wait"
-          }
-        },
-        "required": [
-          "task_id",
-          "block",
-          "timeout"
-        ],
-        "additionalProperties": false
-      }
-    },
-    {
-      "name": "task_stop",
-      "description": "Stop a running background task by its id.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "task_id": {
-            "type": "string",
-            "description": "Identifier of the background task to terminate"
-          },
-          "shell_id": {
-            "type": "string",
-            "description": "Deprecated alias for task_id"
-          }
-        },
         "additionalProperties": false
       }
     },
@@ -1603,6 +1493,70 @@
       "inputSchema": {
         "type": "object",
         "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "TaskOutput",
+      "description": "Returns the current state of a background task — a shell command that kept running in the background, or a sub-agent started with run_in_background — whether it is still running or has since finished.\n\n- status: \"running\" (still working; the output so far is returned), \"completed\", \"failed\", \"interrupted\", or for shell commands \"exited\" / \"killed\"\n- Results also reach you by themselves when a background task finishes, unless the message that started it said otherwise, so you don't need to check on it. Use this tool to read a finished task's result again, or to check once on a task you have lost track of — never to wait: while a task runs, calling this tool only returns its state so far, and when it finishes its result reaches you without a call. To wait for background work, call Yield.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "The id of the background task to read: the task id of a sub-agent started in the background, or the shell id returned by a background command. A named sub-agent can also be read by its name."
+          },
+          "shell_id": {
+            "type": "string",
+            "description": "Deprecated alias for task_id"
+          },
+          "shellId": {
+            "type": "string",
+            "description": "Deprecated alias for task_id"
+          },
+          "filter": {
+            "type": "string",
+            "description": "Optional JS regex; only shell output lines matching it are returned"
+          },
+          "block": {
+            "type": "boolean",
+            "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
+          },
+          "yieldMs": {
+            "type": "integer",
+            "description": "Deprecated and ignored: this tool never waits. Call Yield to wait for background work."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "TaskStop",
+      "description": "- Stops a running background task by its ID: a background shell command or a background sub-agent\n- Takes a task_id parameter identifying the task to stop\n- To stop an agent-team teammate, pass its agent ID or bare teammate name as task_id\n- To stop a background agent spawned with a name, pass that name as task_id\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "The id of the background task to stop: the task id of a running sub-agent, or the shell id of a background command. To stop an agent-team teammate, pass its agent id or bare teammate name; to stop a background agent spawned with a name, pass that name."
+          },
+          "shell_id": {
+            "type": "string",
+            "description": "Deprecated alias for task_id"
+          },
+          "shellId": {
+            "type": "string",
+            "description": "Deprecated alias for task_id"
+          },
+          "signal": {
+            "type": "string",
+            "description": "Signal used to stop a background command: SIGTERM (default) or SIGKILL"
+          }
+        },
         "additionalProperties": false
       }
     },
@@ -1914,7 +1868,7 @@
     },
     {
       "name": "write_stdin",
-      "description": "Send input to, or poll output from, a persistent shell session started by exec_command. Prefer bash in background mode with bash_output and kill_shell for long-running non-interactive commands; do not use write_stdin merely to wait for a build or server. Use write_stdin only when the same live process must receive interactive input or preserve REPL/TTY state. On failure inspect errorClass, retryAllowed, retriesRemaining, sessionBlocked, and attemptPrevented: terminal failures allow zero retries; transient failures allow exactly one recovery call before the engine blocks that sessionId. Never repeat identical failed calls. Send \"\\u0003\" to interrupt or \"\\u0004\" / \"exit\\n\" to end a shell.",
+      "description": "Send input to, or poll output from, a persistent shell session started by exec_command. Prefer bash in background mode with TaskOutput and TaskStop for long-running non-interactive commands; do not use write_stdin merely to wait for a build or server. Use write_stdin only when the same live process must receive interactive input or preserve REPL/TTY state. On failure inspect errorClass, retryAllowed, retriesRemaining, sessionBlocked, and attemptPrevented: terminal failures allow zero retries; transient failures allow exactly one recovery call before the engine blocks that sessionId. Never repeat identical failed calls. Send \"\\u0003\" to interrupt or \"\\u0004\" / \"exit\\n\" to end a shell.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1954,6 +1908,15 @@
         "required": [
           "sessionId"
         ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Yield",
+      "description": "Pause until one of your asynchronous tools reports something. Call it only when you have no other work. You resume as soon as a report or a message arrives (shown after the line that follows this call's result, before your next reply, unless that line says it waits for the end of your turn), at once if none of your asynchronous tools has anything under way that could produce a report, or when a tool you are waiting on reaches its own time limit. Also resumes shortly before the prompt cache would expire, with a line saying how many tasks are still running; call it again to keep waiting.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
         "additionalProperties": false
       }
     }

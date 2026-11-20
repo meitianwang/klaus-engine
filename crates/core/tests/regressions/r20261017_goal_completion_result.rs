@@ -126,6 +126,7 @@ fn make_ctx(
     identity: Arc<Mutex<GoalRequestIdentity>>,
 ) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             klaus_agent_core::command_runtime::background::BackgroundCommandRegistry::new(),

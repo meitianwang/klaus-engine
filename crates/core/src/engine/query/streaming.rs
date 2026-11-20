@@ -421,6 +421,9 @@ pub(super) async fn stream_and_dispatch(
     };
     let deps = shared.deps();
     let assistant_uuid = (deps.uuid)();
+    if let Some(gate) = shared.params.reply_gate.as_ref() {
+        gate.begin_reply(assistant_uuid.clone());
+    }
     if let Some(reviewer) = &shared.params.approval_reviewer {
         reviewer.assistant_started(&RuntimeString::from(assistant_uuid.clone()));
     }

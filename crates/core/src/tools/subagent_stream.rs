@@ -248,7 +248,7 @@ pub(crate) async fn consume_foreground_sub_agent_detailed(
 
 /// Render one completed [`ThreadItem`] as a line of a background agent's running
 /// transcript — the engine's analog of an incremental disk transcript (every
-/// message/tool-use), which `task_output` returns while a background task is still
+/// message/tool-use), which `TaskOutput` returns while a background task is still
 /// running. Concise but covers every item type, so the surface is the full
 /// activity log, not a curated subset.
 pub fn render_item_for_transcript(item: &ThreadItem) -> RuntimeString {
@@ -317,7 +317,7 @@ pub fn append_transcript(
 /// to disk — the clean final answer is written only on completion. So a task the
 /// parent session lost to a restart has partial work on disk (its sidechain
 /// transcript) and no output file. Projecting the saved history back through the
-/// SAME renderer and the SAME tail bound is what lets `task_output` return that
+/// SAME renderer and the SAME tail bound is what lets `TaskOutput` return that
 /// work again instead of an empty string, without inventing a second transcript
 /// format that can drift from the live one.
 ///
@@ -684,6 +684,7 @@ mod tests {
             signal.cancel();
         }
         let ctx = ToolContext {
+            reply_gate: None,
             async_question: None,
             background_processes: Arc::new(
                 crate::command_runtime::background::BackgroundCommandRegistry::new(),

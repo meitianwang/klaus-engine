@@ -1227,7 +1227,11 @@ impl Session {
             goal_identity.goal_work = false;
         }
         let goal_generation = Arc::new(Mutex::new(goal_identity));
+        // Reply-scoped gate for the background-work tools; the streaming loop
+        // marks each new assistant reply on the same instance.
+        let main_reply_gate = Arc::new(crate::types::tool::ReplyScopedGate::default());
         let tool_context_base: ToolContextFactory = {
+            let reply_gate = main_reply_gate.clone();
             let goal_generation = goal_generation.clone();
             let turn_goal = turn_goal.clone();
             let this = this.clone();
@@ -1258,6 +1262,7 @@ impl Session {
                     permission.clone(),
                     policy.sandbox_backend.clone(),
                 );
+                ctx.reply_gate = Some(reply_gate.clone());
                 {
                     let session = this.clone();
                     let turn = question_turn_id.clone();
@@ -2026,6 +2031,7 @@ impl Session {
                 .arm_cold_reclaim();
         }
         let params = QueryParams {
+            reply_gate: Some(main_reply_gate.clone()),
             multi_agent_instructions: this.meta.role
                 != Some(crate::schemas::rollout::SessionRole::SideTask),
             thread_id: this.id.clone(),

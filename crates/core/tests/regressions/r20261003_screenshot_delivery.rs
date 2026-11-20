@@ -143,6 +143,7 @@ async fn screenshot_default_save_explicit_transient_and_model_image_are_one_cont
 
 fn make_ctx(cwd: &str, process: RuntimeProcessContext) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             klaus_agent_core::command_runtime::background::BackgroundCommandRegistry::new(),

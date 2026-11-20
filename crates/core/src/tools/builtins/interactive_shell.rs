@@ -196,7 +196,7 @@ fn exec_input_schema() -> JsonSchema {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to run. Prefer bash with runInBackground plus bash_output and kill_shell for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
+                "description": "The command to run. Prefer bash with runInBackground plus TaskOutput and TaskStop for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
             },
             "yieldMs": {
                 "description": "How long to wait for it to finish before handing back a session (default 10000).",
@@ -273,7 +273,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn static_description(&self) -> &str {
-        "Run a command in a persistent interactive shell. Prefer bash in background mode with bash_output and kill_shell for long-running non-interactive work. Use exec_command only when the same live process must receive later input or preserve REPL/TTY state. If it stays alive, it returns a sessionId for write_stdin; stop it with kill_shell. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
+        "Run a command in a persistent interactive shell. Prefer bash in background mode with TaskOutput and TaskStop for long-running non-interactive work. Use exec_command only when the same live process must receive later input or preserve REPL/TTY state. If it stays alive, it returns a sessionId for write_stdin; stop it with TaskStop. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
@@ -592,7 +592,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn static_description(&self) -> &str {
-        "Send input to, or poll output from, a persistent shell session started by exec_command. Prefer bash in background mode with bash_output and kill_shell for long-running non-interactive commands; do not use write_stdin merely to wait for a build or server. Use write_stdin only when the same live process must receive interactive input or preserve REPL/TTY state. On failure inspect errorClass, retryAllowed, retriesRemaining, sessionBlocked, and attemptPrevented: terminal failures allow zero retries; transient failures allow exactly one recovery call before the engine blocks that sessionId. Never repeat identical failed calls. Send \"\\u0003\" to interrupt or \"\\u0004\" / \"exit\\n\" to end a shell."
+        "Send input to, or poll output from, a persistent shell session started by exec_command. Prefer bash in background mode with TaskOutput and TaskStop for long-running non-interactive commands; do not use write_stdin merely to wait for a build or server. Use write_stdin only when the same live process must receive interactive input or preserve REPL/TTY state. On failure inspect errorClass, retryAllowed, retriesRemaining, sessionBlocked, and attemptPrevented: terminal failures allow zero retries; transient failures allow exactly one recovery call before the engine blocks that sessionId. Never repeat identical failed calls. Send \"\\u0003\" to interrupt or \"\\u0004\" / \"exit\\n\" to end a shell."
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(tool.exposure(), ToolExposure::Deferred);
         assert!(tool
             .static_description()
-            .contains("Prefer bash in background mode with bash_output and kill_shell"));
+            .contains("Prefer bash in background mode with TaskOutput and TaskStop"));
         assert!(tool
             .static_description()
             .contains("only when the same live process must receive later input"));
@@ -923,7 +923,7 @@ mod tests {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The command to run. Prefer bash with runInBackground plus bash_output and kill_shell for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
+                        "description": "The command to run. Prefer bash with runInBackground plus TaskOutput and TaskStop for long-running non-interactive commands. Use exec_command only when the same live process must accept later input or preserve REPL/TTY state; if it stays alive, a sessionId is returned for write_stdin. write_stdin terminal failures allow zero retries; transient failures allow one recovery call before the engine blocks that sessionId."
                     },
                     "yieldMs": {
                         "description": "How long to wait for it to finish before handing back a session (default 10000).",
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(tool.exposure(), ToolExposure::Deferred);
         assert!(tool
             .static_description()
-            .contains("Prefer bash in background mode with bash_output and kill_shell"));
+            .contains("Prefer bash in background mode with TaskOutput and TaskStop"));
         assert!(tool
             .static_description()
             .contains("only when the same live process must receive interactive input"));

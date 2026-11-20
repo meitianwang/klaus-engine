@@ -247,15 +247,33 @@ impl Tool for ControlTool {
         }
         let handles = ctx.background_tasks.as_ref().unwrap().list();
         assert_eq!(handles.len(), 1);
-        let mut input = RuntimeObject::new();
-        input.insert("task_id", Json::String(handles[0].agent_id.clone()));
-        input.insert("block", Json::Bool(true));
-        input.insert("timeout", Json::from(5000));
-        let result = create_task_output_tool()
-            .call(Json::Object(input), ctx, None)
-            .await?;
-        let _ = self.observations.send(observe("task_output", &result));
-        Ok(result)
+        let mut fields = RuntimeObject::new();
+        fields.insert("task_id", Json::String(handles[0].agent_id.clone()));
+        // Legacy wait parameters stay in the input to prove they are tolerated
+        // and ignored: the unified reader only returns snapshots, so the
+        // fixture polls until the cancellation settles.
+        fields.insert("block", Json::Bool(true));
+        fields.insert("timeout", Json::from(5000));
+        let input = Json::Object(fields);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = create_task_output_tool()
+                .call(input.clone(), ctx, None)
+                .await?;
+            let settled = result
+                .serializable
+                .output
+                .get("status")
+                .and_then(Json::as_str)
+                != Some(&RuntimeString::from("running"));
+            // Observe only the settled retrieval: the snapshot reader may poll
+            // while the cancellation is still in flight.
+            if settled || std::time::Instant::now() >= deadline {
+                let _ = self.observations.send(observe("task_output", &result));
+                return Ok(result);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 

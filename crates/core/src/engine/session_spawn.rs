@@ -2085,11 +2085,17 @@ impl Session {
                     child_collaboration_mode,
                     mcp_runtime.clone(),
                 );
+            // The child gets its own reply-scoped gate: its Yield/TaskOutput
+            // budgets are per child reply, not the parent's.
+            let child_reply_gate = Arc::new(crate::types::tool::ReplyScopedGate::default());
             let tool_context_base: ToolContextFactory = {
                 let rollout_owner = own_rollout_lease.clone();
+                let reply_gate = child_reply_gate.clone();
                 Arc::new(move || {
                     let _owner = &rollout_owner;
-                    tool_context_base()
+                    let mut ctx = tool_context_base();
+                    ctx.reply_gate = Some(reply_gate.clone());
+                    ctx
                 })
             };
 
@@ -2439,6 +2445,7 @@ impl Session {
                 Some(domain)
             };
             let mut params = QueryParams {
+            reply_gate: Some(child_reply_gate.clone()),
                 retained_tool_tasks: Some(this.persistence.tool_tasks.clone()),
                 prepare_request_usage: Some(this.request_usage_recorder({
                     let bundle = bundle.clone();

@@ -2662,9 +2662,9 @@ pub(crate) fn render_background_completion_notice_for_profile(
             // The task died with the parent session, so there is no final answer
             // to read and no live process to wait on. Telling the model not to
             // re-spawn it here would strand work that genuinely needs redoing.
-            "interrupted" => ". It was interrupted and never produced a final answer; task_output returns only incomplete activity. Resume or re-spawn it if the work is still needed.",
-            "failed" => ". It failed and did not produce a completed result. Read task_output for the failure and incomplete activity before deciding how to recover.",
-            _ => ". Read its result with task_output (or its output file); do not re-spawn it.",
+            "interrupted" => ". It was interrupted and never produced a final answer; TaskOutput returns only incomplete activity. Resume or re-spawn it if the work is still needed.",
+            "failed" => ". It failed and did not produce a completed result. Read TaskOutput for the failure and incomplete activity before deciding how to recover.",
+            _ => ". Read its result with TaskOutput (or its output file); do not re-spawn it.",
         }));
     render_deferred_notice_for_profile(&body, profile)
 }

@@ -222,7 +222,7 @@ fn join_lines(values: &[RuntimeString]) -> RuntimeString {
 
 const RUNNING_TASKS_CLASS_PREFIX: &str = "These background tasks are still running";
 
-const RUNNING_TASKS_PREAMBLE: &str = "These background tasks are still running after the context was compacted. Do NOT re-spawn them; read their results with task_output:\n";
+const RUNNING_TASKS_PREAMBLE: &str = "These background tasks are still running after the context was compacted. Do NOT re-spawn them; read their results with TaskOutput:\n";
 
 /// Running background agents that the model must not re-spawn after a rewrite
 /// dropped the tool call that started them.
@@ -916,7 +916,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("bg-1"), "{text}");
-        assert!(text.contains("task_output"), "{text}");
+        assert!(text.contains("TaskOutput"), "{text}");
         assert_eq!(
             resolve_previous_state(&messages, &section),
             PreviousFragmentState::Known

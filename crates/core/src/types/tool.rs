@@ -768,7 +768,7 @@ impl RuntimeDecode for BackgroundTaskStatus {
     }
 }
 
-/// A live background sub-agent, exposed to the `task_output` / `task_stop` tools.
+/// A live background sub-agent, exposed to the `TaskOutput` / `TaskStop` tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundTaskHandle {
     pub agent_id: RuntimeString,
@@ -1123,6 +1123,22 @@ pub trait BackgroundTaskRegistry: Send + Sync {
         None
     }
     fn get(&self, agent_id: &RuntimeString) -> Option<BackgroundTaskHandle>;
+    /// The tasks owned by `caller` (None = the root session): direct children
+    /// only, so a wait never watches another agent's descendants. The default
+    /// keeps registries without ownership metadata whole.
+    fn list_owned(&self, caller: Option<&RuntimeString>) -> Vec<BackgroundTaskHandle> {
+        let _ = caller;
+        self.list()
+    }
+    /// Resolve a stop/message target that may be an exact agent id, a bound
+    /// name, or an unambiguous id/name prefix. `None` means no sub-agent
+    /// target matches; `Some(Err(_))` reports an ambiguous match.
+    fn resolve_target(
+        &self,
+        _target: &RuntimeString,
+    ) -> Option<Result<RuntimeString, RuntimeString>> {
+        None
+    }
     fn list(&self) -> Vec<BackgroundTaskHandle>;
     /// Pending input for this caller must be applied before a long wait resumes.
     fn has_pending_input(&self) -> bool {
@@ -1362,6 +1378,59 @@ pub struct PlanFileContext {
 
 /// What a tool's `call` receives. Optional fields are present only when the host
 /// wires the corresponding capability.
+/// Reply-scoped coordination state shared by the background-work tools.
+///
+/// One "reply" is one assistant message: the streaming loop calls
+/// [`ReplyScopedGate::begin_reply`] when a new assistant message starts, and
+/// the tools use it for the once-per-reply wait gate and the bounded
+/// repeat-answer budget on state reads of the same task.
+#[derive(Default)]
+pub struct ReplyScopedGate {
+    current_reply: std::sync::Mutex<Option<String>>,
+    yield_waited_reply: std::sync::Mutex<Option<String>>,
+    read_counts: std::sync::Mutex<std::collections::HashMap<(String, String), u32>>,
+}
+
+impl ReplyScopedGate {
+    /// Mark the start of a new assistant reply; per-reply budgets reset.
+    pub fn begin_reply(&self, reply_id: String) {
+        *self.current_reply.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply_id);
+    }
+
+    /// True only for the first wait request in the current reply.
+    pub fn first_yield_of_reply(&self) -> bool {
+        let current = self
+            .current_reply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut waited = self
+            .yield_waited_reply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if current.is_some() && *waited == current {
+            return false;
+        }
+        *waited = current;
+        true
+    }
+
+    /// Count one state read of `task_id` in the current reply, returning the
+    /// number of times this task has been read within the reply (1-based).
+    pub fn count_task_read(&self, task_id: &str) -> u32 {
+        let current = self
+            .current_reply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
+        let mut counts = self.read_counts.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = counts.entry((current, task_id.to_string())).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+}
+
 pub struct ToolContext {
     /// The exact process namespace owned by the enclosing engine/session.
     /// Spawn-bearing tools must pass this context through explicitly.
@@ -1399,7 +1468,7 @@ pub struct ToolContext {
     pub emit: EmitFn,
     /// Enqueue a background-completion notice for the model's next continuation:
     /// a `run_in_background` shell that EXITS tells the model instead of the model
-    /// polling `bash_output` forever. Absent in contexts with no session queue.
+    /// polling `TaskOutput` forever. Absent in contexts with no session queue.
     pub enqueue_background_notice: Option<EnqueueBackgroundNoticeFn>,
     /// Append a host-managed rollout event. Absent in ephemeral/test contexts.
     pub record_rollout_event: Option<RecordRolloutEventFn>,
@@ -1427,6 +1496,8 @@ pub struct ToolContext {
     /// Enumerate all tools (for tool_search to match against).
     pub tool_catalog: Option<ToolCatalogFn>,
     pub advisor: Option<AdvisorContext>,
+    /// Reply-scoped gate shared by Yield / TaskOutput / TaskStop.
+    pub reply_gate: Option<std::sync::Arc<ReplyScopedGate>>,
     /// Ask the user a structured question (used by ask_user).
     pub elicit: Option<Arc<dyn ElicitHandler>>,
     /// Optional questions retain an exact admitted-turn scope.
@@ -1440,7 +1511,7 @@ pub struct ToolContext {
     pub run_bash: Option<RunBashFn>,
     /// Connected MCP servers (for list_mcp_resources / read_mcp_resource).
     pub mcp_clients: Option<McpClientsFn>,
-    /// Background sub-agent registry (for task_output / task_stop).
+    /// Background sub-agent registry (for TaskOutput / TaskStop).
     pub background_tasks: Option<Arc<dyn BackgroundTaskRegistry>>,
     /// Which durable task list the current Task tools read/write.
     pub task_list_id: Option<RuntimeString>,

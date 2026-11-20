@@ -1001,6 +1001,7 @@ mod tests {
     fn make_ctx(cwd: &std::path::Path, events: Arc<Mutex<Vec<ToolDomainEvent>>>) -> ToolContext {
         let sink = events;
         ToolContext {
+            reply_gate: None,
             async_question: None,
             background_processes: Arc::new(
                 crate::command_runtime::background::BackgroundCommandRegistry::new(),

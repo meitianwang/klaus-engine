@@ -21,6 +21,7 @@ use klaus_agent_core::tools::builtins::swarm_tools::{
 };
 use klaus_agent_core::tools::builtins::task::{create_task_tool, TaskToolOptions};
 use klaus_agent_core::tools::builtins::task_control::create_task_output_tool;
+use klaus_agent_core::tools::builtins::yield_tool::create_yield_tool;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::errors::ToolError;
 use klaus_agent_core::types::events::EngineEvent;
@@ -233,11 +234,7 @@ impl ModelProvider for Provider {
         } else if has(&request, "root-hold") && !result(&request, "root-gate") {
             call("root-gate", "communication_gate", json!({"name":"root"}))
         } else if has(&request, "root-wait") && !result(&request, "root-wait-tool") {
-            call(
-                "root-wait-tool",
-                "task_output",
-                json!({"task_id":self.wait_target.lock().unwrap().as_ref().unwrap(),"block":true,"timeout":600000}),
-            )
+            call("root-wait-tool", "Yield", json!({}))
         } else if has(&request, "root-teammate-wait") && !result(&request, "team-wait-tool") {
             call("team-wait-tool", "WaitForTeammates", json!({}))
         } else if has(&request, "root-seed") && !result(&request, "spawn-a") {
@@ -299,7 +296,7 @@ impl Fixture {
         let release = Arc::new(Semaphore::new(0));
         let mut options = agent_options(process.clone());
         options.provider = provider.clone();
-        options.tools = Some(vec![create_task_tool(TaskToolOptions::default()), create_send_message_tool(), create_task_output_tool(), create_wait_for_teammates_tool(), Arc::new(Gate {
+        options.tools = Some(vec![create_task_tool(TaskToolOptions::default()), create_send_message_tool(), create_task_output_tool(), create_yield_tool(), create_wait_for_teammates_tool(), Arc::new(Gate {
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}).as_object().unwrap().clone(),
             entered: entered_send, release: release.clone(),
         })]);
@@ -954,15 +951,28 @@ async fn root_wait_yields_for_child_mail_before_the_watched_child_finishes() {
         klaus_agent_core::types::tool::BackgroundTaskStatus::Running
     );
     let history = fixture.session.history();
+    // The wait primitive ends with the fixed header; the reason line rides the
+    // notice rail right after the result.
     assert!(history.iter().any(|message| match message {
         Message::ToolResult(result) if result.tool_use_id == "root-wait-tool" =>
             result
                 .output
                 .as_ref()
-                .and_then(|output| output.get("retrieval_status"))
-                == Some(&RuntimeJson::from("input_pending")),
+                .and_then(|output| output.get("content"))
+                == Some(&RuntimeJson::from(
+                    "The wait has ended. The line after this result says why."
+                )),
         _ => false,
     }));
+    let encoded_history = runtime_json::stringify(
+        &klaus_agent_core::runtime_values::runtime_codec::encode_value(&history).unwrap(),
+    )
+    .try_to_utf8()
+    .unwrap();
+    assert!(
+        encoded_history.contains("a message arrived"),
+        "the child mail must wake the wait with the message-arrival reason"
+    );
     assert!(fixture
         .prompts
         .lock()
@@ -1119,7 +1129,16 @@ async fn persistent_mail_wakes_both_wait_tools_without_consuming_the_receipt_ear
         )
         .try_to_utf8()
         .unwrap();
-        assert!(encoded.contains("input_pending"));
+        if tool_id == "root-wait-tool" {
+            // The wait primitive reports the fixed header; the arrival reason
+            // rides the notice rail behind it.
+            assert!(encoded.contains("The wait has ended"), "{encoded}");
+            assert!(encoded.contains("a message arrived"), "{encoded}");
+        } else {
+            // The teammate wait wakes on the pending mail with its own
+            // input-pending result instead of riding out the idle wait.
+            assert!(encoded.contains("New input is waiting"), "{encoded}");
+        }
         drop(requests);
         assert_eq!(
             fixture

@@ -3,7 +3,6 @@
 pub mod advisor;
 pub mod ask_user;
 pub mod bash;
-pub mod bash_output;
 pub mod browser;
 /// Retired from the product tool surface: the `exec` / `wait` pair was
 /// replaced by the `REPL` tool. The implementation survives only so the frozen
@@ -18,7 +17,6 @@ pub mod grep;
 pub mod host_policy;
 pub mod index;
 pub mod interactive_shell;
-pub mod kill_shell;
 pub mod ls;
 pub mod lsp_tools;
 pub mod multi_edit;
@@ -48,6 +46,7 @@ mod web_search_browser;
 pub mod workflow;
 pub mod worktree_tools;
 pub mod write;
+pub mod yield_tool;
 
 pub mod mcp_prompts;
 pub mod mcp_resources;

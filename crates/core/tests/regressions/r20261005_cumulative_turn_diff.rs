@@ -57,6 +57,7 @@ fn make_ctx(
     events: Arc<std::sync::Mutex<Vec<ToolDomainEvent>>>,
 ) -> ToolContext {
     ToolContext {
+        reply_gate: None,
         async_question: None,
         background_processes: Arc::new(
             klaus_agent_core::command_runtime::background::BackgroundCommandRegistry::new(),

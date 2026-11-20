@@ -6,7 +6,7 @@
       "style": "anthropic",
       "name": "Bash",
       "sourceSha256": "0dada62f3191da0ed1e266277ed81b798039d9da93435e49ecd44978ffe185a3",
-      "targetSha256": "713723c9785b757dff2d49d6a2507d5794e334dfee95fae7ae9f248fa615c655",
+      "targetSha256": "3604a8901b3f89286c18726d0e9f1eb374f1f803e63b3a9b6bd24778165ed9fc",
       "source": {
         "name": "Bash",
         "description": "Execute a shell command and return its combined output and exit code. Do not use it for file reads, edits, or searches a dedicated tool covers — use read (not cat/head/tail), edit (not sed/awk), grep (not shell grep), glob (not find); quote paths that contain spaces. Keep the working directory stable — use absolute paths and avoid cd unless the user asks (the working directory persists between calls). Before a command that creates files or directories, ls the parent first to confirm it exists and is the intended location.\n\n<system-reminder>\nCall `Bash` for shell commands. Put the command in `command`; use `run_in_background` only when the result is not needed immediately.\n</system-reminder>",
@@ -67,7 +67,7 @@
               "type": "string"
             },
             "run_in_background": {
-              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
               "type": "boolean"
             },
             "sandbox_permissions": {
@@ -874,7 +874,7 @@
       "style": "generic",
       "name": "bash",
       "sourceSha256": "7f850aea269cbc8e26375d63bb909d063c02e7362046809fb6b6156b5204acc0",
-      "targetSha256": "702c9517c6cb2c9db450fa598e9655b2e624da061ce6e22d921a7f7646c5815c",
+      "targetSha256": "89d488b5b4fa6d1f38ba1c80949d0a0aa3b8ad6b18ef9227ecd8251643334c42",
       "source": {
         "name": "bash",
         "description": "Execute a shell command and return its combined output and exit code. Do not use it for file reads, edits, or searches a dedicated tool covers — use read (not cat/head/tail), edit (not sed/awk), grep (not shell grep), glob (not find); quote paths that contain spaces. Keep the working directory stable — use absolute paths and avoid cd unless the user asks (the working directory persists between calls). Before a command that creates files or directories, ls the parent first to confirm it exists and is the intended location.",
@@ -933,7 +933,7 @@
               "maximum": 9007199254740991
             },
             "runInBackground": {
-              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
               "type": "boolean"
             },
             "sandboxPermissions": {
@@ -1586,7 +1586,7 @@
       "style": "openai",
       "name": "bash",
       "sourceSha256": "7f850aea269cbc8e26375d63bb909d063c02e7362046809fb6b6156b5204acc0",
-      "targetSha256": "702c9517c6cb2c9db450fa598e9655b2e624da061ce6e22d921a7f7646c5815c",
+      "targetSha256": "89d488b5b4fa6d1f38ba1c80949d0a0aa3b8ad6b18ef9227ecd8251643334c42",
       "source": {
         "name": "bash",
         "description": "Execute a shell command and return its combined output and exit code. Do not use it for file reads, edits, or searches a dedicated tool covers — use read (not cat/head/tail), edit (not sed/awk), grep (not shell grep), glob (not find); quote paths that contain spaces. Keep the working directory stable — use absolute paths and avoid cd unless the user asks (the working directory persists between calls). Before a command that creates files or directories, ls the parent first to confirm it exists and is the intended location.",
@@ -1645,7 +1645,7 @@
               "maximum": 9007199254740991
             },
             "runInBackground": {
-              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+              "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
               "type": "boolean"
             },
             "sandboxPermissions": {
@@ -2141,168 +2141,6 @@
       }
     },
     {
-      "style": "anthropic",
-      "name": "bash_output",
-      "sourceSha256": "b7082c2d25ad0f8eb7d486ffed917de19f676eff2d9906d615301cc39a323660",
-      "targetSha256": "ce1e482aaa574d77e98103c088b9246866c8322ce4083514dd8a4cba0f20e249",
-      "source": {
-        "name": "bash_output",
-        "description": "Return new output from a background shell since the last poll, with its status and exit code. Optionally filter lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "target": {
-        "name": "bash_output",
-        "description": "Wait for background shell output until the observation window expires or the process finishes, then return its new output, status and exit code. A live process keeps the same shellId. Optionally filter the collected lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "yieldMs": {
-              "description": "Observation window in milliseconds. Empty polls wait at least 5000 ms; the default maximum is 300000 ms. Expiry does not stop the process.",
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "style": "generic",
-      "name": "bash_output",
-      "sourceSha256": "b7082c2d25ad0f8eb7d486ffed917de19f676eff2d9906d615301cc39a323660",
-      "targetSha256": "ce1e482aaa574d77e98103c088b9246866c8322ce4083514dd8a4cba0f20e249",
-      "source": {
-        "name": "bash_output",
-        "description": "Return new output from a background shell since the last poll, with its status and exit code. Optionally filter lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "target": {
-        "name": "bash_output",
-        "description": "Wait for background shell output until the observation window expires or the process finishes, then return its new output, status and exit code. A live process keeps the same shellId. Optionally filter the collected lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "yieldMs": {
-              "description": "Observation window in milliseconds. Empty polls wait at least 5000 ms; the default maximum is 300000 ms. Expiry does not stop the process.",
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "style": "openai",
-      "name": "bash_output",
-      "sourceSha256": "b7082c2d25ad0f8eb7d486ffed917de19f676eff2d9906d615301cc39a323660",
-      "targetSha256": "ce1e482aaa574d77e98103c088b9246866c8322ce4083514dd8a4cba0f20e249",
-      "source": {
-        "name": "bash_output",
-        "description": "Return new output from a background shell since the last poll, with its status and exit code. Optionally filter lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "target": {
-        "name": "bash_output",
-        "description": "Wait for background shell output until the observation window expires or the process finishes, then return its new output, status and exit code. A live process keeps the same shellId. Optionally filter the collected lines by regex.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "shellId": {
-              "type": "string",
-              "description": "The id returned by bash when run in the background"
-            },
-            "yieldMs": {
-              "description": "Observation window in milliseconds. Empty polls wait at least 5000 ms; the default maximum is 300000 ms. Expiry does not stop the process.",
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "filter": {
-              "description": "Optional JS regex; only output lines matching it are returned",
-              "type": "string"
-            }
-          },
-          "required": [
-            "shellId"
-          ],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
       "style": "generic",
       "name": "tool_search",
       "sourceSha256": "4dd9f7ad006135918594ab10f99b4b94a5f8116e3f222395b1527f0278d77524",
@@ -2365,6 +2203,96 @@
           "additionalProperties": false
         }
       }
+    },
+    {
+      "style": "openai",
+      "name": "wait_agent",
+      "source": {
+        "name": "wait_agent",
+        "description": "Get the output (and status) of a background task by its id.\n\n# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Background agent id returned by spawn_agent."
+            },
+            "timeout_ms": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 600000,
+              "description": "Maximum milliseconds to wait for the background agent."
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "sourceSha256": "28551c2449b24a3d70614fa49dfabfc4393e03aef431457332a944ef2141ed29",
+      "target": {
+        "name": "wait_agent",
+        "description": "Returns the current state of a background task — a shell command that kept running in the background, or a sub-agent started with run_in_background — whether it is still running or has since finished.\n\n- status: \"running\" (still working; the output so far is returned), \"completed\", \"failed\", \"interrupted\", or for shell commands \"exited\" / \"killed\"\n- Results also reach you by themselves when a background task finishes, unless the message that started it said otherwise, so you don't need to check on it. Use this tool to read a finished task's result again, or to check once on a task you have lost track of — never to wait: while a task runs, calling this tool only returns its state so far, and when it finishes its result reaches you without a call. To wait for background work, call Yield.\n\n# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Background agent id returned by spawn_agent."
+            },
+            "timeout_ms": {
+              "type": "number",
+              "description": "Maximum milliseconds to wait for the background agent."
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "targetSha256": "e6e43fddf910ab1774d0c8b8b77d3ed629adbe8fbe9a39028998def816615805"
+    },
+    {
+      "style": "openai",
+      "name": "interrupt_agent",
+      "source": {
+        "name": "interrupt_agent",
+        "description": "Stop a running background task by its id.\n\n# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Background agent id to stop."
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "sourceSha256": "750f238184d1fa1bb2a6fba96cc8112579f656e1ee0e803990e72d85316d149a",
+      "target": {
+        "name": "interrupt_agent",
+        "description": "- Stops a running background task by its ID: a background shell command or a background sub-agent\n- Takes a task_id parameter identifying the task to stop\n- To stop an agent-team teammate, pass its agent ID or bare teammate name as task_id\n- To stop a background agent spawned with a name, pass that name as task_id\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n\n# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string",
+              "description": "Background agent id to stop."
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "targetSha256": "dc365ede0991b98c926bef28dc68f7827e9c85483634e6ec124400b3ea863411"
     }
   ]
 }

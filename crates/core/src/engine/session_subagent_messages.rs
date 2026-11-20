@@ -1344,6 +1344,18 @@ impl Session {
         })
     }
 
+    /// Resolve a stop/message target against the ordinary sub-agent state:
+    /// exact committed id, bound name, or unambiguous id/name prefix.
+    pub(crate) fn resolve_subagent_target(
+        &self,
+        target: &RuntimeString,
+    ) -> Option<Result<String, RuntimeString>> {
+        let admission = self.background_tasks.lock_recover();
+        let runtime = admission.ordinary.clone();
+        let state = runtime.state.lock_recover();
+        resolve_target(&state, target)
+    }
+
     pub(crate) fn stop_ordinary_subagent(&self, id: &RuntimeString, user: bool) -> Option<bool> {
         let id = id.try_to_utf8().ok()?;
         let mut admission = self.background_tasks.lock_recover();

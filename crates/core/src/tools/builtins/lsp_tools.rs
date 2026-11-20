@@ -1323,6 +1323,7 @@ mod tests {
 
     fn make_ctx(cwd: &str, lsp: Option<Arc<dyn LspController>>) -> ToolContext {
         ToolContext {
+            reply_gate: None,
             async_question: None,
             background_processes: Arc::new(
                 crate::command_runtime::background::BackgroundCommandRegistry::new(),
