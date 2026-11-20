@@ -965,7 +965,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r7")
+        RuntimeString::from("bundled-r8")
     );
 }
 
@@ -1186,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r7"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r8"));
 }
 
 mod store_refresh {
@@ -1251,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r7"
+            "bundled-r8"
         );
 
         let v1 = document("distributed-v1");
@@ -1374,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r7"
+            "bundled-r8"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1884,6 +1884,118 @@ fn decorated_model_key_prefers_exact_binding_and_falls_back_to_identity() {
     assert_eq!(
         text_of(&unbound, SLOT_BASE_INSTRUCTIONS).as_deref(),
         Some("generic pack")
+    );
+}
+
+#[test]
+fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
+    let generic = RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS);
+    let family = ModelFragments::for_model(&RuntimeString::from("gemini-2.5-pro"), None);
+    assert_ne!(family.base_instructions(), generic);
+
+    let family_base = family.base_instructions().try_to_utf8().unwrap();
+    assert!(family_base.starts_with("You are Klaus."));
+    for expected in [
+        "You are powered by a Gemini model.",
+        "# Communication style",
+        "- Keep your responses concise.",
+        "# Behavioral guidelines",
+        "Never defeat or bypass an access control",
+        "Never solve, click through",
+        "# Batch tool calls",
+        "you SHOULD call multiple tools in parallel in a single turn.",
+    ] {
+        assert!(
+            family_base.contains(expected),
+            "Gemini family base misses {expected}"
+        );
+    }
+    for banned in ["run_command", "create_file", "view_file", "replace_chunks"] {
+        assert!(
+            !family_base.contains(banned),
+            "Gemini family base still contains {banned}"
+        );
+    }
+
+    // Gemini 3.8 Flash adds the task-details suffix that gates what the
+    // model may do after launching a long-running command.
+    const SUFFIX: &str = "\nWhen a command you launched is still running and will finish later: YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.\n DO NOTHING ELSE.\n";
+    let high = ModelFragments::for_model(&RuntimeString::from("gemini-3.8-flash-high"), None);
+    let high_base = high.base_instructions().try_to_utf8().unwrap();
+    assert_eq!(high_base.strip_suffix(SUFFIX), Some(family_base.as_str()));
+    assert_eq!(
+        high.resolved().profile_ref,
+        Some(RuntimeString::from("model/gemini-3.8-flash"))
+    );
+    assert_eq!(
+        high.resolved()
+            .provenance(SLOT_BASE_INSTRUCTIONS)
+            .map(|p| p.layer),
+        Some(FragmentLayer::ModelProfile)
+    );
+    let decorated = ModelFragments::for_route(
+        &RuntimeString::from("gemini-3.8-flash-high[context=1m]@max"),
+        Some("antigravity"),
+        None,
+    );
+    assert_eq!(decorated.base_instructions(), high.base_instructions());
+
+    for model in [
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-tiered",
+    ] {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_eq!(
+            fragments.base_instructions(),
+            high.base_instructions(),
+            "{model} must share the 3.8 Flash pack"
+        );
+        assert_eq!(
+            fragments.resolved().profile_ref,
+            Some(RuntimeString::from("model/gemini-3.8-flash"))
+        );
+    }
+
+    // The Flash and Pro profiles add no prompt text of their own. They stay
+    // on the family base so no model inherits an invented per-model rewrite.
+    for model in [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-thinking",
+        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ] {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_eq!(fragments.base_instructions(), family.base_instructions());
+        assert_eq!(
+            fragments.resolved().profile_ref,
+            Some(RuntimeString::from("model/gemini-flash"))
+        );
+        assert!(!fragments
+            .base_instructions()
+            .try_to_utf8()
+            .unwrap()
+            .contains("YOU MUST TAKE ONE OF"));
+    }
+    for model in ["gemini-2.5-pro", "gemini-3-flash"] {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_eq!(fragments.base_instructions(), family.base_instructions());
+        assert_eq!(
+            fragments.resolved().profile_ref,
+            Some(RuntimeString::from("model/gemini-pro"))
+        );
+        assert!(!fragments
+            .base_instructions()
+            .try_to_utf8()
+            .unwrap()
+            .contains("YOU MUST TAKE ONE OF"));
+    }
+    assert_eq!(
+        family.commentary(),
+        Some(&RuntimeString::from(
+            crate::context::system_prompt::COMMENTARY_UNTAGGED_THINKING_CHANNEL
+        ))
     );
 }
 

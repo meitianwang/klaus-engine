@@ -492,6 +492,37 @@ mod tests {
         assert_eq!(commentary(""), RuntimeString::from(COMMENTARY_PHASE_TAGGED));
     }
 
+    #[test]
+    fn base_instructions_follow_gemini_profile() {
+        fn base(model: &str) -> String {
+            let parts = build_system_prompt(&SystemPromptInput {
+                config: crate::schemas::config::ResolvedConfig {
+                    model: RuntimeString::from(model),
+                    ..default_config()
+                },
+                ..Default::default()
+            });
+            parts
+                .iter()
+                .find(|part| part.name == "base")
+                .expect("base fragment")
+                .text
+                .try_to_utf8()
+                .unwrap()
+        }
+
+        let pro = base("gemini-2.5-pro");
+        assert!(pro.starts_with("You are Klaus."));
+        assert!(pro.contains("You are powered by a Gemini model."));
+        assert!(pro.contains("# Communication style"));
+        assert!(pro.contains("# Batch tool calls"));
+        assert!(!pro.contains("YOU MUST TAKE ONE OF"));
+
+        let high = base("gemini-3.8-flash-high");
+        assert!(high.contains("YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS"));
+        assert!(high.ends_with(" DO NOTHING ELSE.\n"));
+    }
+
     struct TempDir {
         dir: PathBuf,
     }
