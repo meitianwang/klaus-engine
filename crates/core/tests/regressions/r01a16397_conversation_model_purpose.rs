@@ -137,7 +137,20 @@ async fn source_catalog_responses_filter_dedicated_models_from_existing_snapshot
             let shown = response["result"]["models"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{source}/{read}: {response}"));
-            let expected = vector["conversationRows"].as_array().unwrap();
+            let curated: Vec<&str> = case["curated"]
+                .as_array()
+                .map(|list| list.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let expected = vector["conversationRows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row["key"]
+                        .as_str()
+                        .is_none_or(|key| !curated.contains(&key))
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
                 shown.iter().map(|model| &model["key"]).collect::<Vec<_>>(),
                 expected
@@ -209,11 +222,22 @@ async fn live_source_projections_preserve_purpose_before_normalizing_metadata() 
         let models = response["result"]["models"]
             .as_array()
             .unwrap_or_else(|| panic!("{source}: {response}"));
+        let curated: Vec<&str> = case["curated"]
+            .as_array()
+            .map(|list| list.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
         for row in vector["conversationRows"].as_array().unwrap() {
+            let key = row["key"].as_str().unwrap();
+            if curated.contains(&key) {
+                assert!(
+                    !models.iter().any(|model| model["key"] == row["key"]),
+                    "{source} curates {key}: {response}"
+                );
+                continue;
+            }
             assert!(
                 models.iter().any(|model| model["key"] == row["key"]),
-                "{source} retains {}: {response}",
-                row["key"]
+                "{source} retains {key}: {response}"
             );
         }
         for row in vector["dedicatedRows"].as_array().unwrap() {

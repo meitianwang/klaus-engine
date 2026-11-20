@@ -5,18 +5,86 @@ use serde_json::{json, Map, Value};
 /// Apply purpose filtering after a source read so old snapshots follow the same
 /// rules as live catalogs, without removing metadata needed by dedicated calls.
 pub(super) fn response(source: &str, models: Vec<Value>) -> Value {
-    json!({"models":models.into_iter().filter(|model| is_conversation_model(source, model)).collect::<Vec<_>>()})
+    json!({"models":models.into_iter().filter(|model| is_conversation_model(source, model) && !curated_conversation_exclusion(source, &model_identity(model))).collect::<Vec<_>>()})
 }
 
-pub(super) fn is_conversation_model(source: &str, model: &Value) -> bool {
-    let key = model
+/// The lowercase identity a catalog row is matched by, mirroring the field
+/// precedence every projection already uses.
+fn model_identity(model: &Value) -> String {
+    model
         .get("key")
         .or_else(|| model.get("id"))
         .or_else(|| model.get("serverModelName"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// Product curation: aged or small-context lineups kept out of the offered
+/// conversation list. These rows are genuine chat models, so inventory
+/// metadata keeps describing them as conversation-capable and an explicit
+/// selection keeps working; only the picker narrows. Exact catalog identities
+/// only, never name patterns, so a future lineup is offered until it is
+/// deliberately added here.
+const CURATED_ANTIGRAVITY: &[&str] = &["gpt-oss-120b-medium"];
+const CURATED_MINIMAX: &[&str] = &[
+    "minimax-m2",
+    "minimax-m2.1",
+    "minimax-m2.1-highspeed",
+    "minimax-m2.5",
+    "minimax-m2.5-highspeed",
+    "minimax-m2.7",
+    "minimax-m2.7-highspeed",
+];
+const CURATED_WORKBUDDY: &[&str] = &[
+    "kimi-k2-instruct-taiji",
+    "deepseek-r1-0528",
+    "deepseek-r1-0528-lkeap",
+    "deepseek-v3-0324",
+    "deepseek-v3-0324-lkeap",
+    "deepseek-v3-1",
+    "deepseek-v3-1-lkeap",
+    "deepseek-v3-1-volc",
+    "deepseek-v3-2-volc",
+    "glm-4.6v",
+    "glm-4.6",
+    "hunyuan-2.0-instruct",
+    "hunyuan-chat",
+    "hy3",
+    "hy3-b",
+    "hy3-c",
+    "hy3-x",
+    "completion-gf",
+    "default-1.1",
+    "default-1.2",
+    "glm-5.0-turbo",
+    "minimax-m2.5",
+    "minimax-m2.7",
+];
+const CURATED_ZHIPU: &[&str] = &[
+    "glm-4.5",
+    "glm-4.5-air",
+    "glm-4.6",
+    "glm-4.7",
+    "glm-5",
+    "glm-5-turbo",
+    "glm-5.1",
+];
+
+fn curated_conversation_exclusion(source: &str, key: &str) -> bool {
+    let list = match source {
+        "antigravity" => CURATED_ANTIGRAVITY,
+        "minimax" => CURATED_MINIMAX,
+        "workbuddy" => CURATED_WORKBUDDY,
+        "zhipu" => CURATED_ZHIPU,
+        _ => return false,
+    };
+    list.contains(&key)
+}
+
+pub(super) fn is_conversation_model(source: &str, model: &Value) -> bool {
+    let key = model_identity(model);
     !dedicated_identity(source, &key)
         && [
             Some(model),
@@ -33,13 +101,15 @@ pub(super) fn is_conversation_model(source: &str, model: &Value) -> bool {
 pub(super) fn mark_purpose(source: &str, raw: &Value, entry: &mut Map<String, Value>) {
     let key = entry
         .get("key")
-        .or_else(|| raw.get("key"))
-        .or_else(|| raw.get("id"))
-        .or_else(|| raw.get("serverModelName"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+    let key = if key.is_empty() {
+        model_identity(raw)
+    } else {
+        key
+    };
     if dedicated_identity(source, &key) || !is_conversation_model(source, raw) {
         entry.insert("conversationModel".into(), json!(false));
     }
@@ -274,5 +344,68 @@ mod tests {
         ];
         let result = response("custom", rows.clone());
         assert_eq!(result["models"], json!(&rows[..3]));
+    }
+
+    #[test]
+    fn curated_exclusions_hide_every_listed_identity() {
+        for (source, list) in [
+            ("antigravity", CURATED_ANTIGRAVITY),
+            ("minimax", CURATED_MINIMAX),
+            ("workbuddy", CURATED_WORKBUDDY),
+            ("zhipu", CURATED_ZHIPU),
+        ] {
+            for key in list {
+                // A genuine chat declaration must not save a curated identity.
+                let model = json!({"key":key,"supportsToolCall":true});
+                assert!(
+                    response(source, vec![model.clone()])["models"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty(),
+                    "{source}/{key} must stay out of the conversation list"
+                );
+                // Inventory metadata stays truthful: curation is not a purpose
+                // claim, so the row is never marked non-conversation.
+                let mut entry = Map::new();
+                entry.insert("key".into(), json!(key));
+                mark_purpose(source, &model, &mut entry);
+                assert!(
+                    !entry.contains_key("conversationModel"),
+                    "{source}/{key} must not gain a purpose marker"
+                );
+                // The exclusion is scoped to its own source.
+                assert_eq!(
+                    response("custom", vec![model.clone()])["models"],
+                    json!([model])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn curated_exclusions_keep_neighbouring_identities() {
+        for (source, key) in [
+            ("antigravity", "claude-sonnet-4-6"),
+            ("antigravity", "claude-opus-4-6-thinking"),
+            ("antigravity", "gpt-oss-120b"),
+            ("minimax", "minimax-m3"),
+            ("minimax", "minimax-m3.1-flash"),
+            ("minimax", "minimax-m3.1-flash-preview"),
+            ("workbuddy", "kimi-k2-thinking"),
+            ("workbuddy", "kimi-k2.5"),
+            ("workbuddy", "glm-5.2"),
+            ("zhipu", "glm-5.2"),
+            ("zhipu", "glm-5.3"),
+            ("zhipu", "glm-5.3-flash"),
+            ("zhipu", "glm-5.3-flashx"),
+            ("zhipu", "glm-5.3-flashx-legal"),
+        ] {
+            let model = json!({"key":key});
+            assert_eq!(
+                response(source, vec![model.clone()])["models"],
+                json!([model]),
+                "{source}/{key} must remain a conversation choice"
+            );
+        }
     }
 }
