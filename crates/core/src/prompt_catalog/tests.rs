@@ -965,7 +965,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r8")
+        RuntimeString::from("bundled-r9")
     );
 }
 
@@ -1186,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r8"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r9"));
 }
 
 mod store_refresh {
@@ -1251,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r8"
+            "bundled-r9"
         );
 
         let v1 = document("distributed-v1");
@@ -1374,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r8"
+            "bundled-r9"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1939,6 +1939,12 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
         None,
     );
     assert_eq!(decorated.base_instructions(), high.base_instructions());
+    let cursor_38 = ModelFragments::for_route(
+        &RuntimeString::from("gemini-3.8-flash[reasoning_effort=high]"),
+        Some("cursor"),
+        None,
+    );
+    assert_eq!(cursor_38.base_instructions(), high.base_instructions());
 
     for model in [
         "gemini-3.8-flash-medium",
@@ -1963,7 +1969,11 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
         "gemini-2.5-flash",
         "gemini-2.5-flash-thinking",
         "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.5-flash-extra-low",
+        "gemini-3.5-flash-low",
+        "gemini-3-flash-agent",
         "gemini-3.1-flash-lite",
     ] {
         let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
@@ -1978,7 +1988,7 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
             .unwrap()
             .contains("YOU MUST TAKE ONE OF"));
     }
-    for model in ["gemini-2.5-pro", "gemini-3-flash"] {
+    for model in ["gemini-2.5-pro", "gemini-3-flash", "gemini-3.1-pro"] {
         let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
         assert_eq!(fragments.base_instructions(), family.base_instructions());
         assert_eq!(
@@ -1991,6 +2001,52 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
             .unwrap()
             .contains("YOU MUST TAKE ONE OF"));
     }
+    // Gemini 4 adds the same command follow-through plus an explicit
+    // response-language rule. Cursor exposes these models through decorated
+    // keys; the canonical key must still reach the pack.
+    const FOUR_SUFFIX: &str = "
+When a command you launched is still running and will finish later: YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.
+ DO NOTHING ELSE.
+ When updating the user, always respond in the language of the user (defaulting to English). Never mix two or more languages in the same response.
+";
+    let carbon = ModelFragments::for_route(
+        &RuntimeString::from("gemini-4-carbon[context=1m,reasoning_effort=medium]@max"),
+        Some("cursor"),
+        None,
+    );
+    let carbon_base = carbon.base_instructions().try_to_utf8().unwrap();
+    assert_eq!(
+        carbon_base.strip_suffix(FOUR_SUFFIX),
+        Some(family_base.as_str())
+    );
+    assert!(
+        carbon_base.contains("always respond in the language of the user (defaulting to English)")
+    );
+    assert_eq!(
+        carbon.resolved().profile_ref,
+        Some(RuntimeString::from("model/gemini-4"))
+    );
+    assert_eq!(
+        carbon
+            .resolved()
+            .provenance(SLOT_BASE_INSTRUCTIONS)
+            .map(|p| p.layer),
+        Some(FragmentLayer::ModelProfile)
+    );
+    for model in [
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-4-hydrogen",
+        "gemini-4-neon",
+    ] {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_eq!(
+            fragments.base_instructions(),
+            carbon.base_instructions(),
+            "{model} must share the Gemini 4 pack"
+        );
+    }
+
     assert_eq!(
         family.commentary(),
         Some(&RuntimeString::from(
