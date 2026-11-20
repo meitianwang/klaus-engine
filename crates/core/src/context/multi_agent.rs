@@ -9,7 +9,8 @@ use crate::types::provider::{SystemPromptPart, ToolSpec};
 pub(crate) const ROLE_PART: &str = "multi-agent-role";
 pub(crate) const MODE_PART: &str = "orchestration-mode";
 
-const ROOT_ROLE: &str = "You are the primary agent coordinating the user's requested outcome. \
+pub(crate) const ROOT_ROLE: &str =
+    "You are the primary agent coordinating the user's requested outcome. \
     Delegate independent, bounded work through the native collaboration tools declared for this \
     request, continue complementary work yourself, and integrate the returned evidence into your \
     final answer. Messages sent to other agents may be read by the user, so make them legible. \
@@ -20,7 +21,7 @@ const ROOT_ROLE: &str = "You are the primary agent coordinating the user's reque
     unresolved risk. Review evidence when that risk warrants it; additional reviewers or review \
     rounds are not a completion requirement.";
 
-const CHILD_ROLE: &str = "You are a child agent collaborating with your parent on a bounded \
+pub(crate) const CHILD_ROLE: &str = "You are a child agent collaborating with your parent on a bounded \
     assignment. Complete the assigned scope, report the evidence and any remaining uncertainty in \
     your final answer, and return it to your parent. Your final answer and messages to other agents \
     may also be read by the user, so make them legible. Always put proper spaces between words \
@@ -41,65 +42,27 @@ pub(crate) const EXPLICIT_MODE: &str = "Any earlier instruction enabling proacti
     delegation no longer applies. Do not spawn sub-agents unless the user or applicable \
     AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
 
-pub(crate) fn instructions(
-    tools: &[ToolSpec],
-    agent_id: Option<&RuntimeString>,
-    ultra_mode: bool,
-) -> Vec<SystemPromptPart> {
-    instructions_with_model_messages(tools, agent_id, ultra_mode, None, None)
-}
-
+/// Delegation role/mode parts resolved through the model prompt catalog.
+///
+/// The resolved fragments bind to this inference: engine defaults at the
+/// bottom, catalog packs above them, and the source declaration riding with
+/// the model metadata as the top layer. A slot resolved to disabled (or an
+/// explicitly empty text) omits its part, preserving the pre-catalog
+/// suppression semantics.
 pub(crate) fn instructions_with_model_messages(
     _tools: &[ToolSpec],
     agent_id: Option<&RuntimeString>,
     ultra_mode: bool,
+    family: Option<&'static str>,
     model_messages: Option<&RuntimeJson>,
     configured_hint: Option<&RuntimeString>,
 ) -> Vec<SystemPromptPart> {
-    let messages = model_messages.and_then(|messages| {
-        messages
-            .get("multi_agent")
-            .or_else(|| messages.get("multiAgent"))
-    });
-    let role = messages.and_then(|messages| messages.get("role"));
-    let mode = messages.and_then(|messages| messages.get("mode"));
-    let role_text = role
-        .and_then(|role| {
-            role.get(if agent_id.is_some() {
-                "subagent"
-            } else {
-                "root"
-            })
-        })
-        .and_then(RuntimeJson::as_string)
-        .cloned()
-        .unwrap_or_else(|| {
-            RuntimeString::from(if agent_id.is_some() {
-                CHILD_ROLE
-            } else {
-                ROOT_ROLE
-            })
-        });
-    let mode_text = configured_hint
-        .or_else(|| {
-            mode.and_then(|mode| mode.get("hint_text").or_else(|| mode.get("hintText")))
-                .and_then(RuntimeJson::as_string)
-        })
-        .or_else(|| {
-            mode.and_then(|mode| mode.get(if ultra_mode { "proactive" } else { "explicit" }))
-                .and_then(RuntimeJson::as_string)
-        })
-        .cloned()
-        .unwrap_or_else(|| {
-            RuntimeString::from(if ultra_mode {
-                PROACTIVE_MODE
-            } else {
-                EXPLICIT_MODE
-            })
-        });
+    let fragments = crate::prompt_catalog::ModelFragments::for_family(family, model_messages);
+    let role_text = fragments.agent_role(agent_id.is_some()).cloned();
+    let mode_text = fragments.agent_mode(ultra_mode, configured_hint);
     let mut parts = Vec::new();
     for (name, text) in [(ROLE_PART, role_text), (MODE_PART, mode_text)] {
-        if !text.is_empty() {
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
             parts.push(SystemPromptPart {
                 name: name.into(),
                 text,
@@ -154,6 +117,7 @@ mod tests {
                 &tools(),
                 None,
                 enabled,
+                None,
                 Some(&messages),
                 Some(&hint),
             );
@@ -165,8 +129,14 @@ mod tests {
     fn empty_configured_hint_suppresses_a_nonempty_catalog_hint() {
         let messages = declared(r#"{"multi_agent":{"mode":{"hint_text":"catalog"}}}"#);
         let hint = RuntimeString::default();
-        let parts =
-            instructions_with_model_messages(&tools(), None, true, Some(&messages), Some(&hint));
+        let parts = instructions_with_model_messages(
+            &tools(),
+            None,
+            true,
+            None,
+            Some(&messages),
+            Some(&hint),
+        );
         assert!(mode(&parts).is_none());
         assert!(parts.iter().any(|part| part.name == ROLE_PART));
     }
@@ -177,8 +147,14 @@ mod tests {
             r#"{"multi_agent":{"mode":{"hint_text":"catalog","proactive":"active","explicit":"inactive"}}}"#,
         );
         for enabled in [false, true] {
-            let parts =
-                instructions_with_model_messages(&tools(), None, enabled, Some(&messages), None);
+            let parts = instructions_with_model_messages(
+                &tools(),
+                None,
+                enabled,
+                None,
+                Some(&messages),
+                None,
+            );
             assert_eq!(mode(&parts), Some(&RuntimeString::from("catalog")));
         }
     }
@@ -186,10 +162,11 @@ mod tests {
     #[test]
     fn absent_mode_uses_bundled_text_but_empty_mode_suppresses_it() {
         let messages = declared(r#"{"multi_agent":{"mode":{"proactive":""}}}"#);
-        let enabled = instructions_with_model_messages(&tools(), None, true, Some(&messages), None);
+        let enabled =
+            instructions_with_model_messages(&tools(), None, true, None, Some(&messages), None);
         assert!(mode(&enabled).is_none());
         let disabled =
-            instructions_with_model_messages(&tools(), None, false, Some(&messages), None);
+            instructions_with_model_messages(&tools(), None, false, None, Some(&messages), None);
         assert_eq!(mode(&disabled), Some(&RuntimeString::from(EXPLICIT_MODE)));
     }
 
@@ -199,8 +176,14 @@ mod tests {
             r#"{"multi_agent":{"role":{"root":"root base","subagent":"child base"},"mode":{"proactive":" custom\nmode ","explicit":"off"}}}"#,
         );
         let child = RuntimeString::from("child-id");
-        let parts =
-            instructions_with_model_messages(&tools(), Some(&child), true, Some(&messages), None);
+        let parts = instructions_with_model_messages(
+            &tools(),
+            Some(&child),
+            true,
+            None,
+            Some(&messages),
+            None,
+        );
         assert_eq!(parts[0].text, "child base");
         assert_eq!(mode(&parts), Some(&RuntimeString::from(" custom\nmode ")));
         assert!(parts.iter().all(|part| part.cacheable == Some(false)));

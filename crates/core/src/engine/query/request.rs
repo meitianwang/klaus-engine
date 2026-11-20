@@ -326,8 +326,10 @@ pub(crate) fn finalize_instruction_system(
         tool_specs,
         agent_id,
         multi_agent_instructions,
-        None,
-        None,
+        super::orchestration::DelegationBinding {
+            family: profile.family,
+            ..Default::default()
+        },
     );
     render_system_prompt_for_behavior(
         &render_query_owned_system_parts(&current_system, profile),
@@ -410,8 +412,11 @@ pub(super) fn prepare_with_inference(
         internal_visible_tool_specs,
         params.agent_id.as_ref(),
         params.multi_agent_instructions,
-        model_messages,
-        config.multi_agent_mode_hint_text.as_ref(),
+        super::orchestration::DelegationBinding {
+            family: profile.family,
+            model_messages,
+            configured_hint: config.multi_agent_mode_hint_text.as_ref(),
+        },
     );
     let tools = render_tool_specs_for_behavior(internal_visible_tool_specs, &profile);
     let tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);

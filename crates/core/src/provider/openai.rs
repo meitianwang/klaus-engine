@@ -8319,7 +8319,7 @@ mod tests {
             crate::planning::CollaborationMode::Default,
             crate::planning::CollaborationMode::Plan,
         ] {
-            let part = crate::planning::instructions::instruction_part(&config, mode);
+            let part = crate::planning::instructions::instruction_part(&config, mode, None);
             req.system = vec![
                 SystemPromptPart {
                     name: "base".into(),

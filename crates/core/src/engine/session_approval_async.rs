@@ -276,22 +276,6 @@ fn optional_utf8(value: Option<&RuntimeString>) -> Result<Option<String>, Runtim
     value.map(utf8).transpose()
 }
 
-fn model_message(
-    messages: Option<&RuntimeJson>,
-    key: &str,
-) -> Result<Option<String>, RuntimeString> {
-    messages
-        .and_then(|messages| {
-            messages
-                .get("auto_review")
-                .or_else(|| messages.get("autoReview"))
-        })
-        .and_then(|messages| messages.get(key))
-        .and_then(RuntimeJson::as_string)
-        .map(utf8)
-        .transpose()
-}
-
 fn async_model_policy_messages(
     parent: &ModelCapabilities,
     catalog: &[(RuntimeString, ModelCapabilities)],
@@ -301,20 +285,19 @@ fn async_model_policy_messages(
         .auto_review_model_override
         .as_ref()
         .unwrap_or(preferred);
-    let selected = catalog
-        .iter()
-        .find(|(model, _)| model == wanted)
-        .map(|(_, metadata)| metadata);
-    let metadata = selected.or_else(|| {
-        parent
-            .auto_review_model_override
-            .is_none()
-            .then_some(parent)
-    });
+    let selected = catalog.iter().find(|(model, _)| model == wanted);
+    let (model, metadata) = match selected {
+        Some((model, metadata)) => (Some(model), Some(metadata)),
+        None if parent.auto_review_model_override.is_none() => (Some(preferred), Some(parent)),
+        None => (None, None),
+    };
+    let fragments = crate::prompt_catalog::ModelFragments::for_model(
+        model.unwrap_or(preferred),
+        metadata.and_then(|metadata| metadata.model_messages.as_ref()),
+    );
     Ok(evidence::ModelReviewMessages {
-        policy: model_message(
-            metadata.and_then(|metadata| metadata.model_messages.as_ref()),
-            "policy",
+        policy: optional_utf8(
+            fragments.review_text(crate::prompt_catalog::slots::SLOT_REVIEW_POLICY),
         )?,
         ..Default::default()
     })
@@ -344,19 +327,14 @@ fn resolve_settings(
         .and_then(scoring::AsyncFeatureConfig::local_config)
         .cloned()
         .unwrap_or_default();
+    let parent_fragments = crate::prompt_catalog::ModelFragments::for_model(
+        &capture.request.model,
+        parent_metadata.model_messages.as_ref(),
+    );
     let defaults = parent_metadata
         .guardian_v2
         .as_ref()
-        .or_else(|| {
-            parent_metadata
-                .model_messages
-                .as_ref()
-                .and_then(|messages| {
-                    messages
-                        .get("guardian_v2")
-                        .or_else(|| messages.get("guardianV2"))
-                })
-        })
+        .or_else(|| parent_fragments.guardian_v2())
         .map(runtime_codec::decode_value::<scoring::AsyncModelConfig>)
         .transpose()
         .map_err(|_| RuntimeString::from("The classifier model settings are invalid."))?;

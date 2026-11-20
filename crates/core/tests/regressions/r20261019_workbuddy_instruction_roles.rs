@@ -317,7 +317,7 @@ async fn workbuddy_full_modes_use_system_without_changing_another_chat_provider(
                     "no retry or generic 11128 replay"
                 );
                 let body = &captured[before];
-                let expected = instruction_part(&resolve_config_default(), mode_value)
+                let expected = instruction_part(&resolve_config_default(), mode_value, None)
                     .text
                     .try_to_utf8()
                     .unwrap();

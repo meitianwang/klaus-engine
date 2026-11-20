@@ -238,7 +238,13 @@ fn merge_review_catalog_metadata(
     catalog.node_repl_auto_review_required |= declared.node_repl_auto_review_required;
     catalog.guardian = declared.guardian.or(catalog.guardian);
     catalog.guardian_v2 = declared.guardian_v2.or(catalog.guardian_v2);
-    catalog.model_messages = declared.model_messages.or(catalog.model_messages);
+    // Leaf-wise merge: a partial declaration only replaces the fragments it
+    // actually mentions; every other catalog fragment survives. A whole-object
+    // replacement here silently dropped the unmentioned fragments.
+    catalog.model_messages = klaus_agent_core::prompt_catalog::merge_declared_leaves(
+        catalog.model_messages.take(),
+        declared.model_messages,
+    );
     catalog.comp_hash = declared.comp_hash.or(catalog.comp_hash);
     catalog.auto_compact_token_limit = declared
         .auto_compact_token_limit

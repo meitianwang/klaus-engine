@@ -553,6 +553,7 @@ fn assert_collaboration_view(request: &ModelRequest, mode: CollaborationMode) {
     let expected = klaus_agent_core::planning::instructions::instruction_part(
         &klaus_agent_core::schemas::config::default_config(),
         mode,
+        None,
     );
     assert_eq!(
         runtime_codec::encode_value(actual[0]).unwrap(),

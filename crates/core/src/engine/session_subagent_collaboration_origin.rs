@@ -22,10 +22,13 @@ impl SubagentCollaborationOrigin {
         self,
         config: &ResolvedConfig,
         mut parts: Vec<SystemPromptPart>,
+        model_messages: Option<&RuntimeJson>,
     ) -> Vec<SystemPromptPart> {
         parts.retain(|part| part.name != "collaboration-mode");
         parts.push(crate::planning::instructions::instruction_part(
-            config, self.mode,
+            config,
+            self.mode,
+            model_messages,
         ));
         parts
     }
@@ -122,13 +125,16 @@ mod tests {
             cache_scope: None,
         };
         let config = default_config();
-        let actual = SubagentCollaborationOrigin::capture(CollaborationMode::Plan)
-            .apply(&config, vec![base.clone(), old]);
+        let actual = SubagentCollaborationOrigin::capture(CollaborationMode::Plan).apply(
+            &config,
+            vec![base.clone(), old],
+            None,
+        );
         assert_eq!(actual.len(), 2);
         assert_eq!(actual[0], base);
         assert_eq!(
             actual[1],
-            crate::planning::instructions::instruction_part(&config, CollaborationMode::Plan)
+            crate::planning::instructions::instruction_part(&config, CollaborationMode::Plan, None)
         );
         assert_eq!(actual[1].cacheable, Some(false));
         assert_eq!(actual[1].cache_scope, None);
@@ -143,9 +149,13 @@ mod tests {
             let default = crate::planning::instructions::instruction_part(
                 &config,
                 CollaborationMode::Default,
+                None,
             );
-            let plan =
-                crate::planning::instructions::instruction_part(&config, CollaborationMode::Plan);
+            let plan = crate::planning::instructions::instruction_part(
+                &config,
+                CollaborationMode::Plan,
+                None,
+            );
             assert!(default
                 .text
                 .try_to_utf8()

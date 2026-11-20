@@ -722,6 +722,7 @@ async fn cold_authority_case(
                 vec![&crate::planning::instructions::instruction_part(
                     &creation.config,
                     original_mode,
+                    None,
                 )],
                 "the outgoing request separately projects its selected collaboration instructions"
             );
@@ -1022,7 +1023,9 @@ async fn cold_authority_case(
         assert_eq!(
             collaboration,
             expected_origin_mode
-                .map(|mode| crate::planning::instructions::instruction_part(&restored.config, mode))
+                .map(|mode| {
+                    crate::planning::instructions::instruction_part(&restored.config, mode, None)
+                })
                 .into_iter()
                 .collect::<Vec<_>>()
         );
@@ -1043,7 +1046,8 @@ async fn cold_authority_case(
                     .collect::<Vec<_>>(),
                 vec![crate::planning::instructions::instruction_part(
                     &restored.config,
-                    cold_mode
+                    cold_mode,
+                    None
                 )]
             );
         }

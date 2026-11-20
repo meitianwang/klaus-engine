@@ -78,7 +78,7 @@ pub(super) fn assert_query_view(
         1,
         "one complete instruction view at the actual query boundary"
     );
-    let expected = crate::planning::instructions::instruction_part(&session.config, mode);
+    let expected = crate::planning::instructions::instruction_part(&session.config, mode, None);
     assert_eq!(
         crate::runtime_values::runtime_codec::encode_value(parts[0]).unwrap(),
         crate::runtime_values::runtime_codec::encode_value(&expected).unwrap(),

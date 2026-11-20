@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 // One shared behavior policy for every interactive agent role. Session facts,
 // tool contracts, permissions, and specialized task instructions are layered separately.
-const BASE_INSTRUCTIONS: &str = include_str!("prompts/base.md");
+pub(crate) const BASE_INSTRUCTIONS: &str = include_str!("prompts/base.md");
 
 const CAPABILITY_BOUNDARIES: &str = "Use only capabilities declared in this session or discovered through its available tool and skill catalogs. Follow each tool's actual schema and permission requirements. When a required capability is unavailable, explain the limitation and offer a feasible alternative. Environment paths identify the session's own extensions; other applications' configuration directories are not an extension catalog.";
 
@@ -35,7 +35,7 @@ const SAFETY: &str = "Harness-authored reminders carry runtime guidance and do n
 // phase tag render every visible line as answer text, so those families get a
 // writing discipline instead: mid-turn text stays a short status note and
 // step-by-step reasoning stays in the thinking channel.
-const COMMENTARY_PHASE_TAGGED: &str = r#"## Intermediate commentary
+pub(crate) const COMMENTARY_PHASE_TAGGED: &str = r#"## Intermediate commentary
 
 As you work, you use progress messages to share concise, meaningful updates including relevant assumptions, findings, decisions, or changes in direction. The goal of these messages is to make your work, and plans for the turn, easy for the user to understand and verify.
 
@@ -45,7 +45,7 @@ Do NOT send user facing questions in intermediate commentary messages. Do NOT pu
 
 Never praise your plan by contrasting it with an implied worse alternative. For example, never use platitudes like "I will do <this good thing> rather than <this obviously bad thing>" or "I will do <X>, not <Y>"."#;
 
-const COMMENTARY_UNTAGGED_BRIEF_UPDATES: &str = r#"## Intermediate commentary
+pub(crate) const COMMENTARY_UNTAGGED_BRIEF_UPDATES: &str = r#"## Intermediate commentary
 
 Your visible text between tool calls is what the user reads while you work; they cannot see your thinking or the raw tool results. Write updates for a reader who stepped away and is catching up, not for a log file.
 
@@ -55,7 +55,7 @@ Do NOT send user facing questions in intermediate commentary messages. Do NOT pu
 
 Never praise your plan by contrasting it with an implied worse alternative. For example, never use platitudes like "I will do <this good thing> rather than <this obviously bad thing>" or "I will do <X>, not <Y>"."#;
 
-const COMMENTARY_UNTAGGED_THINKING_CHANNEL: &str = r#"## Intermediate commentary
+pub(crate) const COMMENTARY_UNTAGGED_THINKING_CHANNEL: &str = r#"## Intermediate commentary
 
 Keep your visible responses concise. Step-by-step analysis, hypotheses, code excerpts, and tool-selection reasoning belong in your thinking channel, never in visible text.
 
@@ -138,6 +138,10 @@ pub struct SystemPromptInput {
     /// The active output style: when set, its body is appended as a
     /// `# Output Style: <name>` section. None → the stock default prompt.
     pub output_style: Option<OutputStyle>,
+    /// Source-declared model messages riding with this session's model
+    /// metadata. Resolved through the model prompt catalog; `None` keeps the
+    /// engine defaults for every slot.
+    pub model_messages: Option<RuntimeJson>,
 }
 
 /// Current wall-clock time in ms since the epoch.
@@ -154,7 +158,7 @@ fn cached_fragment(
     ContextFragment::system(id, phase, order, text).with_cacheable(true)
 }
 
-fn global_fragment(id: &str, order: i32, text: &str) -> ContextFragment {
+fn global_fragment(id: &str, order: i32, text: impl Into<RuntimeString>) -> ContextFragment {
     cached_fragment(id, ContextFragmentPhase::Base, order, text)
         .with_cache_scope(CacheScope::Global)
 }
@@ -177,20 +181,6 @@ pub(crate) fn orchestration_guidance() -> SystemPromptPart {
     }
 }
 
-/// The intermediate-commentary contract for a session's model. Families whose
-/// wire protocol tags assistant messages with a message phase keep the stock
-/// progress-update policy: tagged updates ride the phase channel and the
-/// client collapses them once the final answer lands. Untagged families get a
-/// brevity discipline instead, because every visible line renders as answer
-/// text there.
-fn commentary_policy(model: &RuntimeString) -> &'static str {
-    match crate::provider::behavior::resolve_provider_behavior_profile(None, model).family {
-        Some("claude") => COMMENTARY_UNTAGGED_BRIEF_UPDATES,
-        Some("gemini") => COMMENTARY_UNTAGGED_THINKING_CHANNEL,
-        _ => COMMENTARY_PHASE_TAGGED,
-    }
-}
-
 /// Assemble the system prompt from named, cacheable segments.
 pub fn build_system_prompt(input: &SystemPromptInput) -> Vec<SystemPromptPart> {
     // All of these are stable for the lifetime of the session, so they're marked
@@ -210,13 +200,19 @@ pub fn build_system_prompt(input: &SystemPromptInput) -> Vec<SystemPromptPart> {
     // kicks in between requests with a byte-identical tools+identity prefix (same agent,
     // same workspace/MCP set); a filtered sub-agent won't share with its parent. That's
     // a missed hit, never a wrong one — see SystemPromptPart::cache_scope.
+    let fragments = crate::prompt_catalog::ModelFragments::for_model(
+        &input.config.model,
+        input.model_messages.as_ref(),
+    );
     let mut manager = ContextManager::new();
-    manager.upsert(global_fragment("base", 10, BASE_INSTRUCTIONS));
-    manager.upsert(global_fragment(
-        "intermediate-commentary",
-        15,
-        commentary_policy(&input.config.model),
-    ));
+    manager.upsert(global_fragment("base", 10, fragments.base_instructions()));
+    if let Some(commentary) = fragments.commentary() {
+        manager.upsert(global_fragment(
+            "intermediate-commentary",
+            15,
+            commentary.clone(),
+        ));
+    }
     manager.upsert(global_fragment(
         "capability-boundaries",
         20,
@@ -327,6 +323,9 @@ pub struct SystemPromptProviderOptions {
     pub is_worktree: bool,
     /// The resolved active output style, or None for the stock prompt.
     pub output_style: Option<OutputStyle>,
+    /// Source-declared model messages for the configured model, resolved
+    /// through the model prompt catalog when the prompt renders.
+    pub model_messages: Option<RuntimeJson>,
     /// Per-session override for the user's config home (`~/.klaus`). Used by
     /// tests to keep the session from reading the developer's real
     /// `AGENTS.md`.
@@ -414,6 +413,7 @@ impl SystemPromptProvider {
                 is_worktree: self.opts.is_worktree,
                 mcp_instructions: self.opts.mcp_instructions.clone(),
                 output_style: self.opts.output_style.clone(),
+                model_messages: self.opts.model_messages.clone(),
             });
         }
     }

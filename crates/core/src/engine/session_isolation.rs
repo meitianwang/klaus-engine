@@ -765,11 +765,20 @@ impl Session {
                         name: s.name.clone(),
                         body: s.body.clone(),
                     });
+            let config = self.inference_config();
+            // Re-resolve the prompt catalog declaration for the current model:
+            // a model switch establishes a new fragment baseline here.
+            let model_messages = self
+                .inference_snapshot()
+                .provider
+                .model_metadata(&config.model)
+                .model_messages;
             let provider = Arc::new(create_system_prompt_provider(
                 self.process_context.clone(),
                 SystemPromptProviderOptions {
                     cwd: self.cwd_now(),
-                    config: self.inference_config(),
+                    config,
+                    model_messages,
                     // Anchor the date to the STABLE session-start time, not a fresh clock read.
                     now_ms: Some(self.meta.created_at),
                     is_worktree: self.workspace.is_in_worktree(),

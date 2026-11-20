@@ -1644,9 +1644,12 @@ impl Session {
                         });
                     }
                     parts.retain(|part| part.name != "collaboration-mode");
+                    let collaboration_metadata =
+                        bundle.provider.model_metadata(&bundle.config.model);
                     parts.push(crate::planning::instructions::instruction_part(
                         &this.config,
                         turn_collaboration_mode,
+                        collaboration_metadata.model_messages.as_ref(),
                     ));
                     parts
                 })

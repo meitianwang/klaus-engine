@@ -344,7 +344,7 @@ async fn workbuddy_model_defaults_reach_both_modes_without_changing_explicit_or_
                 "a declared default must work on the first inference attempt"
             );
             let body = &captured[before];
-            let expected = instruction_part(&resolve_config_default(), mode_value)
+            let expected = instruction_part(&resolve_config_default(), mode_value, None)
                 .text
                 .try_to_utf8()
                 .unwrap();

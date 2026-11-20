@@ -1250,11 +1250,18 @@ impl Session {
             sp
         } else {
             init.system_prompt_provider.unwrap_or_else(|| {
+                // Bind the prompt catalog declaration of the session's initial
+                // model; later model switches rebuild the provider.
+                let initial_model_messages = init
+                    .provider
+                    .model_metadata(&init.config.model)
+                    .model_messages;
                 let provider = Arc::new(create_system_prompt_provider(
                     init.process_context.clone(),
                     SystemPromptProviderOptions {
                         cwd: cwd.clone(),
                         config: init.config.clone(),
+                        model_messages: initial_model_messages,
                         now_ms: Some(created_at),
                         is_worktree: current_worktree.is_some(),
                         mcp_instructions: if mcp_instructions.is_empty() {

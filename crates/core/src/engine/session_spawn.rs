@@ -2105,7 +2105,15 @@ impl Session {
                     None => {
                         let mut parts = child_system_prompt().await;
                         parts.retain(|part| part.name != "collaboration-mode");
-                        parts.push(crate::planning::instructions::instruction_part(&config, child_collaboration_mode));
+                        let child_model_messages = bundle
+                            .provider
+                            .model_metadata(&config.model)
+                            .model_messages;
+                        parts.push(crate::planning::instructions::instruction_part(
+                            &config,
+                            child_collaboration_mode,
+                            child_model_messages.as_ref(),
+                        ));
                         parts
                     }
                 };
@@ -2142,10 +2150,15 @@ impl Session {
                 let base = child_system_prompt.clone();
                 let config = config.clone();
                 let mcp_runtime = mcp_runtime.clone();
+                let child_model_messages = bundle
+                    .provider
+                    .model_metadata(&config.model)
+                    .model_messages;
                 child_system_prompt = Arc::new(move || {
                     let base = base.clone();
                     let config = config.clone();
                     let mcp_runtime = mcp_runtime.clone();
+                    let child_model_messages = child_model_messages.clone();
                     Box::pin(async move {
                         let mut parts = mcp_runtime.rebind_instruction_parts(base().await);
                         parts.retain(|part| {
@@ -2153,7 +2166,11 @@ impl Session {
                                 && part.name != "advisor"
                                 && part.name != "orchestration-mode"
                         });
-                        parts.push(crate::planning::instructions::instruction_part(&config, child_collaboration_mode));
+                        parts.push(crate::planning::instructions::instruction_part(
+                            &config,
+                            child_collaboration_mode,
+                            child_model_messages.as_ref(),
+                        ));
                         parts
                     })
                 });

@@ -693,23 +693,27 @@ impl Session {
             &capture.request.model,
             capture.request.effort.clone(),
         );
-        let messages = target
-            .metadata
-            .model_messages
-            .as_ref()
-            .and_then(|messages| messages.get("auto_review"));
-        let message = |key: &str| {
-            messages
-                .and_then(|messages| messages.get(key))
-                .and_then(RuntimeJson::as_str)
+        // Review texts resolve through the model prompt catalog bound to the
+        // review target model; empty strings stay literal overrides.
+        let fragments = crate::prompt_catalog::ModelFragments::for_model(
+            &target.model,
+            target.metadata.model_messages.as_ref(),
+        );
+        let message = |slot: &'static str| {
+            fragments
+                .review_text(slot)
                 .map(NodeText::to_node_utf8_string)
         };
         let model_messages = context::ModelReviewMessages {
-            policy: message("policy"),
-            policy_template: message("policy_template"),
-            node_repl_policy: message("node_repl_policy"),
-            rejection_instructions: message("rejection_instructions"),
-            timeout_instructions: message("timeout_instructions"),
+            policy: message(crate::prompt_catalog::slots::SLOT_REVIEW_POLICY),
+            policy_template: message(crate::prompt_catalog::slots::SLOT_REVIEW_POLICY_TEMPLATE),
+            node_repl_policy: message(crate::prompt_catalog::slots::SLOT_REVIEW_NODE_REPL_POLICY),
+            rejection_instructions: message(
+                crate::prompt_catalog::slots::SLOT_REVIEW_REJECTION_INSTRUCTIONS,
+            ),
+            timeout_instructions: message(
+                crate::prompt_catalog::slots::SLOT_REVIEW_TIMEOUT_INSTRUCTIONS,
+            ),
         };
         let local = context::ReviewPolicyOptions {
             policy: capture

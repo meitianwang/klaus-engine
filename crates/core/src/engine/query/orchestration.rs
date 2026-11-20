@@ -64,6 +64,16 @@ pub(super) fn resolve_effort(
     }
 }
 
+/// The prompt-catalog binding of one request: the model family and the source
+/// declaration the delegation fragments resolve against, plus the user's
+/// configured hint override.
+#[derive(Default)]
+pub(super) struct DelegationBinding<'a> {
+    pub family: Option<&'static str>,
+    pub model_messages: Option<&'a crate::runtime_values::RuntimeJson>,
+    pub configured_hint: Option<&'a crate::runtime_values::RuntimeString>,
+}
+
 #[cfg(test)]
 pub(super) fn request_policy(
     canonical: &[SystemPromptPart],
@@ -71,7 +81,14 @@ pub(super) fn request_policy(
     tools: &[crate::types::provider::ToolSpec],
     agent_id: Option<&crate::runtime_values::RuntimeString>,
 ) -> Vec<SystemPromptPart> {
-    request_policy_with_model_messages(canonical, ultra_mode, tools, agent_id, true, None, None)
+    request_policy_with_model_messages(
+        canonical,
+        ultra_mode,
+        tools,
+        agent_id,
+        true,
+        DelegationBinding::default(),
+    )
 }
 
 pub(super) fn request_policy_with_model_messages(
@@ -80,8 +97,7 @@ pub(super) fn request_policy_with_model_messages(
     tools: &[crate::types::provider::ToolSpec],
     agent_id: Option<&crate::runtime_values::RuntimeString>,
     include_instructions: bool,
-    model_messages: Option<&crate::runtime_values::RuntimeJson>,
-    configured_hint: Option<&crate::runtime_values::RuntimeString>,
+    binding: DelegationBinding<'_>,
 ) -> Vec<SystemPromptPart> {
     let mut parts: Vec<_> = canonical
         .iter()
@@ -95,17 +111,14 @@ pub(super) fn request_policy_with_model_messages(
         .iter()
         .position(|part| part.name == "total-tokens" || part.name.starts_with("provider-behavior:"))
         .unwrap_or(parts.len());
-    let instructions = if model_messages.is_none() && configured_hint.is_none() {
-        crate::context::multi_agent::instructions(tools, agent_id, ultra_mode)
-    } else {
-        crate::context::multi_agent::instructions_with_model_messages(
-            tools,
-            agent_id,
-            ultra_mode,
-            model_messages,
-            configured_hint,
-        )
-    };
+    let instructions = crate::context::multi_agent::instructions_with_model_messages(
+        tools,
+        agent_id,
+        ultra_mode,
+        binding.family,
+        binding.model_messages,
+        binding.configured_hint,
+    );
     parts.splice(index..index, instructions);
     parts
 }
@@ -271,7 +284,12 @@ mod tests {
             PROACTIVE_MODE
         );
         assert!(request_policy_with_model_messages(
-            &ordinary, true, &tools, None, false, None, None
+            &ordinary,
+            true,
+            &tools,
+            None,
+            false,
+            DelegationBinding::default()
         )
         .is_empty());
         let child = request_policy(&ordinary, true, &tools, Some(&"worker".into()));

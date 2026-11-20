@@ -512,6 +512,7 @@ fn restore_instruction_parts(
     value: &RuntimeJson,
     config: &ResolvedConfig,
     current: Vec<SystemPromptPart>,
+    model_messages: Option<&RuntimeJson>,
 ) -> Result<(Option<SubagentCollaborationOrigin>, Vec<SystemPromptPart>), RuntimeString> {
     let current_environment = value
         .get("systemPromptParts")
@@ -544,7 +545,7 @@ fn restore_instruction_parts(
             RuntimeString::from(format!("Invalid original collaboration origin: {error}"))
         })?;
     if let Some(origin) = origin {
-        parts = origin.apply(config, parts);
+        parts = origin.apply(config, parts, model_messages);
     }
     if let Some(environment) = current_environment {
         if let Some(part) = parts.iter_mut().find(|part| part.name == "env") {
@@ -1125,8 +1126,13 @@ impl Session {
             inherited_system,
         )()
         .await;
-        let (collaboration_origin, parts) =
-            restore_instruction_parts(value, &config, current_parts)?;
+        let restored_metadata = resume.bundle.provider.model_metadata(&config.model);
+        let (collaboration_origin, parts) = restore_instruction_parts(
+            value,
+            &config,
+            current_parts,
+            restored_metadata.model_messages.as_ref(),
+        )?;
         mcp_runtime.restore_instruction_evidence(value.get("mcpInstructionSources"))?;
         let parts = mcp_runtime.rebind_instruction_parts(parts);
         let mut fork_seed = if version >= 6 {

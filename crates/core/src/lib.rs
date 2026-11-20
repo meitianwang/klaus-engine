@@ -279,3 +279,4 @@ pub(crate) mod v8_platform;
 pub mod worktree;
 
 pub mod planning;
+pub mod prompt_catalog;

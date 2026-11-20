@@ -273,7 +273,7 @@ async fn a_plan_mode_child_cannot_declare_its_way_out_of_plan_mode() {
             env_key: None,
         },
         sentinel: sentinel.to_string_lossy().into_owned(),
-        expected_plan: instruction_part(&default_config(), CollaborationMode::Plan),
+        expected_plan: instruction_part(&default_config(), CollaborationMode::Plan, None),
         parent_requests: AtomicUsize::new(0),
         child_requests: AtomicUsize::new(0),
         child_write_rejected: AtomicBool::new(false),

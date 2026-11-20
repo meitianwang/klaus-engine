@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "revision": "bundled-r1",
+  "fragments": {},
+  "profiles": {
+    "klaus/default": {
+      "modelMessages": {}
+    }
+  },
+  "bindings": []
+}

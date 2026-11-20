@@ -2092,6 +2092,7 @@ mod tests {
             let part = klaus_agent_core::planning::instructions::instruction_part(
                 &klaus_agent_core::engine::session::resolve_config_default(),
                 mode,
+                None,
             );
             let text = part.text.try_to_utf8().unwrap();
             let body = json!({"messages":[

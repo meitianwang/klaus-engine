@@ -97,7 +97,7 @@ impl Provider {
     }
 
     fn assert_mode(&self, child: bool, mode: CollaborationMode) {
-        let expected = instruction_part(&default_config(), mode);
+        let expected = instruction_part(&default_config(), mode, None);
         for (_, request) in self
             .requests
             .lock()
@@ -575,7 +575,7 @@ async fn captured_plan_effect_limit_survives_mode_change_until_the_next_turn() {
     {
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        let expected = instruction_part(&default_config(), CollaborationMode::Default);
+        let expected = instruction_part(&default_config(), CollaborationMode::Default, None);
         for (_, request) in &requests[2..] {
             assert_eq!(
                 request

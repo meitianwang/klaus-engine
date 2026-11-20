@@ -1,17 +1,34 @@
 //! Complete collaboration instructions, rendered once at an inference boundary.
 use super::CollaborationMode;
+use crate::runtime_values::RuntimeJson;
 use crate::schemas::config::ResolvedConfig;
 use crate::types::provider::SystemPromptPart;
-pub fn instruction_part(config: &ResolvedConfig, mode: CollaborationMode) -> SystemPromptPart {
+
+fn template_text(template: &crate::runtime_values::RuntimeString) -> String {
+    String::from_utf8(template.to_node_utf8()).expect("Node projection is UTF-8")
+}
+
+/// Render the collaboration-mode part for one inference boundary.
+///
+/// Template precedence keeps the explicit user configuration on top: a
+/// configured template wins, then the model prompt catalog slot bound to this
+/// session's model, then the bundled template. The mode-switch boundary text
+/// is engine-owned and independent of the template source.
+pub fn instruction_part(
+    config: &ResolvedConfig,
+    mode: CollaborationMode,
+    model_messages: Option<&RuntimeJson>,
+) -> SystemPromptPart {
+    let fragments = crate::prompt_catalog::ModelFragments::for_model(&config.model, model_messages);
     let template = match mode {
         CollaborationMode::Default => config
             .collaboration_default_instructions
-            .as_deref()
-            .unwrap_or(include_str!("prompts/default.md")),
+            .clone()
+            .unwrap_or_else(|| template_text(&fragments.collaboration_template(false))),
         CollaborationMode::Plan => config
             .collaboration_plan_instructions
-            .as_deref()
-            .unwrap_or(include_str!("prompts/plan.md")),
+            .clone()
+            .unwrap_or_else(|| template_text(&fragments.collaboration_template(true))),
     };
     let default_boundary = include_str!("prompts/default.md")
         .split("## request_user_input availability")

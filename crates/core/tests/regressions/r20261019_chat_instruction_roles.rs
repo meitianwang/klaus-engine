@@ -106,7 +106,7 @@ fn request(mode: CollaborationMode, model: &str) -> ModelRequest {
                 cacheable: Some(true),
                 cache_scope: None,
             },
-            instruction_part(&resolve_config_default(), mode),
+            instruction_part(&resolve_config_default(), mode, None),
         ],
         messages: vec![Message::User(UserMessage {
             question_answer: None,
