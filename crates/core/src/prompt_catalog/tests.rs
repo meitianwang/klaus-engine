@@ -959,7 +959,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r5")
+        RuntimeString::from("bundled-r6")
     );
 }
 
@@ -1180,7 +1180,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r5"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r6"));
 }
 
 mod store_refresh {
@@ -1245,7 +1245,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r5"
+            "bundled-r6"
         );
 
         let v1 = document("distributed-v1");
@@ -1368,7 +1368,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r5"
+            "bundled-r6"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1486,6 +1486,102 @@ fn model_pack_base_keeps_klaus_identity_and_tool_vocabulary() {
     ] {
         assert!(base.contains(expected), "converted base misses {expected}");
     }
+}
+
+#[test]
+fn bundled_claude_model_packs_resolve_per_model_and_keep_model_sections() {
+    let generic = RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS);
+    let fable = ModelFragments::for_model(&RuntimeString::from("claude-fable-5-2"), None);
+    let opus = ModelFragments::for_model(&RuntimeString::from("claude-opus-5-5"), None);
+    let sonnet = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-5-5"), None);
+    let haiku = ModelFragments::for_model(&RuntimeString::from("claude-haiku-5-5"), None);
+
+    for (model, fragments) in [
+        ("claude-fable-5-2", &fable),
+        ("claude-opus-5-5", &opus),
+        ("claude-sonnet-5-5", &sonnet),
+        ("claude-haiku-5-5", &haiku),
+    ] {
+        assert_ne!(fragments.base_instructions(), generic);
+        let base = fragments.base_instructions().try_to_utf8().unwrap();
+        assert!(base.starts_with("You are Klaus."));
+        assert!(
+            base.contains(&format!("The exact model ID is {model}.")),
+            "{model} pack lost its model identity line"
+        );
+        assert!(base.contains("# Harness"));
+        assert!(base.contains("# Session-specific guidance"));
+        assert!(base.contains("# Using skills"));
+        assert!(base.contains("# Apps (Connectors)"));
+        assert!(base.contains("# Plugins"));
+        // Lean packs keep the capable-model prompt small instead of carrying
+        // the full generic final-answer and tool-discipline sections.
+        assert!(
+            base.len() <= 12 * 1024,
+            "{model} lean pack grew past its budget: {} bytes",
+            base.len()
+        );
+        assert!(!base.contains("### Final answer structure and style guidelines"));
+        assert_eq!(
+            fragments.commentary(),
+            Some(&RuntimeString::from(
+                crate::context::system_prompt::COMMENTARY_UNTAGGED_BRIEF_UPDATES
+            )),
+            "{model} must keep the Claude progress-channel policy"
+        );
+        for banned in [
+            "Claude Code",
+            "Anthropic's official CLI",
+            "CLAUDE.md",
+            "AgentTool",
+            "functions.",
+        ] {
+            assert!(
+                !base.contains(banned),
+                "{model} pack still contains product token {banned}"
+            );
+        }
+    }
+
+    let fable_base = fable.base_instructions().try_to_utf8().unwrap();
+    assert!(fable_base.contains("# Finishing work"));
+    assert!(fable_base.contains("# Memory, notes and feedback"));
+    assert!(fable_base.contains("# Original games"));
+
+    let opus_base = opus.base_instructions().try_to_utf8().unwrap();
+    assert!(opus_base.contains("# Original games"));
+    assert!(!opus_base.contains("# Finishing work"));
+    assert!(!opus_base.contains("# Early stopping"));
+
+    let sonnet_base = sonnet.base_instructions().try_to_utf8().unwrap();
+    assert!(!sonnet_base.contains("# Finishing work"));
+    assert!(!sonnet_base.contains("# Early stopping"));
+    assert!(!sonnet_base.contains("# Original games"));
+
+    let haiku_base = haiku.base_instructions().try_to_utf8().unwrap();
+    assert!(haiku_base.contains("# Early stopping"));
+    assert!(!haiku_base.contains("# Finishing work"));
+
+    assert_ne!(
+        fable.base_instructions(),
+        opus.base_instructions(),
+        "model bundles must not collapse to one shared base"
+    );
+    assert_ne!(opus.base_instructions(), sonnet.base_instructions());
+    assert_ne!(sonnet.base_instructions(), haiku.base_instructions());
+
+    // Aggregating routes may decorate the model key; the same Claude model
+    // still resolves its pack.
+    let decorated = ModelFragments::for_route(
+        &RuntimeString::from("claude-opus-5-5[context=1m]@max"),
+        Some("cursor"),
+        None,
+    );
+    assert_eq!(decorated.base_instructions(), opus.base_instructions());
+
+    // A legacy Claude id with no current menu entry keeps the generic pack.
+    let legacy = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    assert_eq!(legacy.base_instructions(), generic);
 }
 
 #[test]
