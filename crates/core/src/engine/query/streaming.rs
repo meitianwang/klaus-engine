@@ -65,7 +65,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 /// Flag a call whose tool is still collapsed: deferred exposure, never
 /// surfaced by a search, and absent from this request's visible wire list.
-/// Eager inventories (which render deferred tools directly) never flag.
+/// Eager inventories (which render deferred tools directly) never flag, and
+/// without a visible search entry there is no load path to point the refusal
+/// at, so the call keeps the historical lenient execution.
 fn mark_not_loaded(
     call: &mut ResolvedToolCall,
     tool: Option<&Arc<dyn crate::types::tool::Tool>>,
@@ -77,6 +79,10 @@ fn mark_not_loaded(
     if dominated
         && !shared.surfaced.lock_recover().contains(&call.internal_name)
         && !req.tools.iter().any(|spec| spec.name == call.internal_name)
+        && req
+            .tools
+            .iter()
+            .any(|spec| spec.name == "tool_search")
     {
         call.not_loaded = true;
     }

@@ -652,7 +652,17 @@ impl Rig {
         options.tools = Some(if browser.is_some() {
             klaus_agent_core::tools::builtins::browser::create_browser_tools()
         } else {
-            vec![create_write_tool(), create_exec_command_tool()]
+            vec![
+                create_write_tool(),
+                // The rig scripts direct `exec_command` calls; the tool is
+                // pre-loaded (immediate exposure) in this session so the
+                // deferred-loading gate stays out of the approval flows
+                // pinned here.
+                klaus_agent_core::tools::builtins::tool_search::ExposureOverrideTool::wrap(
+                    create_exec_command_tool(),
+                    klaus_agent_core::types::tool::ToolExposure::Direct,
+                ),
+            ]
         });
         let browser_calls = Arc::new(AtomicUsize::new(0));
         if browser.is_some() {

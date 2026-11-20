@@ -1306,20 +1306,30 @@ impl Tool for CallMcpTool {
     }
 }
 
-/// A tool wrapper that overrides ONLY its `exposure` to `deferred`, forwarding
-/// every other behavior to the wrapped tool.
-struct DeferredTool {
+/// A tool wrapper that overrides ONLY its `exposure`, forwarding every other
+/// behavior to the wrapped tool. The catalog folder uses it to defer tools;
+/// fixtures use it to pin a tool's exposure independent of the pool state.
+pub struct ExposureOverrideTool {
     inner: Arc<dyn Tool>,
+    exposure: ToolExposure,
+}
+
+impl ExposureOverrideTool {
+    /// Wrap a tool with an explicit exposure.
+    pub fn wrap(inner: Arc<dyn Tool>, exposure: ToolExposure) -> Arc<dyn Tool> {
+        Arc::new(Self { inner, exposure })
+    }
 }
 
 #[async_trait]
-impl Tool for DeferredTool {
+impl Tool for ExposureOverrideTool {
     fn native_mcp_binding(&self) -> Option<crate::mcp::tool_wrapper::NativeMcpToolBinding> {
         self.inner.native_mcp_binding()
     }
     fn rebind_native_mcp(&self, replacement: Arc<dyn Tool>) -> Arc<dyn Tool> {
         Arc::new(Self {
             inner: self.inner.rebind_native_mcp(replacement),
+            exposure: self.exposure,
         })
     }
     fn approval_metadata(&self) -> Option<crate::types::permission::ApprovalActionMetadata> {
@@ -1349,7 +1359,7 @@ impl Tool for DeferredTool {
         self.inner.output_schema()
     }
     fn exposure(&self) -> ToolExposure {
-        ToolExposure::Deferred
+        self.exposure
     }
     fn search_hint(&self) -> Option<RuntimeString> {
         self.inner.search_hint()
@@ -1451,7 +1461,7 @@ pub fn with_deferred_tools(
     result.push(create_tool_search_tool(None));
     for (i, t) in tools.into_iter().enumerate() {
         if i >= threshold && t.exposure() == ToolExposure::Direct {
-            result.push(Arc::new(DeferredTool { inner: t }));
+            result.push(ExposureOverrideTool::wrap(t, ToolExposure::Deferred));
         } else {
             result.push(t);
         }
@@ -1468,7 +1478,7 @@ pub(crate) fn defer_direct_inventory(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn T
             .into_iter()
             .map(|tool| {
                 if tool.name() != "tool_search" && tool.exposure() == ToolExposure::Direct {
-                    Arc::new(DeferredTool { inner: tool }) as Arc<dyn Tool>
+                    ExposureOverrideTool::wrap(tool, ToolExposure::Deferred)
                 } else {
                     tool
                 }
