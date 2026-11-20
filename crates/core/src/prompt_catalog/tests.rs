@@ -111,9 +111,9 @@ fn bundled_offline_catalog_is_valid_and_resolves_to_engine_defaults() {
     );
     assert!(!catalog.revision.is_empty());
 
-    let model = RuntimeString::from("gpt-5.6-sol");
+    let model = RuntimeString::from("gpt-4o");
     let fragments = ModelFragments::for_model(&model, None);
-    // Required slots resolve from the engine defaults.
+    // Required slots resolve from the engine defaults (gpt-4o carries no model pack).
     assert_eq!(
         fragments.base_instructions(),
         RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS)
@@ -941,7 +941,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
 
     // The generic pack carries the phase-tagged text for every other model.
-    for model in ["gpt-5.6-sol", "qwen3-max", "deepseek-v3.2", "unknown-model"] {
+    for model in ["gpt-4o", "qwen3-max", "deepseek-v3.2", "unknown-model"] {
         let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
         assert_eq!(
             fragments.commentary(),
@@ -959,7 +959,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r2")
+        RuntimeString::from("bundled-r3")
     );
 }
 
@@ -1180,7 +1180,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r2"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r3"));
 }
 
 mod store_refresh {
@@ -1245,7 +1245,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r2"
+            "bundled-r3"
         );
 
         let v1 = document("distributed-v1");
@@ -1368,8 +1368,121 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r2"
+            "bundled-r3"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// ---- Bundled model packs: per-model base prompts synced from the published
+// ---- subscription catalog data (converted into Klaus slot vocabulary).
+
+#[test]
+fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
+    let sol = ModelFragments::for_model(&RuntimeString::from("gpt-6.2-sol"), None);
+    let astra = ModelFragments::for_model(&RuntimeString::from("gpt-6.2-astra"), None);
+    let reserve = ModelFragments::for_model(&RuntimeString::from("gpt-reserve"), None);
+    let five_six = ModelFragments::for_model(&RuntimeString::from("gpt-5.6-sol"), None);
+
+    // Each bound model resolves its own base pack instead of the generic
+    // engine default, and sibling models of one generation still differ.
+    let generic = RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS);
+    assert_ne!(sol.base_instructions(), generic);
+    assert_ne!(astra.base_instructions(), generic);
+    assert_ne!(sol.base_instructions(), astra.base_instructions());
+    // Models sharing one template share one fragment.
+    assert_eq!(reserve.base_instructions(), five_six.base_instructions());
+    assert_eq!(
+        sol.resolved()
+            .provenance(SLOT_BASE_INSTRUCTIONS)
+            .map(|p| p.layer),
+        Some(FragmentLayer::ModelProfile)
+    );
+
+    // Same confirmed model through another route resolves the same pack
+    // (sourceKind "*" bindings): cross-entry sharing with per-model identity.
+    let via_other_route =
+        ModelFragments::for_route(&RuntimeString::from("gpt-6.2-sol"), Some("cursor"), None);
+    assert_eq!(via_other_route.base_instructions(), sol.base_instructions());
+
+    // Commentary follows the model's own group text, not the generic pack.
+    assert_ne!(
+        sol.commentary(),
+        Some(&RuntimeString::from(
+            crate::context::system_prompt::COMMENTARY_PHASE_TAGGED
+        ))
+    );
+    assert_eq!(sol.commentary(), astra.commentary());
+    assert_ne!(sol.commentary(), five_six.commentary());
+
+    // Unbound and non-GPT models keep the generic resolution.
+    let unbound = ModelFragments::for_model(&RuntimeString::from("gpt-4o"), None);
+    assert_eq!(unbound.base_instructions(), generic);
+    assert_eq!(
+        unbound.commentary(),
+        Some(&RuntimeString::from(
+            crate::context::system_prompt::COMMENTARY_PHASE_TAGGED
+        ))
+    );
+    let claude = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    assert_eq!(claude.base_instructions(), generic);
+
+    // Model packs leave the other slots on their inherited layers.
+    assert_eq!(
+        sol.collaboration_template(false),
+        RuntimeString::from(include_str!("../planning/prompts/default.md"))
+    );
+    assert_eq!(
+        sol.title_instructions(),
+        RuntimeString::from(crate::engine::session::SESSION_TITLE_PROMPT)
+    );
+}
+
+#[test]
+fn model_pack_base_keeps_klaus_identity_and_tool_vocabulary() {
+    let sol = ModelFragments::for_model(&RuntimeString::from("gpt-6.2-sol"), None);
+    let base = sol.base_instructions().try_to_utf8().unwrap();
+    // Identity and product surface are Klaus's own.
+    assert!(base.starts_with("You are Klaus."));
+    for banned in [
+        "functions.",
+        "{{",
+        "ImageGen",
+        "exec_command",
+        "$CODEX_HOME",
+        "skills.read",
+        "list_mcp_resource_templates",
+    ] {
+        assert!(
+            !base.contains(banned),
+            "converted base still contains {banned}"
+        );
+    }
+    for expected in [
+        "ask_user_async",
+        "`skill`",
+        "# Apps (Connectors)",
+        "`generate_image`",
+    ] {
+        assert!(base.contains(expected), "converted base misses {expected}");
+    }
+}
+
+#[test]
+fn declared_layer_still_wins_over_a_model_pack() {
+    let declared_value = declared(r#"{"multi_agent":{"role":{"root":"declared root override"}}}"#);
+    let fragments =
+        ModelFragments::for_model(&RuntimeString::from("gpt-6.2-sol"), Some(&declared_value));
+    assert_eq!(
+        fragments.agent_role(false),
+        Some(&RuntimeString::from("declared root override"))
+    );
+    // The pack's base stays untouched by the declaration.
+    assert_eq!(
+        fragments
+            .resolved()
+            .provenance(SLOT_BASE_INSTRUCTIONS)
+            .map(|p| p.layer),
+        Some(FragmentLayer::ModelProfile)
+    );
 }
