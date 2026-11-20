@@ -79,6 +79,7 @@ pub(crate) fn unsupported_native_tools(status: Option<u16>, message: &str) -> bo
         && ([
             "defer_loading",
             "tool_search",
+            "tool_reference",
             "execution",
             "additional_tools",
             "tool_addition",

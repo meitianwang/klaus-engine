@@ -113,6 +113,7 @@ struct NativeCandidate {
     tools: Vec<crate::types::provider::ToolSpec>,
     native_deferred_tools: Option<bool>,
     deferred_tools: Vec<crate::types::provider::ToolSpec>,
+    surfaced_deferred_names: Vec<RuntimeString>,
     wire_caps: Option<crate::types::provider::WireCapabilityPolicy>,
     frozen_tools: Option<Vec<crate::types::provider::ToolSpec>>,
 }
@@ -223,6 +224,7 @@ impl PrecomputeRegistry {
                 tools: arm.request.tools.clone(),
                 native_deferred_tools: arm.request.native_deferred_tools,
                 deferred_tools: arm.request.deferred_tools.clone(),
+                surfaced_deferred_names: arm.request.surfaced_deferred_names.clone(),
                 wire_caps: arm.request.wire_caps.clone(),
                 frozen_tools: arm.request.frozen_tools.clone(),
             })
@@ -409,6 +411,7 @@ impl PrecomputeRegistry {
                         && request.system == native.system
                         && request.tools == native.tools
                         && request.deferred_tools == native.deferred_tools
+                        && request.surfaced_deferred_names == native.surfaced_deferred_names
                         && request.native_deferred_tools == native.native_deferred_tools
                         && request.wire_caps == native.wire_caps
                         && request.frozen_tools == native.frozen_tools
@@ -907,6 +910,7 @@ mod tests {
                 tools: Vec::new(),
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
+                surfaced_deferred_names: Vec::new(),
                 wire_caps: None,
                 frozen_tools: None,
                 frozen_instructions: None,

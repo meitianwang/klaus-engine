@@ -101,9 +101,12 @@ async fn negotiate(anthropic: bool, reject_fallback: bool) {
     });
     let mut request = request();
     if anthropic {
-        // Unloaded inventory is not active; the active read declaration must stay.
-        request.deferred_tools = vec![request.tools[1].clone()];
-        request.deferred_tools[0].name = "not_yet_loaded".into();
+        // An unlocked deferred tool rides as a marked registration; the
+        // immediate read declaration must stay whatever the gateway does.
+        let mut unlocked = request.tools[1].clone();
+        unlocked.name = "not_yet_loaded".into();
+        request.tools.push(unlocked);
+        request.surfaced_deferred_names = vec!["not_yet_loaded".into()];
     }
     for _ in 0..2 {
         let events = tokio::time::timeout(
@@ -140,7 +143,12 @@ async fn negotiate(anthropic: bool, reject_fallback: bool) {
             .any(|tool| tool["type"] == "tool_search" || tool["defer_loading"] == true);
         assert_eq!(native, index == 0);
         if anthropic && index > 0 {
-            assert!(!tools.iter().any(|tool| tool["name"] == "not_yet_loaded"));
+            // The downgrade keeps the unlocked tool available as an immediate
+            // declaration; only the native mark disappears.
+            assert!(
+                tools.iter().any(|tool| tool["name"] == "not_yet_loaded"),
+                "unlocked tool survives the downgrade"
+            );
         }
     }
 }

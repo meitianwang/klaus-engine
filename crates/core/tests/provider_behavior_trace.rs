@@ -6489,7 +6489,7 @@ async fn live_trace_contract_rebuilds_tool_search_missing_from_its_catalog() {
         .and_then(Json::as_str)
         .unwrap()
         .concat(&RuntimeString::from_utf8(
-            "\nNo matching tools found for:\n- missing",
+            "\nNo matching deferred tools found for:\n- missing",
         ));
     rewrite_trace_tool_call(
         &mut trace,

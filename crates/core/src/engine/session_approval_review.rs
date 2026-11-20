@@ -1183,6 +1183,7 @@ impl ReviewerRequest for ReviewAttempt {
                 tools: session.state.tool_specs(&self.setup.target.capabilities),
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
+                surfaced_deferred_names: Vec::new(),
                 wire_caps: None,
                 frozen_tools: None,
                 frozen_instructions: None,

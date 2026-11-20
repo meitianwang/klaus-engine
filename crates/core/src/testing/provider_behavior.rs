@@ -5536,7 +5536,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "73e39daa21437118d4db35e292204eedfc1723777036cff8fb322f3ea3f4b761";
+    "8679ef076e83d316f78a2a0f8ad7117ec8567c1d090604aa4d92c7e97b64f672";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -12081,7 +12081,9 @@ fn tool_search_result_text(result: &Json) -> Result<RuntimeString, ProviderBehav
     }
     if let Some(missing) = result.get("missing").and_then(Json::as_array) {
         if !missing.is_empty() {
-            lines.push(RuntimeString::from_utf8("No matching tools found for:"));
+            lines.push(RuntimeString::from_utf8(
+                "No matching deferred tools found for:",
+            ));
             for name in missing {
                 let name = name.as_str().ok_or_else(|| {
                     ProviderBehaviorEvalError::Task(
@@ -12093,7 +12095,7 @@ fn tool_search_result_text(result: &Json) -> Result<RuntimeString, ProviderBehav
         }
     }
     Ok(if lines.is_empty() {
-        RuntimeString::from_utf8("No matching tools found.")
+        RuntimeString::from_utf8("No matching deferred tools found")
     } else {
         runtime_join(lines, "\n")
     })
@@ -12492,6 +12494,30 @@ async fn validate_tool_result_reconstruction(
             internal_name.as_str(),
             "write" | "subagent_report_write" | "edit" | "apply_patch"
         );
+
+        // A deferred fixture tool called while still collapsed (no successful
+        // activation ahead of it in lifecycle order) is refused with the load
+        // guidance and never runs, exactly like production; nothing is
+        // reconstructed for it.
+        if task.config.deferred_threshold == Some(0)
+            && internal_name != "tool_search"
+            && !evidence
+                .tool_search_activations
+                .values()
+                .flatten()
+                .any(|activated| activated == internal_name_runtime)
+        {
+            let mut error_object = RuntimeObject::new();
+            error_object.insert(
+                "message",
+                Json::String(crate::engine::query::tool_not_loaded_message(
+                    &RuntimeString::from(internal_name.clone()),
+                )),
+            );
+            let expected_error = Json::Object(error_object);
+            validate_reconstructed_terminal(&id, &terminal, "failed", None, Some(&expected_error))?;
+            continue;
+        }
 
         match internal_name.as_str() {
             "write" | "subagent_report_write" => {

@@ -461,6 +461,7 @@ pub(super) fn prepare_with_inference(
         // `Shared::prepare`, which owns the exposure/surfaced state.
         native_deferred_tools: None,
         deferred_tools: Vec::new(),
+        surfaced_deferred_names: Vec::new(),
         wire_caps: None,
         frozen_tools: None,
         frozen_instructions: None,
@@ -570,6 +571,7 @@ impl Shared {
                 );
             }
             prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
+            prepared.request.surfaced_deferred_names = self.surfaced_deferred_request_names();
             self.observe_approval_context(
                 messages,
                 canonical_system_prompt,
@@ -693,6 +695,7 @@ impl Shared {
         }
         if capabilities.tools {
             prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
+            prepared.request.surfaced_deferred_names = self.surfaced_deferred_request_names();
         }
         self.attach_frozen_tool_projection(&mut prepared.request, messages);
         self.observe_approval_context(
@@ -801,6 +804,25 @@ impl Shared {
             return Vec::new();
         }
         render_tool_specs_for_behavior(&internal, profile)
+    }
+
+    /// Names of already-surfaced deferred tools, in pool order. Wires with
+    /// native deferred loading render these as marked registrations paired
+    /// with the historical search references instead of immediate entries.
+    pub(super) fn surfaced_deferred_request_names(&self) -> Vec<RuntimeString> {
+        if self.uses_static_deferred_tool_dispatch() || self.uses_eager_tool_inventory() {
+            return Vec::new();
+        }
+        let tools = self.tools.lock_recover().clone();
+        let surfaced = self.surfaced.lock_recover();
+        tools
+            .iter()
+            .filter(|tool| {
+                tool.exposure() == crate::types::tool::ToolExposure::Deferred
+                    && surfaced.contains(&tool.name())
+            })
+            .map(|tool| tool.name())
+            .collect()
     }
 
     /// Maintain the frozen tool-inventory epoch for transports that announce

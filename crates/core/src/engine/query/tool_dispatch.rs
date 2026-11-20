@@ -483,6 +483,21 @@ pub(super) async fn dispatch_tool_calls(
     .await)
 }
 
+/// The refusal text for a call to a tool that is still collapsed: names the
+/// load step, asks for one combined search, and defers the retry to the next
+/// turn so the schema is in context first.
+pub(crate) fn tool_not_loaded_message(name: &RuntimeString) -> RuntimeString {
+    RuntimeString::from("InputValidationError: ")
+        .concat(name)
+        .concat(&RuntimeString::from(
+            " did not run: it was not loaded when it was called. Unless tool_search has loaded it since, load it together with the other tools you expect to need, in one tool_search call (for example, query \"select:",
+        ))
+        .concat(name)
+        .concat(&RuntimeString::from(
+            "\", with the other names after it, comma-separated). Call it again once that result has come back, not in the same reply.",
+        ))
+}
+
 /// Persist a provider-executed native tool search as a completed, non-error
 /// result. The server's own output item rides `native_tool_output` so the wire
 /// projection replays the native call/output pair verbatim; the visible text
@@ -680,6 +695,21 @@ fn execute_tool_call_inner(
             == Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch)
         {
             return Ok(recorded_server_tool_search_result(&shared, &call, emit_started).await);
+        }
+        // A deferred tool called while still collapsed never runs: the model
+        // has no schema to parameterize it, and the refusal carries the load
+        // instruction that recovers the call on the next turn.
+        if call.not_loaded {
+            if emit_started {
+                push_tool_call_started(&shared, &call).await?;
+            }
+            return Ok(error_result(
+                &call,
+                &shared,
+                tool_not_loaded_message(&call.internal_name),
+                &[],
+            )
+            .await);
         }
         let signal = shared.params.signal.clone();
         if signal.is_cancelled() {

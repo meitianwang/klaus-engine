@@ -302,6 +302,7 @@ mod tests {
             tools: Vec::new(),
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
+            surfaced_deferred_names: Vec::new(),
             wire_caps: None,
             frozen_tools: None,
             frozen_instructions: None,

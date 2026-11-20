@@ -63,6 +63,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+/// Flag a call whose tool is still collapsed: deferred exposure, never
+/// surfaced by a search, and absent from this request's visible wire list.
+/// Eager inventories (which render deferred tools directly) never flag.
+fn mark_not_loaded(
+    call: &mut ResolvedToolCall,
+    tool: Option<&Arc<dyn crate::types::tool::Tool>>,
+    shared: &Arc<Shared>,
+    req: &ModelRequest,
+) {
+    let dominated =
+        tool.is_some_and(|tool| tool.exposure() == crate::types::tool::ToolExposure::Deferred);
+    if dominated
+        && !shared.surfaced.lock_recover().contains(&call.internal_name)
+        && !req.tools.iter().any(|spec| spec.name == call.internal_name)
+    {
+        call.not_loaded = true;
+    }
+}
+
 fn panic_payload_detail(payload: &(dyn std::any::Any + Send)) -> RuntimeString {
     if let Some(error) = payload.downcast_ref::<ToolError>() {
         error.message.clone()
@@ -1078,6 +1097,7 @@ async fn stream_and_dispatch_inner(
                     let mut call = ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                     let tools = shared.tools.lock_recover().clone();
                     let tool = call.bind_resolved_tool(&tools);
+                    mark_not_loaded(&mut call, tool.as_ref(), shared, req);
                     let source = tool
                         .as_ref()
                         .map(|found| tool_lifecycle_source_for_tool(found.as_ref()));
@@ -1111,6 +1131,7 @@ async fn stream_and_dispatch_inner(
                         }
                         if let Some(tool) = tool {
                             if p.arguments_are_parseable()
+                                && !call.not_loaded
                                 && tool.mcp_server().is_none()
                                 && call.internal_name != "advisor"
                                 && call.visible.tool_kind
@@ -1361,6 +1382,7 @@ async fn stream_and_dispatch_inner(
                             ResolvedToolCall::new(p.to_tool_use_block(&id), profile.clone());
                         let tools = shared.tools.lock_recover().clone();
                         let tool = call.bind_resolved_tool(&tools);
+                        mark_not_loaded(&mut call, tool.as_ref(), shared, req);
                         let source = tool
                             .as_ref()
                             .map(|tool| tool_lifecycle_source_for_tool(tool.as_ref()));

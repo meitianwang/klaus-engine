@@ -115,6 +115,25 @@ const TOOL_SEARCH_BETA: &str = "tool-search-tool-2025-10-19";
 /// request on. Never activated; the model cannot see or call it.
 const DEFERRED_PLACEHOLDER_TOOL: &str = "__klaus_deferred_placeholder__";
 
+/// Whether the structured-output policy replaced the whole tool inventory with
+/// the single result tool, which suppresses every native tool surface.
+fn structured_output_replaces_inventory(
+    req: &ModelRequest,
+    output_mode: StructuredOutputMode,
+) -> bool {
+    req.output_schema.is_some() && !output_mode.native && !output_mode.review_tool_loop
+}
+
+/// Wire description of the search entry while the native deferred channel is
+/// armed. Static text: it never lists the deferred tools themselves.
+const TOOL_SEARCH_WIRE_DESCRIPTION: &str = "Fetches full schema definitions for deferred tools so they can be called.\n\nDeferred tools appear by name in <system-reminder> messages. Until fetched, only the name is known \u{2014} there is no parameter schema, so calling the tool fails with InputValidationError. When any instruction, system reminder, or other tool's description names a deferred tool, fetch it with query \"select:<name>\" before calling it. This tool takes a query, matches it against the deferred tool list, and returns the matched tools' complete JSONSchema definitions inside a <functions> block. Once a tool's schema appears in that result, it is callable exactly like any tool defined at the top of the prompt.\n\nResult format: each matched tool appears as one <function>{\"description\": \"...\", \"name\": \"...\", \"parameters\": {...}}</function> line inside the <functions> block \u{2014} the same encoding as the tool list at the top of this prompt.\n\nQuery forms:\n- \"select:Read,Edit,Grep\" \u{2014} fetch these exact tools by name\n- \"notebook jupyter\" \u{2014} keyword search, up to max_results best matches\n- \"+slack send\" \u{2014} require \"slack\" in the name, rank by remaining terms";
+/// Header of the by-name announcement for the collapsed tool pool. Rides a
+/// system-reminder block on the trailing user turn, so the announcement
+/// costs no cached prefix and always reflects the current pool.
+const DEFERRED_ANNOUNCEMENT_HEADER: &str = "The following deferred tools are available via tool_search. Their schemas are NOT loaded. Use tool_search with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:";
+/// Load-when-needed guidance appended to the announcement list.
+const DEFERRED_ANNOUNCEMENT_GUIDANCE: &str = "When the step in front of you is one that an entry in this list is made for, and that tool is not loaded yet, load it as your next step. That holds even if you could do the step another way, with a general tool or in a plain-text reply. Loading runs nothing: it brings the tool's definition into the conversation, and you choose how to do the step once you have read it.";
+
 /// Which announcement variant the tool-change block channel renders with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolChangeMode {
@@ -1963,7 +1982,7 @@ async fn attempt_with_media_remediation(
                             raw.status,
                         );
                     }
-                    if downgrade_tool_protocol_body(&ctx, refusal, raw.status) {
+                    if downgrade_tool_protocol_body(ctx, refusal, raw.status) {
                         continue;
                     }
                 }
@@ -3132,16 +3151,47 @@ fn build_params_with_media_limits(
             .frozen_tools
             .as_ref()
             .is_some_and(|frozen| !frozen.is_empty());
+    // Surfaced deferred tools ride the native pairing channel (a marked
+    // registration plus the historical search references), so on wires with
+    // native deferred loading they leave both the immediate list and the
+    // inventory-event stream.
+    let is_surfaced_deferred = |name: &RuntimeString| {
+        defer_loading_supported
+            && req
+                .surfaced_deferred_names
+                .iter()
+                .any(|surfaced| surfaced == name)
+    };
+    let inventory_events: Vec<crate::types::provider::ToolInventoryEvent> = if frozen_active {
+        req.tool_inventory_events
+            .iter()
+            .map(|event| crate::types::provider::ToolInventoryEvent {
+                anchor_uuid: event.anchor_uuid.clone(),
+                added: event
+                    .added
+                    .iter()
+                    .filter(|spec| !is_surfaced_deferred(&spec.name))
+                    .cloned()
+                    .collect(),
+                removed: event
+                    .removed
+                    .iter()
+                    .filter(|name| !is_surfaced_deferred(name))
+                    .cloned()
+                    .collect(),
+            })
+            .filter(|event| !event.added.is_empty() || !event.removed.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut messages = to_api_messages(
         &req.messages,
         &diagnostic_string(&req.model),
         &req.tools,
-        if frozen_active {
-            &req.tool_inventory_events
-        } else {
-            &[]
-        },
+        &inventory_events,
         tool_change_mode == ToolChangeMode::ByValue,
+        defer_loading_supported && !structured_output_replaces_inventory(req, output_mode),
     );
     // Modern Claude models reject assistant message prefill (400 when the final
     // message has role="assistant"). Ensure empty-input continuations after a
@@ -3166,6 +3216,35 @@ fn build_params_with_media_limits(
             ),
         ]));
     }
+    // Collapsed deferred tools are announced by name: a bare sorted list plus
+    // load guidance, wrapped as a system reminder on the trailing user turn.
+    // The trailing turn is the freshest bytes of the request, so the always
+    // current list costs no cached prefix, and unlocked tools drop off it as
+    // their marked registrations take over.
+    if defer_loading_supported
+        && !req.deferred_tools.is_empty()
+        && !structured_output_replaces_inventory(req, output_mode)
+    {
+        if let Some(last_user) = messages.iter_mut().rev().find(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+        }) {
+            let mut text = RuntimeString::from("<system-reminder>\n")
+                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_HEADER));
+            for spec in &req.deferred_tools {
+                text = text.concat(&RuntimeString::from("\n")).concat(&spec.name);
+            }
+            text = text
+                .concat(&RuntimeString::from("\n\n"))
+                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE))
+                .concat(&RuntimeString::from("\n</system-reminder>"));
+            if let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut) {
+                blocks.push(vobj(vec![("type", vs("text")), ("text", vs(text))]));
+            }
+        }
+    }
     // The final per-image ceiling precedes aggregate shedding. Otherwise an
     // invalid historical image could be silently discarded instead of refused.
     validate_final_images(&messages, image_limits.max_base64_chars)?;
@@ -3181,8 +3260,30 @@ fn build_params_with_media_limits(
             .map(to_api_tool)
             .collect()
     } else {
-        req.tools.iter().map(to_api_tool).collect()
+        req.tools
+            .iter()
+            .filter(|spec| !is_surfaced_deferred(&spec.name))
+            .map(to_api_tool)
+            .collect()
     };
+    // While the native deferred channel is armed, the search entry carries the
+    // static protocol description; it never lists the deferred tools.
+    if defer_loading_supported {
+        for tool in tools.iter_mut() {
+            if tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "tool_search")
+            {
+                if let Some(object) = tool.as_object_mut() {
+                    object.insert(
+                        "description",
+                        vs(RuntimeString::from(TOOL_SEARCH_WIRE_DESCRIPTION)),
+                    );
+                }
+            }
+        }
+    }
     let mut tool_choice: Option<Value> = req.tool_choice.as_ref().map(to_api_tool_choice);
     let mut structured_replacement = false;
 
@@ -3231,26 +3332,41 @@ fn build_params_with_media_limits(
         cache_scope_enabled,
     );
 
-    // Native deferred tool loading: not-yet-surfaced definitions ride along
-    // marked `defer_loading` so a supporting model can pull them in without
-    // paying their context cost up front. Appended AFTER cache breakpoints so
-    // the breakpoint stays on the last immediate tool and the cached prefix
-    // does not shift. Skipped when a forced structured-output tool replaced
-    // the whole inventory, and under the inline tool-change protocol where the
-    // frozen baseline already anchors the scaffolding via the placeholder.
-    if defer_loading_supported && !req.deferred_tools.is_empty() && !structured_replacement {
-        if tools.is_empty() {
+    // Native deferred tool loading: folded (not-yet-unlocked) definitions
+    // never ride the wire at all — the search channel announces them by name
+    // and the model pulls schemas on demand. Only UNLOCKED (surfaced) tools
+    // register here, marked `defer_loading` so the server pairs them with the
+    // historical search references and renders each definition at its
+    // reference position instead of the standing header. Appended AFTER the
+    // cache breakpoints so the breakpoint stays on the last immediate tool and
+    // the cached prefix does not shift; the mark is never removed while the
+    // tool stays unlocked. Skipped when a forced structured-output tool
+    // replaced the whole inventory.
+    if defer_loading_supported && !structured_replacement {
+        let marked: Vec<Value> =
+            req.tools
+                .iter()
+                .filter(|spec| {
+                    is_surfaced_deferred(&spec.name)
+                        && !(frozen_active
+                            && req.frozen_tools.as_ref().is_some_and(|frozen| {
+                                frozen.iter().any(|base| base.name == spec.name)
+                            }))
+                })
+                .map(|spec| {
+                    let mut tool = to_api_tool(spec);
+                    if let Some(object) = tool.as_object_mut() {
+                        object.insert("defer_loading", Value::Bool(true));
+                    }
+                    tool
+                })
+                .collect();
+        if tools.is_empty() && marked.is_empty() && !req.deferred_tools.is_empty() {
             // Nothing immediate to bootstrap from: promote the deferred
             // definitions instead of sending an all-deferred inventory.
             tools.extend(req.deferred_tools.iter().map(to_api_tool));
         } else {
-            tools.extend(req.deferred_tools.iter().map(|spec| {
-                let mut tool = to_api_tool(spec);
-                if let Some(object) = tool.as_object_mut() {
-                    object.insert("defer_loading", Value::Bool(true));
-                }
-                tool
-            }));
+            tools.extend(marked);
         }
     }
 
@@ -3260,17 +3376,15 @@ fn build_params_with_media_limits(
     // blocks carry name-only references the server pairs them with.
     if frozen_active && tool_change_mode == ToolChangeMode::ByReference && !structured_replacement {
         let baseline = req.frozen_tools.as_ref().expect("checked above");
-        let visible = crate::engine::query::request::fold_tool_inventory(
-            baseline,
-            &req.tool_inventory_events,
-        );
+        let visible =
+            crate::engine::query::request::fold_tool_inventory(baseline, &inventory_events);
         for spec in visible
             .iter()
             .filter(|spec| !baseline.iter().any(|base| base.name == spec.name))
         {
             let mut tool = to_api_tool(spec);
             if let Some(object) = tool.as_object_mut() {
-                object.insert("defer_loading".to_string(), Value::Bool(true));
+                object.insert("defer_loading", Value::Bool(true));
             }
             tools.push(tool);
         }
@@ -3968,16 +4082,30 @@ fn refused_beta_capability(status: Option<u16>, message: &str) -> Option<&'stati
     None
 }
 
-/// Strip every `defer_loading`-marked entry from the top-level tool list.
-/// Returns whether anything was removed.
-fn strip_defer_loading_tools(body: &mut Value) -> bool {
+/// Downgrade the native deferred registrations in the top-level tool list:
+/// the never-activated placeholder drops, and every other `defer_loading`
+/// entry converts to an immediate declaration (the mark is removed, the tool
+/// stays available). Returns whether anything changed.
+fn downgrade_deferred_registrations(body: &mut Value) -> bool {
     let mut changed = false;
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         tools.retain(|tool| {
-            let deferred = tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
-            changed |= deferred;
-            !deferred
+            let is_placeholder = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == DEFERRED_PLACEHOLDER_TOOL);
+            changed |= is_placeholder;
+            !is_placeholder
         });
+        for tool in tools.iter_mut() {
+            let deferred = tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
+            if deferred {
+                if let Some(object) = tool.as_object_mut() {
+                    object.remove("defer_loading");
+                }
+                changed = true;
+            }
+        }
     }
     changed
 }
@@ -4003,20 +4131,20 @@ fn rebuild_inline_values_as_references(body: &mut Value) -> bool {
                 continue;
             };
             for block in blocks.iter_mut() {
-                if !block
+                if block
                     .get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|tag| tag == "tool_addition")
+                    .is_none_or(|tag| tag != "tool_addition")
                 {
                     continue;
                 }
                 let Some(tool) = block.get_mut("tool") else {
                     continue;
                 };
-                if !tool
+                if tool
                     .get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|tag| tag == "tool_definition")
+                    .is_none_or(|tag| tag != "tool_definition")
                 {
                     continue;
                 }
@@ -4054,6 +4182,52 @@ fn rebuild_inline_values_as_references(body: &mut Value) -> bool {
     true
 }
 
+/// Replace reference-only search results with their plain-text equivalent.
+/// Used when the endpoint refuses the native reference blocks: the search
+/// channel is learned off and results fall back to the recorded text shape.
+fn rebuild_reference_results_as_text(body: &mut Value) -> bool {
+    let mut rebuilt = false;
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    for message in messages.iter_mut() {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|tag| tag != "tool_result")
+            {
+                continue;
+            }
+            let Some(content) = block.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let names: Vec<RuntimeString> = content
+                .iter()
+                .filter(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tag| tag == "tool_reference")
+                })
+                .filter_map(|item| item.get("name").and_then(Value::as_str).cloned())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let mut text = RuntimeString::from("These tools are now available:");
+            for name in &names {
+                text = text.concat(&RuntimeString::from("\n- ")).concat(name);
+            }
+            *content = vec![vobj(vec![("type", vs("text")), ("text", vs(text))])];
+            rebuilt = true;
+        }
+    }
+    rebuilt
+}
+
 /// Apply the classified downgrade to the serialized body. Returns whether the
 /// body changed and the attempt should re-run.
 fn downgrade_tool_protocol_body(
@@ -4082,48 +4256,55 @@ fn downgrade_tool_protocol_body(
             // learned: the situation is request-bound (an oversized definition
             // batch, a late block position), not an endpoint capability.
             let mut body = ctx.body.lock_recover();
-            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
-                || strip_defer_loading_tools(&mut body);
+            let rebuilt = rebuild_without_inline_tool_blocks(&mut body);
             if rebuilt {
                 record("tool-change-scenario");
             }
             rebuilt
         }
         ToolProtocolRefusal::ValueUnsupported => {
-            learn(INLINE_TOOLS_CAPABILITY);
-            let mut body = ctx.body.lock_recover();
-            if rebuild_inline_values_as_references(&mut body) {
-                record("inline-values-to-references");
-                return true;
+            {
+                let mut body = ctx.body.lock_recover();
+                if rebuild_inline_values_as_references(&mut body) {
+                    learn(INLINE_TOOLS_CAPABILITY);
+                    record("inline-values-to-references");
+                    return true;
+                }
             }
-            // Nothing by value to convert: fall back to folding the channel.
-            learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
-            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
-                || strip_defer_loading_tools(&mut body);
-            if rebuilt {
-                record("tool-change-blocks");
-            }
-            rebuilt
+            // Nothing by value to convert: fall back to the channel-level
+            // cascade, which learns only what the body actually carries.
+            downgrade_tool_protocol_body(ctx, ToolProtocolRefusal::BlocksUnsupported, status)
         }
         ToolProtocolRefusal::PlatformUnsupported | ToolProtocolRefusal::BlocksUnsupported => {
-            learn(INLINE_TOOLS_CAPABILITY);
-            learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
+            // Learn only the surface the body actually carries: block
+            // artifacts fold into the top-level list; without them the
+            // refusal can only target the deferred registrations, which
+            // convert to immediate declarations. With neither surface on
+            // the wire nothing is learned and ordinary error handling
+            // proceeds.
             let mut body = ctx.body.lock_recover();
-            let rebuilt = rebuild_without_inline_tool_blocks(&mut body)
-                || strip_defer_loading_tools(&mut body);
-            if rebuilt {
+            if rebuild_without_inline_tool_blocks(&mut body) {
+                learn(INLINE_TOOLS_CAPABILITY);
+                learn(TOOL_CHANGE_BLOCKS_CAPABILITY);
                 record("tool-change-blocks");
+                return true;
             }
-            rebuilt
+            if downgrade_deferred_registrations(&mut body) {
+                learn("");
+                record("defer-loading");
+                return true;
+            }
+            false
         }
         ToolProtocolRefusal::DeferUnsupported => {
             learn("");
             let mut body = ctx.body.lock_recover();
-            let rebuilt = strip_defer_loading_tools(&mut body);
-            if rebuilt {
+            let references = rebuild_reference_results_as_text(&mut body);
+            let downgraded = downgrade_deferred_registrations(&mut body);
+            if references || downgraded {
                 record("defer-loading");
             }
-            rebuilt
+            references || downgraded
         }
     }
 }
@@ -4135,6 +4316,7 @@ fn to_api_messages(
     tools: &[ToolSpec],
     inventory_events: &[crate::types::provider::ToolInventoryEvent],
     by_value: bool,
+    reference_results: bool,
 ) -> Vec<Value> {
     let behavior_profile = resolve_provider_behavior_profile(
         Some(&ProviderInfo {
@@ -4176,7 +4358,7 @@ fn to_api_messages(
                     let Message::ToolResult(tr) = &messages[i] else {
                         break;
                     };
-                    content.push(tool_result_msg_block(tr));
+                    content.push(tool_result_msg_block(tr, reference_results));
                     if let Some(extra) = &tr.extra_user_blocks {
                         for eb in extra {
                             deferred.extend(map_block(eb, tools));
@@ -4600,8 +4782,39 @@ fn map_output_block(b: &OutputBlock) -> Value {
     }
 }
 
-fn tool_result_msg_block(tr: &ToolResultMessage) -> Value {
-    let content: Vec<Value> = tr.content.iter().map(map_output_block).collect();
+fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Value {
+    // A successful native search result replays as name-only reference blocks:
+    // the server pairs each reference with the matching `defer_loading`
+    // registration in the tool list and renders the definition at the
+    // reference position. Without the native channel the recorded text rides
+    // instead.
+    let references = reference_results
+        && !tr.is_error
+        && tr.tool_kind == Some(crate::types::provider::ProviderToolCallKind::ToolSearch)
+        && tr
+            .native_tool_output
+            .as_ref()
+            .and_then(|output| output.get("matched"))
+            .and_then(Value::as_array)
+            .is_some_and(|matched| !matched.is_empty());
+    let content: Vec<Value> = if references {
+        tr.native_tool_output
+            .as_ref()
+            .and_then(|output| output.get("matched"))
+            .and_then(Value::as_array)
+            .expect("checked above")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|name| {
+                vobj(vec![
+                    ("type", vs("tool_reference")),
+                    ("name", vs(name.clone())),
+                ])
+            })
+            .collect()
+    } else {
+        tr.content.iter().map(map_output_block).collect()
+    };
     vobj(vec![
         ("type", vs("tool_result")),
         ("tool_use_id", vs(tr.tool_use_id.clone())),
@@ -5413,6 +5626,143 @@ mod tests {
         assert!(!rebuild_inline_values_as_references(&mut body));
     }
 
+    fn search_result_message(names: &[&str]) -> Message {
+        use crate::runtime_values::{RuntimeJson, RuntimeObject};
+        let matched: Vec<RuntimeJson> = names
+            .iter()
+            .map(|name| RuntimeJson::String(RuntimeString::from(*name)))
+            .collect();
+        let mut output = RuntimeObject::new();
+        output.insert("matched", RuntimeJson::Array(matched));
+        Message::ToolResult(ToolResultMessage {
+            uuid: "tr1".into(),
+            tool_use_id: "call-1".into(),
+            content: vec![crate::schemas::content::OutputBlock::Text(
+                crate::schemas::content::TextBlock {
+                    text: "These tools are now available:\n- mcp__alpha__one".into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                },
+            )],
+            is_error: false,
+            tool_kind: Some(crate::types::provider::ProviderToolCallKind::ToolSearch),
+            native_tool_output: Some(RuntimeJson::Object(output)),
+            output: None,
+            extra_user_blocks: None,
+        })
+    }
+
+    #[test]
+    fn native_search_results_replay_as_reference_blocks_when_the_channel_is_armed() {
+        use crate::runtime_values::{runtime_json, RuntimeJson};
+        let assistant = Message::Assistant(crate::schemas::message::AssistantMessage {
+            uuid: "a1".into(),
+            content: vec![crate::schemas::content::ContentBlock::ToolUse(
+                crate::schemas::content::ToolUseBlock {
+                    id: "call-1".into(),
+                    name: "tool_search".into(),
+                    input: runtime_json::parse(&RuntimeString::from(
+                        "{\"query\":\"select:mcp__alpha__one\"}",
+                    ))
+                    .unwrap(),
+                    tool_kind: Some(crate::types::provider::ProviderToolCallKind::ToolSearch),
+                    thought_signature: None,
+                },
+            )],
+            model: "claude-sonnet-5-5".into(),
+            usage: None,
+        });
+        let messages = vec![
+            user_msg("find it"),
+            assistant,
+            search_result_message(&["mcp__alpha__one"]),
+        ];
+        let out = to_api_messages(&messages, "claude-sonnet-5-5", &[], &[], true, true);
+        let result_message = out
+            .iter()
+            .find(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|tag| tag == "tool_result")
+                        })
+                    })
+            })
+            .expect("tool_result message");
+        let blocks = result_message
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap();
+        let result_block = blocks
+            .iter()
+            .find(|block| {
+                block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "tool_result")
+            })
+            .unwrap();
+        let content = result_block
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").unwrap(),
+            &exact_json!("tool_reference")
+        );
+        assert_eq!(
+            content[0].get("name").unwrap(),
+            &exact_json!("mcp__alpha__one")
+        );
+
+        // Without the native channel the recorded text rides instead.
+        let out = to_api_messages(&messages, "claude-sonnet-5-5", &[], &[], true, false);
+        let serialized = runtime_json::stringify(&RuntimeJson::Array(out))
+            .try_to_utf8()
+            .unwrap();
+        assert!(serialized.contains("These tools are now available"));
+        assert!(!serialized.contains("tool_reference"));
+    }
+
+    #[test]
+    fn rebuild_reference_results_restores_the_text_shape() {
+        let mut body = vobj(vec![(
+            "messages",
+            Value::Array(vec![vobj(vec![
+                ("role", vs("user")),
+                (
+                    "content",
+                    Value::Array(vec![vobj(vec![
+                        ("type", vs("tool_result")),
+                        ("tool_use_id", vs("call-1")),
+                        (
+                            "content",
+                            Value::Array(vec![vobj(vec![
+                                ("type", vs("tool_reference")),
+                                ("name", vs("mcp__alpha__one")),
+                            ])]),
+                        ),
+                    ])]),
+                ),
+            ])]),
+        )]);
+        assert!(rebuild_reference_results_as_text(&mut body));
+        let serialized = runtime_json::stringify(&body).try_to_utf8().unwrap();
+        assert!(serialized.contains("These tools are now available"));
+        assert!(serialized.contains("mcp__alpha__one"));
+        assert!(!serialized.contains("tool_reference"));
+        // Idempotent: no reference blocks remain.
+        assert!(!rebuild_reference_results_as_text(&mut body));
+    }
+
     #[test]
     fn refused_beta_headers_map_to_their_capability_keys() {
         assert_eq!(
@@ -5448,10 +5798,7 @@ mod tests {
 
     #[test]
     fn tool_protocol_refusals_classify_by_wording() {
-        let classify = |status, message: &str| {
-            classify_tool_protocol_refusal(status, message)
-                .map(|(refusal, header)| (refusal, header))
-        };
+        let classify = |status, message: &str| classify_tool_protocol_refusal(status, message);
         // Platform-wide unavailability kills the whole block channel.
         assert_eq!(
             classify(
@@ -5511,7 +5858,7 @@ mod tests {
                     summary: RuntimeString::from(summary),
                 },
             )];
-            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[], &[], true);
+            let out = to_api_messages(&messages, "claude-sonnet-4-6", &[], &[], true, false);
             let expected_text = RuntimeString::from(format!(
                 "<system-reminder>\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nEarlier conversation summary:\n{summary}\n</system-reminder>"
             ));
@@ -5545,7 +5892,7 @@ mod tests {
         })];
 
         assert_eq!(
-            to_api_messages(&messages, "claude-opus-4-8", &[], &[], true),
+            to_api_messages(&messages, "claude-opus-4-8", &[], &[], true, false),
             vec![exact_json!({
                 "role": "user",
                 "content": [{
@@ -5574,6 +5921,7 @@ mod tests {
             tools: vec![],
             native_deferred_tools: None,
             deferred_tools: vec![],
+            surfaced_deferred_names: Vec::new(),
             wire_caps: None,
             frozen_tools: None,
             frozen_instructions: None,
@@ -5948,26 +6296,39 @@ mod tests {
     }
 
     #[test]
-    fn deferred_tools_ride_after_the_cache_breakpoint_when_supported() {
+    fn folded_definitions_never_ride_and_unlocked_ones_register_marked() {
+        // Folded (not-yet-unlocked) definitions are zero bytes on the wire:
+        // the search channel announces them by name instead.
         let tools = deferred_wire_tools(&deferred_req(), false, true);
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), &exact_json!("read"));
+        assert!(tools[0].get("defer_loading").is_none());
+        assert!(tools[0].get("cache_control").is_some());
+
+        // An unlocked tool registers after the breakpoint marked
+        // `defer_loading`, so the server pairs it with the historical search
+        // references and the cached prefix does not shift.
+        let mut req = deferred_req();
+        req.surfaced_deferred_names = vec!["mcp__alpha__one".into()];
+        req.tools.push(deferred_spec("mcp__alpha__one"));
+        let tools = deferred_wire_tools(&req, false, true);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].get("name").unwrap(), &exact_json!("read"));
         assert!(tools[0].get("defer_loading").is_none());
         // The cache breakpoint stays on the last immediate tool, never on a
-        // deferred definition appended behind it.
+        // marked registration appended behind it.
         assert!(tools[0].get("cache_control").is_some());
-        for tool in &tools[1..] {
-            assert_eq!(tool.get("defer_loading").unwrap(), &exact_json!(true));
-            assert!(tool.get("cache_control").is_none());
-        }
         assert_eq!(
             tools[1].get("name").unwrap(),
             &exact_json!("mcp__alpha__one")
         );
-        assert_eq!(
-            tools[2].get("name").unwrap(),
-            &exact_json!("mcp__alpha__two")
-        );
+        assert_eq!(tools[1].get("defer_loading").unwrap(), &exact_json!(true));
+        assert!(tools[1].get("cache_control").is_none());
+        // The still-folded sibling never appears.
+        assert!(tools.iter().all(|tool| tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| name != "mcp__alpha__two")));
     }
 
     #[test]
@@ -6685,7 +7046,7 @@ mod tests {
             })
         };
         let msgs = vec![tr("a"), tr("b")];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true, false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get("role").unwrap(), &exact_json!("user"));
         let content = out[0].get("content").unwrap().as_array().unwrap();
@@ -6716,7 +7077,7 @@ mod tests {
                 }),
             ],
         })];
-        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true);
+        let out = to_api_messages(&msgs, "claude-opus-4-8", &[], &[], true, false);
         let content = out[0].get("content").unwrap().as_array().unwrap();
         // The trailing thinking block is stripped; only the text remains.
         assert_eq!(content.len(), 1);
@@ -7838,7 +8199,7 @@ mod empty_text_thinking_replay {
             ),
             tr("t1", 2),
         ];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true, false);
         let blocks = out[1].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")
@@ -7863,7 +8224,7 @@ mod empty_text_thinking_replay {
             "claude-opus-5-5",
             vec![think("SIG", "reasoning text"), tool_use("t1")],
         )];
-        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true);
+        let out = to_api_messages(&messages, "claude-opus-5-5", &[], &[], true, false);
         let blocks = out[0].get("content").unwrap().as_array().unwrap();
         let kind = |v: &Value| {
             v.get("type")

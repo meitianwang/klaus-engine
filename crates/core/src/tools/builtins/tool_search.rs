@@ -25,7 +25,13 @@ use crate::types::tool::{
 };
 
 /// Default number of results `tool_search` returns.
-pub(crate) const DEFAULT_MAX_RESULTS: usize = 8;
+pub(crate) const DEFAULT_MAX_RESULTS: usize = 5;
+/// Query byte ceiling: longer queries are rejected before scoring.
+const QUERY_MAX_BYTES: usize = 16_384;
+/// Query word ceiling.
+const QUERY_MAX_WORDS: usize = 32;
+/// Ceiling on names in one `select:` list.
+const SELECT_MAX_NAMES: usize = 64;
 /// Default tool-count threshold above which tools are deferred.
 const DEFAULT_THRESHOLD: usize = 30;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -166,6 +172,24 @@ fn parse_tool_search_input(input: &Json) -> Result<Json, ToolError> {
     let mut issues = Vec::new();
     match object.get("query") {
         Some(value @ Json::String(_)) => {
+            if let Some(query) = value.as_str().and_then(|q| q.try_to_utf8().ok()) {
+                if query.len() > QUERY_MAX_BYTES {
+                    issues.push(format!(
+                        "Invalid arguments: query: Invalid input: query exceeds {QUERY_MAX_BYTES} bytes"
+                    ));
+                } else if query.split_whitespace().count() > QUERY_MAX_WORDS {
+                    issues.push(format!(
+                        "Invalid arguments: query: Invalid input: query exceeds {QUERY_MAX_WORDS} words"
+                    ));
+                } else if let Some(names) = query.trim().strip_prefix("select:") {
+                    let count = names.split(',').filter(|n| !n.trim().is_empty()).count();
+                    if count > SELECT_MAX_NAMES {
+                        issues.push(format!(
+                            "Invalid arguments: query: Invalid input: select: list exceeds {SELECT_MAX_NAMES} names"
+                        ));
+                    }
+                }
+            }
             parsed.insert("query", value.clone());
         }
         Some(value) => {
@@ -724,7 +748,7 @@ fn format_selection_result(
         );
     }
     if !missing.is_empty() {
-        lines.push(RuntimeString::from("No matching tools found for:"));
+        lines.push(RuntimeString::from("No matching deferred tools found for:"));
         lines.extend(
             missing
                 .iter()
@@ -732,7 +756,7 @@ fn format_selection_result(
         );
     }
     if lines.is_empty() {
-        RuntimeString::from("No matching tools found.")
+        RuntimeString::from("No matching deferred tools found")
     } else {
         join_runtime(&lines, "\n")
     }
@@ -936,7 +960,7 @@ pub(crate) fn resolve_tool_search(
         .map(|tool| to_search_output_tool(tool))
         .collect::<Vec<_>>();
     let text = if matched.is_empty() {
-        RuntimeString::from("No matching tools found.")
+        RuntimeString::from("No matching deferred tools found")
     } else {
         let mut lines = vec![RuntimeString::from("These tools are now available:")];
         lines.extend(selected.iter().map(|tool| {
@@ -2030,7 +2054,7 @@ mod tests {
             res.serializable.output,
             rjson!({ "matched": [], "tools": [] })
         );
-        assert_eq!(text_of(&res), "No matching tools found.");
+        assert_eq!(text_of(&res), "No matching deferred tools found");
         assert!(surfaced.lock().unwrap().is_empty());
     }
 
@@ -2114,7 +2138,7 @@ mod tests {
         assert_eq!(*surfaced.lock().unwrap(), vec!["alpha"]);
         assert_eq!(
             text_of(&res),
-            "These tools are now available:\n- alpha: alpha description\nThese tools were already available:\n- beta\nNo matching tools found for:\n- missing"
+            "These tools are now available:\n- alpha: alpha description\nThese tools were already available:\n- beta\nNo matching deferred tools found for:\n- missing"
         );
     }
 
@@ -2753,8 +2777,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_limit_caps_keyword_results_at_eight() {
-        assert_eq!(DEFAULT_MAX_RESULTS, 8);
+    async fn default_limit_caps_keyword_results_at_five() {
+        assert_eq!(DEFAULT_MAX_RESULTS, 5);
         let tool = create_tool_search_tool(None);
         let mut ctx = mk_ctx();
         let catalog = (0..10)
@@ -2771,8 +2795,8 @@ mod tests {
         let res = call_search(&tool, &ctx, rjson!({ "query": "deploy" })).await;
 
         let matched = res.serializable.output["matched"].as_array().unwrap();
-        assert_eq!(matched.len(), 8);
-        assert_eq!(surfaced.lock().unwrap().len(), 8);
+        assert_eq!(matched.len(), 5);
+        assert_eq!(surfaced.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]

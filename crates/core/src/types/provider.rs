@@ -895,6 +895,11 @@ pub struct ModelRequest {
     /// Internal only: ordinary decoded requests leave it unset.
     pub frozen_instructions: Option<RuntimeString>,
     pub deferred_tools: Vec<ToolSpec>,
+    /// Names of deferred-exposure tools already surfaced via `tool_search`.
+    /// Wires with native deferred loading render them as marked registrations
+    /// instead of immediate declarations. Internal only: ordinary decoded
+    /// requests leave it empty.
+    pub surfaced_deferred_names: Vec<RuntimeString>,
     pub tool_choice: Option<ToolChoice>,
     pub max_output_tokens: u64,
     /// Agentic task budget (Anthropic task-budgets beta): the output-token
@@ -1062,6 +1067,7 @@ impl RuntimeDecode for ModelRequest {
                 tools: object.required("tools", &[])?,
                 native_deferred_tools: None,
                 deferred_tools: Vec::new(),
+                surfaced_deferred_names: Vec::new(),
                 wire_caps: None,
                 frozen_tools: None,
                 frozen_instructions: None,

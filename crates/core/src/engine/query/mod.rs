@@ -71,6 +71,7 @@ mod support;
 pub(super) mod tool_dispatch;
 mod tool_tasks;
 pub(crate) use tool_dispatch::gate_request_images;
+pub(crate) use tool_dispatch::tool_not_loaded_message;
 pub use tool_tasks::RetainedToolTasks;
 mod turn;
 
@@ -1040,6 +1041,10 @@ struct ResolvedToolCall {
     /// Recorded output of a provider-executed native tool search. The engine
     /// never runs such a call; it persists the pair for verbatim replay.
     server_output: Option<RuntimeJson>,
+    /// A deferred-exposure tool called while still collapsed: not surfaced by
+    /// any search and not visible on this request's wire. Refused with load
+    /// guidance instead of executed.
+    not_loaded: bool,
 }
 
 impl ResolvedToolCall {
@@ -1056,6 +1061,7 @@ impl ResolvedToolCall {
             approval_call_source: Default::default(),
             profile,
             server_output: None,
+            not_loaded: false,
         }
     }
 
@@ -1075,6 +1081,7 @@ impl ResolvedToolCall {
             approval_call_source: Default::default(),
             profile,
             server_output: None,
+            not_loaded: false,
         }
     }
 

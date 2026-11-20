@@ -8155,6 +8155,7 @@ mod tests {
             tools: vec![],
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
+            surfaced_deferred_names: Vec::new(),
             wire_caps: None,
             frozen_tools: None,
             frozen_instructions: None,
@@ -9240,16 +9241,20 @@ mod tests {
     fn declared_capabilities_override_the_offline_shape_classification() {
         // A custom-endpoint model whose backend declares the batch protocol
         // rides the batch shape even though no offline list names it.
-        let mut caps = ModelCapabilities::default();
-        caps.additional_tools = Some(true);
-        caps.mid_convo_system_messages = Some(true);
+        let caps = ModelCapabilities {
+            additional_tools: Some(true),
+            mid_convo_system_messages: Some(true),
+            ..Default::default()
+        };
         let body = matrix_body("my-custom-responses-model", true, &caps);
         assert!(body.get("tools").is_none());
         assert_eq!(body["input"][0]["type"], json!("additional_tools"));
         // An explicit negative declaration pulls a catalog batch model back to
         // the eager top-level shape (the same lever the learning layer uses).
-        let mut caps = ModelCapabilities::default();
-        caps.additional_tools = Some(false);
+        let caps = ModelCapabilities {
+            additional_tools: Some(false),
+            ..Default::default()
+        };
         let body = matrix_body("gpt-6.2-sol", true, &caps);
         assert!(body["tools"].as_array().is_some());
         assert_eq!(body["input"][0]["role"], json!("developer"));
