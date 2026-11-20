@@ -69,6 +69,36 @@ impl PromptCatalogKey {
     }
 }
 
+/// The model identity without an in-source selection suffix.
+///
+/// Aggregating routes identify one selection as `<model>[k=v,…]` and may add a
+/// trailing `@<mode>` tag after it. Catalog packs describe the model, so a key
+/// that carries those decorations still resolves the pack of the same model.
+/// The undecorated key is only consulted when no binding matches the exact
+/// key, which keeps route- or variant-specific bindings authoritative.
+pub fn canonical_model_key(model: &RuntimeString) -> RuntimeString {
+    let units = model.as_utf16();
+    let mut end = units.len();
+    if let Some(at) = units.iter().rposition(|unit| *unit == u16::from(b'@')) {
+        if at > 0 && at + 1 < units.len() && units[at - 1] == u16::from(b']') {
+            end = at;
+        }
+    }
+    if end > 0 && units[end - 1] == u16::from(b']') {
+        if let Some(open) = units[..end - 1]
+            .iter()
+            .rposition(|unit| *unit == u16::from(b'['))
+        {
+            end = open;
+        }
+    }
+    if end == units.len() {
+        model.clone()
+    } else {
+        model.slice_utf16(..end)
+    }
+}
+
 /// The resolution layer a slot value came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragmentLayer {

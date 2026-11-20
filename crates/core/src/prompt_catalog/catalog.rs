@@ -502,7 +502,18 @@ impl PromptCatalog {
     /// The binding whose key matches, if any. First match wins; decode-time
     /// validation rejects duplicate identical keys.
     pub fn binding(&self, key: &super::resolve::PromptCatalogKey) -> Option<&CatalogBinding> {
-        self.bindings.iter().find(|binding| binding.matches(key))
+        if let Some(exact) = self.bindings.iter().find(|binding| binding.matches(key)) {
+            return Some(exact);
+        }
+        let canonical = super::resolve::canonical_model_key(&key.model_key);
+        if canonical == key.model_key {
+            return None;
+        }
+        let mut canonical_key = key.clone();
+        canonical_key.model_key = canonical;
+        self.bindings
+            .iter()
+            .find(|binding| binding.matches(&canonical_key))
     }
 
     /// An empty but valid catalog: no profiles beyond nothing, no bindings.

@@ -1391,7 +1391,10 @@ fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
     assert_ne!(astra.base_instructions(), generic);
     assert_ne!(sol.base_instructions(), astra.base_instructions());
     // Models sharing one template share one fragment.
-    assert_eq!(five_six_terra.base_instructions(), five_six.base_instructions());
+    assert_eq!(
+        five_six_terra.base_instructions(),
+        five_six.base_instructions()
+    );
     assert_eq!(
         sol.resolved()
             .provenance(SLOT_BASE_INSTRUCTIONS)
@@ -1401,9 +1404,26 @@ fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
 
     // Same confirmed model through another route resolves the same pack
     // (sourceKind "*" bindings): cross-entry sharing with per-model identity.
-    let via_other_route =
-        ModelFragments::for_route(&RuntimeString::from("gpt-6.2-sol"), Some("cursor"), None);
-    assert_eq!(via_other_route.base_instructions(), sol.base_instructions());
+    // Aggregating routes carry the selected parameters inside the model key, so
+    // the decorated key must reach the same pack as the bare model id.
+    for selection in [
+        "gpt-6.2-sol",
+        "gpt-6.2-sol[context=1m,fast=false,reasoning=high]@max",
+        "gpt-5.6-sol[context=272k,fast=true,reasoning=none]",
+    ] {
+        let via_other_route =
+            ModelFragments::for_route(&RuntimeString::from(selection), Some("cursor"), None);
+        let expected = if selection.starts_with("gpt-6.2-sol") {
+            sol.base_instructions()
+        } else {
+            five_six.base_instructions()
+        };
+        assert_eq!(
+            via_other_route.base_instructions(),
+            expected,
+            "decorated selection {selection} must resolve its model pack"
+        );
+    }
 
     // Commentary follows the model's own group text, not the generic pack.
     assert_ne!(
@@ -1466,6 +1486,75 @@ fn model_pack_base_keeps_klaus_identity_and_tool_vocabulary() {
     ] {
         assert!(base.contains(expected), "converted base misses {expected}");
     }
+}
+
+#[test]
+fn decorated_model_key_prefers_exact_binding_and_falls_back_to_identity() {
+    let catalog = parse(
+        r#"{
+          "schemaVersion": 2,
+          "revision": "catalog-decorated",
+          "fragments": {
+            "base-generic": "generic pack",
+            "base-canonical": "canonical pack",
+            "base-exact": "exact decorated pack"
+          },
+          "profiles": {
+            "klaus/default": {
+              "modelMessages": { "base.instructions": { "ref": "base-generic" } }
+            },
+            "fixture/canonical": {
+              "extends": "klaus/default",
+              "modelMessages": { "base.instructions": { "ref": "base-canonical" } }
+            },
+            "fixture/exact": {
+              "extends": "klaus/default",
+              "modelMessages": { "base.instructions": { "ref": "base-exact" } }
+            }
+          },
+          "bindings": [
+            {
+              "sourceKind": "cursor", "sourceScope": "*", "modelKey": "mapped-a",
+              "variantKey": "standard", "profileRef": "fixture/canonical"
+            },
+            {
+              "sourceKind": "cursor", "sourceScope": "*",
+              "modelKey": "mapped-a[context=1m]@max",
+              "variantKey": "standard", "profileRef": "fixture/exact"
+            }
+          ]
+        }"#,
+    );
+    let exact = resolve(
+        &catalog,
+        &key("cursor", "", "mapped-a[context=1m]@max", "standard"),
+        None,
+        None,
+    );
+    assert_eq!(
+        text_of(&exact, SLOT_BASE_INSTRUCTIONS).as_deref(),
+        Some("exact decorated pack")
+    );
+    let canonical = resolve(
+        &catalog,
+        &key("cursor", "", "mapped-a[context=272k]", "standard"),
+        None,
+        None,
+    );
+    assert_eq!(
+        text_of(&canonical, SLOT_BASE_INSTRUCTIONS).as_deref(),
+        Some("canonical pack")
+    );
+    let unbound = resolve(
+        &catalog,
+        &key("cursor", "", "other[context=272k]@max", "standard"),
+        None,
+        None,
+    );
+    assert_eq!(
+        text_of(&unbound, SLOT_BASE_INSTRUCTIONS).as_deref(),
+        Some("generic pack")
+    );
 }
 
 #[test]
