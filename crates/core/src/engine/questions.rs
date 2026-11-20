@@ -590,6 +590,27 @@ impl AsyncQuestionRegistry {
         }
     }
 
+    pub fn has_pending_for_turn(&self, turn_id: &RuntimeString) -> bool {
+        let turns = self.turns.lock().unwrap_or_else(|error| error.into_inner());
+        turns.get(turn_id).is_some_and(|turn| {
+            turn.open
+                && !turn.signal.is_cancelled()
+                && turn
+                    .requests
+                    .iter()
+                    .any(|request| request.state != "answered")
+        })
+    }
+
+    pub fn has_ready_for_turn(&self, turn_id: &RuntimeString) -> bool {
+        let turns = self.turns.lock().unwrap_or_else(|error| error.into_inner());
+        turns.get(turn_id).is_some_and(|turn| {
+            turn.pending
+                .front()
+                .is_some_and(|id| turn.submissions.get(id).is_some_and(|answer| answer.ready))
+        })
+    }
+
     pub fn take_ready(&self, turn_id: &RuntimeString) -> Vec<UserMessage> {
         let mut turns = self.turns.lock().unwrap_or_else(|error| error.into_inner());
         let Some(turn) = turns.get_mut(turn_id) else {

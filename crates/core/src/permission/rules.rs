@@ -111,7 +111,8 @@ fn legacy_background_rule_matches(tool_name: &RuntimeString, rule_name: &Runtime
     fn canonical(name: &RuntimeString) -> Option<&'static str> {
         let folded = name.try_to_utf8().ok()?.to_ascii_lowercase();
         Some(match folded.as_str() {
-            "task_output" | "bash_output" | "taskoutput" => "TaskOutput",
+            "task_output" | "bash_output" | "taskoutput" | "agentoutputtool" | "bashoutputtool"
+            | "agentoutput" | "bashoutput" => "TaskOutput",
             "task_stop" | "kill_shell" | "kill_bash" | "taskstop" | "killshell" | "killbash" => {
                 "TaskStop"
             }

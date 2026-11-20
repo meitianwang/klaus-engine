@@ -392,6 +392,7 @@ fn session_background_options(command: &str) -> StartBackgroundCommandOptions {
         network_allowed: None,
         managed_network: None,
         on_complete: None,
+        owner_agent_id: None,
     }
 }
 

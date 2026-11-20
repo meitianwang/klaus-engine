@@ -557,6 +557,8 @@ pub(crate) fn bg_to_handle(
         status: e.status,
         description: Some(e.description.clone()),
         partial: Some(e.partial.clone()),
+        idle: e.idle,
+        notification_pending: e.notification_pending,
     }
 }
 
@@ -862,7 +864,7 @@ pub(crate) fn teammate_prompt(team: &RuntimeString, peer: &RuntimeString) -> Run
         .concat(&RuntimeString::from(
             "\".
 Use SendMessage for live coordination with your teammates or team lead. Plain text
-is recorded in your transcript and can be retrieved through task_output; terminal
+is recorded in your transcript and can be retrieved through TaskOutput; terminal
 completion also publishes a result to your direct parent. A persistent teammate may
 go idle between turns, so ordinary text is not an immediate mailbox message.
 Incoming teammate messages are delivered automatically; you do not poll an inbox.
@@ -999,6 +1001,12 @@ impl BackgroundTaskRegistry for SessionBackgroundTaskRegistry {
         let m = self.session.subagents.background_agents.lock_recover();
         m.get(&id).map(|e| bg_to_handle(&id, e))
     }
+    fn is_owned_by_caller(&self, id: &RuntimeString) -> Option<bool> {
+        let id = id.try_to_utf8().ok()?;
+        let m = self.session.subagents.background_agents.lock_recover();
+        let entry = m.get(&id)?;
+        Some(self.caller_agent_id.is_none() || entry.parent_agent_id == self.caller_agent_id)
+    }
     fn list(&self) -> Vec<crate::types::tool::BackgroundTaskHandle> {
         let m = self.session.subagents.background_agents.lock_recover();
         m.iter().map(|(id, e)| bg_to_handle(id, e)).collect()
@@ -1014,18 +1022,45 @@ impl BackgroundTaskRegistry for SessionBackgroundTaskRegistry {
             .collect()
     }
     fn has_pending_input(&self) -> bool {
-        self.session
-            .conversation
-            .queue()
-            .admitted_snapshot()
-            .iter()
-            .any(|message| {
-                message.agent_id == self.caller_agent_id
-                    && matches!(
-                        message.mode.try_to_utf8().as_deref(),
-                        Ok("prompt" | "subagent-message" | "task-notification")
-                    )
-            })
+        matches!(
+            self.pending_wake_input(),
+            Some(
+                crate::types::tool::PendingWakeKind::Message
+                    | crate::types::tool::PendingWakeKind::TaskNotification
+            )
+        )
+    }
+    fn pending_wake_input(&self) -> Option<crate::types::tool::PendingWakeKind> {
+        let mut saw_notification = false;
+        let mut saw_later = false;
+        for message in self.session.conversation.queue().admitted_snapshot() {
+            if message.agent_id != self.caller_agent_id {
+                continue;
+            }
+            let priority = message
+                .priority
+                .unwrap_or(crate::engine::message_queue::QueuePriority::Next);
+            if priority == crate::engine::message_queue::QueuePriority::Later {
+                saw_later = true;
+                continue;
+            }
+            match message.mode.try_to_utf8().as_deref() {
+                Ok("prompt" | "subagent-message") => {
+                    return Some(crate::types::tool::PendingWakeKind::Message);
+                }
+                Ok("task-notification") => {
+                    saw_notification = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_notification {
+            Some(crate::types::tool::PendingWakeKind::TaskNotification)
+        } else if saw_later {
+            Some(crate::types::tool::PendingWakeKind::TurnEndQueued)
+        } else {
+            None
+        }
     }
     async fn send_message(
         &self,
@@ -1051,8 +1086,19 @@ impl BackgroundTaskRegistry for SessionBackgroundTaskRegistry {
             .resolve_subagent_target(target)
             .map(|resolved| resolved.map(RuntimeString::from))
     }
+    fn resolve_owned_target(
+        &self,
+        target: &RuntimeString,
+    ) -> Option<Result<RuntimeString, RuntimeString>> {
+        self.session
+            .resolve_subagent_target_for_caller(target, self.caller_agent_id.as_ref())
+            .map(|resolved| resolved.map(RuntimeString::from))
+    }
 
     fn stop(&self, id: &RuntimeString) -> bool {
+        if self.caller_agent_id.is_some() && self.is_owned_by_caller(id) != Some(true) {
+            return false;
+        }
         if let Some(stopped) = self.session.stop_ordinary_subagent(id, false) {
             return stopped;
         }

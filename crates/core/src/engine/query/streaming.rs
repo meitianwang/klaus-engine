@@ -14,6 +14,7 @@ use super::push_tool_call_started;
 use super::record_tool_lifecycle_parts;
 use super::request::tool_over_limit_halve_text;
 use super::request::tool_over_limit_raise_text;
+use super::safe_is_concurrency_safe;
 use super::safe_is_read_only;
 use super::support::notify;
 use super::support::trim_ecmascript_whitespace;
@@ -1158,6 +1159,10 @@ async fn stream_and_dispatch_inner(
                                 && call.visible.tool_kind
                                     != Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch)
                                 && safe_is_read_only(tool.as_ref(), &call.initial_internal_input)
+                                && safe_is_concurrency_safe(
+                                    tool.as_ref(),
+                                    &call.initial_internal_input,
+                                )
                             {
                                 let _handoff = match shared.persistence_in_flight.enter() {
                                     Ok(owner) => owner,
@@ -1590,6 +1595,7 @@ async fn stream_and_dispatch_inner(
             stop_reason,
             final_text: text_buf.clone(),
             sleep_ran: false,
+            post_result_notices: Vec::new(),
             truncated_tool_calls: Vec::new(),
         };
     }
@@ -1757,6 +1763,7 @@ async fn stream_and_dispatch_inner(
             stop_reason,
             final_text: text_buf,
             sleep_ran: false,
+            post_result_notices: Vec::new(),
             truncated_tool_calls,
         };
     }
@@ -1774,8 +1781,11 @@ async fn stream_and_dispatch_inner(
     } else {
         None
     };
-    match dispatch_tool_calls(shared, &calls, prestarted).await {
-        Ok(results) => tool_results.extend(results),
+    let post_result_notices = match dispatch_tool_calls(shared, &calls, prestarted).await {
+        Ok((results, notices)) => {
+            tool_results.extend(results);
+            notices
+        }
         Err(error) => return Outcome::Fatal { error },
     };
     // Tell the model how to finish a file it only got part of, and hand it the
@@ -1796,6 +1806,7 @@ async fn stream_and_dispatch_inner(
         stop_reason,
         final_text: text_buf,
         sleep_ran,
+        post_result_notices,
         truncated_tool_calls,
     }
 }

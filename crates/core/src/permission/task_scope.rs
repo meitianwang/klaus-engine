@@ -22,6 +22,9 @@ pub(crate) fn task_scope_builtin_allowed(tool: &dyn Tool) -> bool {
         "think",
         "ask_user",
         "ask_user_async",
+        "TaskOutput",
+        "TaskStop",
+        "Yield",
         // Search only exposes the already filtered registry's deferred tools.
         "tool_search",
     ]

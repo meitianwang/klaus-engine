@@ -427,6 +427,8 @@ fn adoption(
         events: owner.subscribe_events(id).unwrap(),
         stop: Arc::new(move |id, signal| stop_owner.kill_with_signal(id, signal)),
         on_complete: None,
+        owner_agent_id: None,
+        interactive_tty: false,
     }
 }
 

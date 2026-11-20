@@ -193,6 +193,8 @@ pub struct StartBackgroundCommandOptions {
     pub network_allowed: Option<bool>,
     pub managed_network: Option<ManagedNetworkSandboxContext>,
     pub on_complete: Option<BackgroundCommandOnComplete>,
+    /// Direct caller sub-agent id (`None` for root session).
+    pub owner_agent_id: Option<RuntimeString>,
 }
 
 /// A process that another runtime owns but this Session projects through the
@@ -205,6 +207,10 @@ pub struct AdoptBackgroundCommandOptions {
     pub events: ProcessEventReceiver,
     pub stop: BackgroundProcessStop,
     pub on_complete: Option<BackgroundCommandOnComplete>,
+    /// Direct caller sub-agent id (`None` for root session).
+    pub owner_agent_id: Option<RuntimeString>,
+    /// True when the adopted process runs attached to an interactive TTY.
+    pub interactive_tty: bool,
 }
 
 /// The result of [`BackgroundCommandRegistry::read_new`].
@@ -252,6 +258,19 @@ pub struct BackgroundCommandListEntry {
     pub exit_code: Option<i32>,
 }
 
+/// Internal runtime view of a background command including caller ownership,
+/// interactive TTY flag, and completion-callback delivery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundCommandStatusSummary {
+    pub id: RuntimeString,
+    pub command: RuntimeString,
+    pub status: BackgroundCommandStatus,
+    pub exit_code: Option<i32>,
+    pub owner_agent_id: Option<RuntimeString>,
+    pub interactive_tty: bool,
+    pub notifying: bool,
+}
+
 impl RuntimeEncode for BackgroundCommandListEntry {
     fn encode_runtime(&self, out: &mut RuntimeEncoder) -> Result<(), RuntimeCodecError> {
         let mut object = RuntimeObjectEncoder::new();
@@ -279,8 +298,11 @@ impl RuntimeDecode for BackgroundCommandListEntry {
 struct SharedState {
     buffer: CommandOutputBuffer,
     record: BackgroundProcessRecord,
+    owner_agent_id: Option<RuntimeString>,
+    interactive_tty: bool,
     on_complete: Option<BackgroundCommandOnComplete>,
     complete_fired: bool,
+    callback_in_flight: bool,
     controller: Option<RuntimeProcessController>,
     external_stop: Option<BackgroundProcessStop>,
     output_file: Option<std::fs::File>,
@@ -392,6 +414,9 @@ impl BackgroundCommandRegistry {
                         exit_observed: None,
                         output_closed: true,
                         model_output_collected: false,
+                        owner_agent_id: None,
+                        interactive_tty: false,
+                        callback_in_flight: false,
                     })),
                     cursor: 0,
                 }
@@ -562,8 +587,11 @@ impl BackgroundCommandRegistry {
         let shared = Arc::new(Mutex::new(SharedState {
             buffer: CommandOutputBuffer::new(opts.max_output_bytes),
             record: record.clone(),
+            owner_agent_id: opts.owner_agent_id,
+            interactive_tty: false,
             on_complete: opts.on_complete,
             complete_fired: false,
+            callback_in_flight: false,
             controller: None,
             external_stop: None,
             output_file,
@@ -654,8 +682,11 @@ impl BackgroundCommandRegistry {
             let shared = Arc::new(Mutex::new(SharedState {
                 buffer: CommandOutputBuffer::new(opts.max_output_bytes),
                 record: record.clone(),
+                owner_agent_id: opts.owner_agent_id,
+                interactive_tty: opts.interactive_tty,
                 on_complete: opts.on_complete,
                 complete_fired: false,
+                callback_in_flight: false,
                 controller: None,
                 external_stop: Some(opts.stop),
                 output_file,
@@ -1027,6 +1058,29 @@ impl BackgroundCommandRegistry {
             .collect()
     }
 
+    pub fn status_summaries(&self) -> Vec<BackgroundCommandStatusSummary> {
+        self.commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|command| {
+                let state = command.shared.lock().unwrap_or_else(|e| e.into_inner());
+                let status = compatibility_status(&state.record);
+                let notifying = status != BackgroundCommandStatus::Killed
+                    && (state.on_complete.is_some() || state.callback_in_flight);
+                BackgroundCommandStatusSummary {
+                    id: state.record.shell_id.clone(),
+                    command: state.record.command.clone(),
+                    status,
+                    exit_code: state.record.exit_code,
+                    owner_agent_id: state.owner_agent_id.clone(),
+                    interactive_tty: state.interactive_tty,
+                    notifying,
+                }
+            })
+            .collect()
+    }
+
     pub fn has(&self, id: &RuntimeString) -> bool {
         find_shared(&self.commands, id).is_some()
     }
@@ -1332,6 +1386,7 @@ fn take_complete(
     }
     st.complete_fired = true;
     let cb = st.on_complete.take()?;
+    st.callback_in_flight = true;
     let result = BackgroundCommandComplete {
         id: id.clone(),
         status: compatibility_status(&st.record),
@@ -1708,6 +1763,10 @@ async fn finish_callback(shared: &Arc<Mutex<SharedState>>) {
     };
     if let Some((callback, complete)) = fired {
         callback(complete);
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .callback_in_flight = false;
     }
 }
 
@@ -2266,6 +2325,7 @@ mod tests {
             network_allowed: None,
             managed_network: None,
             on_complete,
+            owner_agent_id: None,
         }
     }
 
@@ -2315,6 +2375,7 @@ mod tests {
                         calls_cb.fetch_add(1, Ordering::SeqCst);
                         let _ = tx.send((result.status, result.exit_code));
                     })),
+                    owner_agent_id: None,
                 },
             )
             .await
@@ -2359,6 +2420,7 @@ mod tests {
                     network_allowed: None,
                     managed_network: None,
                     on_complete: None,
+                    owner_agent_id: None,
                 },
             )
             .await
@@ -2417,6 +2479,7 @@ mod tests {
                         calls_cb.fetch_add(1, Ordering::SeqCst);
                         let _ = tx.send(result.status);
                     })),
+                    owner_agent_id: None,
                 },
             )
             .await
@@ -2454,6 +2517,7 @@ mod tests {
                     network_allowed: Some(true),
                     managed_network: None,
                     on_complete: None,
+                    owner_agent_id: None,
                 },
             )
             .await

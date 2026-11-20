@@ -832,6 +832,8 @@ mod tests {
             status,
             description: Some("inspect logs".into()),
             partial: None,
+            idle: false,
+            notification_pending: false,
         }
     }
 

@@ -1127,7 +1127,7 @@ impl ProtocolClient {
         .await
     }
 
-    /// Read retained output without advancing the model-facing `bash_output` cursor.
+    /// Read retained output without advancing the model-facing `TaskOutput` cursor.
     pub async fn read_background_process_output(
         &self,
         shell_id: impl Into<RuntimeString>,

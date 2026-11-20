@@ -780,6 +780,11 @@ pub struct BackgroundTaskHandle {
     /// transcript). Returned while the task is still running; replaced by the
     /// clean final answer once complete.
     pub partial: Option<RuntimeString>,
+    /// True while a persistent teammate is parked idle waiting for mailbox input.
+    pub idle: bool,
+    /// True after terminal status flip until the completion notification has
+    /// entered the parent queue.
+    pub notification_pending: bool,
 }
 
 impl RuntimeEncode for BackgroundTaskHandle {
@@ -807,6 +812,8 @@ impl RuntimeDecode for BackgroundTaskHandle {
                 status: object.required("status", &[])?,
                 description: object.optional("description", &[])?,
                 partial: object.optional("partial", &[])?,
+                idle: false,
+                notification_pending: false,
             })
         })
     }
@@ -1103,6 +1110,14 @@ impl RuntimeDecode for SubagentMessageResult {
     }
 }
 
+/// Kind of pending queue input that should wake a wait primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingWakeKind {
+    TaskNotification,
+    Message,
+    TurnEndQueued,
+}
+
 /// Query + control the session's background sub-agents (run_in_background).
 #[async_trait]
 pub trait BackgroundTaskRegistry: Send + Sync {
@@ -1123,6 +1138,11 @@ pub trait BackgroundTaskRegistry: Send + Sync {
         None
     }
     fn get(&self, agent_id: &RuntimeString) -> Option<BackgroundTaskHandle>;
+    /// Whether `agent_id` exists and is owned by this caller (root owns any
+    /// task in the session; a sub-agent owns only its direct children).
+    fn is_owned_by_caller(&self, agent_id: &RuntimeString) -> Option<bool> {
+        self.get(agent_id).map(|_| true)
+    }
     /// The tasks owned by `caller` (None = the root session): direct children
     /// only, so a wait never watches another agent's descendants. The default
     /// keeps registries without ownership metadata whole.
@@ -1139,10 +1159,23 @@ pub trait BackgroundTaskRegistry: Send + Sync {
     ) -> Option<Result<RuntimeString, RuntimeString>> {
         None
     }
+    /// Resolve a target visible to the current caller (filtering out tasks
+    /// belonging to other agents when a sub-agent queries).
+    fn resolve_owned_target(
+        &self,
+        target: &RuntimeString,
+    ) -> Option<Result<RuntimeString, RuntimeString>> {
+        self.resolve_target(target)
+    }
     fn list(&self) -> Vec<BackgroundTaskHandle>;
     /// Pending input for this caller must be applied before a long wait resumes.
     fn has_pending_input(&self) -> bool {
         false
+    }
+    /// Classify any pending input queued for this caller so waits distinguish
+    /// immediate arrivals from turn-end items.
+    fn pending_wake_input(&self) -> Option<PendingWakeKind> {
+        self.has_pending_input().then_some(PendingWakeKind::Message)
     }
     /// Abort a running task; returns false if no such running task.
     fn stop(&self, agent_id: &RuntimeString) -> bool;
@@ -1395,6 +1428,10 @@ impl ReplyScopedGate {
     /// Mark the start of a new assistant reply; per-reply budgets reset.
     pub fn begin_reply(&self, reply_id: String) {
         *self.current_reply.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply_id);
+        self.read_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// True only for the first wait request in the current reply.
@@ -1415,19 +1452,26 @@ impl ReplyScopedGate {
         true
     }
 
-    /// Count one state read of `task_id` in the current reply, returning the
-    /// number of times this task has been read within the reply (1-based).
-    pub fn count_task_read(&self, task_id: &str) -> u32 {
+    /// Count one state read of `task_id` in `state_key` for the current reply,
+    /// returning the number of times that state was read within the reply (1-based).
+    pub fn count_task_read_for_state(&self, task_id: &str, state_key: &str) -> u32 {
         let current = self
             .current_reply
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default();
+        let key = format!("{task_id}:{state_key}");
         let mut counts = self.read_counts.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = counts.entry((current, task_id.to_string())).or_insert(0);
+        let entry = counts.entry((current, key)).or_insert(0);
         *entry += 1;
         *entry
+    }
+
+    /// Count one state read of `task_id` in the current reply, returning the
+    /// number of times this task has been read within the reply (1-based).
+    pub fn count_task_read(&self, task_id: &str) -> u32 {
+        self.count_task_read_for_state(task_id, "default")
     }
 }
 
@@ -1628,12 +1672,16 @@ pub struct ToolResultSerializable {
     pub extra_user_blocks: Option<Vec<ContentBlock>>,
 }
 
-/// In-process-only side effects of a tool call (closures that must never be
-/// persisted).
+/// In-process-only side effects of a tool call (closures and transient notices
+/// that must never be serialized as part of tool output).
 #[derive(Default)]
 pub struct ToolResultSideEffects {
     /// Only honored for non-concurrency-safe tools.
     pub context_modifier: Option<Box<dyn FnOnce(ToolContext) -> ToolContext + Send>>,
+    /// Meta system-reminder lines emitted as follow-up user messages
+    /// immediately after this turn's `tool_result` blocks and ahead of any
+    /// queued background notifications.
+    pub post_result_notices: Vec<RuntimeString>,
 }
 
 /// The result of a tool call, split into a serializable payload and in-process

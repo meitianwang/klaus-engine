@@ -24,7 +24,10 @@ use crate::tools::background_shells::BackgroundShellStatus;
 use crate::tools::build_tool::text_result;
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
-use crate::types::tool::{BackgroundTaskStatus, Tool, ToolContext, ToolProgress, ToolResult};
+use crate::types::tool::{
+    BackgroundTaskStatus, PendingWakeKind, Tool, ToolContext, ToolProgress, ToolResult,
+    ToolResultSideEffects,
+};
 
 /// Poll granularity while waiting. Wake sources are queue/registry state, so a
 /// short poll keeps resume latency low without a dedicated event channel.
@@ -44,6 +47,11 @@ const REASON_MESSAGE_ARRIVED: &str = "a message arrived. If it follows this line
 const REASON_INTERRUPTED: &str = "the wait was interrupted.";
 const REASON_DUPLICATE_CALL: &str = "an earlier call to this tool in this reply already waited.";
 const REASON_MESSAGE_WAITING: &str = "a message is waiting for you. If it doesn't follow this line, it reaches you once you end your turn.";
+const REASON_QUEUED_FOR_TURN_END: &str =
+    "a message is waiting for you and will arrive when you end your turn.";
+
+/// Synthetic watched id for an unanswered async user question in the current turn.
+const ASYNC_QUESTION_WATCH_ID: &str = "::async_question";
 
 fn yield_schema() -> JsonSchema {
     json!({
@@ -90,30 +98,124 @@ pub fn create_yield_tool() -> Arc<dyn Tool> {
     })
 }
 
-/// Ids of all background work that could still produce a report: running
-/// sub-agents plus running shell commands.
+/// Ids of all background work that could still produce a report: active owned
+/// sub-agents (or any with an undelivered notification), owned non-interactive
+/// background shells (running or still delivering their completion notice),
+/// and unanswered async questions in the current turn.
 fn running_work(ctx: &ToolContext) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
+    let caller = ctx
+        .background_tasks
+        .as_ref()
+        .and_then(|registry| registry.caller_agent_id());
     if let Some(registry) = ctx.background_tasks.as_ref() {
         // Only this caller's own children: a wait must not wake on another
-        // agent's descendants finishing.
-        let caller = registry.caller_agent_id();
+        // agent's descendants finishing. Idle teammates without a pending
+        // completion notice are parked rather than active background work.
         for handle in registry.list_owned(caller.as_ref()) {
-            if handle.status == BackgroundTaskStatus::Running {
+            let active = (handle.status == BackgroundTaskStatus::Running && !handle.idle)
+                || handle.notification_pending;
+            if active {
                 if let Ok(id) = handle.agent_id.try_to_utf8() {
                     ids.insert(id);
                 }
             }
         }
     }
-    for entry in ctx.background_processes.list() {
-        if entry.status == BackgroundShellStatus::Running {
+    for entry in ctx.background_processes.status_summaries() {
+        let owned = entry.owner_agent_id.as_ref() == caller.as_ref();
+        let active = entry.status == BackgroundShellStatus::Running || entry.notifying;
+        if owned && !entry.interactive_tty && active {
             if let Ok(id) = entry.id.try_to_utf8() {
                 ids.insert(id);
             }
         }
     }
+    if ctx
+        .async_question
+        .as_ref()
+        .is_some_and(|aq| aq.registry.has_pending_for_turn(&aq.turn_id))
+    {
+        ids.insert(ASYNC_QUESTION_WATCH_ID.to_string());
+    }
     ids
+}
+
+async fn check_pending_arrival(
+    ctx: &ToolContext,
+    in_subagent: bool,
+) -> Result<Option<&'static str>, ToolError> {
+    if ctx
+        .async_question
+        .as_ref()
+        .is_some_and(|aq| aq.registry.has_ready_for_turn(&aq.turn_id))
+    {
+        return Ok(Some(REASON_SOMETHING_ARRIVED));
+    }
+    if let Some(kind) = ctx
+        .background_tasks
+        .as_ref()
+        .and_then(|registry| registry.pending_wake_input())
+    {
+        let reason = match kind {
+            PendingWakeKind::TaskNotification => REASON_SOMETHING_ARRIVED,
+            PendingWakeKind::Message => {
+                if in_subagent {
+                    REASON_MESSAGE_WAITING
+                } else {
+                    REASON_MESSAGE_ARRIVED
+                }
+            }
+            PendingWakeKind::TurnEndQueued => REASON_QUEUED_FOR_TURN_END,
+        };
+        return Ok(Some(reason));
+    }
+    if let Some(swarm) = &ctx.swarm {
+        if swarm.has_pending_input().await.map_err(ToolError::new)? {
+            return Ok(Some(if in_subagent {
+                REASON_MESSAGE_WAITING
+            } else {
+                REASON_MESSAGE_ARRIVED
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn departed_with_completion_notice(
+    ctx: &ToolContext,
+    watched: &BTreeSet<String>,
+    now_running: &BTreeSet<String>,
+) -> bool {
+    let shell_summaries = ctx.background_processes.status_summaries();
+    for id in watched {
+        if now_running.contains(id) {
+            continue;
+        }
+        if id == ASYNC_QUESTION_WATCH_ID {
+            continue;
+        }
+        if let Some(registry) = ctx.background_tasks.as_ref() {
+            let key = RuntimeString::from(id.as_str());
+            if let Some(handle) = registry.get(&key) {
+                if handle.notification_pending
+                    || matches!(
+                        handle.status,
+                        BackgroundTaskStatus::Completed | BackgroundTaskStatus::Failed
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+        if shell_summaries.iter().any(|entry| {
+            entry.id.try_to_utf8().ok().as_deref() == Some(id.as_str())
+                && entry.status == BackgroundShellStatus::Exited
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 #[async_trait]
@@ -175,6 +277,11 @@ impl Tool for YieldTool {
             .and_then(|registry| registry.caller_agent_id())
             .is_some();
 
+        if let Some(reason) = check_pending_arrival(ctx, in_subagent).await? {
+            let still_running = running_work(ctx).len();
+            return Ok(self.finish(ctx, Duration::ZERO, reason, still_running));
+        }
+
         let mut watched = running_work(ctx);
         if watched.is_empty() {
             return Ok(self.finish(ctx, Duration::ZERO, REASON_NOTHING_RUNNING, 0));
@@ -187,36 +294,28 @@ impl Tool for YieldTool {
                 return Ok(self.finish(ctx, started.elapsed(), REASON_INTERRUPTED, watched.len()));
             }
 
-            // A finished task flipped out of the running set; its completion
-            // notice rides the same queue and follows this result.
+            if let Some(reason) = check_pending_arrival(ctx, in_subagent).await? {
+                let still_running = running_work(ctx).len();
+                return Ok(self.finish(ctx, started.elapsed(), reason, still_running));
+            }
+
             let now_running = running_work(ctx);
             if watched.iter().any(|id| !now_running.contains(id)) {
-                return Ok(self.finish(
-                    ctx,
-                    started.elapsed(),
-                    REASON_SOMETHING_ARRIVED,
-                    now_running.len(),
-                ));
+                if departed_with_completion_notice(ctx, &watched, &now_running) {
+                    return Ok(self.finish(
+                        ctx,
+                        started.elapsed(),
+                        REASON_SOMETHING_ARRIVED,
+                        now_running.len(),
+                    ));
+                }
+                // Cancelled/stopped work or an idle teammate with no notice
+                // produces no follow-up message: end cleanly when nothing remains.
+                if now_running.is_empty() {
+                    return Ok(self.finish(ctx, started.elapsed(), REASON_NOTHING_RUNNING, 0));
+                }
             }
             watched = now_running;
-
-            // Queued steering input or mailbox messages wake the wait early.
-            let queue_pending = ctx
-                .background_tasks
-                .as_ref()
-                .is_some_and(|registry| registry.has_pending_input());
-            let swarm_pending = match &ctx.swarm {
-                Some(swarm) => swarm.has_pending_input().await.map_err(ToolError::new)?,
-                None => false,
-            };
-            if queue_pending || swarm_pending {
-                let reason = if in_subagent {
-                    REASON_MESSAGE_WAITING
-                } else {
-                    REASON_MESSAGE_ARRIVED
-                };
-                return Ok(self.finish(ctx, started.elapsed(), reason, watched.len()));
-            }
 
             if Instant::now() >= deadline {
                 // Resume before the cache window closes; the count line tells
@@ -258,12 +357,11 @@ impl YieldTool {
         let line = resumed_prefix(elapsed)
             .concat(&RuntimeString::from(": "))
             .concat(&reason);
-        let mut delivered = false;
-        if let Some(enqueue) = &ctx.enqueue_background_notice {
-            enqueue(line.clone());
-            delivered = true;
-        }
-        let text = if delivered {
+        // When the turn loop supplies the notice rail, return the wake line via
+        // `side_effects.post_result_notices` so query places it immediately after
+        // the `tool_result` block and before drained task notifications.
+        let has_notice_rail = ctx.enqueue_background_notice.is_some();
+        let text = if has_notice_rail {
             RuntimeString::from(WAIT_ENDED_HEADER)
         } else {
             RuntimeString::from(WAIT_ENDED_HEADER)
@@ -274,7 +372,14 @@ impl YieldTool {
         result.insert("content", RuntimeJson::String(text.clone()));
         result.insert("waitedMs", RuntimeJson::from(elapsed.as_millis() as f64));
         result.insert("stillRunning", RuntimeJson::from(still_running as f64));
-        text_result(RuntimeJson::Object(result), text, false)
+        let mut tool_result = text_result(RuntimeJson::Object(result), text, false);
+        if has_notice_rail {
+            tool_result.side_effects = Some(ToolResultSideEffects {
+                context_modifier: None,
+                post_result_notices: vec![line],
+            });
+        }
+        tool_result
     }
 }
 
@@ -302,6 +407,8 @@ mod tests {
             status,
             description: None,
             partial: None,
+            idle: false,
+            notification_pending: false,
         }
     }
 
@@ -468,6 +575,161 @@ mod tests {
         assert_eq!(
             resumed_prefix(Duration::from_secs(150)),
             RuntimeString::from("Resumed after 3 minutes")
+        );
+    }
+
+    struct WakeRegistry {
+        handles: Vec<BackgroundTaskHandle>,
+        caller: Option<RuntimeString>,
+        wake: Option<PendingWakeKind>,
+    }
+
+    #[async_trait]
+    impl BackgroundTaskRegistry for WakeRegistry {
+        fn caller_agent_id(&self) -> Option<RuntimeString> {
+            self.caller.clone()
+        }
+        fn get(&self, agent_id: &RuntimeString) -> Option<BackgroundTaskHandle> {
+            self.handles
+                .iter()
+                .find(|h| &h.agent_id == agent_id)
+                .cloned()
+        }
+        fn list(&self) -> Vec<BackgroundTaskHandle> {
+            self.handles.clone()
+        }
+        fn pending_wake_input(&self) -> Option<PendingWakeKind> {
+            self.wake
+        }
+        fn stop(&self, _agent_id: &RuntimeString) -> bool {
+            false
+        }
+        async fn wait_for_idle(&self) {}
+    }
+
+    #[tokio::test]
+    async fn ignores_idle_teammate_unless_notification_pending() {
+        let mut h = handle("peer-1", BackgroundTaskStatus::Running);
+        h.idle = true;
+        let mut ctx = gated_ctx();
+        ctx.background_tasks = Some(Arc::new(WakeRegistry {
+            handles: vec![h.clone()],
+            caller: None,
+            wake: None,
+        }));
+        let res = create_yield_tool()
+            .call(
+                runtime_json::parse(&RuntimeString::from("{}")).unwrap(),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            text_of(&res).contains("none of your background work is running"),
+            "{}",
+            text_of(&res)
+        );
+
+        let mut h_notifying = h;
+        h_notifying.notification_pending = true;
+        assert_eq!(
+            running_work(&ToolContext {
+                background_tasks: Some(Arc::new(WakeRegistry {
+                    handles: vec![h_notifying],
+                    caller: None,
+                    wake: None,
+                })),
+                ..gated_ctx()
+            }),
+            BTreeSet::from(["peer-1".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_turn_end_wake_surfaces_turn_end_reason() {
+        let mut ctx = gated_ctx();
+        ctx.background_tasks = Some(Arc::new(WakeRegistry {
+            handles: Vec::new(),
+            caller: None,
+            wake: Some(PendingWakeKind::TurnEndQueued),
+        }));
+        let res = create_yield_tool()
+            .call(
+                runtime_json::parse(&RuntimeString::from("{}")).unwrap(),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            text_of(&res).contains("will arrive when you end your turn"),
+            "{}",
+            text_of(&res)
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_task_departure_does_not_claim_something_arrived() {
+        let handles = Arc::new(Mutex::new(vec![handle(
+            "agent-1",
+            BackgroundTaskStatus::Running,
+        )]));
+        let mut ctx = gated_ctx();
+        ctx.background_tasks = Some(Arc::new(FlipRegistry {
+            handles: Arc::clone(&handles),
+        }));
+        let flip = Arc::clone(&handles);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flip.lock().unwrap()[0].status = BackgroundTaskStatus::Interrupted;
+        });
+        let res = create_yield_tool()
+            .call(
+                runtime_json::parse(&RuntimeString::from("{}")).unwrap(),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains("none of your background work is running"),
+            "{text}"
+        );
+        assert!(!text.contains("something arrived"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn post_result_notice_rides_side_effects_without_calling_enqueue() {
+        let enqueued = Arc::new(Mutex::new(Vec::<String>::new()));
+        let enqueued_sink = Arc::clone(&enqueued);
+        let mut ctx = gated_ctx();
+        ctx.enqueue_background_notice = Some(Arc::new(move |line| {
+            enqueued_sink
+                .lock()
+                .unwrap()
+                .push(line.try_to_utf8().unwrap_or_default());
+        }));
+        let res = create_yield_tool()
+            .call(
+                runtime_json::parse(&RuntimeString::from("{}")).unwrap(),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(text_of(&res), WAIT_ENDED_HEADER);
+        assert!(enqueued.lock().unwrap().is_empty());
+        let notices = &res.side_effects.expect("side effects").post_result_notices;
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .try_to_utf8()
+                .unwrap_or_default()
+                .contains("none of your background work is running"),
+            "{:?}",
+            notices
         );
     }
 }

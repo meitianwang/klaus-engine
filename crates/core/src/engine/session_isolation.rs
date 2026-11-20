@@ -1255,6 +1255,7 @@ impl Session {
                 }
                 e.status = BackgroundTaskStatus::Running;
                 e.notified = false;
+                e.notification_pending = false;
             }
         }
     }
@@ -1286,11 +1287,27 @@ impl Session {
     /// Deliver a terminal result to its direct parent's passive mailbox.
     pub(crate) async fn notify_background_complete(&self, agent_id: &str) {
         if self.lifecycle.is_disposed() {
+            if let Some(entry) = self
+                .subagents
+                .background_agents
+                .lock_recover()
+                .get_mut(agent_id)
+            {
+                entry.notification_pending = false;
+            }
             return;
         }
         let Some((payload, state, spawn_turn_id)) =
             self.take_background_completion_notice(agent_id)
         else {
+            if let Some(entry) = self
+                .subagents
+                .background_agents
+                .lock_recover()
+                .get_mut(agent_id)
+            {
+                entry.notification_pending = false;
+            }
             return;
         };
         self.publish_background_completion_notice(agent_id, payload, state, spawn_turn_id)
@@ -1376,6 +1393,14 @@ impl Session {
             .get(agent_id)
             .is_some_and(|entry| entry.depth > 1);
         if nested && parent_agent_id.is_none() {
+            if let Some(entry) = self
+                .subagents
+                .background_agents
+                .lock_recover()
+                .get_mut(agent_id)
+            {
+                entry.notification_pending = false;
+            }
             tracing::warn!(
                 agent_id,
                 "nested completion has no direct parent; refusing root delivery"
@@ -1402,6 +1427,14 @@ impl Session {
                 delivery: None,
                 display_metadata: None,
             });
+        if let Some(entry) = self
+            .subagents
+            .background_agents
+            .lock_recover()
+            .get_mut(agent_id)
+        {
+            entry.notification_pending = false;
+        }
         if received.is_ok() {
             let receipt = crate::schemas::agent_notification::AgentNotification {
                 notification_id,
@@ -1457,6 +1490,7 @@ impl Session {
             .get_mut(agent_id)
         {
             e.status = BackgroundTaskStatus::Failed;
+            e.notification_pending = true;
         }
         self.notify_background_complete(agent_id).await;
         if is_teammate {
@@ -2163,6 +2197,7 @@ impl Session {
                                     if failure.is_some() {
                                         x.partial = body.clone();
                                     }
+                                    x.notification_pending = !interrupted && !abort.is_cancelled();
                                     x.status = if interrupted || abort.is_cancelled() {
                                         BackgroundTaskStatus::Interrupted
                                     } else if failure.is_some() {
@@ -2400,6 +2435,7 @@ impl Session {
                     .get_mut(&agent_id)
                 {
                     entry.partial = body;
+                    entry.notification_pending = !interrupted;
                     entry.status = BackgroundTaskStatus::Failed;
                 }
                 if !interrupted {
@@ -2463,6 +2499,7 @@ impl Session {
             if failure.is_some() {
                 x.partial = body.clone();
             }
+            x.notification_pending = !interrupted && !signal.is_cancelled();
             x.status = if interrupted || signal.is_cancelled() {
                 BackgroundTaskStatus::Interrupted
             } else if failure.is_some() {

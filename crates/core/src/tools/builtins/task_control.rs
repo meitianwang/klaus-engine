@@ -16,22 +16,71 @@
 //! check, not a polling loop.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::runtime_values::{NodeBufferUtf8, RuntimeJson, RuntimeObject, RuntimeString};
+use crate::tools::background_shells::BackgroundShellStatus;
 use crate::tools::build_tool::text_result;
 use crate::tools::shell::Signal;
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
-use crate::types::tool::{BackgroundTaskStatus, Tool, ToolContext, ToolProgress, ToolResult};
+use crate::types::tool::{
+    BackgroundTaskHandle, BackgroundTaskRegistry, BackgroundTaskStatus, PlanningToolCapability,
+    Tool, ToolContext, ToolProgress, ToolResult,
+};
 
 use super::shell_common::first_chars;
 
 /// How many times one assistant reply may re-read the same still-running task
 /// before the reader refuses to answer the repetition again.
 const READ_ANSWER_BUDGET: u32 = 2;
+
+const FACADE_WAIT_INTERVAL_MS: u64 = 250;
+const MAX_FACADE_WAIT_MS: u64 = 270_000;
+
+fn parse_facade_wait_ms(input: &Json) -> u64 {
+    input
+        .get("_facade_wait_ms")
+        .and_then(RuntimeJson::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| (value as u64).min(MAX_FACADE_WAIT_MS))
+        .unwrap_or(0)
+}
+
+fn not_owner_output_result(task_id: RuntimeString, task_type: &str) -> ToolResult {
+    let message = RuntimeString::from("Task ")
+        .concat(&task_id)
+        .concat(&RuntimeString::from(" belongs to another agent."));
+    text_result(
+        runtime_object([
+            ("task_id", RuntimeJson::String(task_id)),
+            ("task_type", RuntimeJson::from(task_type)),
+            ("status", RuntimeJson::from("not_found")),
+            ("output", RuntimeJson::String(RuntimeString::default())),
+            ("retrieval_status", RuntimeJson::from("not_owner")),
+        ]),
+        message,
+        true,
+    )
+}
+
+fn not_owner_stop_result(task_id: RuntimeString, task_type: &str) -> ToolResult {
+    let message = RuntimeString::from("Task ")
+        .concat(&task_id)
+        .concat(&RuntimeString::from(" belongs to another agent."));
+    text_result(
+        runtime_object([
+            ("message", RuntimeJson::String(message.clone())),
+            ("task_id", RuntimeJson::String(task_id)),
+            ("task_type", RuntimeJson::from(task_type)),
+        ]),
+        message,
+        true,
+    )
+}
 
 /// The wire form of a background sub-agent status.
 fn status_str(status: BackgroundTaskStatus) -> &'static str {
@@ -257,6 +306,9 @@ impl Tool for TaskOutputTool {
         vec![
             RuntimeString::from("task_output"),
             RuntimeString::from("bash_output"),
+            RuntimeString::from("agent_output"),
+            RuntimeString::from("AgentOutputTool"),
+            RuntimeString::from("BashOutputTool"),
         ]
     }
 
@@ -297,6 +349,36 @@ impl Tool for TaskOutputTool {
         ])
     }
 
+    fn parse_input(&self, input: &Json) -> Result<Json, ToolError> {
+        // Internal bounded-wait metadata injected by OpenAI facade input
+        // normalization is validated separately so it never weakens the strict
+        // `additionalProperties: false` schema contract exposed to models.
+        let Some(object) = input.as_object() else {
+            let schema = self.input_schema();
+            return crate::tools::input_parser::parse_native_input(&schema, input, &|path| {
+                self.input_schema_property_order(path)
+            });
+        };
+        let facade_wait = object.get("_facade_wait_ms").cloned();
+        let mut stripped = object.clone();
+        stripped.remove("_facade_wait_ms");
+        let schema = self.input_schema();
+        let mut parsed = crate::tools::input_parser::parse_native_input(
+            &schema,
+            &RuntimeJson::Object(stripped),
+            &|path| self.input_schema_property_order(path),
+        )?;
+        if let (Some(wait_val), Some(parsed_obj)) = (facade_wait, parsed.as_object_mut()) {
+            if wait_val
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+            {
+                parsed_obj.insert("_facade_wait_ms", wait_val);
+            }
+        }
+        Ok(parsed)
+    }
+
     fn summarize(&self, input: &Json) -> Option<RuntimeString> {
         let task_id = target_id(input).unwrap_or_default();
         Some(RuntimeString::from("Reading background task ").concat(&first_chars(&task_id, 8)))
@@ -322,52 +404,45 @@ impl Tool for TaskOutputTool {
         };
 
         let reg = ctx.background_tasks.as_ref();
-        let mut handle = reg.and_then(|r| r.get(&task_id));
-        // A bound name or an unambiguous prefix addresses the same sub-agent.
-        if handle.is_none() {
-            if let Some(registry) = reg {
-                match registry.resolve_target(&task_id) {
-                    Some(Ok(agent_id)) => handle = registry.get(&agent_id),
-                    Some(Err(message)) => {
-                        return Ok(text_result(
-                            runtime_object([
-                                ("task_id", RuntimeJson::String(task_id)),
-                                ("status", RuntimeJson::from("not_found")),
-                                ("output", RuntimeJson::String(RuntimeString::default())),
-                                ("retrieval_status", RuntimeJson::from("not_ready")),
-                            ]),
-                            message,
-                            true,
-                        ));
-                    }
-                    None => {}
+        let caller = reg.and_then(|r| r.caller_agent_id());
+        let facade_wait_ms = parse_facade_wait_ms(&input);
+
+        // 1) Exact sub-agent id.
+        if let Some(registry) = reg {
+            if let Some(handle) = registry.get(&task_id) {
+                if registry.is_owned_by_caller(&task_id) == Some(false) {
+                    return Ok(not_owner_output_result(task_id, "agent"));
                 }
+                return self.read_agent(registry, handle, ctx, facade_wait_ms).await;
             }
         }
 
-        if let Some(handle) = handle {
-            return self.read_agent(handle, ctx, &task_id).await;
-        }
-
-        // Shell commands live in the process registry, not the agent registry.
-        // A zero-window read consumes the new output and marks a finished
-        // shell's output as collected, exactly like the legacy shell reader.
-        let shell = ctx
-            .background_processes
-            .read_new_wait(&task_id, 0, &ctx.signal, None)
-            .await
-            .map_err(ToolError::new)?;
-        if shell.found {
-            return self.read_shell(shell, &input, &task_id);
-        }
-        // A finished shell whose final output was already collected still has
-        // an honest terminal state to report.
+        // 2) Exact background shell command id (enforcing caller ownership and
+        // still-running repeat-read budget BEFORE reading so unread bytes are
+        // never consumed or discarded on refusal).
         if let Some(entry) = ctx
             .background_processes
-            .list()
+            .status_summaries()
             .into_iter()
             .find(|entry| entry.id == task_id)
         {
+            if entry.owner_agent_id.as_ref() != caller.as_ref() {
+                return Ok(not_owner_output_result(task_id, "shell"));
+            }
+            if entry.status == BackgroundShellStatus::Running
+                && facade_wait_ms == 0
+                && self.over_read_budget(ctx, &entry.id, shell_status_str(entry.status))
+            {
+                return Ok(self.budget_message(&entry.id, shell_status_str(entry.status)));
+            }
+            let shell = ctx
+                .background_processes
+                .read_new_wait(&task_id, facade_wait_ms, &ctx.signal, None)
+                .await
+                .map_err(ToolError::new)?;
+            if shell.found {
+                return self.read_shell(shell, &input, &task_id);
+            }
             let status = shell_status_str(entry.status);
             let text = RuntimeString::from("Task ")
                 .concat(&task_id)
@@ -397,6 +472,34 @@ impl Tool for TaskOutputTool {
             ));
         }
 
+        // 3) Bound agent name or unambiguous id/name prefix owned by caller.
+        if let Some(registry) = reg {
+            match registry.resolve_owned_target(&task_id) {
+                Some(Ok(agent_id)) => {
+                    if let Some(handle) = registry.get(&agent_id) {
+                        return self.read_agent(registry, handle, ctx, facade_wait_ms).await;
+                    }
+                }
+                Some(Err(message)) => {
+                    return Ok(text_result(
+                        runtime_object([
+                            ("task_id", RuntimeJson::String(task_id)),
+                            ("status", RuntimeJson::from("not_found")),
+                            ("output", RuntimeJson::String(RuntimeString::default())),
+                            ("retrieval_status", RuntimeJson::from("not_ready")),
+                        ]),
+                        message,
+                        true,
+                    ));
+                }
+                None => {
+                    if registry.resolve_target(&task_id).is_some() {
+                        return Ok(not_owner_output_result(task_id, "agent"));
+                    }
+                }
+            }
+        }
+
         let text = RuntimeString::from("No background task with id ")
             .concat(&task_id)
             .concat(&RuntimeString::from(
@@ -417,11 +520,19 @@ impl Tool for TaskOutputTool {
 
 impl TaskOutputTool {
     /// Bounded re-answers: reading the same still-running task more than the
-    /// budget within one reply is refused so the reader never degenerates into
-    /// a polling loop.
-    fn over_read_budget(&self, ctx: &ToolContext, task_id: &RuntimeString) -> bool {
+    /// budget within one reply + state is refused so the reader never
+    /// degenerates into a polling loop.
+    fn over_read_budget(
+        &self,
+        ctx: &ToolContext,
+        canonical_id: &RuntimeString,
+        state_key: &str,
+    ) -> bool {
         ctx.reply_gate.as_ref().is_some_and(|gate| {
-            gate.count_task_read(&task_id.try_to_utf8().unwrap_or_default()) > READ_ANSWER_BUDGET
+            gate.count_task_read_for_state(
+                &canonical_id.try_to_utf8().unwrap_or_default(),
+                state_key,
+            ) > READ_ANSWER_BUDGET
         })
     }
 
@@ -449,22 +560,46 @@ impl TaskOutputTool {
 
     async fn read_agent(
         &self,
-        handle: crate::types::tool::BackgroundTaskHandle,
+        registry: &Arc<dyn BackgroundTaskRegistry>,
+        mut handle: BackgroundTaskHandle,
         ctx: &ToolContext,
-        requested_id: &RuntimeString,
+        facade_wait_ms: u64,
     ) -> Result<ToolResult, ToolError> {
+        if handle.status == BackgroundTaskStatus::Running && facade_wait_ms > 0 {
+            let deadline = Instant::now() + Duration::from_millis(facade_wait_ms);
+            while handle.status == BackgroundTaskStatus::Running && !ctx.signal.is_cancelled() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let step = remaining.min(Duration::from_millis(FACADE_WAIT_INTERVAL_MS));
+                tokio::select! {
+                    biased;
+                    () = ctx.signal.cancelled() => break,
+                    () = tokio::time::sleep(step) => {}
+                }
+                if let Some(latest) = registry.get(&handle.agent_id) {
+                    handle = latest;
+                } else {
+                    break;
+                }
+            }
+        }
+
         // Still running: the transcript accumulated so far shows progress
         // instead of empty, keeping the honest status. Waiting is Yield's job.
         if handle.status == BackgroundTaskStatus::Running {
-            if self.over_read_budget(ctx, requested_id) {
-                return Ok(self.budget_message(requested_id, "running"));
+            if facade_wait_ms == 0 && self.over_read_budget(ctx, &handle.agent_id, "running") {
+                return Ok(self.budget_message(&handle.agent_id, "running"));
             }
             let partial = handle.partial.clone().unwrap_or_default();
             let text = if !partial.is_empty() {
-                RuntimeString::from("Task ")
+                partial
+                    .clone()
+                    .concat(&RuntimeString::from("\n\nTask "))
                     .concat(&handle.agent_id)
                     .concat(&RuntimeString::from(
-                        " still running; partial output above. To wait for background work, call Yield; you are also notified when it completes.",
+                        " is still running (partial output above). To wait for background work, call Yield; you are also notified when it completes.",
                     ))
             } else {
                 RuntimeString::from("Task ")
@@ -490,10 +625,12 @@ impl TaskOutputTool {
         if handle.status == BackgroundTaskStatus::Interrupted {
             let partial = handle.partial.clone().unwrap_or_default();
             let text = if !partial.is_empty() {
-                RuntimeString::from("Task ")
+                partial
+                    .clone()
+                    .concat(&RuntimeString::from("\n\nTask "))
                     .concat(&handle.agent_id)
                     .concat(&RuntimeString::from(
-                        " was interrupted and never produced a final answer. The available partial activity is not a completed result. Resume or re-spawn the task if the work is still needed.",
+                        " was interrupted and never produced a final answer. The available partial activity above is not a completed result. Resume or re-spawn the task if the work is still needed.",
                     ))
             } else {
                 RuntimeString::from("Task ")
@@ -556,12 +693,14 @@ impl TaskOutputTool {
                 .concat(&RuntimeString::from(" failed; any available output is incomplete activity, not a final answer.\n"))
                 .concat(&output),
             "success" => output.clone(),
-            "transcript_only" => RuntimeString::from("Task ")
+            "transcript_only" => output
+                .clone()
+                .concat(&RuntimeString::from("\n\nTask "))
                 .concat(&handle.agent_id)
                 .concat(&RuntimeString::from(" "))
                 .concat(&RuntimeString::from(status_str(handle.status)))
                 .concat(&RuntimeString::from(
-                    ", but its result file is gone, so the transcript it left behind is returned instead. That is its activity log, not its clean final answer.",
+                    ", but its result file is gone, so the transcript activity above is returned instead. That is its activity log, not its clean final answer.",
                 )),
             _ => RuntimeString::from("Task ")
                 .concat(&handle.agent_id)
@@ -728,11 +867,15 @@ impl Tool for TaskStopTool {
     }
 
     fn is_concurrency_safe(&self, _input: &Json) -> bool {
-        true
+        false
     }
 
     fn is_read_only(&self, _input: &Json) -> bool {
         false
+    }
+
+    fn planning_capability(&self, _input: &Json) -> PlanningToolCapability {
+        PlanningToolCapability::Research
     }
 
     fn input_schema_property_order(
@@ -767,25 +910,32 @@ impl Tool for TaskStopTool {
             ));
         };
 
-        // 1) An exact sub-agent id.
+        // 1) An exact sub-agent id owned by this caller.
         let reg = ctx.background_tasks.as_ref();
+        let caller = reg.and_then(|r| r.caller_agent_id());
         if let Some(handle) = reg.and_then(|r| r.get(&id)) {
+            if reg.is_some_and(|r| r.is_owned_by_caller(&id) == Some(false)) {
+                return Ok(not_owner_stop_result(id, "agent"));
+            }
             return Ok(self.stop_agent(reg, handle, &id));
         }
 
-        // 2) A background shell command id.
+        // 2) A background shell command id owned by this caller.
         let known_shell = ctx
             .background_processes
-            .list()
+            .status_summaries()
             .into_iter()
             .find(|entry| entry.id == id);
         if let Some(entry) = known_shell {
+            if entry.owner_agent_id.as_ref() != caller.as_ref() {
+                return Ok(not_owner_stop_result(id, "shell"));
+            }
             return self.stop_shell(ctx, &input, &id, entry.command).await;
         }
 
-        // 3) A bound agent/teammate name or an unambiguous prefix.
+        // 3) A bound agent/teammate name or an unambiguous prefix owned by this caller.
         if let Some(registry) = reg {
-            match registry.resolve_target(&id) {
+            match registry.resolve_owned_target(&id) {
                 Some(Ok(agent_id)) => {
                     if let Some(handle) = registry.get(&agent_id) {
                         return Ok(self.stop_agent(reg, handle, &agent_id));
@@ -802,7 +952,11 @@ impl Tool for TaskStopTool {
                         true,
                     ));
                 }
-                None => {}
+                None => {
+                    if registry.resolve_target(&id).is_some() {
+                        return Ok(not_owner_stop_result(id, "agent"));
+                    }
+                }
             }
         }
 
@@ -960,6 +1114,8 @@ mod tests {
             status,
             description: Some(RuntimeString::from("stub task")),
             partial: Some(RuntimeString::from(partial)),
+            idle: false,
+            notification_pending: false,
         }
     }
 
@@ -1240,6 +1396,7 @@ mod tests {
                     unconfined_writes: false,
                     network_allowed: None,
                     managed_network: None,
+                    owner_agent_id: None,
                     on_complete: None,
                 },
             )
@@ -1327,5 +1484,247 @@ mod tests {
             "{}",
             utf8(&collected_text)
         );
+    }
+
+    #[tokio::test]
+    async fn output_includes_partial_text_for_running_interrupted_and_transcript_only() {
+        let ctx = ctx_with(StubRegistry::new(vec![
+            handle("run-1", BackgroundTaskStatus::Running, "working step 2"),
+            handle("int-1", BackgroundTaskStatus::Interrupted, "partial int"),
+            handle("trn-1", BackgroundTaskStatus::Completed, "partial trn"),
+        ]));
+        let tool = create_task_output_tool();
+        let run_res = tool
+            .call(rjson!({"task_id":"run-1"}), &ctx, None)
+            .await
+            .unwrap();
+        assert!(text_of(&run_res).contains("working step 2"));
+        let int_res = tool
+            .call(rjson!({"task_id":"int-1"}), &ctx, None)
+            .await
+            .unwrap();
+        assert!(text_of(&int_res).contains("partial int"));
+        let trn_res = tool
+            .call(rjson!({"task_id":"trn-1"}), &ctx, None)
+            .await
+            .unwrap();
+        assert!(text_of(&trn_res).contains("partial trn"));
+    }
+
+    #[tokio::test]
+    async fn parse_input_accepts_facade_wait_ms_and_waits_for_agent() {
+        let tool = create_task_output_tool();
+        let parsed = tool
+            .parse_input(&rjson!({"task_id":"agent-1","_facade_wait_ms":400}))
+            .expect("parse_input keeps _facade_wait_ms");
+        assert_eq!(
+            parsed.get("_facade_wait_ms").and_then(RuntimeJson::as_f64),
+            Some(400.0)
+        );
+
+        let shared_handles = Arc::new(Mutex::new(vec![handle(
+            "agent-1",
+            BackgroundTaskStatus::Running,
+            "starting",
+        )]));
+        struct LiveRegistry(Arc<Mutex<Vec<BackgroundTaskHandle>>>);
+        #[async_trait]
+        impl BackgroundTaskRegistry for LiveRegistry {
+            fn get(&self, agent_id: &RuntimeString) -> Option<BackgroundTaskHandle> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|h| &h.agent_id == agent_id)
+                    .cloned()
+            }
+            fn list(&self) -> Vec<BackgroundTaskHandle> {
+                self.0.lock().unwrap().clone()
+            }
+            fn stop(&self, _agent_id: &RuntimeString) -> bool {
+                false
+            }
+            async fn wait_for_idle(&self) {}
+        }
+        let writer = Arc::clone(&shared_handles);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let mut guard = writer.lock().unwrap();
+            guard[0].status = BackgroundTaskStatus::Completed;
+            guard[0].partial = Some(RuntimeString::from("done via wait"));
+        });
+        let mut ctx = make_ctx("/tmp");
+        ctx.background_tasks = Some(Arc::new(LiveRegistry(shared_handles)));
+        ctx.reply_gate = Some(Arc::new(ReplyScopedGate::default()));
+        ctx.reply_gate
+            .as_ref()
+            .unwrap()
+            .begin_reply("reply-wait".to_string());
+        let res = tool.call(parsed, &ctx, None).await.unwrap();
+        assert!(text_of(&res).contains("done via wait"));
+        assert!(!is_err(&res));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_repeat_read_budget_preserves_uncollected_output() {
+        use crate::tools::background_shells::StartShellOptions;
+        let ctx = ctx_with(StubRegistry::new(vec![]));
+        let shell_id = ctx
+            .background_processes
+            .start(
+                ctx.process_context.clone(),
+                StartShellOptions {
+                    command: RuntimeString::from("sleep 0.4 && printf preserved-tail"),
+                    cwd: RuntimePath::from("/tmp"),
+                    sandbox: Arc::new(IdSandbox),
+                    env: None,
+                    max_output_bytes: 64 * 1024,
+                    writable_roots: None,
+                    unconfined_writes: false,
+                    network_allowed: None,
+                    managed_network: None,
+                    owner_agent_id: None,
+                    on_complete: None,
+                },
+            )
+            .await
+            .expect("shell starts");
+        let tool = create_task_output_tool();
+        let req = runtime_json::parse(
+            &RuntimeString::from("{\"task_id\":\"")
+                .concat(&shell_id)
+                .concat(&RuntimeString::from("\"}")),
+        )
+        .unwrap();
+        for _ in 0..READ_ANSWER_BUDGET {
+            let ok = tool.call(req.clone(), &ctx, None).await.unwrap();
+            assert!(!is_err(&ok));
+        }
+        let refused = tool.call(req.clone(), &ctx, None).await.unwrap();
+        assert!(is_err(&refused));
+        assert!(text_of(&refused).contains("not answered again"));
+
+        // Wait for shell to finish so status transitions away from running; unread
+        // output emitted while running must still be intact.
+        for _ in 0..30 {
+            if ctx
+                .background_processes
+                .status_summaries()
+                .iter()
+                .any(|s| s.id == shell_id && s.status != BackgroundShellStatus::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let final_read = tool.call(req, &ctx, None).await.unwrap();
+        assert!(!is_err(&final_read), "{}", utf8(&text_of(&final_read)));
+        assert!(
+            text_of(&final_read).contains("preserved-tail"),
+            "{}",
+            utf8(&text_of(&final_read))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_ownership_blocks_reading_or_stopping_other_agent_tasks() {
+        use crate::tools::background_shells::StartShellOptions;
+        struct OwnedRegistry {
+            caller: RuntimeString,
+            handles: Vec<BackgroundTaskHandle>,
+        }
+        #[async_trait]
+        impl BackgroundTaskRegistry for OwnedRegistry {
+            fn caller_agent_id(&self) -> Option<RuntimeString> {
+                Some(self.caller.clone())
+            }
+            fn get(&self, agent_id: &RuntimeString) -> Option<BackgroundTaskHandle> {
+                self.handles
+                    .iter()
+                    .find(|h| &h.agent_id == agent_id)
+                    .cloned()
+            }
+            fn is_owned_by_caller(&self, _agent_id: &RuntimeString) -> Option<bool> {
+                Some(false)
+            }
+            fn list(&self) -> Vec<BackgroundTaskHandle> {
+                self.handles.clone()
+            }
+            fn stop(&self, _agent_id: &RuntimeString) -> bool {
+                false
+            }
+            async fn wait_for_idle(&self) {}
+        }
+
+        let mut ctx = make_ctx("/tmp");
+        ctx.background_tasks = Some(Arc::new(OwnedRegistry {
+            caller: RuntimeString::from("subagent-a"),
+            handles: vec![handle(
+                "sibling-agent",
+                BackgroundTaskStatus::Running,
+                "secret",
+            )],
+        }));
+        let root_shell_id = ctx
+            .background_processes
+            .start(
+                ctx.process_context.clone(),
+                StartShellOptions {
+                    command: RuntimeString::from("printf root-secret && sleep 0.3"),
+                    cwd: RuntimePath::from("/tmp"),
+                    sandbox: Arc::new(IdSandbox),
+                    env: None,
+                    max_output_bytes: 64 * 1024,
+                    writable_roots: None,
+                    unconfined_writes: false,
+                    network_allowed: None,
+                    managed_network: None,
+                    owner_agent_id: None,
+                    on_complete: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let output_tool = create_task_output_tool();
+        let stop_tool = create_task_stop_tool();
+        let agent_read = output_tool
+            .call(rjson!({"task_id":"sibling-agent"}), &ctx, None)
+            .await
+            .unwrap();
+        assert!(is_err(&agent_read));
+        assert!(text_of(&agent_read).contains("belongs to another agent"));
+        let agent_stop = stop_tool
+            .call(rjson!({"task_id":"sibling-agent"}), &ctx, None)
+            .await
+            .unwrap();
+        assert!(is_err(&agent_stop));
+        assert!(text_of(&agent_stop).contains("belongs to another agent"));
+
+        let shell_req = runtime_json::parse(
+            &RuntimeString::from("{\"task_id\":\"")
+                .concat(&root_shell_id)
+                .concat(&RuntimeString::from("\"}")),
+        )
+        .unwrap();
+        let shell_read = output_tool
+            .call(shell_req.clone(), &ctx, None)
+            .await
+            .unwrap();
+        assert!(is_err(&shell_read));
+        assert!(text_of(&shell_read).contains("belongs to another agent"));
+        let shell_stop = stop_tool.call(shell_req, &ctx, None).await.unwrap();
+        assert!(is_err(&shell_stop));
+        assert!(text_of(&shell_stop).contains("belongs to another agent"));
+        // Verify buffer was NOT consumed by the rejected read.
+        let summary = ctx
+            .background_processes
+            .read_new_wait(&root_shell_id, 500, &ctx.signal, None)
+            .await
+            .unwrap();
+        assert!(summary.output.contains("root-secret"));
+        ctx.background_processes.kill_all();
     }
 }

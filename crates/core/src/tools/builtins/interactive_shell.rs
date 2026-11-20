@@ -354,6 +354,7 @@ impl Tool for ExecCommandTool {
                 cols: terminal_u16(&input, "cols", 80),
                 rows: terminal_u16(&input, "rows", 24),
             });
+        let interactive_tty = terminal.is_some();
 
         let shell_sessions = ctx.background_processes.shell_sessions();
         let command_for_process = command.clone();
@@ -447,6 +448,11 @@ impl Tool for ExecCommandTool {
                     max_output_bytes: self.max_output_bytes,
                     events,
                     stop: Arc::new(move |id, signal| stop_sessions.kill_with_signal(id, signal)),
+                    owner_agent_id: ctx
+                        .background_tasks
+                        .as_ref()
+                        .and_then(|registry| registry.caller_agent_id()),
+                    interactive_tty,
                     on_complete: Some(Box::new(move |result| {
                         if result.status
                             == crate::tools::background_shells::BackgroundShellStatus::Killed

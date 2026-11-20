@@ -2792,9 +2792,12 @@ impl Agent {
             }
             builtins.extend(mcp_tools);
             if !config.disabled_tools.is_empty() {
-                let disabled: HashSet<RuntimeString> =
-                    config.disabled_tools.iter().cloned().collect();
-                builtins.retain(|tool| !disabled.contains(&tool.name()));
+                builtins.retain(|tool| {
+                    !crate::engine::agent_definitions::AgentDefinition::policy_list_matches_tool(
+                        &config.disabled_tools,
+                        tool.as_ref(),
+                    )
+                });
             }
             ensure_tool_search(builtins)
         };

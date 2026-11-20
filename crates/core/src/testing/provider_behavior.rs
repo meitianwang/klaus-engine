@@ -5841,7 +5841,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "aff8d23a83b22ed71883cef21245f5885fac92f50c7ff44ba4121c2ffe4a997e";
+    "3677292a7553afee585a75a45734418deb33ed57519758b5b9a1d8395d5a91fb";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(

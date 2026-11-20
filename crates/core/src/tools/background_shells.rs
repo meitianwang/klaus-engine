@@ -9,7 +9,9 @@ pub use crate::command_runtime::background::{
     BackgroundCommandComplete as CompleteResult, BackgroundCommandListEntry as ShellListEntry,
     BackgroundCommandOnComplete as OnComplete,
     BackgroundCommandRegistry as BackgroundShellRegistry,
-    BackgroundCommandStatus as BackgroundShellStatus, ReadBackgroundCommandResult as ReadNewResult,
+    BackgroundCommandStatus as BackgroundShellStatus,
+    BackgroundCommandStatusSummary as ShellStatusSummary,
+    ReadBackgroundCommandResult as ReadNewResult,
     StartBackgroundCommandOptions as StartShellOptions,
 };
 
@@ -77,6 +79,7 @@ mod tests {
                     unconfined_writes: false,
                     network_allowed: None,
                     managed_network: None,
+                    owner_agent_id: None,
                     on_complete: None,
                 },
             )

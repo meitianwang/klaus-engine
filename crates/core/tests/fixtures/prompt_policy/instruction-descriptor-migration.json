@@ -2233,17 +2233,21 @@
       "sourceSha256": "28551c2449b24a3d70614fa49dfabfc4393e03aef431457332a944ef2141ed29",
       "target": {
         "name": "wait_agent",
-        "description": "Returns the current state of a background task — a shell command that kept running in the background, or a sub-agent started with run_in_background — whether it is still running or has since finished.\n\n- status: \"running\" (still working; the output so far is returned), \"completed\", \"failed\", \"interrupted\", or for shell commands \"exited\" / \"killed\"\n- Results also reach you by themselves when a background task finishes, unless the message that started it said otherwise, so you don't need to check on it. Use this tool to read a finished task's result again, or to check once on a task you have lost track of — never to wait: while a task runs, calling this tool only returns its state so far, and when it finishes its result reaches you without a call. To wait for background work, call Yield.\n\n# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
+        "description": "Inspect or wait on a background agent or shell task by id or name.\n\n# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id or background shell id. This target-based facade waits only for that specified agent or shell; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` to bound waiting (omitting it waits up to 30 seconds while running), and `filter` to filter shell output lines. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "target": {
               "type": "string",
-              "description": "Background agent id returned by spawn_agent."
+              "description": "Background agent id (or bound name) or background shell id."
             },
             "timeout_ms": {
               "type": "number",
-              "description": "Maximum milliseconds to wait for the background agent."
+              "description": "Maximum milliseconds to wait while the task is running (defaults to 30000; pass 0 for a non-blocking snapshot)."
+            },
+            "filter": {
+              "type": "string",
+              "description": "Optional regex filter applied to shell output lines."
             }
           },
           "required": [
@@ -2252,7 +2256,7 @@
           "additionalProperties": false
         }
       },
-      "targetSha256": "e6e43fddf910ab1774d0c8b8b77d3ed629adbe8fbe9a39028998def816615805"
+      "targetSha256": "3803aac4f23ab8f4e192b019510388b8d04bd929f65c673a5826a676f5fb0926"
     },
     {
       "style": "openai",
@@ -2277,13 +2281,13 @@
       "sourceSha256": "750f238184d1fa1bb2a6fba96cc8112579f656e1ee0e803990e72d85316d149a",
       "target": {
         "name": "interrupt_agent",
-        "description": "- Stops a running background task by its ID: a background shell command or a background sub-agent\n- Takes a task_id parameter identifying the task to stop\n- To stop an agent-team teammate, pass its agent ID or bare teammate name as task_id\n- To stop a background agent spawned with a name, pass that name as task_id\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n\n# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.",
+        "description": "Stop a running background task (sub-agent or shell) by id or name.\n\n# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id (or bound name) or background shell id to stop. Only use it when that task should no longer continue.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "target": {
               "type": "string",
-              "description": "Background agent id to stop."
+              "description": "Background agent id (or bound name) or background shell id to stop."
             }
           },
           "required": [
@@ -2292,7 +2296,7 @@
           "additionalProperties": false
         }
       },
-      "targetSha256": "dc365ede0991b98c926bef28dc68f7827e9c85483634e6ec124400b3ea863411"
+      "targetSha256": "92079223d0f35044f1e92ccb9d99d57746f7088b4cb0ef87b35d9a1ebc4a5faf"
     }
   ]
 }

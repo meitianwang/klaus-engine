@@ -565,6 +565,18 @@ fn parse_keywords(query: &RuntimeString) -> (Vec<RuntimeString>, Vec<RuntimeStri
         })
 }
 
+fn legacy_canonical_tool_needle(needle: &RuntimeString) -> Option<&'static str> {
+    match needle.try_to_utf8().ok().as_deref() {
+        Some(
+            "task_output" | "bash_output" | "agent_output" | "agentoutputtool" | "bashoutputtool",
+        ) => Some("taskoutput"),
+        Some("task_stop" | "kill_shell" | "kill_bash" | "killshell" | "killbash") => {
+            Some("taskstop")
+        }
+        _ => None,
+    }
+}
+
 fn find_catalog_tool<'a>(
     catalog: &'a [ToolCatalogEntry],
     name: &RuntimeString,
@@ -578,6 +590,14 @@ fn find_catalog_tool<'a>(
         .find(|tool| lowercase_runtime(&tool.name) == needle)
     {
         return Some(exact);
+    }
+    if let Some(canonical) = legacy_canonical_tool_needle(&needle) {
+        if let Some(found) = catalog
+            .iter()
+            .find(|tool| lowercase_runtime(&tool.name).try_to_utf8().as_deref() == Ok(canonical))
+        {
+            return Some(found);
+        }
     }
     let utf8 = needle.try_to_utf8().ok()?;
     let (ns, short) = utf8.split_once('.')?;

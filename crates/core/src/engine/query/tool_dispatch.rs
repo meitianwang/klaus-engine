@@ -11,7 +11,7 @@ use super::permission_denial_message;
 use super::query_path_dialect;
 use super::render_failed_tool_result_content;
 use super::render_interrupted_tool_result_content;
-use super::render_successful_tool_result_content;
+use super::render_successful_tool_result_content_with_output;
 use super::result_trim::render_spilled_tool_result;
 use super::result_trim::tool_result_spill_limit;
 use super::safe_json_text;
@@ -21,12 +21,14 @@ use super::text_out_exact;
 use super::to_json_safe;
 use super::tool_reported_error_detail;
 use super::unknown_tool_message;
+use super::DispatchedToolCall;
 use super::ResolvedToolCall;
 use super::Shared;
 use super::ToolCallResult;
 use crate::hooks::types::HookEvent;
 use crate::permission::engine::PermissionDecision;
 use crate::permission::rules::parse_rule_strings;
+use crate::provider::behavior::{render_provider_text_envelope, ProviderTextEnvelopeKind};
 use crate::runtime_process::path_join;
 use crate::runtime_values::runtime_codec;
 use crate::runtime_values::RuntimeJson;
@@ -289,13 +291,14 @@ pub(super) async fn dispatch_tool_calls(
     shared: &Arc<Shared>,
     calls: &[ResolvedToolCall],
     mut prestarted: HashMap<RuntimeString, JoinHandle<ToolCallResult>>,
-) -> Result<Vec<ToolResultMessage>, ToolError> {
+) -> Result<(Vec<ToolResultMessage>, Vec<RuntimeString>), ToolError> {
     let limit = Arc::new(Semaphore::new(
         shared.config().max_tool_concurrency.max(1) as usize
     ));
     let tools = shared.tools.lock_recover().clone();
     let groups = group_by_concurrency(calls, &tools);
     let mut results: Vec<ToolResultMessage> = Vec::new();
+    let mut post_result_notices: Vec<RuntimeString> = Vec::new();
     let mut handled: HashSet<RuntimeString> = HashSet::new();
 
     for group in &groups {
@@ -314,7 +317,7 @@ pub(super) async fn dispatch_tool_calls(
         }
         if group.len() == 1 {
             let call = group[0].clone();
-            let r = match prestarted.remove(&call.visible.id) {
+            let dispatched = match prestarted.remove(&call.visible.id) {
                 Some(handle) => await_prestarted_tool_call(handle).await,
                 None => {
                     let permit = Arc::clone(&limit).acquire_owned().await.unwrap();
@@ -324,7 +327,8 @@ pub(super) async fn dispatch_tool_calls(
                 }
             }?;
             handled.insert(call.visible.id.clone());
-            results.push(r);
+            results.push(dispatched.message);
+            post_result_notices.extend(dispatched.post_result_notices);
         } else {
             // Promise.all starts every sibling before observing the first
             // rejection, and rejecting one promise does not cancel the rest.
@@ -414,7 +418,7 @@ pub(super) async fn dispatch_tool_calls(
             }
             let mut group_results = std::iter::repeat_with(|| None)
                 .take(group.len())
-                .collect::<Vec<Option<ToolResultMessage>>>();
+                .collect::<Vec<Option<DispatchedToolCall>>>();
             while let Some((index, joined)) = pending.next().await {
                 match resolve_tool_task(joined) {
                     Ok(result) => group_results[index] = Some(result),
@@ -422,8 +426,10 @@ pub(super) async fn dispatch_tool_calls(
                 }
             }
             for (call, r) in group.iter().zip(group_results) {
+                let dispatched = r.expect("every parallel tool task must produce one result");
                 handled.insert(call.visible.id.clone());
-                results.push(r.expect("every parallel tool task must produce one result"));
+                results.push(dispatched.message);
+                post_result_notices.extend(dispatched.post_result_notices);
             }
         }
     }
@@ -454,9 +460,9 @@ pub(super) async fn dispatch_tool_calls(
         .map(|call| call.visible.id.clone())
         .collect();
     if !shared.config().aggregate_tool_results {
-        return Ok(results);
+        return Ok((results, post_result_notices));
     }
-    Ok(persist_per_message_budget(
+    let results = persist_per_message_budget(
         results,
         shared.config().max_tool_results_per_message_chars as usize,
         spill_dir.clone(),
@@ -480,7 +486,8 @@ pub(super) async fn dispatch_tool_calls(
         },
         |preview, full, path| render_spilled_tool_result(preview, full, path, profile),
     )
-    .await)
+    .await;
+    Ok((results, post_result_notices))
 }
 
 /// The refusal text for a call to a tool that is still collapsed: names the
@@ -710,7 +717,11 @@ fn execute_tool_call_inner(
         if call.visible.tool_kind
             == Some(crate::types::provider::ProviderToolCallKind::ServerToolSearch)
         {
-            return Ok(recorded_server_tool_search_result(&shared, &call, emit_started).await);
+            return Ok(
+                recorded_server_tool_search_result(&shared, &call, emit_started)
+                    .await
+                    .into(),
+            );
         }
         // A deferred tool called while still collapsed never runs: the model
         // has no schema to parameterize it, and the refusal carries the load
@@ -725,11 +736,12 @@ fn execute_tool_call_inner(
                 tool_not_loaded_message(&call.internal_name),
                 &[],
             )
-            .await);
+            .await
+            .into());
         }
         let signal = shared.params.signal.clone();
         if signal.is_cancelled() {
-            return Ok(interrupted_tool_result(&shared, &call).await);
+            return Ok(interrupted_tool_result(&shared, &call).await.into());
         }
         let persistence = Arc::new(super::tool_tasks::ToolPersistence::default());
         let mut work = Box::pin(persistence.scope(execute_tool_call_body(
@@ -752,7 +764,7 @@ fn execute_tool_call_inner(
                         result = &mut work => result,
                         () = persistence.drain() => {
                             drop(work);
-                            Ok(interrupted_tool_result(&shared, &call).await)
+                            Ok(interrupted_tool_result(&shared, &call).await.into())
                         }
                     }
                 }
@@ -791,7 +803,8 @@ fn execute_tool_call_body(
                 "The selected agent definition does not permit this tool".into(),
                 &[],
             )
-            .await);
+            .await
+            .into());
         }
         if emit_started {
             push_tool_call_started(&shared, &call).await?;
@@ -803,7 +816,8 @@ fn execute_tool_call_body(
                 unknown_tool_message(&call.internal_name),
                 &[],
             )
-            .await);
+            .await
+            .into());
         };
 
         // The dispatcher parses the provider-normalized input before
@@ -813,7 +827,11 @@ fn execute_tool_call_body(
         let input = match tool.parse_input(&call.initial_internal_input) {
             Ok(input) => input,
             Err(error) if error.kind == ToolErrorKind::Fatal => return Err(error),
-            Err(error) => return Ok(error_result(&call, &shared, error.message, &[]).await),
+            Err(error) => {
+                return Ok(error_result(&call, &shared, error.message, &[])
+                    .await
+                    .into())
+            }
         };
         call.replace_effective_input(input.clone());
         let context_effective_input = Arc::new(Mutex::new(call.effective_internal_input.clone()));
@@ -1104,9 +1122,9 @@ fn execute_tool_call_body(
                             .await?;
                             match execute_tool_call(Arc::clone(&s), inner_call).await {
                                 Ok(res) => Ok(InvokeToolResult {
-                                    is_error: res.is_error,
-                                    output: res.output,
-                                    content: res.content,
+                                    is_error: res.message.is_error,
+                                    output: res.message.output,
+                                    content: res.message.content,
                                 }),
                                 Err(error) => Err(error),
                             }
@@ -1118,7 +1136,9 @@ fn execute_tool_call_body(
 
         match tool.validate_input(&input, &ctx).await {
             Some(ValidationResult::Err { message, .. }) => {
-                return Ok(error_result(&call, &shared, message.into(), &[]).await);
+                return Ok(error_result(&call, &shared, message.into(), &[])
+                    .await
+                    .into());
             }
             Some(ValidationResult::Fatal { error }) => return Err(error),
             Some(ValidationResult::Ok) | None => {}
@@ -1147,14 +1167,14 @@ fn execute_tool_call_body(
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "Turn halted by PreToolUse hook".into());
-                    return Ok(error_result(&call, &shared, msg, &[]).await);
+                    return Ok(error_result(&call, &shared, msg, &[]).await.into());
                 }
                 if pre.blocked {
                     let msg = pre
                         .block_reason
                         .clone()
                         .unwrap_or_else(|| "Blocked by PreToolUse hook".into());
-                    return Ok(error_result(&call, &shared, msg, &[]).await);
+                    return Ok(error_result(&call, &shared, msg, &[]).await.into());
                 }
                 if let Some(updated) = pre.updated_input {
                     call.replace_effective_input(updated);
@@ -1234,7 +1254,9 @@ fn execute_tool_call_body(
             PermissionDecision::Fatal { error } => return Err(error),
             PermissionDecision::Deny { message, .. } => {
                 return Ok(
-                    error_result(&call, &shared, permission_denial_message(&message), &[]).await,
+                    error_result(&call, &shared, permission_denial_message(&message), &[])
+                        .await
+                        .into(),
                 );
             }
             PermissionDecision::Ask {
@@ -1270,7 +1292,7 @@ fn execute_tool_call_body(
                             permission_stamp = approved_input.policy;
                             call.replace_effective_input(approved_input.input);
                         }
-                        Err(msg) => return Ok(error_result(&call, &shared, msg, &[]).await),
+                        Err(msg) => return Ok(error_result(&call, &shared, msg, &[]).await.into()),
                     }
                 }
             }
@@ -1287,7 +1309,7 @@ fn execute_tool_call_body(
                             permission_stamp = approved_input.policy;
                             call.replace_effective_input(approved_input.input);
                         }
-                        Err(m) => return Ok(error_result(&call, &shared, m, &[]).await),
+                        Err(m) => return Ok(error_result(&call, &shared, m, &[]).await.into()),
                     }
                 } else {
                     call.replace_effective_input(allowed_input);
@@ -1307,7 +1329,9 @@ fn execute_tool_call_body(
             Ok(input) => call.replace_effective_input(input),
             Err(PermissionDecision::Deny { message, .. }) => {
                 return Ok(
-                    error_result(&call, &shared, permission_denial_message(&message), &[]).await,
+                    error_result(&call, &shared, permission_denial_message(&message), &[])
+                        .await
+                        .into(),
                 )
             }
             Err(PermissionDecision::Fatal { error }) => return Err(error),
@@ -1324,7 +1348,9 @@ fn execute_tool_call_body(
             .await
         {
             return Ok(
-                error_result(&call, &shared, permission_denial_message(&message), &[]).await,
+                error_result(&call, &shared, permission_denial_message(&message), &[])
+                    .await
+                    .into(),
             );
         }
 
@@ -1369,7 +1395,8 @@ fn execute_tool_call_body(
                         permission_denial_message(&message),
                         &[],
                     )
-                    .await)
+                    .await
+                    .into())
                 }
             }
         }
@@ -1433,7 +1460,8 @@ fn execute_tool_call_body(
                 "The selected agent definition does not permit this tool".into(),
                 &hook_context,
             )
-            .await);
+            .await
+            .into());
         }
         if permission_stamp
             != RuntimePermissionStamp::capture(
@@ -1448,7 +1476,8 @@ fn execute_tool_call_body(
                     .into(),
                 &hook_context,
             )
-            .await);
+            .await
+            .into());
         }
         let tool_outcome = tool
             .call_with_id(
@@ -1613,27 +1642,48 @@ fn execute_tool_call_body(
                         &call.profile,
                     )
                 } else {
-                    render_successful_tool_result_content(
+                    render_successful_tool_result_content_with_output(
                         model_content,
                         &call.visible.name,
                         &call.profile,
+                        Some(&result.serializable.output),
                     )
                 };
 
+                let post_result_notices: Vec<RuntimeString> = result
+                    .side_effects
+                    .map(|effects| {
+                        effects
+                            .post_result_notices
+                            .into_iter()
+                            .map(|notice| {
+                                render_provider_text_envelope(
+                                    ProviderTextEnvelopeKind::SystemReminder,
+                                    notice,
+                                    &call.profile,
+                                    Default::default(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let extra_user_blocks = result
                     .serializable
                     .extra_user_blocks
                     .clone()
                     .filter(|b| !b.is_empty());
-                Ok(ToolResultMessage {
-                    uuid: (shared.deps.uuid)().into(),
-                    tool_use_id: call.visible.id.clone(),
-                    content,
-                    is_error,
-                    tool_kind: result_tool_kind,
-                    native_tool_output,
-                    output: Some(result.serializable.output.clone()),
-                    extra_user_blocks,
+                Ok(DispatchedToolCall {
+                    message: ToolResultMessage {
+                        uuid: (shared.deps.uuid)().into(),
+                        tool_use_id: call.visible.id.clone(),
+                        content,
+                        is_error,
+                        tool_kind: result_tool_kind,
+                        native_tool_output,
+                        output: Some(result.serializable.output.clone()),
+                        extra_user_blocks,
+                    },
+                    post_result_notices,
                 })
             }
             Err(err) => {
@@ -1666,7 +1716,9 @@ fn execute_tool_call_body(
                 if err.kind == ToolErrorKind::Fatal {
                     return Err(err);
                 }
-                Ok(error_result(&call, &shared, message, &failure_context).await)
+                Ok(error_result(&call, &shared, message, &failure_context)
+                    .await
+                    .into())
             }
         }
     })
@@ -1689,9 +1741,11 @@ fn tool_call_authorized(
         .agent_tool_policy
         .as_ref()
         .is_none_or(|policy| {
-            policy.allows_tool(&call.internal_name)
-                || (call.internal_name == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME
-                    && policy.allows_tool(&RuntimeString::from("tool_search")))
+            tool.map_or_else(
+                || policy.allows_tool(&call.internal_name),
+                |resolved| policy.allows_tool_entry(resolved),
+            ) || (call.internal_name == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME
+                && policy.allows_tool(&RuntimeString::from("tool_search")))
                 || (dependency == Some(true)
                     && call
                         .trusted_caller

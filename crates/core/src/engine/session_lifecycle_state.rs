@@ -67,6 +67,9 @@ pub(crate) struct BackgroundAgentEntry {
     pub(crate) on_idle: Vec<tokio::sync::oneshot::Sender<()>>,
     /// Set once the terminal completion notice has been enqueued (guards double-send).
     pub(crate) notified: bool,
+    /// True from terminal status flip until the completion notification has
+    /// entered the parent queue (or been skipped).
+    pub(crate) notification_pending: bool,
     /// Tree depth of this child: 1 = spawned directly by this session, 2+ =
     /// nested. Nested children settle their lifecycle rows one hop down, in
     /// their direct parent's sidechain, and their terminal receipts never

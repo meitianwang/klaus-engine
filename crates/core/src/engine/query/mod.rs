@@ -924,6 +924,9 @@ enum Outcome {
         final_text: RuntimeString,
         /// Whether a `sleep` tool ran this iteration.
         sleep_ran: bool,
+        /// Meta notices emitted after the turn's tool-result messages (for example
+        /// `Yield`'s wake reason, positioned before drained notifications).
+        post_result_notices: Vec<RuntimeString>,
         /// Unparseable calls at the output ceiling, named in arrival order.
         /// Either the stop reason or measured output usage can establish the
         /// ceiling for safe retries. Only an explicit truncation can authorize
@@ -946,7 +949,21 @@ enum Outcome {
     },
 }
 
-type ToolCallResult = Result<ToolResultMessage, ToolError>;
+pub(crate) struct DispatchedToolCall {
+    pub message: ToolResultMessage,
+    pub post_result_notices: Vec<RuntimeString>,
+}
+
+impl From<ToolResultMessage> for DispatchedToolCall {
+    fn from(message: ToolResultMessage) -> Self {
+        Self {
+            message,
+            post_result_notices: Vec::new(),
+        }
+    }
+}
+
+type ToolCallResult = Result<DispatchedToolCall, ToolError>;
 
 /// One accumulator entry, in stream-arrival order. Text remains in growable
 /// exact UTF-16 buffers until a durable or externally visible snapshot is needed.

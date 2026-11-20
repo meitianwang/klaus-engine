@@ -2140,7 +2140,11 @@ impl Session {
                     effort: child_effort.clone(), ultra_mode: child_ultra_mode, output_schema: opts.output_schema.clone(), web_search: child_web_selection.request.clone(),
                     in_fork_child: fork_path || run_opts.in_fork_child == Some(true),
                     fork_seed,
-                    name: opts.name.clone(), one_shot: crate::engine::builtin_agents::is_one_shot_builtin_role(
+                    name: opts
+                        .name
+                        .clone()
+                        .or_else(|| opts.swarm.as_ref().map(|swarm| swarm.peer.clone())),
+                    one_shot: crate::engine::builtin_agents::is_one_shot_builtin_role(
                         def.as_ref().and_then(|definition| definition.builtin_identity.as_ref())),
                     mcp_clients: mcp_clients.clone(),
                     mcp_runtime: mcp_runtime.clone(),
@@ -2923,6 +2927,46 @@ impl Session {
                 permission,
                 policy.sandbox_backend.clone(),
             );
+            {
+                let this_e = this.clone();
+                let notice_agent = RuntimeString::from(parent_agent_for_children.clone());
+                ctx.enqueue_background_notice = Some(Arc::new(move |text: RuntimeString| {
+                    if this_e.lifecycle.is_disposed() {
+                        return;
+                    }
+                    let rendered = this_e.render_deferred_notice(&text);
+                    let _ = this_e.conversation.queue().enqueue_pending_notification(
+                        crate::engine::message_queue::QueuedMessage {
+                            trigger_turn: None,
+                            value: crate::engine::message_queue::QueuedValue::Blocks(vec![
+                                crate::schemas::content::ContentBlock::Text(
+                                    crate::schemas::content::TextBlock {
+                                        text: rendered,
+                                        citations: None,
+                                        harness_envelope: Some(
+                                            crate::schemas::content::HarnessEnvelope::SystemReminder,
+                                        ),
+                                        message_id: None,
+                                        phase: None,
+                                    },
+                                ),
+                            ]),
+                            mode: "task-notification".into(),
+                            is_meta: Some(true),
+                            origin: Some("background-shell".into()),
+                            priority: Some(crate::engine::message_queue::QueuePriority::Next),
+                            uuid: Some((this_e.deps.uuid)().into()),
+                            session_id: Some(this_e.id.clone()),
+                            agent_id: Some(notice_agent.clone()),
+                            correlation_id: None,
+                            pdf_bytes: 0,
+                            pdf_documents: 0,
+                            delivery: None,
+                            display_metadata: None,
+                        },
+                    );
+                }));
+            }
             {
                 let session = this.clone();
                 let turn = child_turn_id.clone();

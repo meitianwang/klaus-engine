@@ -640,6 +640,10 @@ impl Tool for BashTool {
                         unconfined_writes,
                         network_allowed: network_for_run,
                         managed_network: None,
+                        owner_agent_id: ctx
+                            .background_tasks
+                            .as_ref()
+                            .and_then(|registry| registry.caller_agent_id()),
                         on_complete: Some(Box::new(move |r: CompleteResult| {
                             if r.status == BackgroundShellStatus::Killed
                                 || notice_processes.upgrade().is_some_and(|processes| {

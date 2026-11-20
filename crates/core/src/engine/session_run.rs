@@ -211,7 +211,7 @@ fn index_turn_message(session: &Session, message: &Message, turn_id: &RuntimeStr
 ///   - an unfinished child creation may be cancelled before input acceptance.
 fn user_interrupt_guidance_message(turn_id: &RuntimeString) -> Message {
     let text = RuntimeString::from(
-        "The user interrupted the previous turn on purpose. Background shells started with runInBackground are still running and were not stopped by the interrupt: read their output with bash_output, and stop one with kill_shell when it is no longer wanted. Any tool call or command that was in flight may have partially executed, so check the current state before repeating it. Accepted sub-agents, including persistent teammates, continue independently. Stop a specific sub-agent explicitly when needed; an unfinished creation may have been cancelled before acceptance.",
+        "The user interrupted the previous turn on purpose. Background shells started with runInBackground are still running and were not stopped by the interrupt: read their output with TaskOutput, wait with Yield, and stop one with TaskStop when it is no longer wanted. Any tool call or command that was in flight may have partially executed, so check the current state before repeating it. Accepted sub-agents, including persistent teammates, continue independently. Stop a specific sub-agent explicitly when needed; an unfinished creation may have been cancelled before acceptance.",
     );
     Message::User(UserMessage {
         question_answer: None,

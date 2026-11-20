@@ -99,7 +99,7 @@ use crate::runtime_values::RuntimeJson;
 use crate::runtime_values::RuntimeObject;
 use crate::runtime_values::RuntimePath;
 use crate::runtime_values::RuntimeString;
-use crate::schemas::content::{ContentBlock, TextBlock};
+use crate::schemas::content::{ContentBlock, HarnessEnvelope, TextBlock};
 use crate::schemas::message::Message;
 use crate::schemas::message::ToolResultMessage;
 use crate::schemas::message::Usage;
@@ -1228,6 +1228,7 @@ async fn run_turn(
             stop_reason,
             final_text,
             sleep_ran,
+            post_result_notices,
             truncated_tool_calls,
             _tool_result_handoff,
         ) = match outcome {
@@ -1520,6 +1521,7 @@ async fn run_turn(
                 stop_reason,
                 final_text,
                 sleep_ran,
+                post_result_notices,
                 truncated_tool_calls,
                 tool_result_handoff,
             } => (
@@ -1529,6 +1531,7 @@ async fn run_turn(
                 stop_reason,
                 final_text,
                 sleep_ran,
+                post_result_notices,
                 truncated_tool_calls,
                 tool_result_handoff,
             ),
@@ -1821,6 +1824,7 @@ async fn run_turn(
                 &signal,
                 sleep_ran,
                 &tool_results,
+                &post_result_notices,
                 &final_usage,
                 &mut messages,
                 &mut turn_pdf_bytes,
@@ -4062,6 +4066,7 @@ async fn run_turn_tool_results(
     signal: &crate::types::abort::AbortSignal,
     sleep_ran: bool,
     tool_results: &Vec<ToolResultMessage>,
+    post_result_notices: &[RuntimeString],
     final_usage: &Option<Usage>,
     messages: &mut Vec<Message>,
     turn_pdf_bytes: &mut usize,
@@ -4073,6 +4078,24 @@ async fn run_turn_tool_results(
     // User steers drained this continuation: persisted after the tool results so
     // the rollout keeps chronological order (see the drain site).
     let mut steered_user_messages: Vec<Message> = Vec::new();
+    let post_result_user_messages: Vec<Message> = post_result_notices
+        .iter()
+        .map(|notice| {
+            Message::User(UserMessage {
+                question_answer: None,
+                uuid: (shared.deps.uuid)().into(),
+                content: vec![ContentBlock::Text(TextBlock {
+                    text: notice.clone(),
+                    citations: None,
+                    harness_envelope: Some(HarnessEnvelope::SystemReminder),
+                    message_id: None,
+                    phase: None,
+                })],
+                is_meta: Some(true),
+            })
+        })
+        .collect();
+    let mut appended_post_result_notices = false;
     if let Some(queue) = &shared.params.message_queue {
         if !signal.is_cancelled() {
             let max = if sleep_ran {
@@ -4223,11 +4246,17 @@ async fn run_turn_tool_results(
                 // history took over, because tool results are process evidence and
                 // fold away. Delegations keep the tool-result shape: their envelope
                 // carries the sender id the renderer lifts back out into a bubble.
+                // When a turn emitted a post-result notice (such as `Yield`'s wake
+                // reason), queued `task-notification` items also become separate
+                // meta user messages AFTER the wake notice so chronological order holds.
+                let promote_task_notifications = !post_result_user_messages.is_empty();
                 let (user_steers, inline_steers): (
                     Vec<Arc<QueuedMessage>>,
                     Vec<Arc<QueuedMessage>>,
                 ) = drained.into_iter().partition(|cmd| {
-                    cmd.delivery == Some(SteerDelivery::User) || !cmd.triggers_turn()
+                    cmd.delivery == Some(SteerDelivery::User)
+                        || !cmd.triggers_turn()
+                        || (promote_task_notifications && cmd.mode == "task-notification")
                 });
                 if !inline_steers.is_empty() {
                     let li = final_results.len() - 1;
@@ -4245,6 +4274,10 @@ async fn run_turn_tool_results(
                 let keep = messages.len() - tool_results.len();
                 messages.truncate(keep);
                 messages.extend(final_results.iter().cloned().map(Message::ToolResult));
+                if !post_result_user_messages.is_empty() {
+                    messages.extend(post_result_user_messages.iter().cloned());
+                    appended_post_result_notices = true;
+                }
                 for cmd in &user_steers {
                     let message = Message::User(UserMessage {
                         question_answer: None,
@@ -4284,10 +4317,20 @@ async fn run_turn_tool_results(
             }
         }
     }
+    if !appended_post_result_notices && !post_result_user_messages.is_empty() {
+        messages.extend(post_result_user_messages.iter().cloned());
+    }
     // Persist the FINAL tool_results (possibly carrying steering) once.
     for r in &final_results {
         if let Some(cb) = &shared.params.on_message {
             if cb(Message::ToolResult(r.clone())).await.is_err() {
+                return false;
+            }
+        }
+    }
+    for message in &post_result_user_messages {
+        if let Some(cb) = &shared.params.on_message {
+            if cb(message.clone()).await.is_err() {
                 return false;
             }
         }

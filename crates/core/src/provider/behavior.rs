@@ -367,6 +367,16 @@ pub fn render_tool_result_content(
     is_error: bool,
     profile: &ProviderBehaviorProfile,
 ) -> Vec<OutputBlock> {
+    render_tool_result_content_with_output(content, visible_tool_name, is_error, profile, None)
+}
+
+pub fn render_tool_result_content_with_output(
+    content: Vec<OutputBlock>,
+    visible_tool_name: &RuntimeString,
+    is_error: bool,
+    profile: &ProviderBehaviorProfile,
+    output: Option<&RuntimeJson>,
+) -> Vec<OutputBlock> {
     let mut rendered: Vec<OutputBlock> = content
         .into_iter()
         .map(|block| match block {
@@ -401,7 +411,18 @@ pub fn render_tool_result_content(
         }
     }
 
-    let envelope_kind = resolve_tool_result_envelope_kind(visible_tool_name, is_error);
+    let mut envelope_kind = resolve_tool_result_envelope_kind(visible_tool_name, is_error);
+    if !is_error
+        && (visible_tool_name == "TaskOutput"
+            || visible_tool_name == "task_output"
+            || visible_tool_name == "wait_agent")
+        && output
+            .and_then(|value| value.get("task_type"))
+            .and_then(RuntimeJson::as_str)
+            .is_some_and(|task_type| task_type == "shell")
+    {
+        envelope_kind = ProviderToolResultEnvelopeKind::CommandOutput;
+    }
     if profile.prompt_style == ProviderPromptStyle::Generic
         || envelope_kind == ProviderToolResultEnvelopeKind::PlainText
     {
@@ -962,9 +983,27 @@ pub fn render_tool_description(
     description: &RuntimeString,
     profile: &ProviderBehaviorProfile,
 ) -> RuntimeString {
+    // OpenAI exposes `TaskOutput`/`TaskStop` as `wait_agent`/`interrupt_agent`
+    // with bounded-wait and `target` contracts; replace non-blocking or
+    // `task_id`-specific base copy that would contradict those contracts.
+    let base = if profile.prompt_style == ProviderPromptStyle::OpenAiDeveloper {
+        if name == "TaskOutput" && description.contains("never to wait") {
+            RuntimeString::from(
+                "Inspect or wait on a background agent or shell task by id or name.",
+            )
+        } else if name == "TaskStop" && description.contains("Takes a task_id parameter") {
+            RuntimeString::from(
+                "Stop a running background task (sub-agent or shell) by id or name.",
+            )
+        } else {
+            description.clone()
+        }
+    } else {
+        description.clone()
+    };
     match render_tool_description_fragments(name, profile) {
-        Some(note) => concat_runtime_strings(&[description.clone(), "\n\n".into(), note]),
-        None => description.clone(),
+        Some(note) => concat_runtime_strings(&[base, "\n\n".into(), note]),
+        None => base,
     }
 }
 
@@ -1054,12 +1093,12 @@ pub fn render_tool_description_fragments(
                 ),
                 "TaskOutput" => (
                     "Call `",
-                    "` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
+                    "` with `target` set to a background agent id or background shell id. This target-based facade waits only for that specified agent or shell; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` to bound waiting (omitting it waits up to 30 seconds while running), and `filter` to filter shell output lines. Wait sparingly: only wait when you need that result immediately for the next critical-path step.",
                     false,
                 ),
                 "TaskStop" => (
                     "Call `",
-                    "` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.",
+                    "` with `target` set to the background agent id (or bound name) or background shell id to stop. Only use it when that task should no longer continue.",
                     false,
                 ),
                 "SendMessage" => (
@@ -1442,14 +1481,21 @@ fn render_openai_wait_agent_schema(schema: &RuntimeJson) -> RuntimeJson {
         "target",
         with_description(
             properties.get("task_id"),
-            "Background agent id returned by spawn_agent.",
+            "Background agent id (or bound name) or background shell id.",
         ),
     );
     rendered.insert(
         "timeout_ms",
         with_description(
             properties.get("timeout"),
-            "Maximum milliseconds to wait for the background agent.",
+            "Maximum milliseconds to wait while the task is running (defaults to 30000; pass 0 for a non-blocking snapshot).",
+        ),
+    );
+    rendered.insert(
+        "filter",
+        with_description(
+            properties.get("filter"),
+            "Optional regex filter applied to shell output lines.",
         ),
     );
     closed_object_schema(rendered, &["target"])
@@ -1460,7 +1506,10 @@ fn render_openai_interrupt_agent_schema(schema: &RuntimeJson) -> RuntimeJson {
     let mut rendered = RuntimeObject::new();
     rendered.insert(
         "target",
-        with_description(properties.get("task_id"), "Background agent id to stop."),
+        with_description(
+            properties.get("task_id"),
+            "Background agent id (or bound name) or background shell id to stop.",
+        ),
     );
     closed_object_schema(rendered, &["target"])
 }
@@ -1687,10 +1736,20 @@ pub fn resolve_internal_tool_name(
 ) -> RuntimeString {
     // Legacy per-kind spellings resolve to the unified background-task tools
     // in every style, matching the registry alias resolution.
-    if visible_name == "task_output" || visible_name == "bash_output" {
+    if visible_name == "task_output"
+        || visible_name == "bash_output"
+        || visible_name == "agent_output"
+        || visible_name == "AgentOutputTool"
+        || visible_name == "BashOutputTool"
+    {
         return "TaskOutput".into();
     }
-    if visible_name == "task_stop" || visible_name == "kill_shell" {
+    if visible_name == "task_stop"
+        || visible_name == "kill_shell"
+        || visible_name == "kill_bash"
+        || visible_name == "KillShell"
+        || visible_name == "KillBash"
+    {
         return "TaskStop".into();
     }
     match profile.prompt_style {
@@ -1894,6 +1953,9 @@ fn normalize_openai_write_stdin_input(input: Json) -> Json {
 }
 
 fn normalize_openai_wait_agent_input(input: Json) -> Json {
+    const DEFAULT_WAIT_AGENT_TIMEOUT_MS: u64 = 30_000;
+    const MAX_WAIT_AGENT_TIMEOUT_MS: u64 = 270_000;
+
     let mut input = match take_runtime_object(input) {
         Ok(input) => input,
         Err(input) => return input,
@@ -1904,8 +1966,19 @@ fn normalize_openai_wait_agent_input(input: Json) -> Json {
     let task_id =
         string_target_or_fallback(target.as_ref(), targets.as_ref(), input.get("task_id"));
     input.insert("task_id", RuntimeJson::String(task_id));
+    let facade_wait_ms = match timeout_ms.as_ref() {
+        None => Some(DEFAULT_WAIT_AGENT_TIMEOUT_MS),
+        Some(value) if value.is_null() => None,
+        Some(value) => value
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .map(|n| (n.clamp(0.0, MAX_WAIT_AGENT_TIMEOUT_MS as f64)) as u64),
+    };
     if let Some(timeout_ms) = timeout_ms {
         input.insert("timeout", timeout_ms);
+    }
+    if let Some(wait_ms) = facade_wait_ms {
+        input.insert("_facade_wait_ms", RuntimeJson::from(wait_ms));
     }
     RuntimeJson::Object(input)
 }
@@ -3053,8 +3126,8 @@ mod tests {
     const ANTHROPIC_GREP_NOTE: &str = "<system-reminder>\nCall `Grep` for content search. Prefer `output_mode:\"files_with_matches\"` to locate files, then Read the relevant excerpts.\n</system-reminder>";
     const ANTHROPIC_BASH_NOTE: &str = "<system-reminder>\nCall `Bash` for shell commands. Put the command in `command`; use `run_in_background` only when the result is not needed immediately.\n</system-reminder>";
     const OPENAI_TASK_NOTE: &str = "# Tool-call contract\nWhen the current collaboration mode permits delegation, call `spawn_agent` for a self-contained delegation. Put a short label in `task_name` and the complete brief in `message`, including goal, context, files or commands already known, and the expected shape of its report. For independent subtasks, send multiple `spawn_agent` tool calls in one assistant response. Do not fabricate or predict delegated results before the tool result, report, or notification arrives; keep doing useful non-overlapping work instead of polling unless the result blocks the next critical-path step.";
-    const OPENAI_WAIT_AGENT_NOTE: &str = "# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id returned by `spawn_agent`. This target-based facade waits only for that specified agent; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` when you need to wait for a still-running agent. Wait sparingly: only wait when you need that result immediately for the next critical-path step.";
-    const OPENAI_INTERRUPT_AGENT_NOTE: &str = "# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id to stop. Only use it when that agent should no longer continue.";
+    const OPENAI_WAIT_AGENT_NOTE: &str = "# Tool-call contract\nCall `wait_agent` with `target` set to a background agent id or background shell id. This target-based facade waits only for that specified agent or shell; it does not listen for arbitrary live-agent updates or user steering events. Use `timeout_ms` to bound waiting (omitting it waits up to 30 seconds while running), and `filter` to filter shell output lines. Wait sparingly: only wait when you need that result immediately for the next critical-path step.";
+    const OPENAI_INTERRUPT_AGENT_NOTE: &str = "# Tool-call contract\nCall `interrupt_agent` with `target` set to the background agent id (or bound name) or background shell id to stop. Only use it when that task should no longer continue.";
     const OPENAI_SEND_MESSAGE_NOTE: &str = "# Tool-call contract\nCall `send_message` to queue a message to an existing subagent by ID or name without requiring a team. Running subagents consume it at a tool-round boundary. Sending to an idle or completed agent does not start a new turn; use `followup_task` for explicit follow-up work. Messages do not grant approval or change permissions.";
     const OPENAI_FOLLOWUP_TASK_NOTE: &str = "# Tool-call contract\nCall `followup_task` to explicitly start follow-up work in an existing ordinary subagent by ID or name. Running subagents consume it at a tool-round boundary; completed or model-stopped subagents resume in the background with the same identity, history, tools and permissions. User-cancelled and one-shot agents retain their restart restrictions. Use `send_message` for passive mail that must not start a new turn.";
     const OPENAI_LIST_AGENTS_NOTE: &str = "# Tool-call contract\nCall `list_agents` to list live agents/peers in the current swarm team. This is the team-peer surface, not a full task-tree registry.";
@@ -3483,12 +3556,16 @@ mod tests {
                         "properties": {
                             "target": {
                                 "type": "string",
-                                "description": "Background agent id returned by spawn_agent."
+                                "description": "Background agent id (or bound name) or background shell id."
                             },
                             "timeout_ms": {
                                 "type": "number",
                                 "minimum": 0,
-                                "description": "Maximum milliseconds to wait for the background agent."
+                                "description": "Maximum milliseconds to wait while the task is running (defaults to 30000; pass 0 for a non-blocking snapshot)."
+                            },
+                            "filter": {
+                                "type": "string",
+                                "description": "Optional regex filter applied to shell output lines."
                             }
                         },
                         "required": ["target"],
@@ -3503,7 +3580,7 @@ mod tests {
                         "properties": {
                             "target": {
                                 "type": "string",
-                                "description": "Background agent id to stop."
+                                "description": "Background agent id (or bound name) or background shell id to stop."
                             }
                         },
                         "required": ["target"],
@@ -3822,7 +3899,7 @@ mod tests {
                     json!({ "target": number }),
                     &openai,
                 ),
-                json!({ "task_id": expected })
+                json!({ "task_id": expected, "_facade_wait_ms": 30000 })
             );
         }
 
@@ -3855,7 +3932,7 @@ mod tests {
                     json!({ "target": number }),
                     &openai,
                 ),
-                json!({ "task_id": expected }),
+                json!({ "task_id": expected, "_facade_wait_ms": 30000 }),
                 "wait_agent token {token}"
             );
         }
@@ -4090,7 +4167,7 @@ mod tests {
             (
                 "wait_agent",
                 json!({ "target": "agent-1", "timeout_ms": 500 }),
-                json!({ "task_id": "agent-1", "timeout": 500 }),
+                json!({ "task_id": "agent-1", "timeout": 500, "_facade_wait_ms": 500 }),
             ),
             (
                 "wait_agent",
@@ -4100,14 +4177,18 @@ mod tests {
             (
                 "wait_agent",
                 json!({ "targets": [null, false, 8, "later"] }),
-                json!({ "task_id": "8" }),
+                json!({ "task_id": "8", "_facade_wait_ms": 30000 }),
             ),
             (
                 "wait_agent",
                 json!({ "target": {}, "targets": [null], "task_id": "fallback" }),
-                json!({ "task_id": "fallback" }),
+                json!({ "task_id": "fallback", "_facade_wait_ms": 30000 }),
             ),
-            ("wait_agent", json!({}), json!({ "task_id": "" })),
+            (
+                "wait_agent",
+                json!({}),
+                json!({ "task_id": "", "_facade_wait_ms": 30000 }),
+            ),
             (
                 "interrupt_agent",
                 json!({ "target": 9, "extra": true }),
@@ -4186,6 +4267,11 @@ mod tests {
             ("spawn_agent", "task"),
             ("wait_agent", "TaskOutput"),
             ("interrupt_agent", "TaskStop"),
+            ("AgentOutputTool", "TaskOutput"),
+            ("BashOutputTool", "TaskOutput"),
+            ("KillShell", "TaskStop"),
+            ("KillBash", "TaskStop"),
+            ("kill_bash", "TaskStop"),
             ("send_message", "SendMessage"),
             ("followup_task", "SendMessage"),
             ("list_agents", "ListPeers"),
@@ -4200,6 +4286,29 @@ mod tests {
                 internal
             );
         }
+
+        // Shell TaskOutput / wait_agent results use CommandOutput envelope instead
+        // of SubagentReport so shell stdout is not mislabeled as a child report.
+        let shell_output = json!({ "task_type": "shell", "status": "exited" });
+        let rendered = render_tool_result_content_with_output(
+            vec![OutputBlock::Text(TextBlock {
+                text: "ok".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            &runtime_string("wait_agent"),
+            false,
+            &openai,
+            Some(&shell_output),
+        );
+        let text = match &rendered[0] {
+            OutputBlock::Text(block) => block.text.try_to_utf8().unwrap_or_default(),
+            _ => panic!("expected text block"),
+        };
+        assert!(text.contains("# Command Output"), "{text}");
+        assert!(!text.contains("# Subagent Report"), "{text}");
     }
 
     #[test]

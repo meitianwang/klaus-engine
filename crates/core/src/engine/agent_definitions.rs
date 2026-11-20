@@ -166,12 +166,59 @@ impl AgentDefinition {
         Ok(RuntimeJson::Object(legacy))
     }
 
+    fn canonical_policy_name(name: &RuntimeString) -> RuntimeString {
+        // Legacy per-kind background-task tool names resolve to the unified
+        // built-in controls so policy/disabled lists using old names keep working
+        // without relaxing exact casing on unrelated tools like `read` vs `Read`.
+        match name.try_to_utf8().ok().as_deref() {
+            Some(
+                "task_output" | "bash_output" | "agent_output" | "AgentOutputTool"
+                | "BashOutputTool",
+            ) => RuntimeString::from("TaskOutput"),
+            Some("task_stop" | "kill_shell" | "kill_bash" | "KillShell" | "KillBash") => {
+                RuntimeString::from("TaskStop")
+            }
+            _ => name.clone(),
+        }
+    }
+
+    fn policy_list_matches_name(list: &[RuntimeString], name: &RuntimeString) -> bool {
+        let target = Self::canonical_policy_name(name);
+        list.iter()
+            .any(|entry| entry == name || Self::canonical_policy_name(entry) == target)
+    }
+
+    pub(crate) fn policy_list_matches_tool(
+        list: &[RuntimeString],
+        tool: &dyn crate::types::tool::Tool,
+    ) -> bool {
+        let primary = tool.name();
+        if Self::policy_list_matches_name(list, &primary) {
+            return true;
+        }
+        tool.aliases()
+            .iter()
+            .any(|alias| Self::policy_list_matches_name(list, alias))
+    }
+
     pub(crate) fn allows_tool(&self, name: &RuntimeString) -> bool {
-        self.tools.as_ref().is_none_or(|names| names.contains(name))
+        self.tools
+            .as_ref()
+            .is_none_or(|names| Self::policy_list_matches_name(names, name))
             && !self
                 .disallowed_tools
                 .as_ref()
-                .is_some_and(|names| names.contains(name))
+                .is_some_and(|names| Self::policy_list_matches_name(names, name))
+    }
+
+    pub(crate) fn allows_tool_entry(&self, tool: &dyn crate::types::tool::Tool) -> bool {
+        self.tools
+            .as_ref()
+            .is_none_or(|names| Self::policy_list_matches_tool(names, tool))
+            && !self
+                .disallowed_tools
+                .as_ref()
+                .is_some_and(|names| Self::policy_list_matches_tool(names, tool))
     }
 
     pub(crate) fn retain_tools(
@@ -179,11 +226,11 @@ impl AgentDefinition {
         tools: &mut Vec<std::sync::Arc<dyn crate::types::tool::Tool>>,
     ) {
         tools.retain(|tool| {
-            self.allows_tool(&tool.name())
+            self.allows_tool_entry(tool.as_ref())
                 || (!self
                     .disallowed_tools
                     .as_ref()
-                    .is_some_and(|names| names.contains(&tool.name()))
+                    .is_some_and(|names| Self::policy_list_matches_tool(names, tool.as_ref()))
                     && tool
                         .browser_dependency_owners()
                         .iter()

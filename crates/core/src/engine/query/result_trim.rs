@@ -7,10 +7,12 @@ use super::text_out_exact;
 use super::trim_ecmascript_whitespace;
 use crate::provider::behavior::render_provider_text_envelope;
 use crate::provider::behavior::render_tool_result_content;
+use crate::provider::behavior::render_tool_result_content_with_output;
 use crate::provider::behavior::ProviderBehaviorProfile;
 use crate::provider::behavior::ProviderPromptStyle;
 use crate::provider::behavior::ProviderTextEnvelopeKind;
 use crate::provider::behavior::ProviderTextEnvelopeOptions;
+use crate::runtime_values::RuntimeJson;
 use crate::runtime_values::RuntimePath;
 use crate::runtime_values::RuntimeString;
 use crate::schemas::content::OutputBlock;
@@ -129,13 +131,24 @@ pub(crate) fn tool_result_spill_limit(tool: &dyn Tool, internal_name: &RuntimeSt
 }
 
 /// Query's successful tool-result envelope consumption point.
+pub(super) fn render_successful_tool_result_content_with_output(
+    content: Vec<OutputBlock>,
+    visible_tool_name: &RuntimeString,
+    profile: &ProviderBehaviorProfile,
+    output: Option<&RuntimeJson>,
+) -> Vec<OutputBlock> {
+    let content = normalize_successful_tool_output(content, visible_tool_name);
+    render_tool_result_content_with_output(content, visible_tool_name, false, profile, output)
+}
+
+/// Query's successful tool-result envelope consumption point without structured output.
+#[cfg(test)]
 pub(super) fn render_successful_tool_result_content(
     content: Vec<OutputBlock>,
     visible_tool_name: &RuntimeString,
     profile: &ProviderBehaviorProfile,
 ) -> Vec<OutputBlock> {
-    let content = normalize_successful_tool_output(content, visible_tool_name);
-    render_tool_result_content(content, visible_tool_name, false, profile)
+    render_successful_tool_result_content_with_output(content, visible_tool_name, profile, None)
 }
 
 /// Query's failed tool-result envelope consumption point.

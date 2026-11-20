@@ -1,5 +1,7 @@
 //! Ordinary workers retain identity and serialize message/exit handoff.
 
+use std::collections::BTreeSet;
+
 use crate::engine::agent_definitions::AgentDefinition;
 use crate::engine::message_queue::{
     QueuePriority, QueueTerminalState, QueuedMessage, QueuedValue, SteerDelivery,
@@ -607,19 +609,47 @@ fn resolve_target(
     state: &OrdinaryState,
     target: &RuntimeString,
 ) -> Option<Result<String, RuntimeString>> {
+    resolve_target_for_caller(state, target, None)
+}
+
+fn resolve_target_for_caller(
+    state: &OrdinaryState,
+    target: &RuntimeString,
+    caller: Option<&RuntimeString>,
+) -> Option<Result<String, RuntimeString>> {
+    let owned = |worker: &OrdinaryWorker| -> bool {
+        caller.is_none_or(|caller| {
+            worker
+                .bindings
+                .parent_agent_id
+                .as_ref()
+                .is_some_and(|parent| parent.as_str() == caller)
+        })
+    };
     if let Ok(id) = target.try_to_utf8() {
         if state
             .workers
             .get(&id)
-            .is_some_and(|worker| worker.committed)
+            .is_some_and(|worker| worker.committed && owned(worker))
         {
             return Some(Ok(id));
         }
     }
-    let mut ids = state.names.get(target).cloned().unwrap_or_default();
+    let mut ids = BTreeSet::new();
+    if let Some(bindings) = state.names.get(target) {
+        for id in bindings {
+            if state
+                .workers
+                .get(id)
+                .is_some_and(|worker| worker.committed && owned(worker))
+            {
+                ids.insert(id.clone());
+            }
+        }
+    }
     if target.as_utf16().len() >= 3 {
         for (id, worker) in &state.workers {
-            if !worker.committed {
+            if !worker.committed || !owned(worker) {
                 continue;
             }
             if RuntimeString::from(id.clone())
@@ -631,7 +661,15 @@ fn resolve_target(
         }
         for (name, bindings) in &state.names {
             if name.as_utf16().starts_with(target.as_utf16()) {
-                ids.extend(bindings.iter().cloned());
+                for id in bindings {
+                    if state
+                        .workers
+                        .get(id)
+                        .is_some_and(|worker| worker.committed && owned(worker))
+                    {
+                        ids.insert(id.clone());
+                    }
+                }
             }
         }
     }
@@ -1354,6 +1392,18 @@ impl Session {
         let runtime = admission.ordinary.clone();
         let state = runtime.state.lock_recover();
         resolve_target(&state, target)
+    }
+
+    /// Resolve a target visible to `caller` (`None` = root session).
+    pub(crate) fn resolve_subagent_target_for_caller(
+        &self,
+        target: &RuntimeString,
+        caller: Option<&RuntimeString>,
+    ) -> Option<Result<String, RuntimeString>> {
+        let admission = self.background_tasks.lock_recover();
+        let runtime = admission.ordinary.clone();
+        let state = runtime.state.lock_recover();
+        resolve_target_for_caller(&state, target, caller)
     }
 
     pub(crate) fn stop_ordinary_subagent(&self, id: &RuntimeString, user: bool) -> Option<bool> {
@@ -2226,11 +2276,25 @@ impl Session {
         description: RuntimeString,
         bindings: &OrdinaryBindings,
     ) {
+        self.publish_ordinary_handle_with_notice(id, abort, status, description, bindings, false);
+    }
+
+    fn publish_ordinary_handle_with_notice(
+        &self,
+        id: &str,
+        abort: CancellationToken,
+        status: BackgroundTaskStatus,
+        description: RuntimeString,
+        bindings: &OrdinaryBindings,
+        notification_pending: bool,
+    ) {
         let mut entries = self.subagents.background_agents.lock_recover();
         if let Some(entry) = entries.get_mut(id) {
             entry.abort = abort;
             entry.status = status;
             entry.notified = false;
+            entry.notification_pending =
+                notification_pending && status != BackgroundTaskStatus::Running;
         } else {
             entries.insert(
                 id.to_owned(),
@@ -2247,6 +2311,8 @@ impl Session {
                     shutdown_requested: false,
                     on_idle: Vec::new(),
                     notified: false,
+                    notification_pending: notification_pending
+                        && status != BackgroundTaskStatus::Running,
                     depth: bindings.depth,
                     spawn_turn_id: bindings.spawn_turn_id.clone(),
                 },
@@ -3073,7 +3139,9 @@ impl Session {
                         );
                     } else {
                         worker.running = false;
-                        self.publish_ordinary_handle(
+                        let expect_notice =
+                            worker.notify_completion && !aborted && !abort.is_cancelled();
+                        self.publish_ordinary_handle_with_notice(
                             &id,
                             worker.abort.clone(),
                             if aborted || abort.is_cancelled() {
@@ -3085,9 +3153,17 @@ impl Session {
                             },
                             RuntimeString::default(),
                             &worker.bindings,
+                            expect_notice,
                         );
-                        if worker.notify_completion && !aborted && !abort.is_cancelled() {
+                        if expect_notice {
                             notice = self.take_background_completion_notice(&id);
+                            if notice.is_none() {
+                                if let Some(entry) =
+                                    self.subagents.background_agents.lock_recover().get_mut(&id)
+                                {
+                                    entry.notification_pending = false;
+                                }
+                            }
                         }
                     }
                     worker.exited.notify_waiters();
