@@ -32,6 +32,15 @@ const QUERY_MAX_BYTES: usize = 16_384;
 const QUERY_MAX_WORDS: usize = 32;
 /// Ceiling on names in one `select:` list.
 const SELECT_MAX_NAMES: usize = 64;
+/// Total serialized-definition budget for one search result. Keyword hits
+/// shrink by whole items (lowest relevance first) to fit; an exact refetch
+/// that cannot fit returns an explicit error instead of a truncated schema.
+/// Metered per model context as a follow-up; v1 uses one fixed ceiling.
+const SEARCH_RESULT_BUDGET_BYTES: usize = 64 * 1024;
+/// How a fallback-wire model executes a discovered tool: through the fixed
+/// dispatcher entry, never by the target's own name.
+pub const CALL_MCP_INVOCATION_HINT: &str =
+    "Call call_mcp_tool with the tool name and an arguments object.";
 /// Default tool-count threshold above which tools are deferred.
 const DEFAULT_THRESHOLD: usize = 30;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -103,11 +112,23 @@ pub fn create_tool_search_tool(max_results: Option<usize>) -> Arc<dyn Tool> {
 /// Keep deferred tools reachable whenever a runtime surface is assembled or
 /// refreshed. Existing search tools win so host-specific variants are retained.
 pub(crate) fn ensure_tool_search(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    ensure_tool_search_with_late_mcp(tools, false)
+}
+
+/// Like [`ensure_tool_search`], but also seeds the search entry when the
+/// session expects MCP servers that have not delivered tools yet. Declaring
+/// the fixed discovery/execution entries from the first request keeps the
+/// serialized tool list identical once late servers connect, instead of
+/// rebuilding the cached baseline mid-session.
+pub(crate) fn ensure_tool_search_with_late_mcp(
+    tools: Vec<Arc<dyn Tool>>,
+    late_mcp_expected: bool,
+) -> Vec<Arc<dyn Tool>> {
     let has_deferred = tools
         .iter()
         .any(|tool| tool.exposure() == ToolExposure::Deferred);
     let has_search = tools.iter().any(|tool| tool.name() == "tool_search");
-    if !has_deferred || has_search {
+    if (!has_deferred && !late_mcp_expected) || has_search {
         return tools;
     }
 
@@ -806,7 +827,7 @@ fn select_tools(
     requested: &[RuntimeString],
     catalog: &[ToolCatalogEntry],
     max_results: f64,
-) -> ToolSearchResolution {
+) -> Result<ToolSearchResolution, ToolError> {
     let mut deferred = Vec::new();
     let mut already_available = Vec::new();
     let mut missing = Vec::new();
@@ -837,12 +858,30 @@ fn select_tools(
         .iter()
         .map(|tool| to_search_output_tool(tool))
         .collect::<Vec<_>>();
+    for tool in &tools {
+        if definition_size_bytes(tool) > SEARCH_RESULT_BUDGET_BYTES {
+            let name = tool
+                .get("name")
+                .and_then(Json::as_str)
+                .map(|name| name.try_to_utf8().unwrap_or_default())
+                .unwrap_or_default();
+            return Err(ToolError::new(format!(
+                "The definition of tool {name} exceeds the available delivery budget and cannot be sent without truncating its schema. It was NOT loaded; do not call it blind."
+            )));
+        }
+    }
     let text = format_selection_result(&deferred, &already_available, &missing);
     let mut output_object = RuntimeObject::new();
     output_object.insert(
         "matched",
         RuntimeJson::Array(matched.iter().cloned().map(RuntimeJson::String).collect()),
     );
+    if !matched.is_empty() {
+        output_object.insert(
+            "invocation",
+            RuntimeJson::String(RuntimeString::from(CALL_MCP_INVOCATION_HINT)),
+        );
+    }
     output_object.insert("tools", RuntimeJson::Array(tools));
     if !already_available.is_empty() {
         output_object.insert(
@@ -862,11 +901,11 @@ fn select_tools(
             RuntimeJson::Array(missing.iter().cloned().map(RuntimeJson::String).collect()),
         );
     }
-    ToolSearchResolution {
+    Ok(ToolSearchResolution {
         surface_callback: (!matched.is_empty()).then_some(matched),
         output: RuntimeJson::Object(output_object),
         text,
-    }
+    })
 }
 
 pub(crate) fn resolve_tool_search(
@@ -901,14 +940,10 @@ pub(crate) fn resolve_tool_search(
         .collect::<Vec<_>>();
 
     if let Some(selected) = parse_select_query(query) {
-        return Ok(select_tools(&selected, &catalog, max_results));
+        return select_tools(&selected, &catalog, max_results);
     }
     if let Some(exact) = find_catalog_tool(&catalog, query) {
-        return Ok(select_tools(
-            std::slice::from_ref(&exact.name),
-            &catalog,
-            max_results,
-        ));
+        return select_tools(std::slice::from_ref(&exact.name), &catalog, max_results);
     }
 
     let (required, optional) = parse_keywords(query);
@@ -951,6 +986,19 @@ pub(crate) fn resolve_tool_search(
     scored.truncate(js_slice_end(scored.len(), max_results));
     let selected = expand_atomic_surface_groups(scored, &catalog);
 
+    // Whole-item shrink to the delivery budget: the lowest-relevance entries
+    // drop first, and the reduced result still names what fits.
+    let mut selected = selected;
+    loop {
+        let total: usize = selected
+            .iter()
+            .map(|tool| definition_size_bytes(&to_search_output_tool(tool)))
+            .sum();
+        if total <= SEARCH_RESULT_BUDGET_BYTES || selected.len() <= 1 {
+            break;
+        }
+        selected.pop();
+    }
     let matched = selected
         .iter()
         .map(|tool| tool.name.clone())
@@ -976,12 +1024,76 @@ pub(crate) fn resolve_tool_search(
         "matched",
         RuntimeJson::Array(matched.iter().cloned().map(RuntimeJson::String).collect()),
     );
+    if !matched.is_empty() {
+        output.insert(
+            "invocation",
+            RuntimeJson::String(RuntimeString::from(CALL_MCP_INVOCATION_HINT)),
+        );
+    }
     output.insert("tools", RuntimeJson::Array(tools));
     Ok(ToolSearchResolution {
         surface_callback: Some(matched.clone()),
         output: RuntimeJson::Object(output),
         text,
     })
+}
+
+/// Serialized size of one delivered definition, used for the whole-item
+/// budget shrink and the oversized-single-item refusal.
+fn definition_size_bytes(tool: &Json) -> usize {
+    crate::runtime_values::runtime_json::stringify(tool)
+        .try_to_utf8()
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Project a recorded search result into the full text shape for endpoints
+/// whose tool results only carry text: every delivered definition (name,
+/// description, complete input schema) plus the fixed-entry invocation
+/// guidance. Returns `None` when the output carries no delivered definitions,
+/// so callers keep the recorded compact text.
+pub(crate) fn project_search_result_text(output: &Json) -> Option<RuntimeString> {
+    // Only engine-produced results carry `matched`; foreign output shapes
+    // (provider-executed searches, historical fixtures) keep their recorded
+    // text instead of being re-projected.
+    let matched = output.get("matched")?.as_array()?;
+    if matched.is_empty() {
+        return None;
+    }
+    let tools = output.get("tools")?.as_array()?;
+    if tools.is_empty() {
+        return None;
+    }
+    let mut text = RuntimeString::from("These tools are now available. ")
+        .concat(&RuntimeString::from(CALL_MCP_INVOCATION_HINT));
+    for tool in tools {
+        let name = tool.get("name").and_then(Json::as_str).cloned();
+        let Some(name) = name else { continue };
+        text = text.concat(&RuntimeString::from("\n\n- ")).concat(&name);
+        if let Some(description) = tool.get("description").and_then(Json::as_str) {
+            text = text.concat(&RuntimeString::from(": ")).concat(description);
+        }
+        if let Some(schema) = tool.get("inputSchema") {
+            if let Ok(schema_text) =
+                crate::runtime_values::runtime_json::stringify(schema).try_to_utf8()
+            {
+                text = text
+                    .concat(&RuntimeString::from("\n  Input schema: "))
+                    .concat(&RuntimeString::from(schema_text));
+            }
+        }
+    }
+    if let Some(missing) = output.get("missing").and_then(Json::as_array) {
+        if !missing.is_empty() {
+            text = text.concat(&RuntimeString::from(
+                "\n\nNo matching deferred tools found for:",
+            ));
+            for name in missing.iter().filter_map(Json::as_str) {
+                text = text.concat(&RuntimeString::from("\n- ")).concat(name);
+            }
+        }
+    }
+    Some(text)
 }
 
 #[async_trait]
@@ -2016,6 +2128,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["web_fetch", "web_search"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [
                     {
                         "name": "web_fetch",
@@ -2135,6 +2248,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["alpha"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [{
                     "name": "visible_alpha",
                     "description": "alpha description",
@@ -2176,6 +2290,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["d1"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [{
                     "name": "visible_d1",
                     "description": "d1 description",
@@ -2367,6 +2482,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["alpha"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [{
                     "name": "visible_alpha",
                     "description": "alpha description",
@@ -2828,6 +2944,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["fallback"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [{
                     "name": "fallback",
                     "description": "fallback description",
@@ -2870,6 +2987,7 @@ mod tests {
             res.serializable.output,
             rjson!({
                 "matched": ["internal_patch"],
+                "invocation": "Call call_mcp_tool with the tool name and an arguments object.",
                 "tools": [{
                     "name": "apply_patch",
                     "description": "rendered patch description",

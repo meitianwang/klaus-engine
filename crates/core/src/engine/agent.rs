@@ -11031,11 +11031,16 @@ mod tests {
         assert!(!first_tools
             .iter()
             .any(|name| name == "mcp__session_docs__lookup"));
+        // Static fallback protocol: discovery never reshapes the serialized
+        // tool list. The fixed entries stay, the deferred MCP tool never
+        // enters `tools`, and execution still reaches the real target.
         let second_tools = request_tool_names(&requests[1]);
         assert!(second_tools.iter().any(|name| name == "tool_search"));
-        assert!(second_tools
+        assert!(second_tools.iter().any(|name| name == "call_mcp_tool"));
+        assert!(!second_tools
             .iter()
             .any(|name| name == "mcp__session_docs__lookup"));
+        assert_eq!(first_tools, second_tools, "the frozen tool list shifted");
         assert_eq!(mcp_calls.load(Ordering::SeqCst), 1);
     }
 

@@ -172,7 +172,11 @@ pub(super) fn reinject_query_retained_fragments(
     let surfaced = {
         let surfaced_tools = shared.surfaced.lock_recover();
         let tools = shared.tools.lock_recover().clone();
-        SurfacedToolsSection::new(&tools, &surfaced_tools)
+        SurfacedToolsSection::new(
+            &tools,
+            &surfaced_tools,
+            shared.uses_static_deferred_tool_dispatch(),
+        )
     };
     let skills_snapshot = shared
         .params

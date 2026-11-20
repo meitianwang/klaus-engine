@@ -303,17 +303,25 @@ async fn explicit_single_skill_plugin_reference_surfaces_mcp_tools_and_preloads_
             .iter()
             .filter_map(|t| t.name.try_to_utf8().ok())
             .collect();
+        // Static fallback protocol: the serialized tool list stays frozen;
+        // explicitly referenced plugin MCP tools remain folded and are
+        // announced through the catalog notification instead.
         assert!(
-            active_names.iter().any(|n| n == "mcp__klaus-ppt__ppt_open"),
-            "host-managed plugin MCP tool should be surfaced: {active_names:?}"
+            !active_names.iter().any(|n| n == "mcp__klaus-ppt__ppt_open"),
+            "static protocol must keep the wire list frozen: {active_names:?}"
         );
         assert!(
-            active_names
+            !active_names
                 .iter()
                 .any(|n| n == "mcp__ppt-authoring__ppt_prepare"),
-            "plugin stdio/in-process MCP tool should be surfaced: {active_names:?}"
+            "static protocol must keep the wire list frozen: {active_names:?}"
         );
         let text = flatten_request_text(req);
+        assert!(
+            text.contains("mcp__klaus-ppt__ppt_open"),
+            "catalog notification should announce the folded tool: {text}"
+        );
+        assert!(text.contains("call_mcp_tool"));
         assert!(text.contains("Capabilities from the referenced `PPT` (`ppt`) plugin:"));
         assert!(text.contains("UNIQUE_PPT_SKILL_INSTRUCTIONS_MARKER"));
     }
@@ -523,11 +531,20 @@ async fn explicit_skill_reference_preloads_inline_skill_and_surfaces_owning_plug
             .iter()
             .filter_map(|t| t.name.try_to_utf8().ok())
             .collect();
+        // Static fallback protocol: the wire tool list stays frozen; the
+        // referenced plugin's small MCP inventory remains folded and is
+        // announced through the catalog notification instead.
         assert!(
-            active_names.iter().any(|n| n == "mcp__klaus-digram__digram_open"),
-            "explicitly referencing a plugin skill should surface its small MCP inventory: {active_names:?}"
+            !active_names
+                .iter()
+                .any(|n| n == "mcp__klaus-digram__digram_open"),
+            "static protocol must keep the wire list frozen: {active_names:?}"
         );
         let text = flatten_request_text(req);
+        assert!(
+            text.contains("mcp__klaus-digram__digram_open"),
+            "catalog notification should announce the folded tool: {text}"
+        );
         assert!(text.contains("DIAGRAM_SKILL_INLINE_BODY"));
     }
 

@@ -29,6 +29,10 @@ struct ReviewCatalogProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for ReviewCatalogProvider {
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        self.inner.native_deferred_loading_active(model)
+    }
+
     async fn native_checkpoint_compatibility(
         &self,
         checkpoint: &crate::schemas::message::NativeCompactionCheckpoint,
@@ -453,6 +457,9 @@ struct DeclaredReviewTarget {
 impl ModelProvider for DeclaredReviewTarget {
     fn info(&self) -> &ProviderInfo {
         self.root.info()
+    }
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        self.root.native_deferred_loading_active(model)
     }
     fn capabilities(&self, model: &RuntimeString) -> ProviderCapabilities {
         let mut caps = self.root.capabilities(model);

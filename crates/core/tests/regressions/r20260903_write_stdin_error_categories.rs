@@ -118,27 +118,27 @@ impl ModelProvider for WriteStdinProvider {
                         RuntimeJson::String("write_stdin".into()),
                     ]))
                 );
-                let write_description = request
-                    .tools
+                // Static fallback protocol: the wire tool list stays frozen,
+                // so the surfaced definitions and their guidance reach the
+                // model through the search result text instead of `tools`.
+                assert!(!request.tools.iter().any(|tool| tool.name == "write_stdin"));
+                assert!(!request.tools.iter().any(|tool| tool.name == "exec_command"));
+                let search_text = search_result
+                    .content
                     .iter()
-                    .find(|tool| tool.name == "write_stdin")
-                    .expect("write_stdin must remain available for interactive sessions")
-                    .description
-                    .clone();
-                assert!(write_description
+                    .filter_map(|block| match block {
+                        klaus_agent_core::schemas::content::OutputBlock::Text(text) => {
+                            text.text.try_to_utf8().ok()
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(search_text
                     .contains("Prefer bash in background mode with bash_output and kill_shell"));
-                assert!(write_description
+                assert!(search_text
                     .contains("only when the same live process must receive interactive input"));
-                let exec_description = request
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name == "exec_command")
-                    .expect("exec_command must remain available for interactive sessions")
-                    .description
-                    .clone();
-                assert!(exec_description
-                    .contains("Prefer bash in background mode with bash_output and kill_shell"));
-                assert!(exec_description
+                assert!(search_text
                     .contains("only when the same live process must receive later input"));
 
                 let mut input = RuntimeObject::new();

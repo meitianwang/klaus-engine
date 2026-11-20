@@ -736,49 +736,22 @@ impl Shared {
     pub(super) fn uses_static_deferred_tool_dispatch(&self) -> bool {
         let config = self.config();
         let model = self.turn_context.lock_recover().model.clone();
-        let provider_info = self
-            .bundle()
-            .map(|bundle| bundle.provider.info().clone())
-            .or_else(|| self.params.provider_info.clone());
         let tools = self.tools.lock_recover().clone();
         let tool_search_allowed = self
             .params
             .agent_tool_policy
             .as_ref()
             .is_none_or(|policy| policy.allows_tool(&RuntimeString::from("tool_search")));
-        antigravity_gemini_static_deferred_tools(
-            &config,
-            provider_info.as_ref(),
-            &model,
-            &tools,
-            tool_search_allowed,
-        )
-    }
-
-    pub(super) fn uses_eager_tool_inventory(&self) -> bool {
-        if self
-            .oversized_inventory_deferred
-            .load(std::sync::atomic::Ordering::Acquire)
-            || self.uses_static_deferred_tool_dispatch()
-        {
-            return false;
-        }
-        let config = self.config();
-        let model = self.turn_context.lock_recover().model.clone();
-        let provider_info = self
+        let native_active = self
             .bundle()
-            .map(|bundle| bundle.provider.info().clone())
-            .or_else(|| self.params.provider_info.clone());
-        antigravity_gemini_eager_tools(&config, provider_info.as_ref(), &model)
+            .is_some_and(|bundle| bundle.provider.native_deferred_loading_active(&model));
+        static_deferred_dispatch_active(&config, &tools, tool_search_allowed, native_active)
     }
 
     pub(super) fn visible_tool_specs_for_step(&self) -> Vec<ToolSpec> {
         let tools = self.tools.lock_recover().clone();
         if self.uses_static_deferred_tool_dispatch() {
             return static_deferred_visible_tool_specs(&tools, &self.config().disabled_tools);
-        }
-        if self.uses_eager_tool_inventory() {
-            return eager_visible_tool_specs(&tools);
         }
         let precomp = self.tool_specs.lock_recover().clone();
         let surfaced = self.surfaced.lock_recover();
@@ -793,7 +766,7 @@ impl Shared {
         &self,
         profile: &ProviderBehaviorProfile,
     ) -> Vec<ToolSpec> {
-        if self.uses_static_deferred_tool_dispatch() || self.uses_eager_tool_inventory() {
+        if self.uses_static_deferred_tool_dispatch() {
             return Vec::new();
         }
         let tools = self.tools.lock_recover().clone();
@@ -810,7 +783,7 @@ impl Shared {
     /// native deferred loading render these as marked registrations paired
     /// with the historical search references instead of immediate entries.
     pub(super) fn surfaced_deferred_request_names(&self) -> Vec<RuntimeString> {
-        if self.uses_static_deferred_tool_dispatch() || self.uses_eager_tool_inventory() {
+        if self.uses_static_deferred_tool_dispatch() {
             return Vec::new();
         }
         let tools = self.tools.lock_recover().clone();
@@ -1197,42 +1170,23 @@ pub fn build_model_request(
     .request
 }
 
-/// Tool specs visible to the model this turn: direct tools always, deferred tools
-/// only once surfaced via `tool_search`, hidden tools never. Falls back to the
-/// precomputed specs when no tool carries an exposure (the common case).
-///
-/// A surfaced deferred tool is APPENDED after every always-visible tool rather
-/// than placed at its sorted position. The tools array is the leading region of
-/// the cached prefix, so inserting mid-array shifts every tool behind it and
-/// costs the whole prefix — system and history included — on a session that has
-/// merely found another tool to call. Appending only lengthens the prefix, so
-/// the part already cached stays a hit.
-///
-/// Both passes walk the pool, which is sorted by name, never the surfaced set:
-/// a `HashSet` has no stable iteration order, and reading it would let two
-/// requests that surfaced the same tools emit them in a different order. That
-/// is the same prefix invalidation as a mid-array insert, with no visible cause.
-pub(crate) fn antigravity_gemini_eager_tools(
+/// Whether the session runs the static fallback tool protocol: `Deferred`
+/// schemas never enter the wire tool list and never shift the leading `tools`
+/// prefix when discovery finds tools or new MCP servers finish connecting.
+/// Discovery goes through `tool_search` (catalog notifications ride the
+/// message stream), execution through the fixed `call_mcp_tool` entry.
+/// This is the floor for EVERY wire: a provider arms its native deferred
+/// channel per model, and anything without one — plain function-calling
+/// endpoints, compatibility profiles, managed cloud routes, or a native
+/// channel the endpoint refused — lands here instead of inflating the
+/// standing declaration list with full definitions.
+pub(crate) fn static_deferred_dispatch_active(
     config: &crate::schemas::config::ResolvedConfig,
-    provider_info: Option<&ProviderInfo>,
-    model: &RuntimeString,
-) -> bool {
-    crate::context::runtime_reminders::is_antigravity_source(config)
-        && resolve_provider_behavior_profile(provider_info, model).family == Some("gemini")
-}
-
-/// Whether Antigravity Gemini sessions keep `Deferred` tools out of the wire
-/// `functionDeclarations` list and route them through `tool_search` +
-/// `call_mcp_tool` instead, avoiding cold-prefill schema bloat while keeping the
-/// leading `tools` prefix invariant across mid-turn tool discovery.
-pub(crate) fn antigravity_gemini_static_deferred_tools(
-    config: &crate::schemas::config::ResolvedConfig,
-    provider_info: Option<&ProviderInfo>,
-    model: &RuntimeString,
     tools: &[Arc<dyn Tool>],
     tool_search_allowed: bool,
+    native_active: bool,
 ) -> bool {
-    antigravity_gemini_eager_tools(config, provider_info, model)
+    !native_active
         && tool_search_allowed
         && !config
             .disabled_tools
@@ -1272,16 +1226,12 @@ pub(crate) fn static_deferred_visible_tool_specs(
     visible
 }
 
-/// Static name-sorted tool declarations when no `tool_search` dispatcher is
-/// present in the pool.
-pub(crate) fn eager_visible_tool_specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
-    tools
-        .iter()
-        .filter(|tool| tool.exposure() != ToolExposure::Hidden)
-        .map(|tool| to_tool_spec(tool.as_ref()))
-        .collect()
-}
-
+/// Tool specs visible to the model this turn: direct tools always, deferred
+/// tools only once surfaced via `tool_search`, hidden tools never. Falls back
+/// to the precomputed specs when no tool carries an exposure (the common
+/// case). A surfaced deferred tool is APPENDED after every always-visible
+/// tool rather than inserted at its sorted position, so the cached prefix of
+/// the leading list never shifts when discovery unlocks another tool.
 pub(crate) fn visible_tool_specs(
     tools: &[Arc<dyn Tool>],
     surfaced: &HashSet<RuntimeString>,

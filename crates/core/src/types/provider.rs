@@ -2354,6 +2354,19 @@ pub struct NativeCompactionContext {
 #[async_trait::async_trait]
 pub trait ModelProvider: Send + Sync {
     fn info(&self) -> &ProviderInfo;
+
+    /// Whether this endpoint currently arms a native deferred-tool channel
+    /// for the model: folded definitions and unlocked tools ride wire-native
+    /// surfaces and unlocked tools are called under their own names. When
+    /// false, sessions fall back to the static discovery protocol: fixed
+    /// `tool_search` + `call_mcp_tool` entries, folded catalogs announced in
+    /// the message stream, and definitions delivered through search results.
+    /// Reflects learning state, so a refused native channel flips the session
+    /// to the fallback on the next request.
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        let _ = model;
+        false
+    }
     fn output_token_defaults(&self, _model: &RuntimeString) -> ModelOutputTokenDefaults {
         ModelOutputTokenDefaults::default()
     }

@@ -953,6 +953,10 @@ impl ModelProvider for AnthropicProvider {
         &self.info
     }
 
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        self.native_deferred_tools_enabled(model, None)
+    }
+
     fn model_metadata(&self, model: &RuntimeString) -> ModelCapabilities {
         self.capabilities_for(model).clone()
     }
@@ -3369,13 +3373,11 @@ fn build_params_with_media_limits(
                     tool
                 })
                 .collect();
-        if tools.is_empty() && marked.is_empty() && !req.deferred_tools.is_empty() {
-            // Nothing immediate to bootstrap from: promote the deferred
-            // definitions instead of sending an all-deferred inventory.
-            tools.extend(req.deferred_tools.iter().map(to_api_tool));
-        } else {
-            tools.extend(marked);
-        }
+        // Folded definitions are never promoted into the standing list, even
+        // when it is empty: discovery belongs to the search channel, and a
+        // full-definition collapse is exactly the context bloat the deferred
+        // pool exists to avoid.
+        tools.extend(marked);
     }
 
     // Reference variant of the block channel: definitions announced mid-stream
@@ -4805,6 +4807,17 @@ fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Val
             .and_then(|output| output.get("matched"))
             .and_then(Value::as_array)
             .is_some_and(|matched| !matched.is_empty());
+    // On the fallback protocol the same result projects to full text: every
+    // delivered definition plus the fixed-entry invocation guidance, because
+    // a text-only result is the model's sole copy of the schema.
+    let projected = if !references && !tr.is_error {
+        tr.tool_kind
+            .filter(|kind| *kind == crate::types::provider::ProviderToolCallKind::ToolSearch)
+            .and(tr.native_tool_output.as_ref())
+            .and_then(crate::tools::builtins::tool_search::project_search_result_text)
+    } else {
+        None
+    };
     let content: Vec<Value> = if references {
         tr.native_tool_output
             .as_ref()
@@ -4820,6 +4833,8 @@ fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Val
                 ])
             })
             .collect()
+    } else if let Some(text) = projected {
+        vec![vobj(vec![("type", vs("text")), ("text", vs(text))])]
     } else {
         tr.content.iter().map(map_output_block).collect()
     };
@@ -5632,6 +5647,63 @@ mod tests {
         assert!(!body_declares_inline_tool_values(&body));
         // Idempotent: a second pass finds nothing by value.
         assert!(!rebuild_inline_values_as_references(&mut body));
+    }
+
+    #[test]
+    fn fallback_wires_project_search_results_to_full_definitions() {
+        use crate::runtime_values::runtime_json;
+        let output = runtime_json::parse(&RuntimeString::from(
+            r#"{"matched":["mcp__docs__read"],"tools":[{"name":"mcp__docs__read","description":"Read a document by ID.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}],"invocation":"Call call_mcp_tool with the tool name and an arguments object."}"#,
+        ))
+        .unwrap();
+        let tr = ToolResultMessage {
+            uuid: "tr1".into(),
+            tool_use_id: "call-1".into(),
+            content: vec![crate::schemas::content::OutputBlock::Text(
+                crate::schemas::content::TextBlock {
+                    text:
+                        "These tools are now available:\n- mcp__docs__read: Read a document by ID."
+                            .into(),
+                    citations: None,
+                    harness_envelope: None,
+                    message_id: None,
+                    phase: None,
+                },
+            )],
+            is_error: false,
+            tool_kind: Some(crate::types::provider::ProviderToolCallKind::ToolSearch),
+            native_tool_output: Some(output),
+            output: None,
+            extra_user_blocks: None,
+        };
+        // Fallback wire: the text result is the model's sole copy of the
+        // schema, so it carries the full definition and the fixed-entry
+        // invocation guidance.
+        let block = tool_result_msg_block(&tr, false);
+        let content = block.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].get("type").unwrap(), &exact_json!("text"));
+        let text = content[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap()
+            .try_to_utf8()
+            .unwrap();
+        assert!(text.contains("call_mcp_tool"), "{text}");
+        assert!(text.contains("Input schema:"), "{text}");
+        assert!(text.contains("\"required\""), "{text}");
+        assert!(text.contains("Read a document by ID."), "{text}");
+        // Native wire: the same result stays a name-only reference block.
+        let block = tool_result_msg_block(&tr, true);
+        let content = block.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            content[0].get("type").unwrap(),
+            &exact_json!("tool_reference")
+        );
+        assert_eq!(
+            content[0].get("tool_name").unwrap(),
+            &exact_json!("mcp__docs__read")
+        );
     }
 
     fn search_result_message(names: &[&str]) -> Message {
@@ -6985,17 +7057,16 @@ mod tests {
     }
 
     #[test]
-    fn an_all_deferred_inventory_is_promoted_to_immediate_tools() {
+    fn a_folded_inventory_is_never_promoted_into_the_standing_list() {
         let req = ModelRequest {
             tools: vec![],
             tool_choice: None,
             ..deferred_req()
         };
         let tools = deferred_wire_tools(&req, false, true);
-        assert_eq!(tools.len(), 2);
-        for tool in &tools {
-            assert!(tool.get("defer_loading").is_none());
-        }
+        // Zero immediate declarations: the folded definitions stay off the
+        // wire entirely instead of collapsing into full immediate schemas.
+        assert!(tools.is_empty(), "{tools:?}");
     }
 
     #[test]

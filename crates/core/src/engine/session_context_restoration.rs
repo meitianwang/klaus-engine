@@ -168,9 +168,20 @@ impl Session {
             let surfaced = {
                 let surfaced_tools = self.surfaced_tools.lock_recover().clone();
                 let tools = self.current_tools();
+                let native_active = bundle
+                    .provider
+                    .native_deferred_loading_active(&config.model);
+                let static_dispatch =
+                    crate::engine::query::request::static_deferred_dispatch_active(
+                        config,
+                        &tools,
+                        true,
+                        native_active,
+                    );
                 crate::context::retained_fragments::SurfacedToolsSection::new(
                     &tools,
                     &surfaced_tools,
+                    static_dispatch,
                 )
             };
             let is_side_task =
@@ -218,23 +229,19 @@ impl Session {
         let mut parts = provider().await;
         let bundle = self.inference_snapshot();
         let pool = self.current_tools();
-        let tools = if crate::engine::query::request::antigravity_gemini_static_deferred_tools(
+        let native_active = bundle
+            .provider
+            .native_deferred_loading_active(&config.model);
+        let tools = if crate::engine::query::request::static_deferred_dispatch_active(
             config,
-            Some(bundle.provider.info()),
-            &config.model,
             &pool,
             true,
+            native_active,
         ) {
             crate::engine::query::request::static_deferred_visible_tool_specs(
                 &pool,
                 &config.disabled_tools,
             )
-        } else if crate::engine::query::request::antigravity_gemini_eager_tools(
-            config,
-            Some(bundle.provider.info()),
-            &config.model,
-        ) {
-            crate::engine::query::request::eager_visible_tool_specs(&pool)
         } else {
             let surfaced = self.surfaced_tools.lock_recover().clone();
             crate::engine::query::visible_tool_specs(

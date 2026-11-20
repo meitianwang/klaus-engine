@@ -21,6 +21,7 @@ pub mod tool_lifecycle_trace;
 pub(crate) mod async_queue;
 pub(crate) mod browser_tool_dependencies;
 pub(crate) mod builtin_agents;
+pub(crate) mod catalog_notification;
 pub(crate) mod loop_detection;
 pub(crate) mod observation_wait;
 pub(crate) mod query;

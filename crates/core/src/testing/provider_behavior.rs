@@ -3260,6 +3260,59 @@ fn migrate_baseline_tool_search_default_limit(
     Ok(())
 }
 
+/// Search-result shapes recorded before the fixed-entry `invocation` field
+/// and before the current miss wording. Adoption is exact-match only:
+/// objects that already carry `invocation` pass through, empty matches stay
+/// without one, and unrelated strings are never touched.
+fn migrate_baseline_tool_search_results(value: &mut RuntimeJson) {
+    match value {
+        RuntimeJson::Object(object) => {
+            let is_search_output = object
+                .get("matched")
+                .and_then(RuntimeJson::as_array)
+                .is_some()
+                && object.get("tools").is_some()
+                && object.get("invocation").is_none();
+            if is_search_output {
+                let non_empty = object
+                    .get("matched")
+                    .and_then(RuntimeJson::as_array)
+                    .is_some_and(|matched| !matched.is_empty());
+                if non_empty {
+                    object.insert(
+                        "invocation",
+                        RuntimeJson::String(RuntimeString::from(
+                            crate::tools::builtins::tool_search::CALL_MCP_INVOCATION_HINT,
+                        )),
+                    );
+                }
+            }
+            for child in object.values_mut() {
+                migrate_baseline_tool_search_results(child);
+            }
+        }
+        RuntimeJson::Array(items) => {
+            for item in items {
+                migrate_baseline_tool_search_results(item);
+            }
+        }
+        RuntimeJson::String(text) => {
+            let Ok(rendered) = text.try_to_utf8() else {
+                return;
+            };
+            if rendered == "No matching tools found." {
+                *text = RuntimeString::from("No matching deferred tools found");
+            } else if rendered.contains("\nNo matching tools found for:") {
+                *text = RuntimeString::from(rendered.replace(
+                    "\nNo matching tools found for:",
+                    "\nNo matching deferred tools found for:",
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rewrite_tool_search_limit_descriptions(
     schema: &mut RuntimeJson,
     context: &str,
@@ -7184,6 +7237,20 @@ fn canonicalize_fixed_ts_reference_trace(
     // catalog. See `migrate_baseline_write_schemas_in_events` for why this half of
     // the migration is separate from the request-catalog half.
     migrate_baseline_write_schemas_in_events(&mut trace, row_number)?;
+    // Adopt the live search-result shape (fixed-entry invocation field and
+    // current miss wording) before the resolver re-derivation below compares
+    // recorded results against it.
+    for value in trace
+        .engine_events
+        .iter_mut()
+        .chain(trace.history.iter_mut())
+        .chain(trace.side_effects.iter_mut())
+    {
+        migrate_baseline_tool_search_results(value);
+    }
+    for request in &mut trace.model_requests {
+        migrate_baseline_tool_search_results(request);
+    }
     let scripted_profile = migrate_required_subagent_scripted_profile(
         &task.name,
         trace.run.profile,
@@ -14995,6 +15062,15 @@ struct ScriptedProvider {
 impl ModelProvider for ScriptedProvider {
     fn info(&self) -> &ProviderInfo {
         &self.info
+    }
+
+    /// The scripted rig replays recorded traces captured on the native
+    /// materialization lane: surfaced tools advance the request tool list and
+    /// search results ride their native output. Keeping the native channel
+    /// armed preserves those signed baselines; the static fallback protocol
+    /// is pinned by its own gate-matrix, catalog and projection tests.
+    fn native_deferred_loading_active(&self, _model: &RuntimeString) -> bool {
+        true
     }
 
     fn capabilities(&self, _model: &RuntimeString) -> ProviderCapabilities {

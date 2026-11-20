@@ -302,6 +302,11 @@ const SURFACED_TOOLS_CLASS_PREFIX: &str =
 
 const SURFACED_TOOLS_PREAMBLE: &str = "These tools you previously found via tool_search remain available — call them directly without searching again:\n";
 
+/// Preamble for sessions on the static fallback protocol: surfaced tools are
+/// not declared on the wire, execution goes through the fixed dispatcher, and
+/// a compacted-away schema must be re-fetched before the next call.
+const SURFACED_TOOLS_STATIC_PREAMBLE: &str = "These tools you previously found via tool_search remain available — call them through call_mcp_tool with {\"name\": \"<tool>\", \"arguments\": {...}}. If a tool's schema is no longer in your context, re-fetch it first with tool_search query \"select:<name>\":\n";
+
 /// Deferred tools already surfaced via `tool_search`; after a rewrite dropped
 /// the search call the model would otherwise search for them again.
 pub(crate) struct SurfacedToolsSection {
@@ -310,7 +315,11 @@ pub(crate) struct SurfacedToolsSection {
 }
 
 impl SurfacedToolsSection {
-    pub(crate) fn new(tools: &[Arc<dyn Tool>], surfaced: &HashSet<RuntimeString>) -> Self {
+    pub(crate) fn new(
+        tools: &[Arc<dyn Tool>],
+        surfaced: &HashSet<RuntimeString>,
+        static_dispatch: bool,
+    ) -> Self {
         let entries: Vec<(RuntimeString, RuntimeString)> = tools
             .iter()
             .filter(|tool| {
@@ -318,10 +327,25 @@ impl SurfacedToolsSection {
             })
             .map(|tool| (tool.name(), tool.description()))
             .collect();
-        Self::from_entries(entries)
+        Self::from_entries_with_preamble(
+            entries,
+            if static_dispatch {
+                SURFACED_TOOLS_STATIC_PREAMBLE
+            } else {
+                SURFACED_TOOLS_PREAMBLE
+            },
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<(RuntimeString, RuntimeString)>) -> Self {
+        Self::from_entries_with_preamble(entries, SURFACED_TOOLS_PREAMBLE)
+    }
+
+    fn from_entries_with_preamble(
+        entries: Vec<(RuntimeString, RuntimeString)>,
+        preamble: &str,
+    ) -> Self {
         if entries.is_empty() {
             return Self {
                 text: None,
@@ -337,7 +361,7 @@ impl SurfacedToolsSection {
                     .concat(description)
             })
             .collect();
-        let text = RuntimeString::from(SURFACED_TOOLS_PREAMBLE).concat(&join_lines(&lines));
+        let text = RuntimeString::from(preamble).concat(&join_lines(&lines));
         let payload = text.try_to_utf8().ok();
         Self {
             text: Some(text),

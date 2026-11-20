@@ -1486,6 +1486,22 @@ fn to_chat_messages(system: &[SystemPromptPart], messages: &[Message]) -> Value 
     )
 }
 
+/// The fallback-protocol projection of a successful native search result:
+/// full definitions plus fixed-entry invocation guidance serialized to text
+/// for endpoints whose tool results carry text only. `None` for every other
+/// result shape, so callers keep their recorded content.
+fn fallback_search_projection(
+    tr: &crate::schemas::message::ToolResultMessage,
+) -> Option<RuntimeString> {
+    if tr.is_error {
+        return None;
+    }
+    tr.tool_kind
+        .filter(|kind| *kind == ProviderToolCallKind::ToolSearch)
+        .and(tr.native_tool_output.as_ref())
+        .and_then(crate::tools::builtins::tool_search::project_search_result_text)
+}
+
 fn to_chat_messages_with_profile(
     system: &[SystemPromptPart],
     messages: &[Message],
@@ -1637,10 +1653,15 @@ fn to_chat_messages_with_profile(
                 if !answered.contains(&tr.tool_use_id) {
                     continue;
                 }
+                // Chat results are text-only: a search hit projects its full
+                // definitions and invocation guidance into the text, because
+                // this is the model's sole copy of the schema.
+                let content_text = fallback_search_projection(tr)
+                    .unwrap_or_else(|| text_of_output_blocks(&tr.content));
                 out.push(vobj([
                     ("role", vs("tool")),
                     ("tool_call_id", vs(tr.tool_use_id.clone())),
-                    ("content", vs(text_of_output_blocks(&tr.content))),
+                    ("content", vs(content_text)),
                 ]));
                 // Tool messages accept text only. Defer output images and native
                 // attachments until every result in this tool batch is emitted.
@@ -3260,7 +3281,9 @@ fn project_responses_input(
                             "output",
                             vs(if function_tools {
                                 let text = text_of_output_blocks(&tr.content);
-                                if let Some(native) = &tr.native_tool_output {
+                                if let Some(projected) = fallback_search_projection(tr) {
+                                    projected
+                                } else if let Some(native) = &tr.native_tool_output {
                                     text.concat(&RuntimeString::from("\n\nNative tool output:\n"))
                                         .concat(&runtime_json::stringify(native))
                                 } else {
@@ -6989,6 +7012,23 @@ impl OpenAIProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for OpenAIProvider {
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        if self.api != OpenAiApi::Responses {
+            return false;
+        }
+        if self
+            .compatibility
+            .as_ref()
+            .is_some_and(OpenAICompatibilityOptions::responses_function_tools)
+        {
+            return false;
+        }
+        self.capabilities_for(model).native_deferred_tools == Some(true)
+            && !self
+                .native_tool_support
+                .disabled(&self.endpoint("/responses"), model)
+    }
+
     fn native_compaction_context(
         &self,
         model: &RuntimeString,
@@ -14427,6 +14467,78 @@ mod tests {
         let mut switched = body.clone();
         retain_scoped_responses_context(&mut switched, Some(&owned), &"other-model".into());
         assert_eq!(switched["input"].as_array().expect("input").len(), 2);
+    }
+
+    fn engine_search_output_fixture() -> Value {
+        runtime_json::parse(&RuntimeString::from(
+            r#"{"matched":["mcp__docs__read"],"tools":[{"name":"mcp__docs__read","description":"Read a document by ID.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}],"invocation":"Call call_mcp_tool with the tool name and an arguments object."}"#,
+        ))
+        .expect("engine output fixture parses")
+    }
+
+    #[test]
+    fn fallback_wires_project_engine_search_results_to_full_text() {
+        let result = provider_result(
+            "c1",
+            "These tools are now available:\n- mcp__docs__read: Read a document by ID.",
+            ProviderToolCallKind::ToolSearch,
+            Some(engine_search_output_fixture()),
+        );
+        // Chat wire: the tool-role text carries schema + invocation guidance.
+        let messages = vec![
+            assistant_tool_search("c1", json!({"query":"select:mcp__docs__read"})),
+            result.clone(),
+        ];
+        let rendered = to_chat_messages(&[], &messages);
+        let tool_message = rendered
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == json!("tool"))
+            .expect("tool message");
+        let content = tool_message["content"]
+            .as_str()
+            .unwrap()
+            .try_to_utf8()
+            .unwrap();
+        assert!(content.contains("call_mcp_tool"), "{content}");
+        assert!(content.contains("Input schema:"), "{content}");
+        assert!(content.contains("Read a document by ID."), "{content}");
+
+        // Responses compatibility profile: same projection replaces the raw
+        // native-output append for engine-shaped results.
+        let search = tool_search_spec(
+            "tool_search",
+            "Discover tools",
+            required_string_schema("query"),
+        );
+        let mut request = base_req();
+        request.tools = vec![search];
+        request.messages = vec![
+            assistant_tool_search("c1", json!({"query":"select:mcp__docs__read"})),
+            result,
+        ];
+        let body = build_responses_params_with_tool_mode(
+            &request,
+            &ModelCapabilities::default(),
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: true,
+                tool_batches_allowed: false,
+                tool_namespaces_allowed: false,
+                instructions_item: false,
+                first_party_metadata: false,
+            },
+        )
+        .expect("compat body");
+        let output = body["input"][1]["output"]
+            .as_str()
+            .unwrap()
+            .try_to_utf8()
+            .unwrap();
+        assert!(output.contains("call_mcp_tool"), "{output}");
+        assert!(output.contains("Input schema:"), "{output}");
+        assert!(!output.contains("Native tool output:"), "{output}");
     }
 
     #[test]

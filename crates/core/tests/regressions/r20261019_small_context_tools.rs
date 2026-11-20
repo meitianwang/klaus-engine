@@ -428,6 +428,7 @@ async fn small_model_discovers_and_activates_its_original_tool_with_permissions_
         {
             let requests = fixture.requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
+            // Budget-driven deferral keeps only the search entry.
             assert_eq!(
                 requests[0]
                     .tools
@@ -498,7 +499,10 @@ async fn oversized_workspace_instructions_reach_the_provider_without_local_rejec
                 .iter()
                 .map(|tool| tool.name.clone())
                 .collect::<Vec<_>>(),
-            vec![RuntimeString::from("tool_search")]
+            vec![
+                RuntimeString::from("call_mcp_tool"),
+                RuntimeString::from("tool_search")
+            ]
         );
     }
     assert_eq!(fixture.checks.load(Ordering::SeqCst), 0);

@@ -13714,3 +13714,187 @@ async fn precompute_stays_inert_until_the_config_enables_it() {
         "{history:?}"
     );
 }
+
+/// Coverage matrix for the fallback-protocol gate: every provider family and
+/// endpoint shape resolves to exactly one tool protocol. Native deferred
+/// channels keep their wire-native strategy; everything else — plain models,
+/// third-party gateways, chat and compatibility profiles, managed cloud
+/// routes — lands on the static `tool_search` + `call_mcp_tool` protocol.
+#[test]
+fn static_fallback_gate_matrix_covers_providers_and_endpoints() {
+    use crate::engine::query::request::static_deferred_dispatch_active;
+    use crate::provider::anthropic::{
+        AnthropicProvider, AnthropicProviderOptions, BedrockConfig, VertexConfig,
+    };
+    use crate::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+    use crate::provider::openai::{
+        OpenAICompatibilityOptions, OpenAIProvider, OpenAIProviderOptions, OpenAiApi,
+    };
+    use crate::tools::builtins::tool_search::{create_tool_search_tool, ExposureOverrideTool};
+    use crate::tools::builtins::write::create_write_tool;
+    use crate::types::provider::{ModelCapabilities, ModelProvider};
+
+    let pool: Vec<Arc<dyn Tool>> = vec![
+        create_tool_search_tool(None),
+        ExposureOverrideTool::wrap(create_write_tool(), ToolExposure::Deferred),
+    ];
+    let config = crate::schemas::config::default_config();
+
+    let check = |label: &str,
+                 provider: &dyn ModelProvider,
+                 model: &str,
+                 expect_native: bool,
+                 expect_gate: bool| {
+        let native = provider.native_deferred_loading_active(&RuntimeString::from(model));
+        assert_eq!(native, expect_native, "{label}: native channel");
+        let gate = static_deferred_dispatch_active(&config, &pool, true, native);
+        assert_eq!(gate, expect_gate, "{label}: static fallback gate");
+    };
+
+    // Anthropic first-party: catalog models ride the native deferred channel,
+    // everything else falls back.
+    let first_party = AnthropicProvider::new(AnthropicProviderOptions {
+        protected_first_party_contract: true,
+        ..Default::default()
+    });
+    check(
+        "anthropic/first-party/sonnet-5-5",
+        &first_party,
+        "claude-sonnet-5-5",
+        true,
+        false,
+    );
+    check(
+        "anthropic/first-party/sonnet-4",
+        &first_party,
+        "claude-sonnet-4",
+        false,
+        true,
+    );
+    check(
+        "anthropic/first-party/haiku-5-5",
+        &first_party,
+        "claude-haiku-5-5",
+        false,
+        true,
+    );
+
+    // Anthropic third-party gateway: never native without an explicit
+    // per-model declaration.
+    let third_party = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some("https://gateway.example".to_string()),
+        api_key: Some("fixture".to_string()),
+        ..Default::default()
+    });
+    check(
+        "anthropic/third-party/sonnet-5-5",
+        &third_party,
+        "claude-sonnet-5-5",
+        false,
+        true,
+    );
+
+    let declared = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some("https://gateway.example".to_string()),
+        api_key: Some("fixture".to_string()),
+        default_model: Some("claude-sonnet-5-5".to_string()),
+        capabilities: Some(ModelCapabilities {
+            native_deferred_tools: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    check(
+        "anthropic/declared/sonnet-5-5",
+        &declared,
+        "claude-sonnet-5-5",
+        true,
+        false,
+    );
+
+    // Managed cloud routes never arm the native channel.
+    let vertex = AnthropicProvider::new(AnthropicProviderOptions {
+        vertex: Some(VertexConfig {
+            project: "p".to_string(),
+            location: "global".to_string(),
+        }),
+        ..Default::default()
+    });
+    check(
+        "anthropic/vertex/sonnet-5-5",
+        &vertex,
+        "claude-sonnet-5-5",
+        false,
+        true,
+    );
+    let bedrock = AnthropicProvider::new(AnthropicProviderOptions {
+        bedrock: Some(BedrockConfig {
+            region: "us-east-1".to_string(),
+        }),
+        ..Default::default()
+    });
+    check(
+        "anthropic/bedrock/sonnet-5-5",
+        &bedrock,
+        "claude-sonnet-5-5",
+        false,
+        true,
+    );
+
+    // OpenAI: chat never native; Responses with the official catalog native
+    // for listed models; the function-tools compatibility profile falls back.
+    let chat = OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: Some("fixture".to_string()),
+        ..Default::default()
+    });
+    check("openai/chat/gpt-5.5", &chat, "gpt-5.5", false, true);
+
+    let responses = OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: Some("fixture".to_string()),
+        api: Some(OpenAiApi::Responses),
+        ..Default::default()
+    });
+    check(
+        "openai/responses/gpt-5.5",
+        &responses,
+        "gpt-5.5",
+        true,
+        false,
+    );
+    check("openai/responses/gpt-4o", &responses, "gpt-4o", false, true);
+
+    let compat = OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: Some("fixture".to_string()),
+        api: Some(OpenAiApi::Responses),
+        compatibility: Some(
+            OpenAICompatibilityOptions::try_new(Default::default(), None)
+                .unwrap()
+                .with_responses_function_tools(true),
+        ),
+        ..Default::default()
+    });
+    check(
+        "openai/responses-compat/gpt-5.5",
+        &compat,
+        "gpt-5.5",
+        false,
+        true,
+    );
+
+    // Gemini: always the static protocol.
+    let gemini = GeminiProvider::new(GeminiProviderOptions {
+        api_key: Some("fixture".to_string()),
+        ..Default::default()
+    });
+    check("gemini/gemini-3-pro", &gemini, "gemini-3-pro", false, true);
+
+    // A disabled search entry closes the gate: folded tools simply stay out
+    // of reach instead of collapsing into the standing declaration list.
+    let mut no_search = crate::schemas::config::default_config();
+    no_search
+        .disabled_tools
+        .push(RuntimeString::from("tool_search"));
+    assert!(!static_deferred_dispatch_active(
+        &no_search, &pool, true, false
+    ));
+}

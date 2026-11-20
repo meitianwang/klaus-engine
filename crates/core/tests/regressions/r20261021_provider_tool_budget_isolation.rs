@@ -48,6 +48,8 @@ async fn only_opted_in_providers_defer_tools_and_keep_original_permission_checks
                     required_instruction
                 );
                 if opted_in {
+                    // Budget-driven deferral keeps only the search entry; the
+                    // dispatcher joins when exposure-based deferral is active.
                     assert_eq!(
                         first
                             .tools
@@ -133,7 +135,10 @@ async fn estimated_instruction_pressure_keeps_actual_admission_reachable_for_bot
                         .iter()
                         .map(|tool| tool.name.clone())
                         .collect::<Vec<_>>(),
-                    vec![RuntimeString::from("tool_search")]
+                    vec![
+                        RuntimeString::from("call_mcp_tool"),
+                        RuntimeString::from("tool_search")
+                    ]
                 );
             } else {
                 assert!(!request.tools.iter().any(|tool| tool.name == "tool_search"));

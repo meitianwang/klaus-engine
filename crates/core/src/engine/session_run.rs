@@ -285,7 +285,7 @@ use crate::schemas::rollout::TurnContextSnapshot;
 use crate::store::session_store::AppendEventOptions;
 use crate::sync_ext::{MutexExt, RwLockExt};
 use crate::tasks::task_store::get_task_list_id;
-use crate::tools::builtins::tool_search::ensure_tool_search;
+use crate::tools::builtins::tool_search::ensure_tool_search_with_late_mcp;
 use crate::tools::pool::build_tool_pool;
 use crate::tools::pool::to_tool_specs;
 use crate::tools::pool::BuildPoolOptions;
@@ -1015,20 +1015,22 @@ impl Session {
         let turn_lsp_manager = this.current_lsp_manager();
 
         // Web-search selection.
+        let plugin_mcp_clients = this.plugin_mcp_clients_snapshot();
+        let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
+        let late_mcp_expected = !plugin_mcp_clients.is_empty() && plugin_mcp_tools.is_empty();
         let web_selection = select_web_search(
-            ensure_tool_search(build_tool_pool(BuildPoolOptions {
-                builtins: this.current_tools(),
-                mcp_tools: {
-                    let tools =
-                        Session::mcp_tools_from_clients(&this.plugin_mcp_clients_snapshot());
-                    if tools.is_empty() {
+            ensure_tool_search_with_late_mcp(
+                build_tool_pool(BuildPoolOptions {
+                    builtins: this.current_tools(),
+                    mcp_tools: if plugin_mcp_tools.is_empty() {
                         None
                     } else {
-                        Some(tools)
-                    }
-                },
-                plugin_tools: None,
-            })),
+                        Some(plugin_mcp_tools)
+                    },
+                    plugin_tools: None,
+                }),
+                late_mcp_expected,
+            ),
             Some(&initial_bundle.config.web_search),
             initial_bundle.provider.capabilities(&turn_model).web_search,
         );
@@ -1073,6 +1075,27 @@ impl Session {
             is_main_role,
             this.config.request_user_input_default,
         );
+        // Static fallback protocol: announce folded-catalog drift as one
+        // engine-generated meta message in the live history. The wire tool
+        // list stays frozen, the announcement sits at a stable history
+        // position so its bytes cache after the first send, and the
+        // history-scan ledger keeps retries idempotent. The notification is
+        // not a rollout record: a cold resume simply re-announces the
+        // current catalog on its first turn, which is the intended
+        // restoration behavior.
+        if let Some(notification) =
+            crate::engine::catalog_notification::catalog_notification_message(
+                &initial_bundle.config,
+                &this.history_snapshot(),
+                &available_tools,
+                initial_bundle
+                    .provider
+                    .native_deferred_loading_active(&turn_model),
+            )
+        {
+            index_turn_message(&this, &notification, &turn_id);
+            this.push_history(notification);
+        }
         if orchestration_enabled {
             crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
                 &mut available_tools,
@@ -1113,18 +1136,23 @@ impl Session {
                         .unwrap_or_else(|| this.current_tools());
                     this.prepare_planning_tool_inventory(&mut base);
                     this.prepare_subagent_tool_inventory(&mut base, &bundle.config);
-                    let plugin_mcp_tools =
-                        Session::mcp_tools_from_clients(&this.plugin_mcp_clients_snapshot());
+                    let plugin_mcp_clients = this.plugin_mcp_clients_snapshot();
+                    let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
+                    let late_mcp_expected =
+                        !plugin_mcp_clients.is_empty() && plugin_mcp_tools.is_empty();
                     let mut tools = select_web_search(
-                        ensure_tool_search(build_tool_pool(BuildPoolOptions {
-                            builtins: base,
-                            mcp_tools: if plugin_mcp_tools.is_empty() {
-                                None
-                            } else {
-                                Some(plugin_mcp_tools)
-                            },
-                            plugin_tools: None,
-                        })),
+                        ensure_tool_search_with_late_mcp(
+                            build_tool_pool(BuildPoolOptions {
+                                builtins: base,
+                                mcp_tools: if plugin_mcp_tools.is_empty() {
+                                    None
+                                } else {
+                                    Some(plugin_mcp_tools)
+                                },
+                                plugin_tools: None,
+                            }),
+                            late_mcp_expected,
+                        ),
                         Some(&bundle.config.web_search),
                         bundle.provider.capabilities(&turn_model).web_search,
                     )
@@ -2327,22 +2355,47 @@ impl Session {
             }
             if initial_bundle.provider.capabilities(&turn_model).tools && !plugin_mcp_clients.is_empty() {
                 let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
+                let late_mcp_expected = plugin_mcp_tools.is_empty();
                 let selected = select_web_search(
-                    ensure_tool_search(build_tool_pool(BuildPoolOptions {
-                        builtins: this2.current_tools(),
-                        mcp_tools: if plugin_mcp_tools.is_empty() {
-                            None
-                        } else {
-                            Some(plugin_mcp_tools)
-                        },
-                        plugin_tools: None,
-                    })),
+                    ensure_tool_search_with_late_mcp(
+                        build_tool_pool(BuildPoolOptions {
+                            builtins: this2.current_tools(),
+                            mcp_tools: if plugin_mcp_tools.is_empty() {
+                                None
+                            } else {
+                                Some(plugin_mcp_tools)
+                            },
+                            plugin_tools: None,
+                        }),
+                        late_mcp_expected,
+                    ),
                     Some(&initial_bundle.config.web_search),
                     initial_bundle.provider.capabilities(&turn_model).web_search,
                 );
                 params.tools = selected.tools;
                 params.tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
                 crate::planning::tools::retain_for_mode(&mut params.tools,turn_collaboration_mode,this2.meta.role.is_none()||this2.meta.role==Some(SessionRole::Main),this2.config.request_user_input_default);
+                // The reconcile pass can deliver plugin MCP tools after the
+                // initial catalog announcement; diff the ledger again so a
+                // late-arriving server is still announced while the frozen
+                // tool list stays untouched.
+                if let Some(notification) =
+                    crate::engine::catalog_notification::catalog_notification_message(
+                        &initial_bundle.config,
+                        &this2.history_snapshot(),
+                        &params.tools,
+                        initial_bundle
+                            .provider
+                            .native_deferred_loading_active(&turn_model),
+                    )
+                {
+                    index_turn_message(&this2, &notification, &turn_id);
+                    // The turn's message snapshot was taken before this
+                    // reconcile pass, so the late announcement also joins the
+                    // in-flight request at its history position.
+                    params.messages.push(notification.clone());
+                    this2.push_history(notification);
+                }
                 if orchestration_enabled {
                     crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
                         &mut params.tools,
@@ -2556,13 +2609,29 @@ impl Session {
                         )
                         .await;
                     if !ref_surfaced.is_empty() {
-                        let sink = this2.persistence.rollout().cloned();
-                        if this2
-                            .record_surfaced_tools(&this2.surfaced_tools, sink.as_ref(), ref_surfaced)
-                            .await
-                            .is_ok()
-                        {
-                            surfaced_changed = true;
+                        // Only a native deferred lane materializes an explicit
+                        // reference into the wire inventory. On the static
+                        // fallback protocol the tools stay folded so the
+                        // catalog announcement lists them and the search
+                        // result delivers their definitions; pre-surfacing
+                        // there would hide them from the catalog without
+                        // delivering any schema.
+                        let native_active = initial_bundle
+                            .provider
+                            .native_deferred_loading_active(&turn_model);
+                        if native_active {
+                            let sink = this2.persistence.rollout().cloned();
+                            if this2
+                                .record_surfaced_tools(
+                                    &this2.surfaced_tools,
+                                    sink.as_ref(),
+                                    ref_surfaced,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                surfaced_changed = true;
+                            }
                         }
                     }
                     added.extend(ref_blocks);

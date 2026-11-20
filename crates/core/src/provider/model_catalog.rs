@@ -907,6 +907,10 @@ pub(crate) fn uncaptured_model_stream(model: &RuntimeString) -> ModelStream {
 
 #[async_trait::async_trait]
 impl ModelProvider for CapturedModelProvider {
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        self.inner.native_deferred_loading_active(model)
+    }
+
     fn output_token_defaults(
         &self,
         model: &RuntimeString,
@@ -1186,6 +1190,10 @@ impl ModelProvider for CapturedModelProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for CatalogModelProvider {
+    fn native_deferred_loading_active(&self, model: &RuntimeString) -> bool {
+        self.inner.native_deferred_loading_active(model)
+    }
+
     fn output_token_defaults(
         &self,
         model: &RuntimeString,
