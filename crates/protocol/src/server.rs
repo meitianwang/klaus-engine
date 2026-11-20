@@ -7697,6 +7697,14 @@ impl ServerInner {
                     let _ = catalog.refresh_from_env_default().await;
                 });
             }
+            // The prompt catalog revalidates alongside the capability catalog:
+            // same conditional-fetch pattern, independent versioning and cache.
+            if klaus_agent_core::prompt_catalog::PromptCatalogStore::configured_source().is_some() {
+                let store = klaus_agent_core::prompt_catalog::PromptCatalogStore::global().clone();
+                tokio::spawn(async move {
+                    let _ = store.refresh_from_env_default().await;
+                });
+            }
             klaus_agent_core::provider::model_catalog::with_model_catalog(provider, catalog)
         });
         let host = match host_capabilities_from_init(init.host_capabilities.as_ref()) {

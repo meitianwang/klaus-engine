@@ -1460,7 +1460,14 @@ pub(crate) fn build_extraction_prompt(
     dir: &str,
     recent: &[Message],
     manifest: &str,
+    fragments: &crate::prompt_catalog::ModelFragments,
 ) -> RuntimeString {
+    // Quality bar resolved through the prompt catalog for the model that
+    // actually rides the extraction fork.
+    let learning_quality = fragments
+        .memory_learning_quality()
+        .try_to_utf8()
+        .unwrap_or_default();
     let rendered = join_runtime_strings(
         &recent
             .iter()
@@ -1498,7 +1505,7 @@ pub(crate) fn build_extraction_prompt(
     };
     let tail = [
         "",
-        include_str!("../memory/prompts/learning_quality.md"),
+        learning_quality.as_str(),
         "",
         "Output contract:",
         "- Use ONLY the file tools, and write ONLY inside the memory directory above.",
@@ -1585,7 +1592,21 @@ pub(crate) async fn build_memory_manifest(dir: &str) -> String {
 /// call fails the whole run, so consolidation could never take the first step
 /// that would have created the index: every pass on an empty memory failed, for
 /// good, burning a fork each time.
-pub(crate) fn build_consolidation_prompt(dir: &str, health_report: &str) -> RuntimeString {
+pub(crate) fn build_consolidation_prompt(
+    dir: &str,
+    health_report: &str,
+    fragments: &crate::prompt_catalog::ModelFragments,
+) -> RuntimeString {
+    // Quality bars resolved through the prompt catalog for the model that
+    // actually rides the consolidation fork.
+    let learning_quality = fragments
+        .memory_learning_quality()
+        .try_to_utf8()
+        .unwrap_or_default();
+    let consolidation_quality = fragments
+        .memory_consolidation_quality()
+        .try_to_utf8()
+        .unwrap_or_default();
     let index = join_path(dir, "MEMORY.md");
     let head = [
         "You are the long-term keeper of a persistent memory directory for an ongoing",
@@ -1612,9 +1633,9 @@ files need only spot checks. The report is generated input — never edit it, an
     };
     let tail = [
         "",
-        include_str!("../memory/prompts/learning_quality.md"),
+        learning_quality.as_str(),
         "",
-        include_str!("../memory/prompts/consolidation_quality.md"),
+        consolidation_quality.as_str(),
         "",
         "Work in four phases:",
         "1. Orient — list the directory FIRST, and read only paths that listing actually showed.",

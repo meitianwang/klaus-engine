@@ -265,6 +265,7 @@ pub use session_lifecycle_state_part::SessionShutdownOutcome;
 pub(crate) use session_lifecycle_state_part::*;
 #[path = "session_advisor.rs"]
 mod session_advisor_part;
+pub(crate) use session_advisor_part::{ADVISOR_INSTRUCTIONS, SUMMARY_INSTRUCTIONS};
 #[path = "session_approval_async.rs"]
 mod session_approval_async_part;
 #[path = "session_approval_review.rs"]

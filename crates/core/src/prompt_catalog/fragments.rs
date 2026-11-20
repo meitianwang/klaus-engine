@@ -16,9 +16,12 @@ use crate::runtime_values::{RuntimeJson, RuntimeString};
 use super::catalog::SlotEntry;
 use super::resolve::{self, PromptCatalogKey, ResolvedFragments};
 use super::slots::{
-    SlotSpec, SLOT_AGENT_CHILD, SLOT_AGENT_MODE_EXPLICIT, SLOT_AGENT_MODE_HINT,
-    SLOT_AGENT_MODE_PROACTIVE, SLOT_AGENT_ROOT, SLOT_BASE_INSTRUCTIONS, SLOT_MODE_DEFAULT,
-    SLOT_MODE_PLAN, SLOT_RESPONSE_COMMENTARY, SLOT_REVIEW_GUARDIAN_V2,
+    SlotSpec, SLOT_ADVISOR_GUIDANCE, SLOT_ADVISOR_ROLE, SLOT_ADVISOR_SUMMARY, SLOT_AGENT_CHILD,
+    SLOT_AGENT_MODE_EXPLICIT, SLOT_AGENT_MODE_HINT, SLOT_AGENT_MODE_PROACTIVE, SLOT_AGENT_ROOT,
+    SLOT_BASE_INSTRUCTIONS, SLOT_COMPACT_LEAN_SYSTEM, SLOT_COMPACT_SUMMARY_TEMPLATE,
+    SLOT_MEMORY_CONSOLIDATION_QUALITY, SLOT_MEMORY_LEARNING_QUALITY, SLOT_MODE_DEFAULT,
+    SLOT_MODE_PLAN, SLOT_ORCHESTRATION_GUIDANCE, SLOT_RESPONSE_COMMENTARY, SLOT_REVIEW_GUARDIAN_V2,
+    SLOT_TITLE_INSTRUCTIONS,
 };
 
 /// The fragments bound to one inference: catalog layers plus the source
@@ -50,14 +53,65 @@ impl ModelFragments {
         Self::for_key(&key, family, declared)
     }
 
+    /// Resolve for a model on a known access route (`sourceKind` from the
+    /// session's inference source). Route-scoped bindings only match when the
+    /// source kind is present.
+    pub fn for_route(
+        model: &RuntimeString,
+        source_kind: Option<&str>,
+        declared: Option<&RuntimeJson>,
+    ) -> Self {
+        let family =
+            crate::provider::behavior::resolve_provider_behavior_profile(None, model).family;
+        let key = PromptCatalogKey {
+            source_kind: RuntimeString::from(source_kind.unwrap_or("")),
+            source_scope: RuntimeString::from(""),
+            model_key: model.clone(),
+            variant_key: RuntimeString::from("standard"),
+        };
+        Self::for_key(&key, family, declared)
+    }
+
+    /// Resolve for a session/feature configuration: the model plus, when the
+    /// session recorded one, its access-route source kind.
+    pub fn for_config(
+        config: &crate::schemas::config::ResolvedConfig,
+        declared: Option<&RuntimeJson>,
+    ) -> Self {
+        let source_kind = config
+            .model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref());
+        Self::for_route(&config.model, source_kind, declared)
+    }
+
+    /// Resolve with a pre-derived family and a known route/model. Request
+    /// paths that already carry the behavior profile use this to avoid
+    /// re-deriving the family.
+    pub fn for_route_with_family(
+        model: &RuntimeString,
+        source_kind: Option<&str>,
+        family: Option<&str>,
+        declared: Option<&RuntimeJson>,
+    ) -> Self {
+        let key = PromptCatalogKey {
+            source_kind: RuntimeString::from(source_kind.unwrap_or("")),
+            source_scope: RuntimeString::from(""),
+            model_key: model.clone(),
+            variant_key: RuntimeString::from("standard"),
+        };
+        Self::for_key(&key, family, declared)
+    }
+
     /// Full-form resolution for callers that know the access route.
     pub fn for_key(
         key: &PromptCatalogKey,
         family: Option<&str>,
         declared: Option<&RuntimeJson>,
     ) -> Self {
+        let catalog = super::active();
         Self {
-            resolved: resolve::resolve(super::bundled(), key, family, declared),
+            resolved: resolve::resolve(&catalog, key, family, declared),
         }
     }
 
@@ -134,6 +188,56 @@ impl ModelFragments {
     /// Structured classifier settings declared through the fragment channel.
     pub fn guardian_v2(&self) -> Option<&RuntimeJson> {
         self.resolved.json(SLOT_REVIEW_GUARDIAN_V2)
+    }
+
+    // ---- Specialized inference purposes ----
+    // Each binds to the model that actually receives that request.
+
+    /// Title-generation instructions (required slot).
+    pub fn title_instructions(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_TITLE_INSTRUCTIONS)
+    }
+
+    /// Advisor-tool guidance shown to the calling model (required slot).
+    pub fn advisor_guidance(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_ADVISOR_GUIDANCE)
+    }
+
+    /// Consultation role of the advisor model's own request (required slot).
+    pub fn advisor_role(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_ADVISOR_ROLE)
+    }
+
+    /// Context-summarizer instructions for advisor consultations (required).
+    pub fn advisor_summary(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_ADVISOR_SUMMARY)
+    }
+
+    /// Orchestration-mode guidance for the planning model (required slot).
+    pub fn orchestration_guidance(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_ORCHESTRATION_GUIDANCE)
+    }
+
+    /// Compaction summary template (required slot). A user-configured
+    /// `compact_prompt` outranks this at the consumer.
+    pub fn compact_summary_template(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_COMPACT_SUMMARY_TEMPLATE)
+    }
+
+    /// Stripped-fallback system line for overflowed compaction requests.
+    pub fn compact_lean_system(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_COMPACT_LEAN_SYSTEM)
+    }
+
+    /// Quality bar for the memory learning/maintenance fork.
+    pub fn memory_learning_quality(&self) -> RuntimeString {
+        self.resolved.required_text(SLOT_MEMORY_LEARNING_QUALITY)
+    }
+
+    /// Quality bar for memory consolidation.
+    pub fn memory_consolidation_quality(&self) -> RuntimeString {
+        self.resolved
+            .required_text(SLOT_MEMORY_CONSOLIDATION_QUALITY)
     }
 }
 

@@ -64,14 +64,32 @@ pub(super) fn resolve_effort(
     }
 }
 
-/// The prompt-catalog binding of one request: the model family and the source
-/// declaration the delegation fragments resolve against, plus the user's
-/// configured hint override.
+/// The prompt-catalog binding of one request: the model and route the
+/// delegation fragments resolve against, the source declaration riding with
+/// the model metadata, and the user's configured hint override.
 #[derive(Default)]
-pub(super) struct DelegationBinding<'a> {
+pub(crate) struct DelegationBinding<'a> {
+    pub model: Option<&'a crate::runtime_values::RuntimeString>,
     pub family: Option<&'static str>,
+    pub source_kind: Option<&'a str>,
     pub model_messages: Option<&'a crate::runtime_values::RuntimeJson>,
     pub configured_hint: Option<&'a crate::runtime_values::RuntimeString>,
+}
+
+impl<'a> DelegationBinding<'a> {
+    pub(crate) fn fragments(&self) -> crate::prompt_catalog::ModelFragments {
+        match self.model {
+            Some(model) => crate::prompt_catalog::ModelFragments::for_route_with_family(
+                model,
+                self.source_kind,
+                self.family,
+                self.model_messages,
+            ),
+            None => {
+                crate::prompt_catalog::ModelFragments::for_family(self.family, self.model_messages)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,17 +105,17 @@ pub(super) fn request_policy(
         tools,
         agent_id,
         true,
-        DelegationBinding::default(),
+        &DelegationBinding::default(),
     )
 }
 
-pub(super) fn request_policy_with_model_messages(
+pub(crate) fn request_policy_with_model_messages(
     canonical: &[SystemPromptPart],
     ultra_mode: bool,
     tools: &[crate::types::provider::ToolSpec],
     agent_id: Option<&crate::runtime_values::RuntimeString>,
     include_instructions: bool,
-    binding: DelegationBinding<'_>,
+    binding: &DelegationBinding<'_>,
 ) -> Vec<SystemPromptPart> {
     let mut parts: Vec<_> = canonical
         .iter()
@@ -111,12 +129,12 @@ pub(super) fn request_policy_with_model_messages(
         .iter()
         .position(|part| part.name == "total-tokens" || part.name.starts_with("provider-behavior:"))
         .unwrap_or(parts.len());
-    let instructions = crate::context::multi_agent::instructions_with_model_messages(
+    let fragments = binding.fragments();
+    let instructions = crate::context::multi_agent::instructions_with_fragments(
         tools,
         agent_id,
         ultra_mode,
-        binding.family,
-        binding.model_messages,
+        &fragments,
         binding.configured_hint,
     );
     parts.splice(index..index, instructions);
@@ -289,7 +307,7 @@ mod tests {
             &tools,
             None,
             false,
-            DelegationBinding::default()
+            &DelegationBinding::default()
         )
         .is_empty());
         let child = request_policy(&ordinary, true, &tools, Some(&"worker".into()));

@@ -61,7 +61,7 @@ use crate::types::reminder::ReminderProvider;
 use crate::types::tool::{BackgroundTaskRegistry, Tool, ToolContext};
 
 mod compaction;
-mod orchestration;
+pub(crate) mod orchestration;
 mod precompute;
 pub(crate) use precompute::PrecomputeRegistry;
 pub(crate) mod request;

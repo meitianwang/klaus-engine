@@ -19,7 +19,12 @@ use crate::prompt_catalog::slots::{
 };
 
 fn parse(text: &str) -> PromptCatalog {
-    PromptCatalog::parse(&RuntimeString::from(text)).expect("fixture catalog must be valid")
+    // Fixture catalogs stand in for verified published packages: trusted, so
+    // they may exercise high-authority slots. The untrusted path (distributed
+    // revisions) has its own tests.
+    PromptCatalog::parse(&RuntimeString::from(text))
+        .expect("fixture catalog must be valid")
+        .with_trust(true)
 }
 
 fn parse_err(text: &str) -> CatalogError {
@@ -903,4 +908,468 @@ fn child_role_reads_its_own_leaf() {
         .resolved()
         .provenance(SLOT_AGENT_MODE_HINT)
         .is_none());
+}
+
+// ---- Phase 2: bundled data, source routes, trust tiers, refresh chain ----
+
+#[test]
+fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
+    let claude = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    assert_eq!(
+        claude.commentary(),
+        Some(&RuntimeString::from(
+            crate::context::system_prompt::COMMENTARY_UNTAGGED_BRIEF_UPDATES
+        ))
+    );
+    assert_eq!(
+        claude
+            .resolved()
+            .provenance(SLOT_RESPONSE_COMMENTARY)
+            .map(|p| (p.layer, p.origin.clone())),
+        Some((
+            FragmentLayer::FamilyProfile,
+            RuntimeString::from("commentary-untagged-brief")
+        ))
+    );
+
+    let gemini = ModelFragments::for_model(&RuntimeString::from("gemini-2.5-pro"), None);
+    assert_eq!(
+        gemini.commentary(),
+        Some(&RuntimeString::from(
+            crate::context::system_prompt::COMMENTARY_UNTAGGED_THINKING_CHANNEL
+        ))
+    );
+
+    // The generic pack carries the phase-tagged text for every other model.
+    for model in ["gpt-5.6-sol", "qwen3-max", "deepseek-v3.2", "unknown-model"] {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_eq!(
+            fragments.commentary(),
+            Some(&RuntimeString::from(
+                crate::context::system_prompt::COMMENTARY_PHASE_TAGGED
+            )),
+            "{model} must resolve the generic-pack commentary"
+        );
+    }
+    // Required slots still resolve to the engine baseline.
+    let any = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    assert_eq!(
+        any.base_instructions(),
+        RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS)
+    );
+    assert_eq!(
+        crate::prompt_catalog::bundled().revision,
+        RuntimeString::from("bundled-r2")
+    );
+}
+
+#[test]
+fn purpose_slots_resolve_their_engine_defaults() {
+    let fragments = ModelFragments::for_model(&RuntimeString::from("gpt-5.6-sol"), None);
+    assert_eq!(
+        fragments.title_instructions(),
+        RuntimeString::from(crate::engine::session::SESSION_TITLE_PROMPT)
+    );
+    assert_eq!(
+        fragments.advisor_guidance(),
+        RuntimeString::from(crate::context::system_prompt::ADVISOR_GUIDANCE)
+    );
+    assert_eq!(
+        fragments.advisor_role(),
+        RuntimeString::from(crate::engine::session::ADVISOR_INSTRUCTIONS)
+    );
+    assert_eq!(
+        fragments.advisor_summary(),
+        RuntimeString::from(crate::engine::session::SUMMARY_INSTRUCTIONS)
+    );
+    assert_eq!(
+        fragments.orchestration_guidance(),
+        RuntimeString::from(crate::context::system_prompt::ORCHESTRATION_GUIDANCE)
+    );
+    assert_eq!(
+        fragments.compact_summary_template(),
+        RuntimeString::from(crate::context::compact::full_compact::SUMMARY_PROMPT)
+    );
+    assert_eq!(
+        fragments.compact_lean_system(),
+        RuntimeString::from(crate::context::compact::full_compact::LEAN_SUMMARY_SYSTEM_PROMPT)
+    );
+    assert_eq!(
+        fragments.memory_learning_quality(),
+        RuntimeString::from(include_str!("../memory/prompts/learning_quality.md"))
+    );
+    assert_eq!(
+        fragments.memory_consolidation_quality(),
+        RuntimeString::from(include_str!("../memory/prompts/consolidation_quality.md"))
+    );
+}
+
+/// Two routes of one confirmed model share the model pack; each keeps its own
+/// channel differences (spec acceptance: direct + aggregated same-model).
+const SOURCE_ROUTE_FIXTURE: &str = r#"{
+  "schemaVersion": 2,
+  "revision": "routes-r1",
+  "fragments": {
+    "claude-root": "Coordinate the work across the workers this session declares."
+  },
+  "profiles": {
+    "klaus/default": { "modelMessages": {} },
+    "claude/sonnet-x": {
+      "extends": "klaus/default",
+      "modelMessages": { "agent.root": { "ref": "claude-root" } }
+    }
+  },
+  "bindings": [
+    {
+      "sourceKind": "subscription", "sourceScope": "*", "modelKey": "claude-sonnet-x",
+      "variantKey": "standard", "profileRef": "claude/sonnet-x"
+    },
+    {
+      "sourceKind": "cursor", "sourceScope": "*", "modelKey": "mapped:claude-sonnet-x",
+      "variantKey": "standard", "profileRef": "claude/sonnet-x",
+      "overrides": { "response.commentary": { "disabled": true } }
+    }
+  ]
+}"#;
+
+#[test]
+fn source_scoped_routes_share_the_pack_and_keep_channel_differences() {
+    let catalog = parse(SOURCE_ROUTE_FIXTURE);
+    let direct = resolve(
+        &catalog,
+        &key("subscription", "", "claude-sonnet-x", "standard"),
+        Some("claude"),
+        None,
+    );
+    let aggregated = resolve(
+        &catalog,
+        &key("cursor", "", "mapped:claude-sonnet-x", "standard"),
+        Some("claude"),
+        None,
+    );
+    // Shared model-pack content on both routes.
+    assert_eq!(
+        text_of(&direct, SLOT_AGENT_ROOT).as_deref(),
+        Some("Coordinate the work across the workers this session declares.")
+    );
+    assert_eq!(
+        text_of(&direct, SLOT_AGENT_ROOT),
+        text_of(&aggregated, SLOT_AGENT_ROOT)
+    );
+    // Channel difference: the aggregated route disabled its progress channel.
+    assert!(!direct.is_disabled(SLOT_RESPONSE_COMMENTARY));
+    assert!(aggregated.is_disabled(SLOT_RESPONSE_COMMENTARY));
+
+    // A source declaration rides only its own route.
+    let declared_value = declared(r#"{"auto_review":{"policy":"subscription-only policy"}}"#);
+    let direct_declared = resolve(
+        &catalog,
+        &key("subscription", "", "claude-sonnet-x", "standard"),
+        Some("claude"),
+        Some(&declared_value),
+    );
+    let aggregated_plain = resolve(
+        &catalog,
+        &key("cursor", "", "mapped:claude-sonnet-x", "standard"),
+        Some("claude"),
+        None,
+    );
+    assert_eq!(
+        text_of(&direct_declared, SLOT_REVIEW_POLICY).as_deref(),
+        Some("subscription-only policy")
+    );
+    assert!(text_of(&aggregated_plain, SLOT_REVIEW_POLICY).is_none());
+
+    // An unrelated source never matches the route bindings.
+    let other = resolve(
+        &catalog,
+        &key("kiro", "", "claude-sonnet-x", "standard"),
+        Some("claude"),
+        None,
+    );
+    assert!(other.profile_ref.is_none());
+    assert_eq!(
+        text_of(&other, SLOT_AGENT_ROOT),
+        Some(crate::context::multi_agent::ROOT_ROLE.to_owned())
+    );
+}
+
+#[test]
+fn untrusted_revisions_cannot_override_high_authority_slots() {
+    let document = r#"{
+      "schemaVersion": 2,
+      "revision": "distributed-r1",
+      "fragments": { "rogue-base": "REWRITTEN BASE", "tuned-root": "tuned delegation role" },
+      "profiles": {
+        "klaus/default": {
+          "modelMessages": {
+            "base.instructions": { "ref": "rogue-base" },
+            "response.commentary": { "text": "REWRITTEN COMMENTARY" },
+            "agent.root": { "ref": "tuned-root" },
+            "review.policy": { "text": "tuned review policy" }
+          }
+        }
+      },
+      "bindings": []
+    }"#;
+    // Unsigned (distributed) revision: high-authority slots keep the engine
+    // baseline; model/purpose-scoped slots apply.
+    let untrusted =
+        PromptCatalog::parse(&RuntimeString::from(document)).expect("fixture must be valid");
+    assert!(!untrusted.trusted);
+    let resolved = resolve(
+        &untrusted,
+        &key("", "", "any-model", "standard"),
+        None,
+        None,
+    );
+    assert_eq!(
+        text_of(&resolved, SLOT_BASE_INSTRUCTIONS),
+        Some(crate::context::system_prompt::BASE_INSTRUCTIONS.to_owned())
+    );
+    assert_eq!(
+        text_of(&resolved, SLOT_RESPONSE_COMMENTARY),
+        Some(crate::context::system_prompt::COMMENTARY_PHASE_TAGGED.to_owned())
+    );
+    assert_eq!(
+        text_of(&resolved, SLOT_AGENT_ROOT).as_deref(),
+        Some("tuned delegation role")
+    );
+    assert_eq!(
+        text_of(&resolved, SLOT_REVIEW_POLICY).as_deref(),
+        Some("tuned review policy")
+    );
+
+    // The same revision, trusted (bundled or signature-verified), applies
+    // every slot.
+    let trusted = untrusted.clone().with_trust(true);
+    let resolved = resolve(&trusted, &key("", "", "any-model", "standard"), None, None);
+    assert_eq!(
+        text_of(&resolved, SLOT_BASE_INSTRUCTIONS).as_deref(),
+        Some("REWRITTEN BASE")
+    );
+    assert_eq!(
+        text_of(&resolved, SLOT_RESPONSE_COMMENTARY).as_deref(),
+        Some("REWRITTEN COMMENTARY")
+    );
+}
+
+#[test]
+fn for_route_binds_the_source_key_through_the_active_store() {
+    use crate::prompt_catalog::store::PromptCatalogStore;
+    let store = PromptCatalogStore::global();
+    let bundled_before = store.active();
+    store.install(parse(SOURCE_ROUTE_FIXTURE).with_trust(true));
+
+    let direct = ModelFragments::for_route(
+        &RuntimeString::from("claude-sonnet-x"),
+        Some("subscription"),
+        None,
+    );
+    assert_eq!(
+        direct.agent_role(false),
+        Some(&RuntimeString::from(
+            "Coordinate the work across the workers this session declares."
+        ))
+    );
+    // Without the source kind the route binding cannot match.
+    let routed_out = ModelFragments::for_route(&RuntimeString::from("claude-sonnet-x"), None, None);
+    assert_eq!(
+        routed_out.agent_role(false),
+        Some(&RuntimeString::from(crate::context::multi_agent::ROOT_ROLE))
+    );
+
+    store.install((*bundled_before).clone());
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r2"));
+}
+
+mod store_refresh {
+    use crate::prompt_catalog::store::{CatalogRefresh, PromptCatalogStore};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> String {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "prompt-catalog-{}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::SeqCst),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    async fn serve_scripted(listener: TcpListener, responses: Vec<String>) -> Vec<String> {
+        let mut heads = Vec::new();
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                let read = socket.read(&mut byte).await.unwrap();
+                assert_ne!(read, 0, "client closed before completing the request");
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            heads.push(String::from_utf8(head).unwrap());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        heads
+    }
+
+    fn document(revision: &str) -> String {
+        format!(
+            r#"{{"schemaVersion":2,"revision":"{revision}","fragments":{{}},"profiles":{{"klaus/default":{{"modelMessages":{{}}}}}},"bindings":[]}}"#
+        )
+    }
+
+    fn ok_response(body: &str, etag: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn refresh_activates_valid_revisions_and_keeps_current_on_invalid() {
+        let dir = temp_dir();
+        let store = PromptCatalogStore::load(Some(&dir));
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "bundled-r2"
+        );
+
+        let v1 = document("distributed-v1");
+        let invalid = r#"{"schemaVersion":99,"revision":"bad"}"#.to_string();
+        let v2 = document("distributed-v2");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_scripted(
+            listener,
+            vec![
+                ok_response(&v1, "\"e1\""),
+                ok_response(&invalid, "\"e2\""),
+                ok_response(&v2, "\"e3\""),
+                "HTTP/1.1 304 Not Modified\r\nETag: \"e3\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            ],
+        ));
+        let url = format!("http://{address}/prompt-catalog.json");
+        let http = reqwest::Client::new();
+
+        // A valid revision activates atomically.
+        assert_eq!(
+            store.refresh(&http, &url).await.unwrap(),
+            CatalogRefresh::Updated
+        );
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "distributed-v1"
+        );
+
+        // An invalid candidate never activates; the current revision stays.
+        assert!(store.refresh(&http, &url).await.is_err());
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "distributed-v1"
+        );
+
+        // The next valid revision replaces it, then a 304 only revalidates.
+        assert_eq!(
+            store.refresh(&http, &url).await.unwrap(),
+            CatalogRefresh::Updated
+        );
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "distributed-v2"
+        );
+        assert_eq!(
+            store.refresh(&http, &url).await.unwrap(),
+            CatalogRefresh::NotModified
+        );
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "distributed-v2"
+        );
+
+        let heads = server.await.unwrap();
+        // Conditional requests carry the stored ETag after the first fetch
+        // (hyper writes request header names lowercased).
+        assert!(!heads[0].to_ascii_lowercase().contains("if-none-match"));
+        assert!(heads[1]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"e1\""));
+        assert!(heads[3]
+            .to_ascii_lowercase()
+            .contains("if-none-match: \"e3\""));
+
+        // Offline restart: the cached revision activates without a network
+        // round-trip, and it stays untrusted (no high-authority overrides).
+        let reloaded = PromptCatalogStore::load(Some(&dir));
+        assert_eq!(
+            reloaded.active().revision.try_to_utf8().unwrap().as_str(),
+            "distributed-v2"
+        );
+        assert!(!reloaded.active().trusted);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_publish_complete_revisions_only() {
+        // Two refreshers race the same store: each validates its own
+        // candidate and the store only ever holds one complete revision —
+        // readers never observe a half-applied document.
+        let dir = temp_dir();
+        let store = std::sync::Arc::new(PromptCatalogStore::load(Some(&dir)));
+        let va = document("concurrent-a");
+        let vb = document("concurrent-b");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_scripted(
+            listener,
+            vec![ok_response(&va, "\"ea\""), ok_response(&vb, "\"eb\"")],
+        ));
+        let url = format!("http://{address}/prompt-catalog.json");
+        let http = reqwest::Client::new();
+
+        let (r1, r2) = tokio::join!(store.refresh(&http, &url), store.refresh(&http, &url));
+        assert!(
+            r1.is_ok() && r2.is_ok(),
+            "both refreshes must complete: {r1:?} {r2:?}"
+        );
+        let active = store.active();
+        // Whichever revision won, it is complete and self-consistent.
+        assert!(
+            active.revision.try_to_utf8().unwrap().as_str() == "concurrent-a"
+                || active.revision.try_to_utf8().unwrap().as_str() == "concurrent-b"
+        );
+        assert_eq!(active.schema_version, 2);
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_falls_back_to_the_bundled_package() {
+        let dir = temp_dir();
+        std::fs::write(
+            format!("{dir}/prompt-catalog.json"),
+            r#"{"etag":"x","checkedAtMs":1,"document":{"schemaVersion":2,"revision":"broken","profiles":{"p":{"extends":"missing"}}}}"#,
+        )
+        .unwrap();
+        let store = PromptCatalogStore::load(Some(&dir));
+        assert_eq!(
+            store.active().revision.try_to_utf8().unwrap().as_str(),
+            "bundled-r2"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

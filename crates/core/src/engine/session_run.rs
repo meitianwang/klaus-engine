@@ -1538,26 +1538,45 @@ impl Session {
                             cache_scope: None,
                         });
                     }
-                    if advisor_exposed {
-                        let boundary = parts
-                            .iter()
-                            .position(|part| {
-                                part.cache_scope != Some(crate::types::provider::CacheScope::Global)
-                            })
-                            .unwrap_or(parts.len());
-                        parts.insert(boundary, crate::context::system_prompt::advisor_guidance());
-                    }
-                    if orchestration_exposed {
-                        let boundary = parts
-                            .iter()
-                            .position(|part| {
-                                part.cache_scope != Some(crate::types::provider::CacheScope::Global)
-                            })
-                            .unwrap_or(parts.len());
-                        parts.insert(
-                            boundary,
-                            crate::context::system_prompt::orchestration_guidance(),
+                    if advisor_exposed || orchestration_exposed {
+                        // Guidance fragments bind to the turn's actual model
+                        // and its source declaration.
+                        let guidance_metadata =
+                            bundle.provider.model_metadata(&bundle.config.model);
+                        let guidance_fragments = crate::prompt_catalog::ModelFragments::for_config(
+                            &bundle.config,
+                            guidance_metadata.model_messages.as_ref(),
                         );
+                        if advisor_exposed {
+                            let boundary = parts
+                                .iter()
+                                .position(|part| {
+                                    part.cache_scope
+                                        != Some(crate::types::provider::CacheScope::Global)
+                                })
+                                .unwrap_or(parts.len());
+                            parts.insert(
+                                boundary,
+                                crate::context::system_prompt::advisor_guidance_with(
+                                    &guidance_fragments.advisor_guidance(),
+                                ),
+                            );
+                        }
+                        if orchestration_exposed {
+                            let boundary = parts
+                                .iter()
+                                .position(|part| {
+                                    part.cache_scope
+                                        != Some(crate::types::provider::CacheScope::Global)
+                                })
+                                .unwrap_or(parts.len());
+                            parts.insert(
+                                boundary,
+                                crate::context::system_prompt::orchestration_guidance_with(
+                                    &guidance_fragments.orchestration_guidance(),
+                                ),
+                            );
+                        }
                     }
                     if this.system_prompt_is_default {
                         let is_wt = this.workspace.is_in_worktree();

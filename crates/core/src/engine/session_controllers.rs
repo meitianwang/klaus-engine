@@ -1856,6 +1856,28 @@ impl Session {
         }
     }
 
+    /// Fragments bound to the model that actually rides a restricted memory
+    /// fork: its configured feature target when present, else the session's
+    /// main model.
+    fn memory_fork_fragments(
+        inference: &super::InferenceActivityGuard,
+    ) -> crate::prompt_catalog::ModelFragments {
+        let bundle = inference
+            .bundle
+            .for_feature(FeatureSlot::Memory)
+            .unwrap_or_else(|_| inference.bundle.clone());
+        let metadata = bundle.provider.model_metadata(&bundle.config.model);
+        crate::prompt_catalog::ModelFragments::for_route(
+            &bundle.config.model,
+            bundle
+                .config
+                .model_source
+                .as_ref()
+                .and_then(|source| source.source.as_deref()),
+            metadata.model_messages.as_ref(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn run_extraction_fork(
         self: &Arc<Self>,
@@ -1894,9 +1916,10 @@ impl Session {
         // topic instead of duplicating it, and spends its limited turns on
         // writes instead of discovery.
         let manifest = build_memory_manifest(dir).await;
+        let memory_fragments = Self::memory_fork_fragments(&inference);
         self.run_restricted_memory_fork(
             dir,
-            &build_extraction_prompt(dir, recent, &manifest),
+            &build_extraction_prompt(dir, recent, &manifest, &memory_fragments),
             RestrictedMemoryForkOptions {
                 pinned_root: None,
                 max_turns_override: Some(5),
@@ -3164,7 +3187,11 @@ impl Session {
         match self
             .run_restricted_memory_fork(
                 dir,
-                &build_consolidation_prompt(dir, &health_report),
+                &build_consolidation_prompt(
+                    dir,
+                    &health_report,
+                    &Self::memory_fork_fragments(&inference),
+                ),
                 RestrictedMemoryForkOptions {
                     pinned_root: Some(pinned_root),
                     max_turns_override: Some(DREAM_MAX_TURNS),

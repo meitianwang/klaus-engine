@@ -3,7 +3,7 @@
 //! The role describes the current agent's responsibilities. The mode decides
 //! when delegation is authorized; execution details belong to tool contracts.
 
-use crate::runtime_values::{RuntimeJson, RuntimeString};
+use crate::runtime_values::RuntimeString;
 use crate::types::provider::{SystemPromptPart, ToolSpec};
 
 pub(crate) const ROLE_PART: &str = "multi-agent-role";
@@ -49,15 +49,13 @@ pub(crate) const EXPLICIT_MODE: &str = "Any earlier instruction enabling proacti
 /// the model metadata as the top layer. A slot resolved to disabled (or an
 /// explicitly empty text) omits its part, preserving the pre-catalog
 /// suppression semantics.
-pub(crate) fn instructions_with_model_messages(
+pub(crate) fn instructions_with_fragments(
     _tools: &[ToolSpec],
     agent_id: Option<&RuntimeString>,
     ultra_mode: bool,
-    family: Option<&'static str>,
-    model_messages: Option<&RuntimeJson>,
+    fragments: &crate::prompt_catalog::ModelFragments,
     configured_hint: Option<&RuntimeString>,
 ) -> Vec<SystemPromptPart> {
-    let fragments = crate::prompt_catalog::ModelFragments::for_family(family, model_messages);
     let role_text = fragments.agent_role(agent_id.is_some()).cloned();
     let mode_text = fragments.agent_mode(ultra_mode, configured_hint);
     let mut parts = Vec::new();
@@ -81,7 +79,7 @@ pub(crate) fn is_instruction_part(name: &RuntimeString) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_values::{runtime_json, RuntimeObject};
+    use crate::runtime_values::{runtime_json, RuntimeJson, RuntimeObject};
     use crate::types::provider::ToolSpecKind;
 
     fn tools() -> Vec<ToolSpec> {
@@ -113,12 +111,11 @@ mod tests {
         );
         let hint = RuntimeString::from("configured");
         for enabled in [false, true] {
-            let parts = instructions_with_model_messages(
+            let parts = instructions_with_fragments(
                 &tools(),
                 None,
                 enabled,
-                None,
-                Some(&messages),
+                &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
                 Some(&hint),
             );
             assert_eq!(mode(&parts), Some(&hint));
@@ -129,12 +126,11 @@ mod tests {
     fn empty_configured_hint_suppresses_a_nonempty_catalog_hint() {
         let messages = declared(r#"{"multi_agent":{"mode":{"hint_text":"catalog"}}}"#);
         let hint = RuntimeString::default();
-        let parts = instructions_with_model_messages(
+        let parts = instructions_with_fragments(
             &tools(),
             None,
             true,
-            None,
-            Some(&messages),
+            &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
             Some(&hint),
         );
         assert!(mode(&parts).is_none());
@@ -147,12 +143,11 @@ mod tests {
             r#"{"multi_agent":{"mode":{"hint_text":"catalog","proactive":"active","explicit":"inactive"}}}"#,
         );
         for enabled in [false, true] {
-            let parts = instructions_with_model_messages(
+            let parts = instructions_with_fragments(
                 &tools(),
                 None,
                 enabled,
-                None,
-                Some(&messages),
+                &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
                 None,
             );
             assert_eq!(mode(&parts), Some(&RuntimeString::from("catalog")));
@@ -162,11 +157,21 @@ mod tests {
     #[test]
     fn absent_mode_uses_bundled_text_but_empty_mode_suppresses_it() {
         let messages = declared(r#"{"multi_agent":{"mode":{"proactive":""}}}"#);
-        let enabled =
-            instructions_with_model_messages(&tools(), None, true, None, Some(&messages), None);
+        let enabled = instructions_with_fragments(
+            &tools(),
+            None,
+            true,
+            &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
+            None,
+        );
         assert!(mode(&enabled).is_none());
-        let disabled =
-            instructions_with_model_messages(&tools(), None, false, None, Some(&messages), None);
+        let disabled = instructions_with_fragments(
+            &tools(),
+            None,
+            false,
+            &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
+            None,
+        );
         assert_eq!(mode(&disabled), Some(&RuntimeString::from(EXPLICIT_MODE)));
     }
 
@@ -176,12 +181,11 @@ mod tests {
             r#"{"multi_agent":{"role":{"root":"root base","subagent":"child base"},"mode":{"proactive":" custom\nmode ","explicit":"off"}}}"#,
         );
         let child = RuntimeString::from("child-id");
-        let parts = instructions_with_model_messages(
+        let parts = instructions_with_fragments(
             &tools(),
             Some(&child),
             true,
-            None,
-            Some(&messages),
+            &crate::prompt_catalog::ModelFragments::for_family(None, Some(&messages)),
             None,
         );
         assert_eq!(parts[0].text, "child base");

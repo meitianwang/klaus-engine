@@ -665,6 +665,14 @@ impl AgentEngine {
                 let _ = catalog.refresh_from_env_default().await;
             });
         }
+        // The prompt catalog revalidates alongside the capability catalog:
+        // same conditional-fetch pattern, independent versioning and cache.
+        if klaus_agent_core::prompt_catalog::PromptCatalogStore::configured_source().is_some() {
+            let store = klaus_agent_core::prompt_catalog::PromptCatalogStore::global().clone();
+            tokio::spawn(async move {
+                let _ = store.refresh_from_env_default().await;
+            });
+        }
         let config_value = if config_map.is_empty() {
             None
         } else {

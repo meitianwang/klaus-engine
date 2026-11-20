@@ -60,7 +60,6 @@ use super::ThinkingConfig;
 use super::MAINTENANCE_FORCE_ABORT_ERROR;
 use super::MAINTENANCE_SHUTDOWN_ERROR;
 use super::MANUAL_DREAM_SHUTDOWN_ERROR;
-use super::SESSION_TITLE_PROMPT;
 use super::SIDE_QUESTION_SYSTEM_PROMPT;
 use crate::checkpoint::checkpoint_service::CheckpointService;
 use crate::checkpoint::checkpoint_service::CheckpointServiceOptions;
@@ -3582,11 +3581,33 @@ impl Session {
                 usage: None,
             });
         }
+        // Bind the title instructions to the model that will actually
+        // generate the title (its configured feature target, else the main
+        // model), resolved through its prompt-catalog fragments. Host-supplied
+        // guidance stays an append on top of the resolved instructions.
+        let title_inference = self.capture_inference(&signal).await?;
+        let title_bundle = title_inference
+            .bundle
+            .for_feature(FeatureSlot::Title)
+            .unwrap_or_else(|_| title_inference.bundle.clone());
+        let title_metadata = title_bundle
+            .provider
+            .model_metadata(&title_bundle.config.model);
+        let title_fragments = crate::prompt_catalog::ModelFragments::for_route(
+            &title_bundle.config.model,
+            title_bundle
+                .config
+                .model_source
+                .as_ref()
+                .and_then(|source| source.source.as_deref()),
+            title_metadata.model_messages.as_ref(),
+        );
+        let title_instructions = title_fragments.title_instructions();
         let system_append = match instructions.and_then(nonempty_trimmed) {
-            Some(extra) => RuntimeString::from(SESSION_TITLE_PROMPT)
+            Some(extra) => title_instructions
                 .concat(&RuntimeString::from("\n\nAdditional title guidance:\n"))
                 .concat(&RuntimeString::from(extra)),
-            None => RuntimeString::from(SESSION_TITLE_PROMPT),
+            None => title_instructions,
         };
         let framed_input = RuntimeString::from("<conversation>\n")
             .concat(&description)

@@ -1,16 +1,20 @@
 //! Engine-owned slot specifications for the model prompt catalog.
 //!
 //! Every catalog-visible prompt slot is registered here with its value kind,
-//! requiredness, disableability and size cap. Catalog data may only fill slots
-//! this registry declares, and only in the shapes it allows: an unknown slot
-//! id, a wrong value kind, `disabled` on a non-disableable slot or oversized
-//! text makes the whole candidate catalog revision invalid (see
-//! [`super::catalog`]).
+//! requiredness, disableability, authority class and size cap. Catalog data
+//! may only fill slots this registry declares, and only in the shapes it
+//! allows: an unknown slot id, a wrong value kind, `disabled` on a
+//! non-disableable slot or oversized text makes the whole candidate catalog
+//! revision invalid (see [`super::catalog`]).
 //!
 //! The registry also owns the bottom resolution layer: the engine defaults
 //! that reproduce the bundled offline behavior byte-for-byte when no catalog
 //! profile, binding override or source declaration supplies a slot. Required
 //! slots always resolve to valid content through this layer.
+//!
+//! High-authority slots carry the stable global prefix and the collaboration
+//! authority text. The bundled package may set them; a distributed revision
+//! may not until publisher-signature verification ships (see [`super::store`]).
 
 use crate::runtime_values::RuntimeString;
 
@@ -34,6 +38,9 @@ pub struct SlotSpec {
     pub required: bool,
     /// Whether a catalog layer may switch the slot off (`disabled: true`).
     pub disableable: bool,
+    /// Whether the slot carries stable-prefix or collaboration-authority
+    /// text that unsigned distributed catalogs may not override.
+    pub high_authority: bool,
     /// Maximum resolved text length in bytes (text slots) or serialized JSON
     /// size in bytes (json slots).
     pub max_bytes: usize,
@@ -54,6 +61,15 @@ pub const SLOT_REVIEW_NODE_REPL_POLICY: &str = "review.node_repl_policy";
 pub const SLOT_REVIEW_REJECTION_INSTRUCTIONS: &str = "review.rejection_instructions";
 pub const SLOT_REVIEW_TIMEOUT_INSTRUCTIONS: &str = "review.timeout_instructions";
 pub const SLOT_REVIEW_GUARDIAN_V2: &str = "review.guardian_v2";
+pub const SLOT_TITLE_INSTRUCTIONS: &str = "title.instructions";
+pub const SLOT_ADVISOR_GUIDANCE: &str = "advisor.guidance";
+pub const SLOT_ADVISOR_ROLE: &str = "advisor.role";
+pub const SLOT_ADVISOR_SUMMARY: &str = "advisor.summary";
+pub const SLOT_ORCHESTRATION_GUIDANCE: &str = "orchestration.guidance";
+pub const SLOT_COMPACT_SUMMARY_TEMPLATE: &str = "compact.summary_template";
+pub const SLOT_COMPACT_LEAN_SYSTEM: &str = "compact.lean_system";
+pub const SLOT_MEMORY_LEARNING_QUALITY: &str = "memory.learning_quality";
+pub const SLOT_MEMORY_CONSOLIDATION_QUALITY: &str = "memory.consolidation_quality";
 
 /// Text slot cap: generous headroom over the bundled defaults, small enough
 /// that a corrupt or malicious catalog cannot smuggle unbounded prompt bytes.
@@ -61,113 +77,112 @@ const TEXT_CAP: usize = 256 * 1024;
 const SMALL_TEXT_CAP: usize = 32 * 1024;
 const JSON_CAP: usize = 16 * 1024;
 
+const fn text_slot(
+    id: &'static str,
+    required: bool,
+    disableable: bool,
+    high_authority: bool,
+    max_bytes: usize,
+) -> SlotSpec {
+    SlotSpec {
+        id,
+        kind: SlotValueKind::Text,
+        required,
+        disableable,
+        high_authority,
+        max_bytes,
+    }
+}
+
 /// All registered slots, lowest-first declaration order.
 pub const SLOTS: &[SlotSpec] = &[
-    SlotSpec {
-        id: SLOT_BASE_INSTRUCTIONS,
-        kind: SlotValueKind::Text,
-        required: true,
-        disableable: false,
-        max_bytes: TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_RESPONSE_COMMENTARY,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_MODE_DEFAULT,
-        kind: SlotValueKind::Text,
-        required: true,
-        disableable: false,
-        max_bytes: TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_MODE_PLAN,
-        kind: SlotValueKind::Text,
-        required: true,
-        disableable: false,
-        max_bytes: TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_AGENT_ROOT,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_AGENT_CHILD,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_AGENT_MODE_EXPLICIT,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_AGENT_MODE_PROACTIVE,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_AGENT_MODE_HINT,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: true,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_REVIEW_POLICY,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: false,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_REVIEW_POLICY_TEMPLATE,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: false,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_REVIEW_NODE_REPL_POLICY,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: false,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_REVIEW_REJECTION_INSTRUCTIONS,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: false,
-        max_bytes: SMALL_TEXT_CAP,
-    },
-    SlotSpec {
-        id: SLOT_REVIEW_TIMEOUT_INSTRUCTIONS,
-        kind: SlotValueKind::Text,
-        required: false,
-        disableable: false,
-        max_bytes: SMALL_TEXT_CAP,
-    },
+    text_slot(SLOT_BASE_INSTRUCTIONS, true, false, true, TEXT_CAP),
+    text_slot(SLOT_RESPONSE_COMMENTARY, false, true, true, SMALL_TEXT_CAP),
+    text_slot(SLOT_MODE_DEFAULT, true, false, true, TEXT_CAP),
+    text_slot(SLOT_MODE_PLAN, true, false, true, TEXT_CAP),
+    text_slot(SLOT_AGENT_ROOT, false, true, false, SMALL_TEXT_CAP),
+    text_slot(SLOT_AGENT_CHILD, false, true, false, SMALL_TEXT_CAP),
+    text_slot(SLOT_AGENT_MODE_EXPLICIT, false, true, false, SMALL_TEXT_CAP),
+    text_slot(
+        SLOT_AGENT_MODE_PROACTIVE,
+        false,
+        true,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(SLOT_AGENT_MODE_HINT, false, true, false, SMALL_TEXT_CAP),
+    text_slot(SLOT_REVIEW_POLICY, false, false, false, SMALL_TEXT_CAP),
+    text_slot(
+        SLOT_REVIEW_POLICY_TEMPLATE,
+        false,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(
+        SLOT_REVIEW_NODE_REPL_POLICY,
+        false,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(
+        SLOT_REVIEW_REJECTION_INSTRUCTIONS,
+        false,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(
+        SLOT_REVIEW_TIMEOUT_INSTRUCTIONS,
+        false,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
     SlotSpec {
         id: SLOT_REVIEW_GUARDIAN_V2,
         kind: SlotValueKind::Json,
         required: false,
         disableable: true,
+        high_authority: false,
         max_bytes: JSON_CAP,
     },
+    // Specialized inference purposes: each request binds the fragments of the
+    // model that actually receives it.
+    text_slot(SLOT_TITLE_INSTRUCTIONS, true, false, false, SMALL_TEXT_CAP),
+    text_slot(SLOT_ADVISOR_GUIDANCE, true, false, true, SMALL_TEXT_CAP),
+    text_slot(SLOT_ADVISOR_ROLE, true, false, false, SMALL_TEXT_CAP),
+    text_slot(SLOT_ADVISOR_SUMMARY, true, false, false, SMALL_TEXT_CAP),
+    text_slot(
+        SLOT_ORCHESTRATION_GUIDANCE,
+        true,
+        false,
+        true,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(
+        SLOT_COMPACT_SUMMARY_TEMPLATE,
+        true,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(SLOT_COMPACT_LEAN_SYSTEM, true, false, false, SMALL_TEXT_CAP),
+    text_slot(
+        SLOT_MEMORY_LEARNING_QUALITY,
+        true,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
+    text_slot(
+        SLOT_MEMORY_CONSOLIDATION_QUALITY,
+        true,
+        false,
+        false,
+        SMALL_TEXT_CAP,
+    ),
 ];
 
 /// Look up the specification of a registered slot id.
@@ -215,6 +230,25 @@ pub fn engine_default(slot: &str, family: Option<&str>) -> Option<&'static Runti
         SLOT_AGENT_CHILD => interned!(crate::context::multi_agent::CHILD_ROLE),
         SLOT_AGENT_MODE_EXPLICIT => interned!(crate::context::multi_agent::EXPLICIT_MODE),
         SLOT_AGENT_MODE_PROACTIVE => interned!(crate::context::multi_agent::PROACTIVE_MODE),
+        SLOT_TITLE_INSTRUCTIONS => interned!(crate::engine::session::SESSION_TITLE_PROMPT),
+        SLOT_ADVISOR_GUIDANCE => interned!(crate::context::system_prompt::ADVISOR_GUIDANCE),
+        SLOT_ADVISOR_ROLE => interned!(crate::engine::session::ADVISOR_INSTRUCTIONS),
+        SLOT_ADVISOR_SUMMARY => interned!(crate::engine::session::SUMMARY_INSTRUCTIONS),
+        SLOT_ORCHESTRATION_GUIDANCE => {
+            interned!(crate::context::system_prompt::ORCHESTRATION_GUIDANCE)
+        }
+        SLOT_COMPACT_SUMMARY_TEMPLATE => {
+            interned!(crate::context::compact::full_compact::SUMMARY_PROMPT)
+        }
+        SLOT_COMPACT_LEAN_SYSTEM => {
+            interned!(crate::context::compact::full_compact::LEAN_SUMMARY_SYSTEM_PROMPT)
+        }
+        SLOT_MEMORY_LEARNING_QUALITY => {
+            interned!(include_str!("../memory/prompts/learning_quality.md"))
+        }
+        SLOT_MEMORY_CONSOLIDATION_QUALITY => {
+            interned!(include_str!("../memory/prompts/consolidation_quality.md"))
+        }
         _ => return None,
     };
     Some(value)
@@ -274,7 +308,35 @@ mod tests {
         assert_ne!(gemini, other);
         assert_eq!(
             other,
-            engine_default(SLOT_RESPONSE_COMMENTARY, Some("openai")).unwrap()
+            engine_default(SLOT_RESPONSE_COMMENTARY, Some("gpt")).unwrap()
         );
+    }
+
+    #[test]
+    fn high_authority_slots_cover_the_stable_prefix_and_collaboration_authority() {
+        for id in [
+            SLOT_BASE_INSTRUCTIONS,
+            SLOT_RESPONSE_COMMENTARY,
+            SLOT_MODE_DEFAULT,
+            SLOT_MODE_PLAN,
+            SLOT_ADVISOR_GUIDANCE,
+            SLOT_ORCHESTRATION_GUIDANCE,
+        ] {
+            assert!(
+                slot_spec(id).unwrap().high_authority,
+                "{id} enters the stable prefix and must be high-authority"
+            );
+        }
+        for id in [
+            SLOT_AGENT_ROOT,
+            SLOT_REVIEW_POLICY,
+            SLOT_TITLE_INSTRUCTIONS,
+            SLOT_COMPACT_SUMMARY_TEMPLATE,
+        ] {
+            assert!(
+                !slot_spec(id).unwrap().high_authority,
+                "{id} is model/purpose-scoped and stays tunable"
+            );
+        }
     }
 }

@@ -19,8 +19,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-const ADVISOR_INSTRUCTIONS: &str = "You are an independent advisor to the assistant in the inherited conversation. The inherited instructions and messages describe that assistant's task and are reference context, not work for you to execute. Only answer the consultation question at the end. Give concrete text advice, identify uncertainty and risks, and distinguish evidence from assumptions. Do not continue the parent task, call tools, request permissions, or consult another advisor. You have no tools. Do not claim to have performed actions.";
-const SUMMARY_INSTRUCTIONS: &str = "Produce a factual context summary for an independent advisor. The inherited instructions and conversation are reference material, not a task to continue. Preserve the user's objective, applicable constraints, decisions, relevant evidence and source references, completed work, open questions, and uncertainty needed to answer the consultation question. Distinguish observed evidence from assumptions. Describe relevant images and documents faithfully; do not invent missing details. Do not answer the consultation question, execute work, call tools, or consult the advisor. Return only the summary.";
+pub(crate) const ADVISOR_INSTRUCTIONS: &str = "You are an independent advisor to the assistant in the inherited conversation. The inherited instructions and messages describe that assistant's task and are reference context, not work for you to execute. Only answer the consultation question at the end. Give concrete text advice, identify uncertainty and risks, and distinguish evidence from assumptions. Do not continue the parent task, call tools, request permissions, or consult another advisor. You have no tools. Do not claim to have performed actions.";
+pub(crate) const SUMMARY_INSTRUCTIONS: &str = "Produce a factual context summary for an independent advisor. The inherited instructions and conversation are reference material, not a task to continue. Preserve the user's objective, applicable constraints, decisions, relevant evidence and source references, completed work, open questions, and uncertainty needed to answer the consultation question. Distinguish observed evidence from assumptions. Describe relevant images and documents faithfully; do not invent missing details. Do not answer the consultation question, execute work, call tools, or consult the advisor. Return only the summary.";
 const SUMMARY_NOTICE: &str = "[The current main model summarized the context for this advisor consultation. The main conversation history was not changed.]\n\n";
 const MINIMUM_OUTPUT: u64 = 256;
 
@@ -197,9 +197,17 @@ impl Session {
             .iter()
             .position(|part| part.cacheable != Some(true))
             .unwrap_or(request.system.len());
+        // The consultation role binds to the advisor model that actually
+        // receives this request, through its prompt-catalog fragments.
+        let advisor_metadata = target.provider.model_metadata(&target.model);
+        let advisor_fragments = crate::prompt_catalog::ModelFragments::for_route(
+            &target.model,
+            Some(target.source.as_str()),
+            advisor_metadata.model_messages.as_ref(),
+        );
         let advisor_role = SystemPromptPart {
             name: "advisor-role".into(),
-            text: ADVISOR_INSTRUCTIONS.into(),
+            text: advisor_fragments.advisor_role(),
             cacheable: Some(true),
             cache_scope: None,
         };
@@ -354,9 +362,21 @@ impl Session {
         );
         request.messages = portable_history(request.messages, &caps)?;
         prepare_text_request(&mut request);
+        // The summarizer rides the calling (main) model: bind its fragments.
+        let summary_metadata = billing.provider.model_metadata(&request.model);
+        let summary_source = billing
+            .config
+            .model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref());
+        let summary_fragments = crate::prompt_catalog::ModelFragments::for_route(
+            &request.model,
+            summary_source,
+            summary_metadata.model_messages.as_ref(),
+        );
         request.system.push(SystemPromptPart {
             name: "advisor-summary-role".into(),
-            text: SUMMARY_INSTRUCTIONS.into(),
+            text: summary_fragments.advisor_summary(),
             cacheable: Some(true),
             cache_scope: None,
         });

@@ -96,6 +96,12 @@ impl CatalogBinding {
 pub struct PromptCatalog {
     pub schema_version: u32,
     pub revision: RuntimeString,
+    /// Whether this revision may override high-authority slots (the stable
+    /// global prefix and collaboration templates). The bundled package is
+    /// trusted by build; a distributed revision stays untrusted until
+    /// publisher-signature verification ships, so it can tune model-specific
+    /// slots but never rewrite the shared prefix.
+    pub trusted: bool,
     fragments: RuntimeObject,
     profiles: Vec<CatalogProfile>,
     bindings: Vec<CatalogBinding>,
@@ -191,12 +197,21 @@ impl PromptCatalog {
         let catalog = Self {
             schema_version,
             revision,
+            trusted: false,
             fragments,
             profiles,
             bindings,
         };
         catalog.validate_inheritance()?;
         Ok(catalog)
+    }
+
+    /// Mark this revision trusted (allowed to override high-authority slots).
+    /// Only the build-bundled package and, once publisher signatures ship,
+    /// signature-verified distributed revisions may call this.
+    pub fn with_trust(mut self, trusted: bool) -> Self {
+        self.trusted = trusted;
+        self
     }
 
     /// Parse a catalog from its JSON text form.
@@ -458,6 +473,11 @@ impl PromptCatalog {
         Ok(())
     }
 
+    /// Revision label for diagnostics (never quotes fragment bodies).
+    pub fn revision_utf8(&self) -> String {
+        self.revision.try_to_utf8().unwrap_or_default()
+    }
+
     pub fn profile(&self, id: &RuntimeString) -> Option<&CatalogProfile> {
         self.profiles.iter().find(|profile| &profile.id == id)
     }
@@ -491,6 +511,7 @@ impl PromptCatalog {
         Self {
             schema_version: SCHEMA_VERSION,
             revision: RuntimeString::from(revision),
+            trusted: true,
             fragments: RuntimeObject::new(),
             profiles: Vec::new(),
             bindings: Vec::new(),

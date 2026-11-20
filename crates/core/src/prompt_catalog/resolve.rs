@@ -214,7 +214,8 @@ impl Resolution {
     }
 
     /// Apply one catalog entry list (a profile body or binding overrides).
-    /// Entries are already validated against the slot registry.
+    /// Entries are already validated against the slot registry. An untrusted
+    /// (unsigned distributed) revision never reaches high-authority slots.
     fn apply_entries(
         &mut self,
         catalog: &PromptCatalog,
@@ -228,6 +229,14 @@ impl Resolution {
             else {
                 continue;
             };
+            if !catalog.trusted && spec.high_authority && !matches!(entry, SlotEntry::Inherit) {
+                tracing::debug!(
+                    slot = spec.id,
+                    revision = %catalog.revision_utf8(),
+                    "prompt catalog: unsigned distributed revision may not override a high-authority slot"
+                );
+                continue;
+            }
             match entry {
                 SlotEntry::Inherit => {}
                 SlotEntry::Disabled => self.set(

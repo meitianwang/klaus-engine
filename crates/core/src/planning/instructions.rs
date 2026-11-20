@@ -19,7 +19,7 @@ pub fn instruction_part(
     mode: CollaborationMode,
     model_messages: Option<&RuntimeJson>,
 ) -> SystemPromptPart {
-    let fragments = crate::prompt_catalog::ModelFragments::for_model(&config.model, model_messages);
+    let fragments = crate::prompt_catalog::ModelFragments::for_config(config, model_messages);
     let template = match mode {
         CollaborationMode::Default => config
             .collaboration_default_instructions

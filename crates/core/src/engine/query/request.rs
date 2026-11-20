@@ -308,6 +308,7 @@ pub(crate) fn finalize_instruction_system(
     tool_specs: &[ToolSpec],
     agent_id: Option<&RuntimeString>,
     profile: &ProviderBehaviorProfile,
+    delegation: &super::orchestration::DelegationBinding<'_>,
 ) -> Vec<SystemPromptPart> {
     let permission_index = instruction_system
         .iter()
@@ -326,10 +327,7 @@ pub(crate) fn finalize_instruction_system(
         tool_specs,
         agent_id,
         multi_agent_instructions,
-        super::orchestration::DelegationBinding {
-            family: profile.family,
-            ..Default::default()
-        },
+        delegation,
     );
     render_system_prompt_for_behavior(
         &render_query_owned_system_parts(&current_system, profile),
@@ -396,6 +394,16 @@ pub(super) fn prepare_with_inference(
             messages,
         );
     let permission_context = (params.tool_context_base)();
+    let delegation = super::orchestration::DelegationBinding {
+        model: Some(&model),
+        family: profile.family,
+        source_kind: config
+            .model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref()),
+        model_messages,
+        configured_hint: config.multi_agent_mode_hint_text.as_ref(),
+    };
     let system = finalize_instruction_system(
         instruction_system,
         &permission_context,
@@ -405,6 +413,7 @@ pub(super) fn prepare_with_inference(
         internal_visible_tool_specs,
         params.agent_id.as_ref(),
         &profile,
+        &delegation,
     );
     let system = super::orchestration::request_policy_with_model_messages(
         &system,
@@ -412,11 +421,7 @@ pub(super) fn prepare_with_inference(
         internal_visible_tool_specs,
         params.agent_id.as_ref(),
         params.multi_agent_instructions,
-        super::orchestration::DelegationBinding {
-            family: profile.family,
-            model_messages,
-            configured_hint: config.multi_agent_mode_hint_text.as_ref(),
-        },
+        &delegation,
     );
     let tools = render_tool_specs_for_behavior(internal_visible_tool_specs, &profile);
     let tool_choice = (!tools.is_empty()).then_some(ToolChoice::Auto);

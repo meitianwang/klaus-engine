@@ -257,7 +257,17 @@ impl Session {
                     part.cache_scope != Some(crate::types::provider::CacheScope::Global)
                 })
                 .unwrap_or(parts.len());
-            parts.insert(boundary, crate::context::system_prompt::advisor_guidance());
+            let guidance_metadata = bundle.provider.model_metadata(&config.model);
+            let guidance_fragments = crate::prompt_catalog::ModelFragments::for_config(
+                config,
+                guidance_metadata.model_messages.as_ref(),
+            );
+            parts.insert(
+                boundary,
+                crate::context::system_prompt::advisor_guidance_with(
+                    &guidance_fragments.advisor_guidance(),
+                ),
+            );
         }
         if self.system_prompt_is_default {
             for part in &mut parts {
@@ -365,6 +375,15 @@ impl Session {
             Some(bundle.provider.info()),
             &config.model,
         );
+        let delegation = crate::engine::query::orchestration::DelegationBinding {
+            model: Some(&config.model),
+            family: profile.family,
+            source_kind: config
+                .model_source
+                .as_ref()
+                .and_then(|source| source.source.as_deref()),
+            ..Default::default()
+        };
         let system = crate::engine::query::finalize_instruction_system(
             system,
             &context,
@@ -374,6 +393,7 @@ impl Session {
             &tools,
             None,
             &profile,
+            &delegation,
         );
         let tools = crate::provider::behavior::render_tool_specs_for_behavior(&tools, &profile);
         ModelRequest {

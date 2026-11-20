@@ -21,6 +21,7 @@ pub mod catalog;
 pub mod fragments;
 pub mod resolve;
 pub mod slots;
+pub mod store;
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +32,7 @@ pub use resolve::{
     FragmentLayer, PromptCatalogKey, ResolvedFragments, ResolvedSlot, SlotProvenance, SlotValue,
 };
 pub use slots::{slot_spec, SlotSpec, SlotValueKind, SLOTS};
+pub use store::{CatalogRefresh, PromptCatalogStore};
 
 /// The bundled offline catalog, parsed and validated once.
 ///
@@ -42,7 +44,7 @@ pub fn bundled() -> &'static PromptCatalog {
     static BUNDLED: OnceLock<PromptCatalog> = OnceLock::new();
     BUNDLED.get_or_init(|| {
         let text = RuntimeString::from(include_str!("bundled.json"));
-        match PromptCatalog::parse(&text) {
+        match PromptCatalog::parse(&text).map(|catalog| catalog.with_trust(true)) {
             Ok(catalog) => catalog,
             Err(error) => {
                 tracing::error!(
@@ -53,6 +55,12 @@ pub fn bundled() -> &'static PromptCatalog {
             }
         }
     })
+}
+
+/// The active revision: the cached distributed catalog when one validated at
+/// startup or refreshed since, else the bundled package.
+pub fn active() -> std::sync::Arc<PromptCatalog> {
+    store::PromptCatalogStore::global().active()
 }
 
 /// Serialized size estimate of a structured slot value, in UTF-16 code units.
