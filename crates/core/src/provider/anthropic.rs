@@ -4220,7 +4220,7 @@ fn rebuild_reference_results_as_text(body: &mut Value) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|tag| tag == "tool_reference")
                 })
-                .filter_map(|item| item.get("name").and_then(Value::as_str).cloned())
+                .filter_map(|item| item.get("tool_name").and_then(Value::as_str).cloned())
                 .collect();
             if names.is_empty() {
                 continue;
@@ -4816,7 +4816,7 @@ fn tool_result_msg_block(tr: &ToolResultMessage, reference_results: bool) -> Val
             .map(|name| {
                 vobj(vec![
                     ("type", vs("tool_reference")),
-                    ("name", vs(name.clone())),
+                    ("tool_name", vs(name.clone())),
                 ])
             })
             .collect()
@@ -5727,7 +5727,7 @@ mod tests {
             &exact_json!("tool_reference")
         );
         assert_eq!(
-            content[0].get("name").unwrap(),
+            content[0].get("tool_name").unwrap(),
             &exact_json!("mcp__alpha__one")
         );
 
@@ -5755,7 +5755,7 @@ mod tests {
                             "content",
                             Value::Array(vec![vobj(vec![
                                 ("type", vs("tool_reference")),
-                                ("name", vs("mcp__alpha__one")),
+                                ("tool_name", vs("mcp__alpha__one")),
                             ])]),
                         ),
                     ])]),
