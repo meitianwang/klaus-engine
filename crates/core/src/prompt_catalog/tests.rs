@@ -965,7 +965,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r9")
+        RuntimeString::from("bundled-r10")
     );
 }
 
@@ -1186,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r9"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r10"));
 }
 
 mod store_refresh {
@@ -1251,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r9"
+            "bundled-r10"
         );
 
         let v1 = document("distributed-v1");
@@ -1374,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r9"
+            "bundled-r10"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1467,6 +1467,56 @@ fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
         sol.title_instructions(),
         RuntimeString::from(crate::engine::session::SESSION_TITLE_PROMPT)
     );
+}
+
+#[test]
+fn cursor_gpt5_identities_share_the_legacy_gpt_pack() {
+    let expected = ModelFragments::for_model(&RuntimeString::from("gpt-5.6-sol"), None);
+    for selection in [
+        "gpt-5-mini[]",
+        "gpt-5.1[reasoning=medium]",
+        "gpt-5.2[fast=false,reasoning=medium]",
+        "gpt-5.3-codex[fast=false,reasoning=medium]",
+        "gpt-5.4[context=1m,fast=false,reasoning=medium]@max",
+        "gpt-5.4-mini[reasoning=medium]",
+        "gpt-5.4-nano[reasoning=medium]",
+        "gpt-5.5[context=1m,fast=false,reasoning=medium]@max",
+    ] {
+        let fragments =
+            ModelFragments::for_route(&RuntimeString::from(selection), Some("cursor"), None);
+        assert_eq!(
+            fragments
+                .resolved()
+                .profile_ref
+                .as_ref()
+                .and_then(|value| value.try_to_utf8().ok())
+                .as_deref(),
+            Some("model/gpt-5-legacy-shared"),
+            "decorated selection {selection} must resolve the shared legacy GPT pack"
+        );
+        assert_eq!(fragments.base_instructions(), expected.base_instructions());
+        assert_eq!(fragments.commentary(), expected.commentary());
+    }
+}
+
+#[test]
+fn antigravity_gemini4_sonar_reuses_the_gemini4_pack() {
+    let sonar = ModelFragments::for_route(
+        &RuntimeString::from("gemini-4-hydrogen-sonar"),
+        Some("antigravity"),
+        None,
+    );
+    let carbon = ModelFragments::for_model(&RuntimeString::from("gemini-4-carbon"), None);
+    assert_eq!(
+        sonar
+            .resolved()
+            .profile_ref
+            .as_ref()
+            .and_then(|value| value.try_to_utf8().ok())
+            .as_deref(),
+        Some("model/gemini-4")
+    );
+    assert_eq!(sonar.base_instructions(), carbon.base_instructions());
 }
 
 #[test]
