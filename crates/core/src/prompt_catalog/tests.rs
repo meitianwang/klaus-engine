@@ -951,15 +951,21 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
             "{model} must resolve the generic-pack commentary"
         );
     }
-    // Required slots still resolve to the engine baseline.
-    let any = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    // Claude models resolve the Claude family pack; models with no family
+    // pack still resolve the engine baseline.
+    let claude = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
+    assert_ne!(
+        claude.base_instructions(),
+        RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS)
+    );
+    let any = ModelFragments::for_model(&RuntimeString::from("unknown-model"), None);
     assert_eq!(
         any.base_instructions(),
         RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS)
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r6")
+        RuntimeString::from("bundled-r7")
     );
 }
 
@@ -1180,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r6"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r7"));
 }
 
 mod store_refresh {
@@ -1245,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r6"
+            "bundled-r7"
         );
 
         let v1 = document("distributed-v1");
@@ -1368,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r6"
+            "bundled-r7"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1445,7 +1451,12 @@ fn bundled_model_packs_resolve_per_model_and_share_across_routes() {
         ))
     );
     let claude = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
-    assert_eq!(claude.base_instructions(), generic);
+    assert_ne!(claude.base_instructions(), generic);
+    assert!(claude
+        .base_instructions()
+        .try_to_utf8()
+        .unwrap()
+        .contains("# System"));
 
     // Model packs leave the other slots on their inherited layers.
     assert_eq!(
@@ -1579,9 +1590,232 @@ fn bundled_claude_model_packs_resolve_per_model_and_keep_model_sections() {
     );
     assert_eq!(decorated.base_instructions(), opus.base_instructions());
 
-    // A legacy Claude id with no current menu entry keeps the generic pack.
-    let legacy = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-5"), None);
-    assert_eq!(legacy.base_instructions(), generic);
+    // Claude ids without a dedicated model pack still resolve the Claude
+    // family base, so a Claude model reached through another entry point
+    // cannot silently fall back to the generic pack.
+    let legacy = ModelFragments::for_model(&RuntimeString::from("claude-3-5-sonnet"), None);
+    assert_ne!(legacy.base_instructions(), generic);
+    let legacy_base = legacy.base_instructions().try_to_utf8().unwrap();
+    assert!(legacy_base.contains("# System"));
+    assert!(legacy_base.contains("# Doing tasks"));
+}
+
+#[test]
+fn bundled_claude_full_and_lean_model_routes_resolve_their_packs() {
+    let generic = RuntimeString::from(crate::context::system_prompt::BASE_INSTRUCTIONS);
+
+    let full_models = [
+        ("claude-opus-4-5", "Opus 4.5"),
+        ("claude-opus-4-6", "Opus 4.6"),
+        ("claude-opus-4-7", "Opus 4.7"),
+        ("claude-sonnet-3-7", "Sonnet 3.7"),
+        ("claude-sonnet-4", "Sonnet 4"),
+        ("claude-sonnet-4-5", "Sonnet 4.5"),
+        ("claude-sonnet-4-6", "Sonnet 4.6"),
+        ("claude-sonnet-5", "Sonnet 5"),
+        ("claude-haiku-4-5", "Haiku 4.5"),
+    ];
+    let mut full_bases = Vec::new();
+    for (model, display) in full_models {
+        let fragments = ModelFragments::for_model(&RuntimeString::from(model), None);
+        assert_ne!(
+            fragments.base_instructions(),
+            generic,
+            "{model} fell back to the generic pack"
+        );
+        let base = fragments.base_instructions().try_to_utf8().unwrap();
+        assert!(base.starts_with("You are Klaus."));
+        assert!(
+            base.contains(&format!(
+                "You are powered by the model named {display}. The exact model ID is {model}."
+            )),
+            "{model} pack lost its model identity line"
+        );
+        for section in [
+            "# System",
+            "# Doing tasks",
+            "# Executing actions with care",
+            "# Using your tools",
+            "# Tone and style",
+            "# Output efficiency",
+            "# Harness",
+            "# Session-specific guidance",
+            "# Using skills",
+            "# Apps (Connectors)",
+            "# Plugins",
+        ] {
+            assert!(base.contains(section), "{model} full pack misses {section}");
+        }
+        assert!(
+            base.len() > 12 * 1024,
+            "{model} full pack was truncated to {} bytes",
+            base.len()
+        );
+        for banned in [
+            "Claude Code",
+            "Anthropic's official CLI",
+            "CLAUDE.md",
+            "AgentTool",
+            "functions.",
+        ] {
+            assert!(
+                !base.contains(banned),
+                "{model} pack still contains product token {banned}"
+            );
+        }
+        full_bases.push(base.to_string());
+    }
+    assert_ne!(
+        full_bases[0], full_bases[1],
+        "full model packs must keep distinct identities"
+    );
+
+    let fable5 = ModelFragments::for_model(&RuntimeString::from("claude-fable-5"), None);
+    let fable51 = ModelFragments::for_model(&RuntimeString::from("claude-fable-5-1"), None);
+    let opus48 = ModelFragments::for_model(&RuntimeString::from("claude-opus-4-8"), None);
+    let opus5 = ModelFragments::for_model(&RuntimeString::from("claude-opus-5"), None);
+    for (model, fragments) in [
+        ("claude-fable-5", &fable5),
+        ("claude-fable-5-1", &fable51),
+        ("claude-opus-4-8", &opus48),
+        ("claude-opus-5", &opus5),
+    ] {
+        assert_ne!(
+            fragments.base_instructions(),
+            generic,
+            "{model} fell back to the generic pack"
+        );
+        let base = fragments.base_instructions().try_to_utf8().unwrap();
+        assert!(base.starts_with("You are Klaus."));
+        assert!(base.contains(&format!("The exact model ID is {model}.")));
+        assert!(base.contains("# Harness"));
+        assert!(
+            !base.contains("# System"),
+            "{model} lean pack must not carry the full system section"
+        );
+        assert!(
+            !base.contains("# Doing tasks"),
+            "{model} lean pack must not carry the full tasks section"
+        );
+        assert!(
+            base.len() <= 12 * 1024,
+            "{model} lean pack grew past its budget: {} bytes",
+            base.len()
+        );
+    }
+
+    let fable5_base = fable5.base_instructions().try_to_utf8().unwrap();
+    for absent in [
+        "# Writing for the user",
+        "# Delivering work",
+        "# Reduced delegation",
+        "# Finishing work",
+        "# Memory, notes and feedback",
+        "# Original games",
+        "# Early stopping",
+    ] {
+        assert!(
+            !fable5_base.contains(absent),
+            "Fable 5 must not carry {absent}"
+        );
+    }
+
+    let fable51_base = fable51.base_instructions().try_to_utf8().unwrap();
+    assert!(fable51_base.contains("# Writing for the user"));
+    assert!(fable51_base.contains("# Delivering work"));
+    assert!(!fable51_base.contains("# Reduced delegation"));
+    assert!(!fable51_base.contains("# Original games"));
+
+    let opus48_base = opus48.base_instructions().try_to_utf8().unwrap();
+    for absent in [
+        "# Writing for the user",
+        "# Delivering work",
+        "# Reduced delegation",
+        "# Finishing work",
+        "# Memory, notes and feedback",
+        "# Original games",
+        "# Early stopping",
+    ] {
+        assert!(
+            !opus48_base.contains(absent),
+            "Opus 4.8 must not carry {absent}"
+        );
+    }
+
+    let opus5_base = opus5.base_instructions().try_to_utf8().unwrap();
+    assert!(opus5_base.contains("# Writing for the user"));
+    assert!(opus5_base.contains("# Delivering work"));
+    assert!(opus5_base.contains("# Reduced delegation"));
+    assert!(!opus5_base.contains("# Finishing work"));
+    assert!(!opus5_base.contains("# Original games"));
+
+    // The same model through an aggregating route resolves the same pack.
+    let opus46 = ModelFragments::for_model(&RuntimeString::from("claude-opus-4-6"), None);
+    let via_antigravity = ModelFragments::for_route(
+        &RuntimeString::from("claude-opus-4-6"),
+        Some("antigravity"),
+        None,
+    );
+    assert_eq!(
+        via_antigravity.base_instructions(),
+        opus46.base_instructions()
+    );
+
+    let sonnet46 = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4-6"), None);
+    let via_cursor = ModelFragments::for_route(
+        &RuntimeString::from("claude-sonnet-4-6[context=1m,effort=high,thinking=true]@max"),
+        Some("cursor"),
+        None,
+    );
+    assert_eq!(via_cursor.base_instructions(), sonnet46.base_instructions());
+
+    let via_cursor_lean = ModelFragments::for_route(
+        &RuntimeString::from("claude-opus-4-8[context=1m,effort=high,thinking=true]@max"),
+        Some("cursor"),
+        None,
+    );
+    assert_eq!(
+        via_cursor_lean.base_instructions(),
+        opus48.base_instructions()
+    );
+
+    // Provider-local keys: WorkBuddy names these Claude models `default-1.x`,
+    // and Antigravity carries the thinking toggle in the catalog key.
+    let workbuddy_37 =
+        ModelFragments::for_route(&RuntimeString::from("default-1.1"), Some("workbuddy"), None);
+    let sonnet37 = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-3-7"), None);
+    assert_eq!(
+        workbuddy_37.base_instructions(),
+        sonnet37.base_instructions()
+    );
+
+    let workbuddy_40 =
+        ModelFragments::for_route(&RuntimeString::from("default-1.2"), Some("workbuddy"), None);
+    let sonnet4 = ModelFragments::for_model(&RuntimeString::from("claude-sonnet-4"), None);
+    assert_eq!(
+        workbuddy_40.base_instructions(),
+        sonnet4.base_instructions()
+    );
+
+    let antigravity_thinking = ModelFragments::for_route(
+        &RuntimeString::from("claude-opus-4-6-thinking"),
+        Some("antigravity"),
+        None,
+    );
+    assert_eq!(
+        antigravity_thinking.base_instructions(),
+        opus46.base_instructions()
+    );
+
+    let antigravity_sonnet_thinking = ModelFragments::for_route(
+        &RuntimeString::from("claude-sonnet-4-6-thinking"),
+        Some("antigravity"),
+        None,
+    );
+    assert_eq!(
+        antigravity_sonnet_thinking.base_instructions(),
+        sonnet46.base_instructions()
+    );
 }
 
 #[test]
