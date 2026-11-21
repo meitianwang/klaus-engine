@@ -291,6 +291,59 @@ fn stream_response_header_timeout(model: &str, base_request: &RuntimeJson) -> st
     resolve_stream_response_header_timeout(model, base_request)
 }
 
+fn has_explicit_quota_wording(
+    lower: &str,
+    status: Option<u16>,
+    service_code: Option<&str>,
+) -> bool {
+    // Generic gRPC `RESOURCE_EXHAUSTED` gateway responses format their default
+    // text as `"Resource has been exhausted (e.g. check quota)."`. Matching the
+    // unordered words `"quota"` + `"exhaust"` hits that parenthetical hint and
+    // turns transient upstream capacity throttling into a non-retryable quota
+    // failure. Require an explicit allowance, daily-cap, billing, or credit
+    // exhaustion phrase instead.
+    if [
+        "individual quota reached",
+        "quota reached",
+        "quota is exhausted",
+        "quota has been exhausted",
+        "quota exhausted",
+        "quota exceeded",
+        "exceeded your current quota",
+        "insufficient quota",
+        "allowance is exhausted",
+        "allowance has been exhausted",
+        "allowance exhausted",
+        "allowance exceeded",
+        "allowance reached",
+        "insufficient allowance",
+        "billing account",
+        "spend cap",
+        "spend limit",
+        "generate_content_tokens_per_model_per_user",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+    {
+        return true;
+    }
+    if (status == Some(429) || service_code == Some("RESOURCE_EXHAUSTED"))
+        && ["per day", "daily quota", "daily limit"]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+    {
+        return true;
+    }
+    ["credit balance", "credits"].iter().any(|word| {
+        lower.contains(word)
+            && (lower.contains("exhaust")
+                || lower.contains("exceed")
+                || lower.contains("insufficient")
+                || lower.contains("reached")
+                || lower.contains("too low"))
+    })
+}
+
 const ERROR_TAGS: [&str; 19] = [
     "antigravity_model_access_denied",
     "antigravity_model_not_offered",
@@ -379,23 +432,17 @@ fn service_error(
                     *reason,
                     "QUOTA_EXCEEDED"
                         | "QUOTA_EXHAUSTED"
+                        | "GEMINI_ENTERPRISE_USER_QUOTA_EXHAUSTED"
                         | "CREDIT_BALANCE_EXHAUSTED"
                         | "INSUFFICIENT_CREDITS"
                         | "INSUFFICIENT_G1_CREDITS_BALANCE"
                         | "MONETIZATION_DENIED"
+                        | "BILLING_ACCOUNT_SPEND_LIMIT_EXCEEDED"
+                        | "PROJECT_SPEND_CAP_EXCEEDED"
+                        | "TIER_SPEND_CAP_EXCEEDED"
                 )
             })
-            || (!rate_wording
-                && ["quota", "allowance", "credit balance", "credits"]
-                    .iter()
-                    .any(|word| {
-                        lower.contains(word)
-                            && (lower.contains("exhaust")
-                                || lower.contains("exceed")
-                                || lower.contains("insufficient")
-                                || lower.contains("reached")
-                                || lower.contains("too low"))
-                    })));
+            || (!rate_wording && has_explicit_quota_wording(&lower, status, service_code)));
     let auth_reason = reasons.iter().any(|reason| {
         matches!(
             *reason,
@@ -3318,6 +3365,34 @@ mod tests {
                 ProviderErrorKind::RateLimit,
             ),
             (
+                429,
+                "RESOURCE_EXHAUSTED",
+                "Resource has been exhausted (e.g. check quota).",
+                "antigravity_rate_limited",
+                ProviderErrorKind::RateLimit,
+            ),
+            (
+                429,
+                "RESOURCE_EXHAUSTED",
+                "Resource exhausted. Please try again later.",
+                "antigravity_rate_limited",
+                ProviderErrorKind::RateLimit,
+            ),
+            (
+                429,
+                "RESOURCE_EXHAUSTED",
+                "Daily quota limit reached for this model.",
+                "antigravity_quota_exhausted",
+                ProviderErrorKind::Quota,
+            ),
+            (
+                429,
+                "RESOURCE_EXHAUSTED",
+                "Billing account spend cap reached.",
+                "antigravity_quota_exhausted",
+                ProviderErrorKind::Quota,
+            ),
+            (
                 503,
                 "UNAVAILABLE",
                 "Model capacity is unavailable.",
@@ -3360,7 +3435,12 @@ mod tests {
                 assert!(!classified.message.contains("not-public"));
             }
         }
-        for reason in ["INSUFFICIENT_G1_CREDITS_BALANCE", "MONETIZATION_DENIED"] {
+        for reason in [
+            "INSUFFICIENT_G1_CREDITS_BALANCE",
+            "MONETIZATION_DENIED",
+            "GEMINI_ENTERPRISE_USER_QUOTA_EXHAUSTED",
+            "BILLING_ACCOUNT_SPEND_LIMIT_EXCEEDED",
+        ] {
             let payload = json!({
                 "error": {
                     "code": 403,

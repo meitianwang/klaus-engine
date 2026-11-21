@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261120_antigravity_generic_429_rate_limit.rs"]
+mod r20261120_antigravity_generic_429_rate_limit;
+
 #[path = "regressions/r20261117_antigravity_compaction_and_account_routing.rs"]
 mod r20261117_antigravity_compaction_and_account_routing;
 
