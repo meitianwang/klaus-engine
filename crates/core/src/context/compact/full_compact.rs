@@ -9,7 +9,7 @@ use crate::runtime_values::{
     RuntimeObjectEncoder, RuntimeString,
 };
 use crate::schemas::config::ResolvedConfig;
-use crate::schemas::content::{ContentBlock, HarnessEnvelope, TextBlock};
+use crate::schemas::content::{ContentBlock, HarnessEnvelope, OutputBlock, TextBlock};
 use crate::schemas::message::{AssistantMessage, CompactBoundaryMessage, Message, UserMessage};
 use crate::types::abort::AbortSignal;
 use crate::types::errors::{ProviderError, ProviderErrorKind};
@@ -491,13 +491,19 @@ impl FullCompactor {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.kind == CompactionDiagnosticKind::PromptTooLong);
+            let rate_limited = is_cache_safe_fork_rate_limited(&result);
             if using_cache_safe_fork
                 && !signal.is_cancelled()
-                && is_cache_safe_fork_structural_failure(&result, overflow)
+                && (is_cache_safe_fork_structural_failure(&result, overflow) || rate_limited)
             {
                 using_cache_safe_fork = false;
-                request =
-                    self.lean_fallback_summary_request(&messages, config, instructions, overflow);
+                request = self.lean_fallback_summary_request(
+                    &messages,
+                    config,
+                    instructions,
+                    overflow || rate_limited,
+                    rate_limited,
+                );
                 continue;
             }
             if (!allow_native && require_summary) || !overflow || request.messages.len() <= 1 {
@@ -632,13 +638,15 @@ impl FullCompactor {
     }
 
     /// Stripped fallback used when the cache-preserving fork overflows the
-    /// context window (due to full tool/system overhead) or stops on a tool call.
+    /// context window (due to full tool/system overhead), hits a rate limit on
+    /// an oversized payload, or stops on a tool call.
     fn lean_fallback_summary_request(
         &self,
         messages: &[Message],
         config: &ResolvedConfig,
         instructions: Option<&RuntimeString>,
         strip_system_and_media: bool,
+        prune_aged_tool_outputs: bool,
     ) -> ModelRequest {
         let mut request = self.summary_request(messages, config, instructions);
         request.thinking = Some(ThinkingConfig::Disabled);
@@ -656,6 +664,14 @@ impl FullCompactor {
                     &mut request.messages,
                     false,
                 );
+                if prune_aged_tool_outputs {
+                    request.messages.retain(|message| {
+                        !crate::context::instruction_policy::is_workspace_instruction_projection(
+                            message,
+                        )
+                    });
+                    prune_aged_tool_outputs_for_lean_summary(&mut request.messages);
+                }
                 request.messages.push(last);
             }
         }
@@ -687,7 +703,9 @@ impl FullCompactor {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.kind == CompactionDiagnosticKind::PromptTooLong);
-            if is_cache_safe_fork_structural_failure(&result, overflow) {
+            if is_cache_safe_fork_structural_failure(&result, overflow)
+                || is_cache_safe_fork_rate_limited(&result)
+            {
                 return result;
             }
             let Some(delay) = result.diagnostics.iter().find_map(|diagnostic| {
@@ -1317,6 +1335,89 @@ fn is_cache_safe_fork_structural_failure(result: &CompactionResult, overflow: bo
                     || message.contains("refused the summary request")
             })
     })
+}
+
+fn is_cache_safe_fork_rate_limited(result: &CompactionResult) -> bool {
+    result.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .provider_error
+            .as_ref()
+            .is_some_and(|error| error.kind == ProviderErrorKind::RateLimit)
+    })
+}
+
+/// Shrink an oversized summary-request copy after the full cache-preserving
+/// fork hit a rate limit: keep the most recent turns verbatim, cap older tool
+/// outputs to a compact head+tail slice, and drop replay-only thinking blocks
+/// when visible content or tool calls remain. Durable history is never mutated.
+fn prune_aged_tool_outputs_for_lean_summary(messages: &mut [Message]) {
+    const PRESERVED_RECENT_MESSAGES: usize = 6;
+    const AGED_TOOL_OUTPUT_MAX_TOKENS: u64 = 500;
+
+    let recent_cutoff = messages.len().saturating_sub(PRESERVED_RECENT_MESSAGES);
+    for (index, message) in messages.iter_mut().enumerate() {
+        let is_aged = index < recent_cutoff;
+        match message {
+            Message::Assistant(assistant) => {
+                let has_non_thinking = assistant.content.iter().any(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Thinking(_) | ContentBlock::RedactedThinking(_)
+                    )
+                });
+                if has_non_thinking {
+                    assistant.content.retain(|block| {
+                        !matches!(
+                            block,
+                            ContentBlock::Thinking(_) | ContentBlock::RedactedThinking(_)
+                        )
+                    });
+                }
+            }
+            Message::ToolResult(result) if is_aged => {
+                result.native_tool_output = None;
+                for block in &mut result.content {
+                    if let OutputBlock::Text(text) = block {
+                        text.text = truncate_middle(&text.text, AGED_TOOL_OUTPUT_MAX_TOKENS);
+                    }
+                }
+                if let Some(extra) = result.extra_user_blocks.as_mut() {
+                    for block in extra {
+                        match block {
+                            ContentBlock::Text(text) => {
+                                text.text =
+                                    truncate_middle(&text.text, AGED_TOOL_OUTPUT_MAX_TOKENS);
+                            }
+                            ContentBlock::ToolResult(tr) => {
+                                for output in &mut tr.content {
+                                    if let OutputBlock::Text(text) = output {
+                                        text.text = truncate_middle(
+                                            &text.text,
+                                            AGED_TOOL_OUTPUT_MAX_TOKENS,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Message::User(user) if is_aged => {
+                for block in &mut user.content {
+                    if let ContentBlock::ToolResult(tr) = block {
+                        for output in &mut tr.content {
+                            if let OutputBlock::Text(text) = output {
+                                text.text =
+                                    truncate_middle(&text.text, AGED_TOOL_OUTPUT_MAX_TOKENS);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn message_uuid(message: &Message) -> &RuntimeString {

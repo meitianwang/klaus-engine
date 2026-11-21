@@ -74,8 +74,10 @@ use super::MAX_TRUNCATION_CONTINUATIONS;
 use super::MAX_TURN_PDF_BYTES;
 use super::MAX_TURN_PDF_DOCUMENTS;
 use crate::context::instruction_policy::is_workspace_instruction_projection;
-use crate::context::tokens::estimate_context_tokens_with_prefix;
 use crate::context::tokens::invalidate_context_usage;
+use crate::context::tokens::{
+    estimate_context_tokens_for_model, estimate_context_tokens_with_prefix,
+};
 use crate::context::total_tokens_reminder::render_total_tokens_reminder;
 use crate::engine::async_queue::AsyncQueue;
 use crate::engine::async_queue::AsyncQueueOptions;
@@ -2115,7 +2117,8 @@ async fn run_turn(
         // race the next user turn or replace a conversation after cancellation.
         let config = shared.config();
         let prefix_tokens = fixed_prefix_tokens(&prepared.request);
-        let estimate = estimate_context_tokens_with_prefix(&messages, prefix_tokens);
+        let estimate =
+            estimate_context_tokens_for_model(&messages, prefix_tokens, &prepared.request.model);
         let active = shared
             .params
             .context_window
@@ -2776,7 +2779,8 @@ fn apply_total_tokens_reminder(
 ) {
     let config = &shared.config();
     system_prompt.retain(|part| part.name != TOTAL_TOKENS_PART);
-    let estimate = estimate_context_tokens_with_prefix(messages, prefix_tokens);
+    let estimate =
+        estimate_context_tokens_for_model(messages, prefix_tokens, &prepared.request.model);
     let used = shared
         .params
         .context_window
@@ -4024,10 +4028,17 @@ fn maybe_arm_compaction_precompute(
     };
     let (compactable, _protected) =
         split_compaction_protected(messages, &shared.params.compaction_protected_message_ids);
-    if !compactable
-        .iter()
-        .any(|message| matches!(message, Message::Assistant(_)))
-    {
+    // Only arm background precompute once the active model has completed at
+    // least one turn in this history. Immediately after a model switch (or
+    // while the first turn on a new model is still failing), the target prefix
+    // is cold and firing a parallel background summary doubles cold prefill
+    // load and amplifies rate-limit storms.
+    if !compactable.iter().any(|message| {
+        matches!(
+            message,
+            Message::Assistant(assistant) if assistant.model == request.model
+        )
+    }) {
         return;
     }
     let agent_key = shared
@@ -4045,7 +4056,11 @@ fn maybe_arm_compaction_precompute(
         agent_key,
         session_id: thread_id.clone(),
         pre_compact_tokens: crate::context::tokens::estimate_context_tokens(&compactable),
-        estimated_tokens: estimate_context_tokens_with_prefix(messages, prefix_tokens),
+        estimated_tokens: estimate_context_tokens_for_model(
+            messages,
+            prefix_tokens,
+            &request.model,
+        ),
         snapshot: compactable,
         model: config.model.clone(),
         config: config.clone(),

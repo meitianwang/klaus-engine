@@ -1097,9 +1097,10 @@ impl Shared {
 
 /// Count the fully rendered request without charging projected instructions twice.
 pub(super) fn rendered_context_tokens(request: &ModelRequest) -> u64 {
-    crate::context::tokens::estimate_context_tokens_with_prefix(
+    crate::context::tokens::estimate_context_tokens_for_model(
         &request.messages,
         crate::context::tokens::estimate_prefix_tokens(&request.system, &request.tools),
+        &request.model,
     )
 }
 

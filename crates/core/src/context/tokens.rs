@@ -13,10 +13,23 @@ use crate::schemas::content::{ContentBlock, OutputBlock};
 use crate::schemas::message::{Message, Usage};
 use crate::types::provider::{SystemPromptPart, ToolSpec};
 
-/// Approximate UTF-8 bytes per token when provider usage is unavailable.
+/// Approximate UTF-8 bytes per token for ASCII text when provider usage is unavailable.
 const BYTES_PER_TOKEN: u64 = 4;
 /// Native media uses a stable estimate until provider usage supplies an anchor.
 pub(crate) const MEDIA_TOKENS: u64 = 2_000;
+
+/// East Asian / CJK scripts and fullwidth punctuation tokenize at roughly one
+/// or more tokens per character rather than one token per four UTF-8 bytes.
+fn is_cjk_scalar(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3000}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{2FA1F}'
+    )
+}
 
 /// Authoritative context size from a usage report, honoring each protocol's
 /// native convention:
@@ -31,19 +44,32 @@ pub fn tokens_from_usage(u: &Usage) -> u64 {
     u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
 }
 
-fn rounded_tokens(len: usize) -> u64 {
-    (len as u64).div_ceil(BYTES_PER_TOKEN)
+fn estimate_utf8_tokens(bytes: &[u8]) -> u64 {
+    if bytes.is_ascii() {
+        return (bytes.len() as u64).div_ceil(BYTES_PER_TOKEN);
+    }
+    let mut quarter_tokens: u64 = 0;
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if is_cjk_scalar(ch) {
+                quarter_tokens = quarter_tokens.saturating_add(BYTES_PER_TOKEN);
+            } else {
+                quarter_tokens = quarter_tokens.saturating_add(ch.len_utf8() as u64);
+            }
+        }
+        quarter_tokens = quarter_tokens.saturating_add(chunk.invalid().len() as u64);
+    }
+    quarter_tokens.div_ceil(BYTES_PER_TOKEN)
 }
 
 fn estimate_text(s: &RuntimeString) -> u64 {
-    rounded_tokens(s.to_node_utf8().len())
+    estimate_utf8_tokens(&s.to_node_utf8())
 }
 
 fn estimate_structured<T: RuntimeEncode + ?Sized>(v: &T) -> u64 {
-    let length = runtime_codec::encode_value(v)
-        .map(|value| runtime_json::stringify(&value).to_node_utf8().len())
-        .unwrap_or_default();
-    rounded_tokens(length)
+    runtime_codec::encode_value(v)
+        .map(|value| estimate_utf8_tokens(&runtime_json::stringify(&value).to_node_utf8()))
+        .unwrap_or_default()
 }
 
 /// Rough token estimate for one tool_result output block.
@@ -68,8 +94,9 @@ fn estimate_content_block(b: &ContentBlock) -> u64 {
         ContentBlock::RedactedThinking(t) => estimate_text(&t.data),
         ContentBlock::Image(_) | ContentBlock::Document(_) | ContentBlock::Media(_) => MEDIA_TOKENS,
         ContentBlock::ToolUse(tu) => {
-            let input_length = runtime_json::stringify(&tu.input).to_node_utf8().len();
-            rounded_tokens(tu.name.to_node_utf8().len().saturating_add(input_length))
+            let input_bytes = runtime_json::stringify(&tu.input).to_node_utf8();
+            estimate_utf8_tokens(&tu.name.to_node_utf8())
+                .saturating_add(estimate_utf8_tokens(&input_bytes))
         }
         ContentBlock::ToolResult(tr) => tr.content.iter().map(estimate_output_block).sum(),
         other => estimate_structured(other),
@@ -137,6 +164,36 @@ pub fn estimate_context_tokens_with_prefix(messages: &[Message], prefix_tokens: 
         if let Message::Assistant(a) = &messages[i] {
             if let Some(usage) = &a.usage {
                 return tokens_from_usage(usage) + estimate_messages_tokens(&messages[i + 1..]);
+            }
+        }
+    }
+    prefix_tokens + estimate_messages_tokens(messages)
+}
+
+/// Model-aware variant of [`estimate_context_tokens_with_prefix`].
+///
+/// When the most recent authoritative `usage` came from a *different* model,
+/// server-side context editing (such as provider-managed tool-result clearing)
+/// or tokenizer differences may have made that reported `usage` far smaller
+/// than the unpruned local history being serialized for the new model. In that
+/// cross-model case take the maximum of the anchored count and the full
+/// structural estimate so oversized local histories cannot slip below the
+/// target model's compaction threshold.
+pub fn estimate_context_tokens_for_model(
+    messages: &[Message],
+    prefix_tokens: u64,
+    model: &RuntimeString,
+) -> u64 {
+    for i in (0..messages.len()).rev() {
+        if let Message::Assistant(a) = &messages[i] {
+            if let Some(usage) = &a.usage {
+                let anchored =
+                    tokens_from_usage(usage) + estimate_messages_tokens(&messages[i + 1..]);
+                if a.model == *model {
+                    return anchored;
+                }
+                let structural = prefix_tokens + estimate_messages_tokens(messages);
+                return anchored.max(structural);
             }
         }
     }
