@@ -15,7 +15,9 @@
 
 use super::compaction::query_message_uuid;
 use crate::context::compact::outcome::CompactionNoopReason;
-use crate::context::tokens::estimate_context_tokens;
+use crate::context::tokens::{
+    estimate_context_tokens, estimate_messages_tokens, invalidate_context_usage,
+};
 use crate::engine::deps::{CompactionResult, Compactor, NowFn};
 use crate::observability::provider_timing::record_precompute;
 use crate::runtime_values::RuntimeString;
@@ -541,6 +543,10 @@ impl PrecomputeRegistry {
         }
         let mut spliced = payload.result.messages;
         spliced.splice(boundary_pos + 1..boundary_pos + 1, after.iter().cloned());
+        // Clear pre-compaction provider usage anchors carried over on messages
+        // appended after arm time so both the native budget check and freed
+        // token count reflect the compacted history rather than stale totals.
+        invalidate_context_usage(&mut spliced);
         if entry.native.is_some() {
             let fixed = current.map_or(0, |(_, request)| {
                 super::request::fixed_prefix_tokens(request)
@@ -555,7 +561,8 @@ impl PrecomputeRegistry {
                 return PrecomputeConsume::Miss;
             }
         }
-        let freed = est_now.saturating_sub(estimate_context_tokens(&spliced));
+        let freed = estimate_messages_tokens(messages_now)
+            .saturating_sub(estimate_messages_tokens(&spliced));
         let lead_ms = payload.ready_at_ms.saturating_sub(entry.started_at_ms);
         let total_ms = now().saturating_sub(entry.started_at_ms);
         let messages_since = after.len();
@@ -1578,5 +1585,83 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&RuntimeString::from("main")));
+    }
+
+    #[tokio::test]
+    async fn consumed_hit_reports_freed_tokens_when_appended_assistant_carries_stale_usage() {
+        use crate::schemas::message::{AssistantMessage, Usage};
+
+        let registry = Arc::new(PrecomputeRegistry::default());
+        let large_prefix = Message::User(UserMessage {
+            uuid: "u1".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "history ".repeat(1_000).into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_meta: None,
+            question_answer: None,
+        });
+        let armed_assistant = Message::Assistant(AssistantMessage {
+            uuid: "a-armed".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "armed reply".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            model: default_config().model.clone(),
+            usage: Some(Usage {
+                input_tokens: 220_000,
+                output_tokens: 400,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tokens: Some(220_400),
+            }),
+        });
+        let compactor = Arc::new(ScriptedCompactor {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            outcome: ScriptedOutcome::Summary("short summary".into()),
+        });
+        assert!(registry.arm(arm_request(
+            compactor,
+            vec![large_prefix.clone(), armed_assistant.clone()],
+        )));
+
+        let appended_assistant = Message::Assistant(AssistantMessage {
+            uuid: "a-after".into(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "follow-up reply".into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            model: default_config().model.clone(),
+            usage: Some(Usage {
+                input_tokens: 250_000,
+                output_tokens: 500,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tokens: Some(250_500),
+            }),
+        });
+        let live_messages = vec![large_prefix, armed_assistant, appended_assistant];
+        match settle(&registry, &live_messages).await {
+            PrecomputeConsume::Hit(swap) => {
+                let expected = estimate_messages_tokens(&live_messages)
+                    .saturating_sub(estimate_messages_tokens(&swap.result.messages));
+                assert!(expected > 0, "test fixture must shrink message tokens");
+                assert_eq!(swap.result.freed_tokens, expected);
+                assert!(swap.result.messages.iter().all(|message| match message {
+                    Message::Assistant(assistant) => assistant.usage.is_none(),
+                    _ => true,
+                }));
+            }
+            other => panic!("expected hit, got {other:?}"),
+        }
     }
 }
