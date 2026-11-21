@@ -466,6 +466,83 @@ fn malformed_messages_allow_bounded_recovery_but_integrity_failures_remain_termi
         let error = responses::public_error(guard);
         assert_eq!(error["error"]["type"], "invalid_request_error", "{guard}");
     }
+    for terminal_quota in [
+        "cursor_subscription_required",
+        "cursor_usage_pricing_required",
+        "cursor_usage_limit",
+    ] {
+        let error = responses::public_error(terminal_quota);
+        assert_eq!(
+            error["error"]["code"], "usage_not_included",
+            "{terminal_quota}"
+        );
+        assert_eq!(
+            error["error"]["type"], "usage_not_included",
+            "{terminal_quota}"
+        );
+    }
+    let transient = responses::public_error("cursor_rate_limit");
+    assert_eq!(transient["error"]["code"], "rate_limit_error");
+}
+
+#[tokio::test]
+async fn usage_normalizes_omitted_proto3_enabled_flag_to_false() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::Response;
+    use hyper_util::rt::TokioIo;
+
+    let _guard = test_lock().lock().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    set_config_root(temp.path());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            let service = hyper::service::service_fn(
+                |request: hyper::Request<hyper::body::Incoming>| async move {
+                    assert!(request.uri().path().ends_with("GetCurrentPeriodUsage"));
+                    let body = json!({
+                        "billingCycleStart": "1794975122342",
+                        "billingCycleEnd": "1795579922342",
+                        "planUsage": {
+                            "remainingBonus": false,
+                            "autoPercentUsed": 0,
+                            "totalPercentUsed": 0
+                        },
+                        "spendLimitUsage": {
+                            "pooledLimit": "0",
+                            "pooledRemaining": "0",
+                            "individualLimit": 0,
+                            "limitType": "user",
+                            "overallLimit": 0,
+                            "overallRemaining": 0
+                        }
+                    });
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                        body.to_string(),
+                    ))))
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        }
+    });
+
+    let adopted = adopt_credential(json!({
+        "accessToken": "fixture-token",
+        "clientIdentity": "fixture-device",
+        "backendUrl": origin
+    }));
+    assert_eq!(adopted["ok"], true);
+
+    let answer = super::usage().await;
+    assert_eq!(answer["ok"], true);
+    assert_eq!(answer["enabled"], false);
+    assert_eq!(answer["planUsage"]["totalPercentUsed"], 0);
+    server.abort();
 }
 
 pub(crate) async fn invalid_metadata_fixture(

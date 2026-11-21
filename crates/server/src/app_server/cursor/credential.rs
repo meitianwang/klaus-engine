@@ -526,17 +526,41 @@ fn error_code(value: &Value) -> &str {
     }
 }
 
-fn detail_classification(code: u32) -> Option<&'static str> {
-    Some(match code {
+#[derive(Clone, Copy, Default)]
+struct DetailHints {
+    is_retryable: Option<bool>,
+    action: Option<DetailAction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailAction {
+    Login,
+    Upgrade,
+    Payment,
+}
+
+fn detail_classification(code: u32, hints: DetailHints) -> Option<&'static str> {
+    if !matches!(code, 5 | 20 | 21 | 30 | 31 | 35 | 40 | 43 | 58 | 60 | 61) {
+        match hints.action {
+            Some(DetailAction::Login) => return Some(NEEDS_REIMPORT),
+            Some(DetailAction::Upgrade) => return Some("cursor_subscription_required"),
+            Some(DetailAction::Payment) => return Some("cursor_usage_pricing_required"),
+            None => {}
+        }
+    }
+    let base = match code {
         1 | 42 => "cursor_provider_credentials_invalid",
         2 | 3 | 6 | 11 | 12 | 18 | 38 => NEEDS_REIMPORT,
         4 | 46..=49 | 53 | 54 | 64..=66 => "cursor_permission_denied",
         5 | 61 => "cursor_model_unavailable",
-        7 | 8 | 14 | 22 | 28 | 34 | 41 | 50 | 51 => "cursor_rate_limit",
-        9 | 10 => "cursor_usage_limit",
+        // Free-tier plan rejections and paid-only model gates cannot clear on retry.
+        7 | 23 => "cursor_subscription_required",
+        // Account and plan allowance limits require plan or billing changes, not retries.
+        8..=10 | 22 | 50 | 51 => "cursor_usage_limit",
+        // Provider and capacity rate limits remain retryable unless marked non-retryable.
+        14 | 28 | 34 | 41 => "cursor_rate_limit",
         20 => "cursor_token_limit_exceeded",
         21 | 35 => "cursor_request_cancelled",
-        23 => "cursor_subscription_required",
         25 | 55 | 59 | 63 => "cursor_overloaded",
         30 => "cursor_client_update_required",
         31 => "cursor_image_too_large",
@@ -544,11 +568,22 @@ fn detail_classification(code: u32) -> Option<&'static str> {
         43 => "cursor_context_length_exceeded",
         44 | 45 => "cursor_usage_pricing_required",
         13 | 33 | 36 | 37 | 39 | 57 | 62 => "cursor_overloaded",
-        29 | 52 => "cursor_upstream_error",
+        29 | 52 => {
+            return Some(if hints.is_retryable == Some(true) {
+                "cursor_overloaded"
+            } else {
+                "cursor_upstream_error"
+            });
+        }
         56 => "cursor_network_error",
         58 => "cursor_model_blocked",
         60 => "cursor_max_mode_required",
         _ => return None,
+    };
+    Some(match (base, hints.is_retryable) {
+        ("cursor_rate_limit", Some(false)) => "cursor_usage_limit",
+        ("cursor_overloaded", Some(false)) => "cursor_upstream_error",
+        _ => base,
     })
 }
 
@@ -636,9 +671,83 @@ fn detail_varint(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     None
 }
 
-fn detail_binary_code(bytes: &[u8]) -> Option<u32> {
+fn detail_skip_field(bytes: &[u8], offset: &mut usize, wire: u64) -> Option<()> {
+    let size = match wire {
+        0 => {
+            detail_varint(bytes, offset)?;
+            0
+        }
+        1 => 8,
+        2 => detail_varint(bytes, offset)?.try_into().ok()?,
+        5 => 4,
+        _ => return None,
+    };
+    *offset = offset.checked_add(size).filter(|end| *end <= bytes.len())?;
+    Some(())
+}
+
+fn detail_analytics_action(bytes: &[u8], action: &mut Option<DetailAction>) -> Option<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = detail_varint(bytes, &mut offset)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if field == 0 || field > 0x1fff_ffff {
+            return None;
+        }
+        if field == 1 {
+            if wire != 2 {
+                return None;
+            }
+            let size: usize = detail_varint(bytes, &mut offset)?.try_into().ok()?;
+            let end = offset.checked_add(size).filter(|end| *end <= bytes.len())?;
+            match &bytes[offset..end] {
+                b"login" => *action = Some(DetailAction::Login),
+                b"upgrade" => *action = Some(DetailAction::Upgrade),
+                b"payment" => *action = Some(DetailAction::Payment),
+                _ => {}
+            }
+            offset = end;
+        } else {
+            detail_skip_field(bytes, &mut offset, wire)?;
+        }
+    }
+    Some(())
+}
+
+fn detail_custom_hints(bytes: &[u8], hints: &mut DetailHints) -> Option<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = detail_varint(bytes, &mut offset)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if field == 0 || field > 0x1fff_ffff {
+            return None;
+        }
+        if field == 4 {
+            if wire != 0 {
+                return None;
+            }
+            hints.is_retryable = Some(detail_varint(bytes, &mut offset)? != 0);
+        } else if field == 10 {
+            if wire != 2 {
+                return None;
+            }
+            let size: usize = detail_varint(bytes, &mut offset)?.try_into().ok()?;
+            let end = offset.checked_add(size).filter(|end| *end <= bytes.len())?;
+            detail_analytics_action(&bytes[offset..end], &mut hints.action)?;
+            offset = end;
+        } else {
+            detail_skip_field(bytes, &mut offset, wire)?;
+        }
+    }
+    Some(())
+}
+
+fn detail_binary_entry(bytes: &[u8]) -> Option<(u32, DetailHints)> {
     let mut offset = 0;
     let mut code = None;
+    let mut hints = DetailHints::default();
     while offset < bytes.len() {
         let tag = detail_varint(bytes, &mut offset)?;
         let field = tag >> 3;
@@ -651,24 +760,56 @@ fn detail_binary_code(bytes: &[u8]) -> Option<u32> {
                 return None;
             }
             code = Some(detail_varint(bytes, &mut offset)?.try_into().ok()?);
-        } else {
-            if (field == 2 && wire != 2) || (field == 3 && wire != 0) {
+        } else if field == 2 {
+            if wire != 2 {
                 return None;
             }
-            let size = match wire {
-                0 => {
-                    detail_varint(bytes, &mut offset)?;
-                    0
-                }
-                1 => 8,
-                2 => detail_varint(bytes, &mut offset)?.try_into().ok()?,
-                5 => 4,
-                _ => return None,
-            };
-            offset = offset.checked_add(size).filter(|end| *end <= bytes.len())?;
+            let size: usize = detail_varint(bytes, &mut offset)?.try_into().ok()?;
+            let end = offset.checked_add(size).filter(|end| *end <= bytes.len())?;
+            detail_custom_hints(&bytes[offset..end], &mut hints)?;
+            offset = end;
+        } else if field == 3 {
+            if wire != 0 {
+                return None;
+            }
+            detail_varint(bytes, &mut offset)?;
+        } else {
+            detail_skip_field(bytes, &mut offset, wire)?;
         }
     }
-    code
+    match code {
+        Some(code) => Some((code, hints)),
+        None if hints.action.is_some() => Some((0, hints)),
+        None => None,
+    }
+}
+
+fn detail_json_hints(value: &Value) -> DetailHints {
+    let Some(nested) = value.get("details").and_then(Value::as_object) else {
+        return DetailHints::default();
+    };
+    let is_retryable = nested
+        .get("isRetryable")
+        .or_else(|| nested.get("is_retryable"))
+        .and_then(Value::as_bool);
+    let action = nested
+        .get("analyticsMetadata")
+        .or_else(|| nested.get("analytics_metadata"))
+        .and_then(|meta| {
+            meta.get("actionRequired")
+                .or_else(|| meta.get("action_required"))
+        })
+        .and_then(Value::as_str)
+        .and_then(|raw| match raw {
+            "login" => Some(DetailAction::Login),
+            "upgrade" => Some(DetailAction::Upgrade),
+            "payment" => Some(DetailAction::Payment),
+            _ => None,
+        });
+    DetailHints {
+        is_retryable,
+        action,
+    }
 }
 
 fn typed_error(value: &Value) -> Option<&'static str> {
@@ -682,7 +823,7 @@ fn typed_error(value: &Value) -> Option<&'static str> {
     }
     let mut classification = None;
     for detail in details {
-        let code = if detail.get("type").and_then(Value::as_str) == Some(TYPE)
+        let (code, hints) = if detail.get("type").and_then(Value::as_str) == Some(TYPE)
             || detail.get("typeUrl").and_then(Value::as_str) == Some(TYPE_URL)
         {
             let encoded = detail.get("value")?.as_str()?;
@@ -696,13 +837,21 @@ fn typed_error(value: &Value) -> Option<&'static str> {
             if bytes.len() > MAX_DETAIL_BYTES {
                 return None;
             }
-            detail_binary_code(&bytes)?
+            detail_binary_entry(&bytes)?
         } else if detail.get("@type").and_then(Value::as_str) == Some(TYPE_URL) {
-            detail_json_code(detail)?
+            let hints = detail_json_hints(detail);
+            let code = if detail.get("error").is_some() {
+                detail_json_code(detail)?
+            } else if hints.action.is_some() {
+                0
+            } else {
+                return None;
+            };
+            (code, hints)
         } else {
             continue;
         };
-        if let Some(next) = detail_classification(code) {
+        if let Some(next) = detail_classification(code, hints) {
             if classification.is_some_and(|previous| previous != next) {
                 return None;
             }
@@ -826,9 +975,16 @@ pub async fn usage() -> Value {
         Ok((value, _)) => {
             let mut result = serde_json::Map::new();
             result.insert("ok".into(), json!(true));
+            // Protobuf 3 JSON omits `enabled` when it equals the default `false`.
+            result.insert(
+                "enabled".into(),
+                json!(value
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)),
+            );
             // Only transport the allowance fields the source actually supplies.
             for field in [
-                "enabled",
                 "billingCycleStart",
                 "billingCycleEnd",
                 "planUsage",

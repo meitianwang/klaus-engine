@@ -178,9 +178,16 @@ fn typed_binary_details_distinguish_limits_cancellation_and_account_conditions()
         (58, "cursor_model_blocked"),
         (60, "cursor_max_mode_required"),
         (23, "cursor_subscription_required"),
+        (7, "cursor_subscription_required"),
         (44, "cursor_usage_pricing_required"),
+        (8, "cursor_usage_limit"),
         (9, "cursor_usage_limit"),
-        (8, "cursor_rate_limit"),
+        (10, "cursor_usage_limit"),
+        (22, "cursor_usage_limit"),
+        (50, "cursor_usage_limit"),
+        (51, "cursor_usage_limit"),
+        (14, "cursor_rate_limit"),
+        (41, "cursor_rate_limit"),
         (63, "cursor_overloaded"),
         (12, credential::NEEDS_REIMPORT),
     ] {
@@ -219,9 +226,60 @@ fn typed_json_any_and_binary_any_preserve_the_same_failure_category() {
         credential::upstream_error(&error),
         "cursor_context_length_exceeded"
     );
-    let mut error = binary_error(8);
+    let mut error = binary_error(14);
     error["details"][0]["debug"] = json!({"error":"ERROR_CONVERSATION_TOO_LONG"});
     assert_eq!(credential::upstream_error(&error), "cursor_rate_limit");
+}
+
+#[test]
+fn custom_error_details_stop_retries_and_preserve_account_actions() {
+    // ErrorDetails: field 1 = 41 (RESOURCE_EXHAUSTED), field 2 = CustomErrorDetails { field 4 (is_retryable) = 0 }.
+    let non_retryable_rate_limit = [8, 41, 18, 2, 32, 0];
+    let error = json!({"code":8,"details":[{
+        "type":"aiserver.v1.ErrorDetails",
+        "value":STANDARD_NO_PAD.encode(non_retryable_rate_limit)
+    }]});
+    assert_eq!(credential::upstream_error(&error), "cursor_usage_limit");
+
+    // ErrorDetails: field 1 = 57 (PROVIDER_ERROR), field 2 = CustomErrorDetails { field 4 (is_retryable) = 0 }.
+    let non_retryable_provider = [8, 57, 18, 2, 32, 0];
+    let error = json!({"code":13,"details":[{
+        "type":"aiserver.v1.ErrorDetails",
+        "value":STANDARD_NO_PAD.encode(non_retryable_provider)
+    }]});
+    assert_eq!(credential::upstream_error(&error), "cursor_upstream_error");
+
+    // ErrorDetails: field 1 = 41, field 2 = CustomErrorDetails { field 10 = ErrorAnalyticsMetadata { field 1 = "upgrade" } }.
+    let upgrade_action = [
+        8, 41, 18, 11, 82, 9, 10, 7, b'u', b'p', b'g', b'r', b'a', b'd', b'e',
+    ];
+    let error = json!({"code":8,"details":[{
+        "type":"aiserver.v1.ErrorDetails",
+        "value":STANDARD_NO_PAD.encode(upgrade_action)
+    }]});
+    assert_eq!(
+        credential::upstream_error(&error),
+        "cursor_subscription_required"
+    );
+
+    let json_non_retryable = json!({"code":"resource_exhausted","details":[{
+        "@type":"type.googleapis.com/aiserver.v1.ErrorDetails",
+        "error":"ERROR_RESOURCE_EXHAUSTED",
+        "details":{"isRetryable":false}
+    }]});
+    assert_eq!(
+        credential::upstream_error(&json_non_retryable),
+        "cursor_usage_limit"
+    );
+
+    let json_payment = json!({"code":"resource_exhausted","details":[{
+        "@type":"type.googleapis.com/aiserver.v1.ErrorDetails",
+        "details":{"analyticsMetadata":{"actionRequired":"payment"}}
+    }]});
+    assert_eq!(
+        credential::upstream_error(&json_payment),
+        "cursor_usage_pricing_required"
+    );
 }
 
 #[test]
