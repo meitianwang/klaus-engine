@@ -220,18 +220,9 @@ pub(super) async fn read_body(
 
 pub(super) const STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS: u32 = 10;
 const DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(75);
-const ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(120);
 const EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(180);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ThinkingTimeoutTier {
-    Standard,
-    High,
-    Ultra,
-}
 
 fn is_neon_model(model: &str) -> bool {
     model
@@ -239,7 +230,7 @@ fn is_neon_model(model: &str) -> bool {
         .any(|segment| segment.eq_ignore_ascii_case("neon"))
 }
 
-fn thinking_timeout_tier(model: &str, base_request: &RuntimeJson) -> Option<ThinkingTimeoutTier> {
+fn is_high_thinking_request(model: &str, base_request: &RuntimeJson) -> bool {
     if let Some(thinking_config) = base_request
         .get("generationConfig")
         .and_then(|config| config.get("thinkingConfig"))
@@ -249,52 +240,41 @@ fn thinking_timeout_tier(model: &str, base_request: &RuntimeJson) -> Option<Thin
             .and_then(RuntimeJson::as_bool)
             == Some(false)
         {
-            return None;
+            return false;
         }
         if let Some(level) = thinking_config
             .get("thinkingLevel")
             .and_then(RuntimeJson::as_string)
             .and_then(|value| value.try_to_utf8().ok())
         {
-            if level.eq_ignore_ascii_case("EXTRA_HIGH")
+            if level.eq_ignore_ascii_case("HIGH")
+                || level.eq_ignore_ascii_case("EXTRA_HIGH")
                 || level.eq_ignore_ascii_case("XHIGH")
                 || level.eq_ignore_ascii_case("MAX")
             {
-                return Some(ThinkingTimeoutTier::Ultra);
-            }
-            if level.eq_ignore_ascii_case("HIGH") {
-                return Some(ThinkingTimeoutTier::High);
+                return true;
             }
             if level.eq_ignore_ascii_case("LOW")
                 || level.eq_ignore_ascii_case("MEDIUM")
                 || level.eq_ignore_ascii_case("MINIMAL")
             {
-                return Some(ThinkingTimeoutTier::Standard);
+                return false;
             }
         }
     }
 
     let lower = model.trim().to_ascii_lowercase();
-    if lower.ends_with("-xhigh") || lower.ends_with("-max") {
-        Some(ThinkingTimeoutTier::Ultra)
-    } else if lower.ends_with("-high") {
-        Some(ThinkingTimeoutTier::High)
-    } else {
-        None
-    }
+    lower.ends_with("-high") || lower.ends_with("-xhigh") || lower.ends_with("-max")
 }
 
 fn resolve_stream_response_header_timeout(
     model: &str,
     base_request: &RuntimeJson,
 ) -> std::time::Duration {
-    let neon = is_neon_model(model);
-    match thinking_timeout_tier(model, base_request) {
-        Some(ThinkingTimeoutTier::Ultra) => EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT,
-        Some(ThinkingTimeoutTier::High) if neon => EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT,
-        Some(ThinkingTimeoutTier::High) => ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT,
-        _ if neon => ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT,
-        _ => DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT,
+    if is_neon_model(model) || is_high_thinking_request(model, base_request) {
+        EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT
+    } else {
+        DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT
     }
 }
 
@@ -4100,43 +4080,33 @@ mod tests {
             json!({"generationConfig": {"thinkingConfig": {"includeThoughts": false, "thinkingLevel": "HIGH"}}}),
         );
 
-        // Standard non-Neon models stay at 75s.
+        // Standard non-Neon models default to 120s.
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-argon-medium", &medium),
+            std::time::Duration::from_secs(120)
+        );
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-carbon-low", &low),
-            std::time::Duration::from_secs(75)
+            std::time::Duration::from_secs(120)
         );
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-hydrogen-medium", &medium),
-            std::time::Duration::from_secs(75)
+            std::time::Duration::from_secs(120)
         );
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-2.5-flash", &empty),
-            std::time::Duration::from_secs(75)
+            std::time::Duration::from_secs(120)
         );
 
-        // Non-high Neon tiers and non-Neon high-thinking tiers relax to 120s.
+        // Neon models and high/ultra-thinking tiers relax to 180s.
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-neon-low", &low),
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_secs(180)
         );
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-neon-medium", &medium),
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_secs(180)
         );
-        assert_eq!(
-            resolve_stream_response_header_timeout("gemini-4-carbon-high", &high),
-            std::time::Duration::from_secs(120)
-        );
-        assert_eq!(
-            resolve_stream_response_header_timeout("claude-opus-5-5-high", &empty),
-            std::time::Duration::from_secs(120)
-        );
-        assert_eq!(
-            resolve_stream_response_header_timeout("gemini-3-flash", &high),
-            std::time::Duration::from_secs(120)
-        );
-
-        // Neon high/xhigh and any ultra-thinking tier relax to 180s.
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-neon-high", &high),
             std::time::Duration::from_secs(180)
@@ -4150,6 +4120,22 @@ mod tests {
             std::time::Duration::from_secs(180)
         );
         assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-argon-high", &high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-carbon-high", &high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("claude-opus-5-5-high", &empty),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-3-flash", &high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-hydrogen-xhigh", &extra_high),
             std::time::Duration::from_secs(180)
         );
@@ -4158,14 +4144,19 @@ mod tests {
             std::time::Duration::from_secs(180)
         );
 
-        // Explicitly disabling thoughts drops non-Neon high back to 75s, while Neon keeps 120s.
+        // Explicitly disabling thoughts or lowering thinking level drops non-Neon high back to
+        // 120s, while Neon stays at 180s.
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-carbon-high", &disabled),
-            std::time::Duration::from_secs(75)
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-carbon-high", &low),
+            std::time::Duration::from_secs(120)
         );
         assert_eq!(
             resolve_stream_response_header_timeout("gemini-4-neon-high", &disabled),
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_secs(180)
         );
     }
 
