@@ -221,18 +221,94 @@ pub(super) async fn read_body(
 pub(super) const STREAM_HEADER_TIMEOUT_MAX_ATTEMPTS: u32 = 10;
 const DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(75);
+const ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(180);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThinkingTimeoutTier {
+    Standard,
+    High,
+    Ultra,
+}
+
+fn is_neon_model(model: &str) -> bool {
+    model
+        .split(['-', '_', '/', ':'])
+        .any(|segment| segment.eq_ignore_ascii_case("neon"))
+}
+
+fn thinking_timeout_tier(model: &str, base_request: &RuntimeJson) -> Option<ThinkingTimeoutTier> {
+    if let Some(thinking_config) = base_request
+        .get("generationConfig")
+        .and_then(|config| config.get("thinkingConfig"))
+    {
+        if thinking_config
+            .get("includeThoughts")
+            .and_then(RuntimeJson::as_bool)
+            == Some(false)
+        {
+            return None;
+        }
+        if let Some(level) = thinking_config
+            .get("thinkingLevel")
+            .and_then(RuntimeJson::as_string)
+            .and_then(|value| value.try_to_utf8().ok())
+        {
+            if level.eq_ignore_ascii_case("EXTRA_HIGH")
+                || level.eq_ignore_ascii_case("XHIGH")
+                || level.eq_ignore_ascii_case("MAX")
+            {
+                return Some(ThinkingTimeoutTier::Ultra);
+            }
+            if level.eq_ignore_ascii_case("HIGH") {
+                return Some(ThinkingTimeoutTier::High);
+            }
+            if level.eq_ignore_ascii_case("LOW")
+                || level.eq_ignore_ascii_case("MEDIUM")
+                || level.eq_ignore_ascii_case("MINIMAL")
+            {
+                return Some(ThinkingTimeoutTier::Standard);
+            }
+        }
+    }
+
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.ends_with("-xhigh") || lower.ends_with("-max") {
+        Some(ThinkingTimeoutTier::Ultra)
+    } else if lower.ends_with("-high") {
+        Some(ThinkingTimeoutTier::High)
+    } else {
+        None
+    }
+}
+
+fn resolve_stream_response_header_timeout(
+    model: &str,
+    base_request: &RuntimeJson,
+) -> std::time::Duration {
+    let neon = is_neon_model(model);
+    match thinking_timeout_tier(model, base_request) {
+        Some(ThinkingTimeoutTier::Ultra) => EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT,
+        Some(ThinkingTimeoutTier::High) if neon => EXTENDED_STREAM_RESPONSE_HEADER_TIMEOUT,
+        Some(ThinkingTimeoutTier::High) => ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT,
+        _ if neon => ELEVATED_STREAM_RESPONSE_HEADER_TIMEOUT,
+        _ => DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT,
+    }
+}
 
 #[cfg(test)]
 tokio::task_local! {
     static TEST_STREAM_RESPONSE_HEADER_TIMEOUT: std::time::Duration;
 }
 
-fn stream_response_header_timeout() -> std::time::Duration {
+fn stream_response_header_timeout(model: &str, base_request: &RuntimeJson) -> std::time::Duration {
     #[cfg(test)]
     if let Ok(override_duration) = TEST_STREAM_RESPONSE_HEADER_TIMEOUT.try_with(|value| *value) {
         return override_duration;
     }
-    DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT
+    resolve_stream_response_header_timeout(model, base_request)
 }
 
 const ERROR_TAGS: [&str; 19] = [
@@ -684,6 +760,7 @@ async fn send(
     generation: Option<&str>,
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
+    header_timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Response, GeminiApiError> {
     let first = send_once(
         method,
@@ -691,6 +768,7 @@ async fn send(
         generation,
         signal,
         extra_headers.clone(),
+        header_timeout,
     )
     .await;
     let Err((error, used_token)) = first else {
@@ -702,7 +780,7 @@ async fn send(
         return tokio::select! {
             _ = signal.cancelled() => Err(api_error("antigravity_request_cancelled")),
             _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {
-                send_once(method, body, generation, signal, extra_headers)
+                send_once(method, body, generation, signal, extra_headers, header_timeout)
                     .await
                     .map(|(response, _)| response)
                     .map_err(|(err, _)| err)
@@ -712,10 +790,17 @@ async fn send(
     if let Some(generation) = generation {
         if is_auth_refusal_message(&error.message) && !signal.is_cancelled() {
             return match auth::force_refresh(generation, used_token.as_deref()).await {
-                Ok(_) => send_once(method, body, Some(generation), signal, extra_headers)
-                    .await
-                    .map(|(response, _)| response)
-                    .map_err(|(err, _)| err),
+                Ok(_) => send_once(
+                    method,
+                    body,
+                    Some(generation),
+                    signal,
+                    extra_headers,
+                    header_timeout,
+                )
+                .await
+                .map(|(response, _)| response)
+                .map_err(|(err, _)| err),
                 Err(refresh_err) => Err(map_refresh_failure(refresh_err, error)),
             };
         }
@@ -729,6 +814,7 @@ async fn send_once(
     generation: Option<&str>,
     signal: &AbortSignal,
     extra_headers: Vec<(String, String)>,
+    header_timeout: Option<std::time::Duration>,
 ) -> Result<(reqwest::Response, String), (GeminiApiError, Option<String>)> {
     ensure_identity().await;
     let credential = auth::credential(generation)
@@ -774,7 +860,8 @@ async fn send_once(
     let mut wire_send = super::cache_diagnostics::WireSend::new(wire_request.clone());
     let send_future = async {
         if method == "streamGenerateContent" {
-            match tokio::time::timeout(stream_response_header_timeout(), request.send()).await {
+            let timeout = header_timeout.unwrap_or(DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT);
+            match tokio::time::timeout(timeout, request.send()).await {
                 Ok(result) => Ok(result),
                 Err(_) => Err(()),
             }
@@ -878,7 +965,7 @@ async fn send_json(
     generation: Option<&str>,
     signal: &AbortSignal,
 ) -> Result<Value, String> {
-    let response = send(method, body, generation, signal, Vec::new())
+    let response = send(method, body, generation, signal, Vec::new(), None)
         .await
         .map_err(|e| e.message)?;
     let bytes = tokio::select! {
@@ -1888,6 +1975,7 @@ async fn send_stream_leg(
     signal: &AbortSignal,
     extra_headers: &[(String, String)],
 ) -> Result<reqwest::Response, GeminiApiError> {
+    let header_timeout = Some(stream_response_header_timeout(model, base_request));
     let body = build_leg_body(
         project,
         model,
@@ -1902,6 +1990,7 @@ async fn send_stream_leg(
         Some(generation),
         signal,
         extra_headers.to_vec(),
+        header_timeout,
     )
     .await
     {
@@ -1927,6 +2016,7 @@ async fn send_stream_leg(
                 Some(generation),
                 signal,
                 extra_headers.to_vec(),
+                header_timeout,
             )
             .await
             {
@@ -3981,6 +4071,101 @@ mod tests {
         assert_eq!(
             synthetic.usage_metadata.unwrap().candidates_token_count,
             Some(30)
+        );
+    }
+
+    #[test]
+    fn stream_response_header_timeout_scales_for_neon_and_high_thinking() {
+        let decode = |value: serde_json::Value| -> RuntimeJson {
+            runtime_codec::decode_text(&RuntimeString::from(value.to_string())).unwrap()
+        };
+
+        let empty = decode(json!({}));
+        let low = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "LOW"}}}),
+        );
+        let medium = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "MEDIUM"}}}),
+        );
+        let high = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "HIGH"}}}),
+        );
+        let extra_high = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "EXTRA_HIGH"}}}),
+        );
+        let max_level = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "MAX"}}}),
+        );
+        let disabled = decode(
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": false, "thinkingLevel": "HIGH"}}}),
+        );
+
+        // Standard non-Neon models stay at 75s.
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-carbon-low", &low),
+            std::time::Duration::from_secs(75)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-hydrogen-medium", &medium),
+            std::time::Duration::from_secs(75)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-2.5-flash", &empty),
+            std::time::Duration::from_secs(75)
+        );
+
+        // Non-high Neon tiers and non-Neon high-thinking tiers relax to 120s.
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-low", &low),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-medium", &medium),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-carbon-high", &high),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("claude-opus-5-5-high", &empty),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-3-flash", &high),
+            std::time::Duration::from_secs(120)
+        );
+
+        // Neon high/xhigh and any ultra-thinking tier relax to 180s.
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-high", &high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-high", &empty),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-xhigh", &extra_high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-hydrogen-xhigh", &extra_high),
+            std::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("claude-opus-5-5-max", &max_level),
+            std::time::Duration::from_secs(180)
+        );
+
+        // Explicitly disabling thoughts drops non-Neon high back to 75s, while Neon keeps 120s.
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-carbon-high", &disabled),
+            std::time::Duration::from_secs(75)
+        );
+        assert_eq!(
+            resolve_stream_response_header_timeout("gemini-4-neon-high", &disabled),
+            std::time::Duration::from_secs(120)
         );
     }
 
