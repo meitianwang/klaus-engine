@@ -197,7 +197,13 @@ impl RequestTiming {
             .as_ref()
             .or(request.cache_domain.as_ref())
             .map(crate::provider::util::diagnostic_string);
-        let routing_key = match (base_key, request.skip_cache_write == Some(true)) {
+        let ephemeral = request.skip_cache_write == Some(true)
+            || self
+                .fields
+                .get("turnId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("prediction:"));
+        let routing_key = match (base_key, ephemeral) {
             (Some(key), true) => Some(format!("{key}:skip_write")),
             (Some(key), false) => Some(key),
             (None, true) => Some("default:skip_write".to_string()),
@@ -298,6 +304,22 @@ impl Stream for ObservedStream {
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ObservedStream {
+    fn drop(&mut self) {
+        // Consumers such as the compaction summary loop stop polling as soon as
+        // they observe a terminal event (`MessageStop` or `Error`) without
+        // pulling the trailing `None`. Record the terminal outcome here before
+        // `RequestTiming::drop` would otherwise classify the drop as `"dropped"`.
+        if !self.timing.signal.is_cancelled() {
+            match self.timing.last_event_kind {
+                Some("message_stop") => self.timing.finish("completed"),
+                Some("error") => self.timing.finish("failed"),
+                _ => {}
+            }
         }
     }
 }
@@ -802,5 +824,108 @@ mod tests {
             "skip_cache_write call must not replace main cache_key snapshot"
         );
         assert_eq!(t2.fields["prefixContinuesPrefix"], serde_json::json!(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_stream_drop_after_message_stop_finishes_completed() {
+        use crate::schemas::message::Usage;
+        use crate::types::provider::ModelStopReason;
+
+        let path = std::env::temp_dir().join(format!("klaus-timing-{}.log", uuid::Uuid::new_v4()));
+        let mut timing = RequestTiming::start(
+            "precompute",
+            "synthetic-bg-request",
+            &"synthetic-model".into(),
+            Some(&"synthetic-provider".into()),
+            Some(&"synthetic-session".into()),
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        timing.test_path = Some(path.clone());
+        timing.record("started");
+        let events = vec![
+            ModelStreamEvent::TextDelta {
+                text: "private summary".into(),
+            },
+            ModelStreamEvent::MessageStop {
+                stop_reason: ModelStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    cache_read_input_tokens: 20_000,
+                    cache_creation_input_tokens: 0,
+                    total_tokens: Some(21_200),
+                },
+            },
+        ];
+        let mut stream = ObservedStream::boxed(Box::pin(futures::stream::iter(events)), timing);
+        while let Some(event) = stream.next().await {
+            if matches!(event, ModelStreamEvent::MessageStop { .. }) {
+                break;
+            }
+        }
+        // Drop immediately after MessageStop without polling to Poll::Ready(None),
+        // matching how the compaction summary loop consumes the stream.
+        drop(stream);
+        let records = records(&path);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["started", "first_event", "completed"]);
+        let completed = records.last().unwrap();
+        assert_eq!(completed["lastEventKind"], "message_stop");
+        assert_eq!(completed["promptInputTokens"], 1_000);
+        assert_eq!(completed["cacheReadInputTokens"], 20_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_stream_drop_after_error_finishes_failed() {
+        use crate::types::errors::{ProviderError, ProviderErrorKind};
+
+        let path = std::env::temp_dir().join(format!("klaus-timing-{}.log", uuid::Uuid::new_v4()));
+        let mut timing = RequestTiming::start(
+            "precompute",
+            "synthetic-bg-request",
+            &"synthetic-model".into(),
+            None,
+            None,
+            1,
+            100,
+            200,
+            AbortSignal::new(),
+        );
+        timing.test_path = Some(path.clone());
+        timing.record("started");
+        let events = vec![ModelStreamEvent::Error {
+            error: ProviderError {
+                kind: ProviderErrorKind::Network,
+                message: "private upstream body".into(),
+                status: None,
+                code: None,
+                error_type: None,
+                media_origins: None,
+                media_repair_complete: false,
+                credential_recovery: None,
+                retry_after_ms: None,
+                request_id: None,
+            },
+        }];
+        let mut stream = ObservedStream::boxed(Box::pin(futures::stream::iter(events)), timing);
+        while let Some(event) = stream.next().await {
+            if matches!(event, ModelStreamEvent::Error { .. }) {
+                break;
+            }
+        }
+        drop(stream);
+        let records = records(&path);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["started", "failed"]);
+        assert_eq!(records.last().unwrap()["errorKind"], "network");
     }
 }

@@ -72,7 +72,7 @@ impl PartialEq for ContextHintRequest {
 
 impl Eq for ContextHintRequest {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FrozenHintResults {
     model: Option<RuntimeString>,
     replacements: HashMap<RuntimeString, RuntimeString>,
@@ -100,6 +100,12 @@ impl std::fmt::Debug for ContextHintState {
 impl ContextHintState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn snapshot_clone(&self) -> Self {
+        Self {
+            inner: Mutex::new(self.inner.lock().unwrap().clone()),
+        }
     }
 
     /// Returns true when a previously bound model changes. The query owner can

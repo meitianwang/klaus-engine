@@ -102,6 +102,12 @@ impl ReplacementState {
         self.cold_reclaim_armed = true;
     }
 
+    pub fn snapshot_without_cold_reclaim(&self) -> Self {
+        let mut copy = self.clone();
+        copy.cold_reclaim_armed = false;
+        copy
+    }
+
     /// Consume the cold-cache reclaim arm: true exactly once per arming.
     pub fn take_cold_reclaim_arm(&mut self) -> bool {
         std::mem::replace(&mut self.cold_reclaim_armed, false)

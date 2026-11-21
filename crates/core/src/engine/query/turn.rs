@@ -640,6 +640,11 @@ async fn run_turn(
         .agent_type
         .as_ref()
         .is_some_and(|kind| kind == "approval-review");
+    let prediction_query = shared
+        .params
+        .agent_type
+        .as_ref()
+        .is_some_and(|kind| kind == "prediction");
     bind_step_model(&shared);
     let Some(mut system_prompt) = await_turn_preparation(
         &shared,
@@ -686,11 +691,12 @@ async fn run_turn(
     // not mean work has begun. This survives compaction and resets each run.
     let mut completed_tool_rounds: u32 = 0;
     let mut tool_continuation = false;
-    let mut loop_detector = if !private_review && shared.config().loop_detection {
-        Some(LoopDetector::new())
-    } else {
-        None
-    };
+    let mut loop_detector =
+        if !private_review && !prediction_query && shared.config().loop_detection {
+            Some(LoopDetector::new())
+        } else {
+            None
+        };
     let mut pending_loop_reminder: Option<RuntimeString> = None;
     let mut final_usage: Option<Usage> = None;
     // Whether this turn ever put something on screen: answer text or a tool call.
@@ -852,7 +858,11 @@ async fn run_turn(
                         .unwrap_or_else(|| resolved_max_output.saturating_mul(2));
                     fallback_chain = config.fallback_models.clone();
                     invalidate_context_usage(&mut messages);
-                    if !private_review && config.loop_detection && loop_detector.is_none() {
+                    if !private_review
+                        && !prediction_query
+                        && config.loop_detection
+                        && loop_detector.is_none()
+                    {
                         loop_detector = Some(LoopDetector::new());
                     } else if !config.loop_detection {
                         loop_detector = None;
@@ -1139,19 +1149,20 @@ async fn run_turn(
                 return;
             }
         }
-        if !run_turn_compaction_check(
-            &shared,
-            &cwd,
-            &thread_id,
-            &turn_user_uuid,
-            &mut system_prompt,
-            &tool_specs,
-            &turn_override,
-            effective_max_output,
-            &mut messages,
-            &mut prepared,
-        )
-        .await
+        if !prediction_query
+            && !run_turn_compaction_check(
+                &shared,
+                &cwd,
+                &thread_id,
+                &turn_user_uuid,
+                &mut system_prompt,
+                &tool_specs,
+                &turn_override,
+                effective_max_output,
+                &mut messages,
+                &mut prepared,
+            )
+            .await
         {
             return;
         }
@@ -1347,7 +1358,10 @@ async fn run_turn(
                 partial_uuid: _,
             } => {
                 let e = error;
-                if !private_review && e.kind == ProviderErrorKind::PromptTooLong {
+                if !private_review
+                    && !prediction_query
+                    && e.kind == ProviderErrorKind::PromptTooLong
+                {
                     if let Some(window) = &shared.params.context_window {
                         window
                             .mark_full(crate::context::compact::window::actual_model_window(
@@ -1384,6 +1398,14 @@ async fn run_turn(
                     return;
                 }
                 if is_reactive_rejection(&e) {
+                    if prediction_query {
+                        emit_provider_failure(
+                            &shared,
+                            e,
+                            "prediction-reactive-compaction-disabled",
+                        );
+                        return;
+                    }
                     if !private_review && e.kind == ProviderErrorKind::PromptTooLong {
                         emit_provider_failure(
                             &shared,
@@ -1544,7 +1566,7 @@ async fn run_turn(
         // The authoritative usage is carried on the assistant message itself.
         if let Some(usage) = &usage {
             final_usage = Some(usage.clone());
-            if shared.params.on_message.is_none() {
+            if !prediction_query && shared.params.on_message.is_none() {
                 if let Some(window) = &shared.params.context_window {
                     let active = crate::context::tokens::tokens_from_usage(usage);
                     window
@@ -1552,6 +1574,19 @@ async fn run_turn(
                         .await;
                 }
             }
+        }
+        if prediction_query {
+            let reason = if stop_reason == ModelStopReason::ToolUse {
+                TerminalReason::Aborted
+            } else {
+                TerminalReason::Completed
+            };
+            shared.q.push(EngineEvent::TurnCompleted {
+                turn_id: shared.turn_state.turn_id.clone(),
+                usage: final_usage,
+                stop_reason: reason,
+            });
+            return;
         }
         // Per-response output: did THIS provider response put answer text or a
         // tool call on screen? This, not the turn-level flag, is what settlement
@@ -2244,7 +2279,12 @@ async fn refresh_retained_context(
     cwd: &RuntimePath,
     has_task_tool: bool,
 ) -> bool {
-    refresh_retained_context_inner(shared, messages, cwd, has_task_tool, true).await
+    let record = shared
+        .params
+        .agent_type
+        .as_ref()
+        .is_none_or(|kind| kind != "prediction");
+    refresh_retained_context_inner(shared, messages, cwd, has_task_tool, record).await
 }
 
 async fn refresh_retained_context_inner(

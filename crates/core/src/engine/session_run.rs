@@ -37,14 +37,11 @@ use super::TurnOptions;
 use super::TurnResult;
 use super::UserContentPart;
 use super::ValidatedInput;
-use super::SIDE_TASK_SYSTEM_PROMPT;
 use crate::capabilities::RuntimeCapabilityResolution;
 use crate::context::at_mention::extract_agent_mentions;
 use crate::context::at_mention::extract_file_mentions;
 use crate::context::at_mention::has_at_mention;
 use crate::context::at_mention::FileMention;
-use crate::context::env_info::environment_block;
-use crate::context::env_info::EnvBlockOptions;
 use crate::context::tokens::tokens_from_usage;
 use crate::context::tokens::{estimate_context_tokens, estimate_context_tokens_with_prefix};
 use crate::engine::message_queue::QueuePriority;
@@ -263,8 +260,6 @@ fn file_change_rollout_payload(change: &crate::types::events::FileChange) -> Opt
 }
 use crate::engine::session::is_session_shutdown_refusal;
 use crate::goal::runtime::{GoalContinuation, GoalStopReason};
-use crate::memory::agent_memory::build_agent_memory_prompt_text;
-use crate::memory::agent_memory::AgentMemoryScope;
 use crate::memory::snapshot_decision::AgentMemorySnapshotApplyError;
 use crate::memory::snapshot_decision::AgentMemorySnapshotDecisionAudit;
 use crate::runtime_values::runtime_json;
@@ -301,7 +296,6 @@ use crate::types::file_state::FileStateCache;
 use crate::types::json::runtime_schema_from_static;
 use crate::types::json::Json;
 use crate::types::permission::PermissionUpdate;
-use crate::types::provider::SystemPromptPart;
 use crate::types::provider::PROMPT_CACHE_COLD_AFTER_MS;
 use crate::types::tool::RunBashOptions;
 use crate::types::tool::ToolContext;
@@ -1530,152 +1524,17 @@ impl Session {
                     .unwrap_or_else(|| bundle.config.model.clone());
                 let append = append.clone();
                 Box::pin(async move {
-                    let base_provider = this.system_prompt_provider.read_recover().clone();
-                    let mut parts = (base_provider)().await;
-                    if subagents_exposed {
-                        parts.push(crate::types::provider::SystemPromptPart {
-                            name: "subagent-model-selection".into(),
-                            text: crate::tools::builtins::task::model_selection_description(
-                                bundle.config.subagent_model_catalog,
-                                &bundle.config.subagent_model_options,
-                            ),
-                            cacheable: Some(true),
-                            cache_scope: None,
-                        });
-                    }
-                    if advisor_exposed || orchestration_exposed {
-                        // Guidance fragments bind to the turn's actual model
-                        // and its source declaration.
-                        let guidance_metadata =
-                            bundle.provider.model_metadata(&bundle.config.model);
-                        let guidance_fragments = crate::prompt_catalog::ModelFragments::for_config(
-                            &bundle.config,
-                            guidance_metadata.model_messages.as_ref(),
-                        );
-                        if advisor_exposed {
-                            let boundary = parts
-                                .iter()
-                                .position(|part| {
-                                    part.cache_scope
-                                        != Some(crate::types::provider::CacheScope::Global)
-                                })
-                                .unwrap_or(parts.len());
-                            parts.insert(
-                                boundary,
-                                crate::context::system_prompt::advisor_guidance_with(
-                                    &guidance_fragments.advisor_guidance(),
-                                ),
-                            );
-                        }
-                        if orchestration_exposed {
-                            let boundary = parts
-                                .iter()
-                                .position(|part| {
-                                    part.cache_scope
-                                        != Some(crate::types::provider::CacheScope::Global)
-                                })
-                                .unwrap_or(parts.len());
-                            parts.insert(
-                                boundary,
-                                crate::context::system_prompt::orchestration_guidance_with(
-                                    &guidance_fragments.orchestration_guidance(),
-                                ),
-                            );
-                        }
-                    }
-                    if this.system_prompt_is_default {
-                        let is_wt = this.workspace.is_in_worktree();
-                        let cwd = this.cwd_now();
-                        for p in parts.iter_mut() {
-                            if p.name == "env" {
-                                p.text = environment_block(
-                                    &cwd,
-                                    &bundle.config,
-                                    EnvBlockOptions {
-                                        plat: None,
-                                        shell: None,
-                                        model: Some(turn_model.clone()),
-                                        is_worktree: is_wt,
-                                        windows_shell: None,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    if let Some(part) = this.plugin_mcp_instruction_part().await {
-                        parts.push(part);
-                    }
-                    if let Some(definition) = &this.root_agent_definition {
-                        for (name, text) in [
-                            (
-                                "agent-role",
-                                definition
-                                    .prompt
-                                    .as_ref()
-                                    .or(definition.system_prompt.as_ref()),
-                            ),
-                            (
-                                "agent-critical",
-                                definition.critical_system_reminder.as_ref(),
-                            ),
-                        ] {
-                            if let Some(text) = text {
-                                parts.push(SystemPromptPart {
-                                    name: name.into(),
-                                    text: text.clone(),
-                                    cacheable: Some(true),
-                                    cache_scope: None,
-                                });
-                            }
-                        }
-                    }
-                    if let Some(dir) = this.memory_roots.main() {
-                        if let Some(host) = &this.agent_memory_host {
-                            this.sync_agent_memory(
-                                host.as_ref(),
-                                "main",
-                                AgentMemoryScope::Project,
-                                dir,
-                            )
-                            .await;
-                        }
-                        let text =
-                            build_agent_memory_prompt_text("main", AgentMemoryScope::Project, dir)
-                                .await;
-                        if !text.is_empty() {
-                            parts.push(SystemPromptPart {
-                                name: "memory".into(),
-                                text: text.into(),
-                                cacheable: None,
-                                cache_scope: None,
-                            });
-                        }
-                    }
-                    if this.meta.role.as_ref() == Some(&SessionRole::SideTask) {
-                        parts.push(SystemPromptPart {
-                            name: "side-task".into(),
-                            text: SIDE_TASK_SYSTEM_PROMPT.into(),
-                            cacheable: None,
-                            cache_scope: None,
-                        });
-                    }
-                    if let Some(a) = &append {
-                        parts.push(SystemPromptPart {
-                            name: "append".into(),
-                            text: a.clone(),
-                            cacheable: None,
-                            cache_scope: None,
-                        });
-                    }
-                    parts.retain(|part| part.name != "collaboration-mode");
-                    let collaboration_metadata =
-                        bundle.provider.model_metadata(&bundle.config.model);
-                    parts.push(crate::planning::instructions::instruction_part(
-                        &this.config,
+                    this.assemble_turn_system_prompt_parts(
+                        &bundle,
+                        &turn_model,
                         turn_collaboration_mode,
-                        collaboration_metadata.model_messages.as_ref(),
-                    ));
-                    parts
+                        subagents_exposed,
+                        advisor_exposed,
+                        orchestration_exposed,
+                        append.as_ref(),
+                        true,
+                    )
+                    .await
                 })
             })
         };
@@ -1975,47 +1834,8 @@ impl Session {
 
         let mention_factory = tool_context_base.clone();
         let mut model_history = this.model_history();
-        let mut planning_protected = std::collections::HashSet::new();
-        if let Ok(snapshot) = this.planning.snapshot() {
-            if let Some(plan) = snapshot
-                .plans
-                .iter()
-                .rfind(|plan| plan.status == "proposed" || plan.status == "accepted")
-            {
-                let context_id: RuntimeString = format!(
-                    "planning-context-{}-{}",
-                    crate::planning::runtime::host(&plan.id),
-                    plan.revision
-                )
-                .into();
-                let content = RuntimeString::from("<proposed_plan>\n")
-                    .concat(&plan.content)
-                    .concat(&RuntimeString::from("\n</proposed_plan>"));
-                let present=model_history.iter().find_map(|message|match message{Message::Assistant(message) if message.uuid==context_id||message.content.iter().any(|block|matches!(block,ContentBlock::Text(text) if text.text.as_utf16().windows(content.len_utf16()).any(|units| units==content.as_utf16())))=>Some(message.uuid.clone()),_=>None});
-                if present.is_none() {
-                    let before_user = model_history
-                        .iter()
-                        .rposition(|message| matches!(message, Message::User(_)))
-                        .unwrap_or(model_history.len());
-                    model_history.insert(
-                        before_user,
-                        Message::Assistant(crate::schemas::message::AssistantMessage {
-                            uuid: context_id.clone(),
-                            content: vec![ContentBlock::Text(crate::schemas::content::TextBlock {
-                                text: content,
-                                citations: None,
-                                harness_envelope: None,
-                                message_id: None,
-                                phase: None,
-                            })],
-                            model: turn_model.clone(),
-                            usage: None,
-                        }),
-                    );
-                }
-                planning_protected.insert(present.unwrap_or(context_id));
-            }
-        }
+        let planning_protected =
+            this.inject_proposed_plan_into_history(&mut model_history, &turn_model);
         // One-shot tool-result reclaim: this turn starts after the provider's
         // prompt cache has certainly expired, so the whole prefix re-sends
         // regardless and the budget pass may trade aged full-size results down

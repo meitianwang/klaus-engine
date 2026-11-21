@@ -705,6 +705,7 @@ impl EventQueue {
 /// announce inventory changes inside the message stream. Session-local: the
 /// epoch re-baselines on history discontinuity (compaction, migration,
 /// restore), model change, or an emergency inventory shrink.
+#[derive(Clone)]
 pub(super) struct ToolFreezeEpoch {
     pub(super) model: RuntimeString,
     pub(super) specs: Vec<ToolSpec>,
@@ -729,6 +730,10 @@ pub(crate) struct ToolFreezeState(Mutex<Option<ToolFreezeEpoch>>);
 impl ToolFreezeState {
     pub(crate) fn clear(&self) {
         *self.0.lock_recover() = None;
+    }
+
+    pub(crate) fn snapshot_clone(&self) -> Self {
+        Self(Mutex::new(self.0.lock_recover().clone()))
     }
 
     pub(super) fn lock_recover(&self) -> std::sync::MutexGuard<'_, Option<ToolFreezeEpoch>> {

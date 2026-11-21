@@ -3708,34 +3708,7 @@ impl Session {
         if !self.prediction_source_is_current(&source_turn_id) {
             return Ok(None);
         }
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": { "suggestion": { "anyOf": [{ "type": "string" }, { "type": "null" }] } },
-            "required": ["suggestion"],
-            "additionalProperties": false
-        })
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-        let query = self.run_readonly_query(ReadonlyQueryOptions {
-            input: Input::Text(prompt.into()),
-            system_append: None,
-            output_schema: Some(schema),
-            max_output_tokens: None,
-            model_tier: None,
-            // Predictions ride their configured feature target; an unset or
-            // unavailable target follows the session's main model.
-            feature: Some(FeatureSlot::Prediction),
-            include_history: true,
-            exclude_hidden_history: self.meta.role.as_ref()
-                == Some(&crate::schemas::rollout::SessionRole::SideTask),
-            bare_system_prompt: false,
-            inherit_session_reasoning: true,
-            effort,
-            sync_memory: false,
-            signal: signal.clone(),
-            cancelled_error: "prediction cancelled",
-        });
+        let query = self.run_prediction_query(Input::Text(prompt.into()), effort, signal.clone());
         // Admission changes before provider IO or while it is streaming invalidate
         // this snapshot. Dropping the losing query future releases its capture.
         let changed = async {
@@ -3768,15 +3741,7 @@ impl Session {
         if outcome.stop_reason != TerminalReason::Completed {
             return Ok(None);
         }
-        let value = crate::runtime_values::runtime_json::parse(&outcome.final_text)
-            .map_err(|_| "prediction response must be structured JSON".to_string())?;
-        match value.get("suggestion") {
-            Some(RuntimeJson::Null) => Ok(None),
-            Some(RuntimeJson::String(text)) => {
-                Ok(Some(runtime_trim(text)).filter(|text| !text.is_empty()))
-            }
-            _ => Err("prediction response must contain suggestion".to_string()),
-        }
+        parse_prediction_json(&outcome.final_text)
     }
 
     fn update_prediction_source_checkpoint(&self, generation: u64, turn_id: Option<RuntimeString>) {
@@ -4317,6 +4282,644 @@ impl Session {
                 parts
             })
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn assemble_turn_system_prompt_parts(
+        self: &Arc<Self>,
+        bundle: &super::InferenceBundle,
+        turn_model: &RuntimeString,
+        turn_collaboration_mode: crate::planning::CollaborationMode,
+        subagents_exposed: bool,
+        advisor_exposed: bool,
+        orchestration_exposed: bool,
+        append: Option<&RuntimeString>,
+        sync_memory: bool,
+    ) -> Vec<SystemPromptPart> {
+        let base_provider = self.system_prompt_provider.read_recover().clone();
+        let mut parts = (base_provider)().await;
+        if subagents_exposed {
+            parts.push(crate::types::provider::SystemPromptPart {
+                name: "subagent-model-selection".into(),
+                text: crate::tools::builtins::task::model_selection_description(
+                    bundle.config.subagent_model_catalog,
+                    &bundle.config.subagent_model_options,
+                ),
+                cacheable: Some(true),
+                cache_scope: None,
+            });
+        }
+        if advisor_exposed || orchestration_exposed {
+            let guidance_metadata = bundle.provider.model_metadata(&bundle.config.model);
+            let guidance_fragments = crate::prompt_catalog::ModelFragments::for_config(
+                &bundle.config,
+                guidance_metadata.model_messages.as_ref(),
+            );
+            if advisor_exposed {
+                let boundary = parts
+                    .iter()
+                    .position(|part| {
+                        part.cache_scope != Some(crate::types::provider::CacheScope::Global)
+                    })
+                    .unwrap_or(parts.len());
+                parts.insert(
+                    boundary,
+                    crate::context::system_prompt::advisor_guidance_with(
+                        &guidance_fragments.advisor_guidance(),
+                    ),
+                );
+            }
+            if orchestration_exposed {
+                let boundary = parts
+                    .iter()
+                    .position(|part| {
+                        part.cache_scope != Some(crate::types::provider::CacheScope::Global)
+                    })
+                    .unwrap_or(parts.len());
+                parts.insert(
+                    boundary,
+                    crate::context::system_prompt::orchestration_guidance_with(
+                        &guidance_fragments.orchestration_guidance(),
+                    ),
+                );
+            }
+        }
+        if self.system_prompt_is_default {
+            let is_wt = self.workspace.is_in_worktree();
+            let cwd = self.cwd_now();
+            for p in parts.iter_mut() {
+                if p.name == "env" {
+                    p.text = environment_block(
+                        &cwd,
+                        &bundle.config,
+                        EnvBlockOptions {
+                            plat: None,
+                            shell: None,
+                            model: Some(turn_model.clone()),
+                            is_worktree: is_wt,
+                            windows_shell: None,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(part) = self.plugin_mcp_instruction_part().await {
+            parts.push(part);
+        }
+        if let Some(definition) = &self.root_agent_definition {
+            for (name, text) in [
+                (
+                    "agent-role",
+                    definition
+                        .prompt
+                        .as_ref()
+                        .or(definition.system_prompt.as_ref()),
+                ),
+                (
+                    "agent-critical",
+                    definition.critical_system_reminder.as_ref(),
+                ),
+            ] {
+                if let Some(text) = text {
+                    parts.push(SystemPromptPart {
+                        name: name.into(),
+                        text: text.clone(),
+                        cacheable: Some(true),
+                        cache_scope: None,
+                    });
+                }
+            }
+        }
+        if let Some(dir) = self.memory_roots.main() {
+            if let Some(host) = self.agent_memory_host.as_ref().filter(|_| sync_memory) {
+                self.sync_agent_memory(host.as_ref(), "main", AgentMemoryScope::Project, dir)
+                    .await;
+            }
+            let text = build_agent_memory_prompt_text("main", AgentMemoryScope::Project, dir).await;
+            if !text.is_empty() {
+                parts.push(SystemPromptPart {
+                    name: "memory".into(),
+                    text: text.into(),
+                    cacheable: None,
+                    cache_scope: None,
+                });
+            }
+        }
+        if self.meta.role.as_ref() == Some(&crate::schemas::rollout::SessionRole::SideTask) {
+            parts.push(SystemPromptPart {
+                name: "side-task".into(),
+                text: super::SIDE_TASK_SYSTEM_PROMPT.into(),
+                cacheable: None,
+                cache_scope: None,
+            });
+        }
+        if let Some(a) = append {
+            parts.push(SystemPromptPart {
+                name: "append".into(),
+                text: a.clone(),
+                cacheable: None,
+                cache_scope: None,
+            });
+        }
+        parts.retain(|part| part.name != "collaboration-mode");
+        let collaboration_metadata = bundle.provider.model_metadata(&bundle.config.model);
+        parts.push(crate::planning::instructions::instruction_part(
+            &self.config,
+            turn_collaboration_mode,
+            collaboration_metadata.model_messages.as_ref(),
+        ));
+        parts
+    }
+
+    pub(super) fn inject_proposed_plan_into_history(
+        &self,
+        model_history: &mut Vec<Message>,
+        turn_model: &RuntimeString,
+    ) -> HashSet<RuntimeString> {
+        let mut planning_protected = HashSet::new();
+        if let Ok(snapshot) = self.planning.snapshot() {
+            if let Some(plan) = snapshot
+                .plans
+                .iter()
+                .rfind(|plan| plan.status == "proposed" || plan.status == "accepted")
+            {
+                let context_id: RuntimeString = format!(
+                    "planning-context-{}-{}",
+                    crate::planning::runtime::host(&plan.id),
+                    plan.revision
+                )
+                .into();
+                let content = RuntimeString::from("<proposed_plan>\n")
+                    .concat(&plan.content)
+                    .concat(&RuntimeString::from("\n</proposed_plan>"));
+                let present = model_history.iter().find_map(|message| match message {
+                    Message::Assistant(message)
+                        if message.uuid == context_id
+                            || message.content.iter().any(|block| {
+                                matches!(
+                                    block,
+                                    crate::schemas::content::ContentBlock::Text(text)
+                                        if text
+                                            .text
+                                            .as_utf16()
+                                            .windows(content.len_utf16())
+                                            .any(|units| units == content.as_utf16())
+                                )
+                            }) =>
+                    {
+                        Some(message.uuid.clone())
+                    }
+                    _ => None,
+                });
+                if present.is_none() {
+                    let before_user = model_history
+                        .iter()
+                        .rposition(|message| matches!(message, Message::User(_)))
+                        .unwrap_or(model_history.len());
+                    model_history.insert(
+                        before_user,
+                        Message::Assistant(AssistantMessage {
+                            uuid: context_id.clone(),
+                            content: vec![crate::schemas::content::ContentBlock::Text(
+                                crate::schemas::content::TextBlock {
+                                    text: content,
+                                    citations: None,
+                                    harness_envelope: None,
+                                    message_id: None,
+                                    phase: None,
+                                },
+                            )],
+                            model: turn_model.clone(),
+                            usage: None,
+                        }),
+                    );
+                }
+                planning_protected.insert(present.unwrap_or(context_id));
+            }
+        }
+        planning_protected
+    }
+
+    async fn run_prediction_query(
+        self: &Arc<Self>,
+        input: Input,
+        effort: Option<crate::schemas::effort::EffortValue>,
+        signal: AbortSignal,
+    ) -> Result<ReadonlyQueryOutcome, String> {
+        let capture = self.capture_inference(&signal).await?;
+        let bundle = capture.bundle.clone();
+        if self.is_disposed() {
+            return Err("cannot run a readonly query on a disposed session".to_string());
+        }
+        if signal.is_cancelled() {
+            return Err("prediction cancelled".to_string());
+        }
+        let model = bundle.config.model.clone();
+        let requirements = bundle
+            .load_review_requirements()
+            .await
+            .map_err(|error| error.to_string())?;
+        let step_policy = self.resolve_managed_step_policy(&requirements, &model)?;
+        let validated = self
+            .validate_input_for_bundle(input, &model, &bundle)
+            .map_err(|error| error.message)?;
+        let content = to_content_blocks(&validated.input);
+        let abort = signal;
+
+        let is_side_task =
+            self.meta.role.as_ref() == Some(&crate::schemas::rollout::SessionRole::SideTask);
+        let is_main_role = self.meta.role.is_none()
+            || self.meta.role == Some(crate::schemas::rollout::SessionRole::Main);
+        let turn_collaboration_mode = self.collaboration_mode();
+
+        let plugin_mcp_clients = self.plugin_mcp_clients_snapshot();
+        let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
+        let late_mcp_expected = !plugin_mcp_clients.is_empty() && plugin_mcp_tools.is_empty();
+        let web_selection = crate::engine::web_search_select::select_web_search(
+            crate::tools::builtins::tool_search::ensure_tool_search_with_late_mcp(
+                crate::tools::pool::build_tool_pool(crate::tools::pool::BuildPoolOptions {
+                    builtins: self.current_tools(),
+                    mcp_tools: if plugin_mcp_tools.is_empty() {
+                        None
+                    } else {
+                        Some(plugin_mcp_tools)
+                    },
+                    plugin_tools: None,
+                }),
+                late_mcp_expected,
+            ),
+            Some(&bundle.config.web_search),
+            bundle.provider.capabilities(&model).web_search,
+        );
+        let advisor_enabled = bundle.advisor_target.is_some();
+        let orchestration_enabled = is_main_role
+            && bundle.orchestration_mode
+            && turn_collaboration_mode != crate::planning::CollaborationMode::Plan;
+        let mut available_tools = web_selection.tools;
+        available_tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
+        crate::planning::tools::retain_for_mode(
+            &mut available_tools,
+            turn_collaboration_mode,
+            is_main_role,
+            self.config.request_user_input_default,
+        );
+        if orchestration_enabled {
+            crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
+                &mut available_tools,
+            );
+            available_tools.push(
+                crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(Arc::new(
+                    |_, _| {
+                        Box::pin(async {
+                            Err(crate::types::errors::ToolError::new(
+                                "tool execution disabled during prediction",
+                            ))
+                        })
+                    },
+                )),
+            );
+        }
+        if let Some(definition) = &self.root_agent_definition {
+            definition.retain_tools(&mut available_tools);
+        }
+        self.prepare_subagent_tool_inventory(&mut available_tools, &bundle.config);
+        let tools = if bundle.provider.capabilities(&model).tools {
+            available_tools
+        } else {
+            Vec::new()
+        };
+        let tool_specs = crate::tools::pool::to_tool_specs(&tools);
+
+        let advisor_exposed = tools.iter().any(|tool| tool.name() == "advisor");
+        let orchestration_exposed = tools.iter().any(|tool| {
+            tool.name() == crate::tools::builtins::orchestrate::ORCHESTRATE_EXECUTION_TOOL_NAME
+        });
+        let subagents_exposed = tools.iter().any(|tool| tool.name() == "task");
+        let system_prompt: SystemPromptThunk = {
+            let this = self.clone();
+            let bundle = bundle.clone();
+            let turn_model = model.clone();
+            Arc::new(move || {
+                let this = this.clone();
+                let bundle = bundle.clone();
+                let turn_model = turn_model.clone();
+                Box::pin(async move {
+                    this.assemble_turn_system_prompt_parts(
+                        &bundle,
+                        &turn_model,
+                        turn_collaboration_mode,
+                        subagents_exposed,
+                        advisor_exposed,
+                        orchestration_exposed,
+                        None,
+                        false,
+                    )
+                    .await
+                })
+            })
+        };
+
+        let mut messages = {
+            let history = self.model_history();
+            if is_side_task {
+                history
+                    .into_iter()
+                    .filter(|message| {
+                        !self
+                            .conversation
+                            .hidden_message_ids
+                            .contains(super::message_uuid(message))
+                    })
+                    .collect()
+            } else {
+                history
+            }
+        };
+        let planning_protected = if is_side_task {
+            HashSet::new()
+        } else {
+            self.inject_proposed_plan_into_history(&mut messages, &model)
+        };
+        let user_uuid = (self.deps.uuid)();
+        messages.push(Message::User(UserMessage {
+            question_answer: None,
+            uuid: user_uuid.into(),
+            content,
+            is_meta: None,
+        }));
+
+        let config = bundle.config_for_model(&model);
+        let approvals_reviewer = step_policy.approvals_reviewer;
+        let task_plan = crate::tasks::task_store::TaskPlanBinding::capture(&self.task_list_id());
+        let tool_context_base: ToolContextFactory = {
+            let this = self.clone();
+            let abort = abort.clone();
+            Arc::new(move || {
+                let policy = this.runtime_policy_snapshot();
+                let (permission, _) = this.permission_context_for_policy_with_origin(&policy);
+                let mut ctx = bare_tool_context(
+                    this.process_context.clone(),
+                    this.background_processes.clone(),
+                    this.cwd_now(),
+                    abort.clone(),
+                    this.file_state.clone() as Arc<dyn crate::types::file_state::FileStateCache>,
+                    permission,
+                    policy.sandbox_backend.clone(),
+                );
+                ctx.planning_read_only =
+                    turn_collaboration_mode == crate::planning::CollaborationMode::Plan;
+                policy.apply_to_context(&mut ctx);
+                if let Some(reviewer) = approvals_reviewer {
+                    ctx.approvals_reviewer = Some(reviewer);
+                }
+                let team = this
+                    .swarm_identity
+                    .lock_recover()
+                    .as_ref()
+                    .map(|i| i.team.clone());
+                ctx.task_list_id = Some(crate::tasks::task_store::get_task_list_id(
+                    Some(&this.id),
+                    team.as_ref(),
+                ));
+                task_plan.observe(ctx.task_list_id.as_ref().unwrap());
+                ctx.task_plan = Some(task_plan.clone());
+                ctx
+            })
+        };
+        let cost_so_far: crate::engine::query::CostSoFar = {
+            let cost = self.cost.clone();
+            Box::new(move || cost.lock_recover().total_cost_usd())
+        };
+        let prediction_effort = effort.clone().or_else(|| bundle.config.effort.clone());
+        // OpenAI-wire providers derive shard routing and retention from non-skipped
+        // cache retention (`prompt_cache_key` / `prompt_cache_retention`); Anthropic
+        // and Gemini providers keep their warm prefix while avoiding a cache-write
+        // surcharge on the ephemeral trailing user prompt via `skip_cache_write`.
+        let skip_cache_write = (bundle.provider.info().name != "openai").then_some(true);
+        let reminder_providers = self
+            .reminder_providers
+            .get()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|provider| provider.request_refresh().is_some())
+            .collect();
+        let approval_handler = self.approval_handler.is_some().then(|| {
+            Arc::new(DenyAllApprovalHandler) as Arc<dyn crate::types::permission::ApprovalHandler>
+        });
+        let budget_snapshot = self
+            .tool_result_budget_state()
+            .lock_recover()
+            .snapshot_without_cold_reclaim();
+
+        let params = QueryParams {
+            reply_gate: None,
+            multi_agent_instructions: !is_side_task,
+            thread_id: self.id.clone(),
+            turn_id: RuntimeString::from(format!("prediction:{}", (self.deps.uuid)())),
+            model: model.clone(),
+            provider_info: Some(bundle.provider.info().clone()),
+            messages,
+            compaction_protected_message_ids: planning_protected,
+            context_window: None,
+            precompute: None,
+            compaction_history: None,
+            recover_compaction_history: None,
+            compaction_output: None,
+            tools,
+            tool_specs,
+            refresh_tools: None,
+            refresh_tools_async: None,
+            agent_tool_policy: self.root_agent_definition.clone(),
+            system_prompt: SystemPromptResolvable::Fn(system_prompt),
+            config,
+            max_turns: Some(1),
+            cost_so_far: Some(cost_so_far),
+            tool_context_base,
+            permission_engine: self.permission_engine.clone(),
+            hook_bus: None,
+            signal: abort.clone(),
+            approval_handler,
+            approval_reviewer: None,
+            output_schema: None,
+            token_budget: None,
+            goal: None,
+            goal_request_identity: None,
+            goal_pending_input: None,
+            goal_execution_enabled: None,
+            goal_usage: None,
+            web_search: web_selection.request,
+            on_message: None,
+            prepare_request_usage: Some(self.request_usage_recorder({
+                let bundle = bundle.clone();
+                Arc::new(move || bundle.clone())
+            })),
+            retained_tool_tasks: Some(self.persistence.tool_tasks.clone()),
+            message_rollout: None,
+            on_permission_update: None,
+            on_compaction: None,
+            surfaced_tools: Some(self.surfaced_tools.lock_recover().iter().cloned().collect()),
+            on_surface_tools: None,
+            on_tool_lifecycle: None,
+            provider_call_admission: None,
+            on_provider_request_admitted: None,
+            emit_thread_started: false,
+            reminder_providers,
+            edited_files_reminder: None,
+            effort: prediction_effort,
+            ultra_mode: bundle.config.ultra_mode,
+            thinking: if bundle.config.thinking {
+                Some(ThinkingConfig::Adaptive)
+            } else {
+                None
+            },
+            skip_cache_write,
+            cache_ttl: if self.config.cache1h_ttl {
+                Some(CacheTtl::OneHour)
+            } else {
+                None
+            },
+            cache_domain: None,
+            cache_key: Some(self.id.clone()),
+            plan_file_path: self.plan_file_context(None).map(|p| p.path),
+            message_queue: None,
+            input_pdf_bytes: validated.pdf_bytes,
+            input_pdf_documents: validated.pdf_documents,
+            validate_native_pdf: {
+                let provider = bundle.provider.clone();
+                Some(Arc::new(move |model| {
+                    validate_native_pdf_provider(provider.as_ref(), model)
+                }))
+            },
+            agent_id: None,
+            agent_type: Some("prediction".into()),
+            context_hint_state: (!is_side_task)
+                .then(|| Arc::new(self.context_hint_state.snapshot_clone())),
+            file_state: (!is_side_task).then(|| self.file_state.clone()),
+            invoked_skills: (!is_side_task).then(|| {
+                let session = Arc::downgrade(self);
+                Arc::new(move || {
+                    session
+                        .upgrade()
+                        .map(|session| session.invoked_skills_snapshot(None))
+                        .unwrap_or_default()
+                })
+                    as Arc<
+                        dyn Fn() -> Vec<crate::context::skill_receipts::InvokedSkillContent>
+                            + Send
+                            + Sync,
+                    >
+            }),
+            tool_result_budget_state: Some(Arc::new(std::sync::Mutex::new(budget_snapshot))),
+            on_tool_result_budget_records: None,
+            thinking_context_cold: self.turn.thinking_context_cold(),
+            context_edit_state: (!is_side_task)
+                .then(|| Arc::new(self.context_edit_state.snapshot_clone())),
+            tool_freeze_state: (!is_side_task)
+                .then(|| Arc::new(self.tool_freeze_state.snapshot_clone())),
+            padded_countdown_spend: self.turn.padded_countdown_spend(),
+            task_countdown_anchor: Some(Arc::new(std::sync::Mutex::new(
+                *self.context_countdown_anchor.lock_recover(),
+            ))),
+            live_model_override: None,
+        };
+        let mut events = crate::engine::query::query_with_inference(
+            params,
+            bundle.deps.to_engine_deps(),
+            crate::engine::query::InferenceCapture {
+                slot: Arc::new(std::sync::Mutex::new(Some(capture))),
+                next: None,
+                model_override: None,
+                effort_override: effort,
+                ultra_override: None,
+                last_wire_request: None,
+            },
+        );
+        let mut final_text = RuntimeString::default();
+        let mut usage = None;
+        let mut stop_reason = TerminalReason::Completed;
+        loop {
+            let ev = tokio::select! {
+                biased;
+                _ = abort.cancelled() => {
+                    return Err("prediction cancelled".to_string());
+                }
+                ev = events.next() => ev,
+            };
+            let Some(ev) = ev else {
+                break;
+            };
+            match ev {
+                EngineEvent::ItemCompleted {
+                    inference: _,
+                    item: ThreadItem::AgentMessage { text, .. },
+                } => final_text = text,
+                EngineEvent::TurnCompleted {
+                    usage: u,
+                    stop_reason: reason,
+                    ..
+                } => {
+                    usage = u;
+                    stop_reason = reason;
+                }
+                EngineEvent::TurnFailed { error, .. } => {
+                    return Err(runtime_error_message_to_public_host(&error.message));
+                }
+                _ => {}
+            }
+        }
+        Ok(ReadonlyQueryOutcome {
+            final_text,
+            usage,
+            stop_reason,
+        })
+    }
+}
+
+struct DenyAllApprovalHandler;
+
+#[async_trait::async_trait]
+impl crate::types::permission::ApprovalHandler for DenyAllApprovalHandler {
+    async fn approve(
+        &self,
+        _req: crate::types::permission::ApprovalRequest,
+        _signal: AbortSignal,
+    ) -> crate::types::permission::ApprovalResponse {
+        crate::types::permission::ApprovalResponse::Deny {
+            message: Some("tool execution disabled during prediction".into()),
+        }
+    }
+}
+
+fn strip_markdown_json_fence(trimmed: &RuntimeString) -> RuntimeString {
+    if let Ok(utf8) = trimmed.try_to_utf8() {
+        if let Some(rest) = utf8.strip_prefix("```") {
+            let after_lang = match rest.find('\n') {
+                Some(newline) => &rest[newline + 1..],
+                None => return trimmed.clone(),
+            };
+            if let Some(body) = after_lang.trim_end().strip_suffix("```") {
+                return RuntimeString::from(body.trim());
+            }
+        }
+    }
+    trimmed.clone()
+}
+
+fn parse_prediction_json(raw: &RuntimeString) -> Result<Option<RuntimeString>, String> {
+    let trimmed = runtime_trim(raw);
+    let candidate = strip_markdown_json_fence(&trimmed);
+    let value = crate::runtime_values::runtime_json::parse(&candidate)
+        .map_err(|_| "prediction response must be structured JSON".to_string())?;
+    if !matches!(value, RuntimeJson::Object(_)) {
+        return Err("prediction response must be structured JSON".to_string());
+    }
+    match value.get("suggestion") {
+        Some(RuntimeJson::Null) => Ok(None),
+        Some(RuntimeJson::String(text)) => {
+            Ok(Some(runtime_trim(text)).filter(|text| !text.is_empty()))
+        }
+        _ => Err("prediction response must contain suggestion".to_string()),
     }
 }
 

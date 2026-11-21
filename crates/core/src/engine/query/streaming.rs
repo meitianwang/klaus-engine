@@ -797,6 +797,11 @@ async fn stream_and_dispatch_inner(
     let idle = shared.config().stream_idle_timeout_ms;
     let total = shared.config().stream_total_timeout_ms;
     let stream_deadline = tokio::time::Instant::now() + Duration::from_millis(total);
+    let prediction_query = shared
+        .params
+        .agent_type
+        .as_ref()
+        .is_some_and(|kind| kind == "prediction");
 
     'stream: loop {
         let remaining = stream_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1006,6 +1011,23 @@ async fn stream_and_dispatch_inner(
                 tool_kind,
                 input_format,
             } => {
+                if prediction_query {
+                    attempt.cancel();
+                    if let Some(receipt) = &mut usage_receipt {
+                        receipt.settle();
+                    }
+                    return Outcome::Ok {
+                        messages: req.messages.clone(),
+                        usage,
+                        tool_results: Vec::new(),
+                        tool_result_handoff: None,
+                        stop_reason: ModelStopReason::ToolUse,
+                        final_text: RuntimeString::default(),
+                        sleep_ran: false,
+                        post_result_notices: Vec::new(),
+                        truncated_tool_calls: Vec::new(),
+                    };
+                }
                 // First start wins for a call id. Provider adapters may replay a
                 // start event; replacing the partial and appending another assembly
                 // entry would dispatch the same resolved call twice.
@@ -1026,6 +1048,23 @@ async fn stream_and_dispatch_inner(
                 assembly.push(Assembly::Tool { id });
             }
             ModelStreamEvent::ServerSearchQuery { id, query, action } => {
+                if prediction_query {
+                    attempt.cancel();
+                    if let Some(receipt) = &mut usage_receipt {
+                        receipt.settle();
+                    }
+                    return Outcome::Ok {
+                        messages: req.messages.clone(),
+                        usage,
+                        tool_results: Vec::new(),
+                        tool_result_handoff: None,
+                        stop_reason: ModelStopReason::ToolUse,
+                        final_text: RuntimeString::default(),
+                        sleep_ran: false,
+                        post_result_notices: Vec::new(),
+                        truncated_tool_calls: Vec::new(),
+                    };
+                }
                 assembly.push(Assembly::Search {
                     id,
                     query,
@@ -1147,7 +1186,7 @@ async fn stream_and_dispatch_inner(
                             .record_failure(error.message.clone());
                         return Outcome::Fatal { error };
                     }
-                    if !shared.params.signal.is_cancelled() {
+                    if !prediction_query && !shared.params.signal.is_cancelled() {
                         if let Some(ld) = loop_detector.as_deref_mut() {
                             ld.observe_tool_call();
                         }
@@ -1586,14 +1625,22 @@ async fn stream_and_dispatch_inner(
             _ => None,
         })
         .collect();
-    if calls.is_empty() {
+    if calls.is_empty() || prediction_query {
         return Outcome::Ok {
             messages,
             usage,
             tool_results: Vec::new(),
             tool_result_handoff: None,
-            stop_reason,
-            final_text: text_buf.clone(),
+            stop_reason: if prediction_query && !calls.is_empty() {
+                ModelStopReason::ToolUse
+            } else {
+                stop_reason
+            },
+            final_text: if prediction_query && !calls.is_empty() {
+                RuntimeString::default()
+            } else {
+                text_buf.clone()
+            },
             sleep_ran: false,
             post_result_notices: Vec::new(),
             truncated_tool_calls: Vec::new(),

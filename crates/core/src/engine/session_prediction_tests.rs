@@ -14,7 +14,7 @@ fn source_turn(session: &Session) -> String {
 }
 
 #[tokio::test]
-async fn prediction_inherits_context_and_main_inference_without_tools_or_transcript_changes() {
+async fn prediction_reuses_main_prefix_and_inference_without_transcript_changes() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut config = default_config();
     config.memory.enabled = false;
@@ -73,6 +73,7 @@ async fn prediction_inherits_context_and_main_inference_without_tools_or_transcr
     assert_eq!(session.history_snapshot(), before);
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
+    let main_req = &requests[0];
     let request = &requests[1];
     assert_eq!(request.model, "main-model");
     assert_eq!(
@@ -82,18 +83,24 @@ async fn prediction_inherits_context_and_main_inference_without_tools_or_transcr
         ))
     );
     assert_eq!(requests[2].effort, Some(override_effort));
-    assert!(request.tools.is_empty());
+    assert!(!request.tools.is_empty());
+    assert_eq!(request.tools, main_req.tools);
+    assert_eq!(request.deferred_tools, main_req.deferred_tools);
+    assert_eq!(
+        request.surfaced_deferred_names,
+        main_req.surfaced_deferred_names
+    );
+    assert_eq!(request.frozen_tools, main_req.frozen_tools);
+    assert_eq!(request.tool_choice, main_req.tool_choice);
+    assert_eq!(request.web_search, main_req.web_search);
+    assert_eq!(request.system, main_req.system);
+    assert_eq!(request.cache_key, main_req.cache_key);
+    assert_eq!(request.cache_key, Some(session.id.clone()));
     assert_eq!(request.skip_cache_write, Some(true));
+    assert!(request.output_schema.is_none());
     assert_eq!(&request.messages[..before.len()], before.as_slice());
     assert!(
         matches!(request.messages.last(), Some(Message::User(user)) if matches!(&user.content[0], ContentBlock::Text(text) if text.text == "dynamic prompt"))
-    );
-    let schema = request.output_schema.as_ref().unwrap();
-    assert_eq!(schema["required"][0], RuntimeJson::from("suggestion"));
-    assert_eq!(schema["additionalProperties"], RuntimeJson::Bool(false));
-    assert_eq!(
-        schema["properties"]["suggestion"]["anyOf"][1]["type"],
-        RuntimeJson::from("null")
     );
 }
 
@@ -754,4 +761,306 @@ async fn side_task_predictions_ignore_inherited_prefix_until_side_task_has_own_h
     side.rollback(1).await.unwrap();
     assert_eq!(side.prediction_context().await.unwrap().turn_id, None);
     side.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn prediction_preserves_cache_prefix_across_openai_anthropic_and_gemini_modes() {
+    struct NamedProvider {
+        info: crate::types::provider::ProviderInfo,
+    }
+    impl crate::types::provider::ModelProvider for NamedProvider {
+        fn info(&self) -> &crate::types::provider::ProviderInfo {
+            &self.info
+        }
+        fn capabilities(
+            &self,
+            _model: &RuntimeString,
+        ) -> crate::types::provider::ProviderCapabilities {
+            crate::types::provider::ProviderCapabilities {
+                supports_image_detail_original: false,
+                streaming: true,
+                tools: true,
+                thinking: true,
+                structured_output: true,
+                web_search: true,
+                prompt_cache_control: true,
+                context_window: 200_000,
+                max_output_tokens: 16_384,
+                native_pdf: true,
+                vision: true,
+                image_limits: None,
+                max_media_blocks: None,
+            }
+        }
+        fn stream(&self, _: crate::types::provider::ModelRequest, _: AbortSignal) -> ModelStream {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    for (provider_name, model_name, source_kind, expected_skip_cache_write) in [
+        ("openai", "gpt-5.4", "codex", None),
+        ("openai", "qwen-max", "qoder", None),
+        ("anthropic", "claude-sonnet-4-6", "subscription", Some(true)),
+        ("gemini", "gemini-2.5-pro", "antigravity", Some(true)),
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut config = default_config();
+        config.memory.enabled = false;
+        config.model = model_name.into();
+        config.cache1h_ttl = true;
+        config.model_source = Some(crate::types::events::InferenceSource {
+            source: Some(source_kind.to_string()),
+            model_id: Some(model_name.to_string()),
+            tier: None,
+            selection: None,
+        });
+        let provider = Arc::new(NamedProvider {
+            info: crate::types::provider::ProviderInfo {
+                name: provider_name.into(),
+                default_model: model_name.into(),
+                base_url: None,
+                env_key: None,
+            },
+        });
+        let session = mk_session_with_provider_and_memory(
+            provider,
+            recording_deps(
+                requests.clone(),
+                vec![
+                    text_turn("completed answer"),
+                    text_turn("```json\n{\"suggestion\":\"Run verification suite\"}\n```"),
+                ],
+            ),
+            config,
+            vec![create_read_tool(), create_write_tool()],
+            None,
+        );
+        session
+            .run(
+                Input::Text("implement cache reuse".into()),
+                TurnOptions::default(),
+            )
+            .await;
+        let source = source_turn(&session);
+        let before = session.history_snapshot();
+        let predicted = session
+            .predict_message_with_signal("dynamic prompt".into(), source, None, AbortSignal::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            predicted,
+            Some("Run verification suite".into()),
+            "{provider_name}/{source_kind}"
+        );
+        assert_eq!(session.history_snapshot(), before);
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 2, "{provider_name}/{source_kind}");
+            let main_req = &recorded[0];
+            let pred_req = &recorded[1];
+            assert_eq!(
+                pred_req.model, main_req.model,
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                pred_req.tools, main_req.tools,
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                pred_req.system, main_req.system,
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                pred_req.cache_key,
+                Some(session.id.clone()),
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                pred_req.cache_ttl, main_req.cache_ttl,
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                pred_req.skip_cache_write, expected_skip_cache_write,
+                "{provider_name}/{source_kind}"
+            );
+            assert!(
+                pred_req.output_schema.is_none(),
+                "{provider_name}/{source_kind}"
+            );
+            assert_eq!(
+                &pred_req.messages[..before.len()],
+                before.as_slice(),
+                "{provider_name}/{source_kind}"
+            );
+        }
+        session.shutdown_and_wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prediction_never_executes_tools_and_always_uses_main_session_model() {
+    struct CountingReadOnlyTool {
+        calls: Arc<AtomicUsize>,
+        schema: JsonSchema,
+    }
+    #[async_trait::async_trait]
+    impl Tool for CountingReadOnlyTool {
+        fn static_name(&self) -> &str {
+            "probe_readonly"
+        }
+        fn static_description(&self) -> &str {
+            "Read-only probe"
+        }
+        fn static_input_schema(&self) -> &JsonSchema {
+            &self.schema
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn is_read_only(&self, _input: &Json) -> bool {
+            true
+        }
+        fn is_concurrency_safe(&self, _input: &Json) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _input: Json,
+            _ctx: &ToolContext,
+            _on_progress: Option<ToolProgress>,
+        ) -> Result<ToolResult, crate::types::errors::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(text_result(Json::Null, "executed", false))
+        }
+    }
+
+    struct StaleFeatureProvider {
+        info: crate::types::provider::ProviderInfo,
+        calls: Arc<AtomicUsize>,
+    }
+    impl crate::types::provider::ModelProvider for StaleFeatureProvider {
+        fn info(&self) -> &crate::types::provider::ProviderInfo {
+            &self.info
+        }
+        fn capabilities(
+            &self,
+            _model: &RuntimeString,
+        ) -> crate::types::provider::ProviderCapabilities {
+            fake_provider().capabilities(&"aux-model".into())
+        }
+        fn stream(&self, _: crate::types::provider::ModelRequest, _: AbortSignal) -> ModelStream {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let aux_calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut config = default_config();
+    config.memory.enabled = false;
+    config.model = "main-session-model".into();
+    let tool_turn = vec![
+        ev::message_start(None),
+        crate::types::provider::ModelStreamEvent::ToolUseStart {
+            id: "call-1".into(),
+            name: "probe_readonly".into(),
+            thought_signature: None,
+            tool_kind: None,
+            input_format: None,
+        },
+        crate::types::provider::ModelStreamEvent::ToolUseInputDelta {
+            id: "call-1".into(),
+            partial_json: "{}".into(),
+        },
+        crate::types::provider::ModelStreamEvent::ToolUseStop {
+            id: "call-1".into(),
+        },
+        ev::stop(Some(ModelStopReason::ToolUse), Some(make_usage(None, None))),
+    ];
+    let session = mk_session_with_deps(
+        recording_deps(
+            requests.clone(),
+            vec![
+                text_turn("parent reply"),
+                tool_turn,
+                text_turn(r#"{"suggestion":"Check main model"}"#),
+            ],
+        ),
+        config,
+        vec![
+            Arc::new(CountingReadOnlyTool {
+                calls: tool_calls.clone(),
+                schema: serde_json::json!({"type": "object", "properties": {}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }),
+            create_write_tool(),
+        ],
+    );
+    session
+        .install_feature_targets(crate::engine::session::FeatureTargets {
+            title: None,
+            prediction: Some(crate::engine::session::InferenceTargetState::Ready(
+                crate::engine::session::InferenceTarget {
+                    source: "custom".into(),
+                    model_id: "stale-prediction-entry".into(),
+                    model: "stale-prediction-model".into(),
+                    provider: Arc::new(StaleFeatureProvider {
+                        info: crate::types::provider::ProviderInfo {
+                            name: "stale-aux".into(),
+                            default_model: "stale-prediction-model".into(),
+                            base_url: None,
+                            env_key: None,
+                        },
+                        calls: aux_calls.clone(),
+                    }),
+                    pricing: Vec::new(),
+                    review_requirements: None,
+                },
+            )),
+            memory: None,
+        })
+        .unwrap();
+
+    session
+        .run(Input::Text("parent context".into()), TurnOptions::default())
+        .await;
+    let source = source_turn(&session);
+    let before = session.history_snapshot();
+
+    // If the model attempts a tool call during prediction, zero tools execute and None is returned.
+    assert_eq!(
+        session
+            .predict_message_with_signal(
+                "dynamic prompt".into(),
+                source.clone(),
+                None,
+                AbortSignal::new(),
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(aux_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.history_snapshot(), before);
+
+    // Subsequent text prediction still uses the main session model, ignoring stale feature targets.
+    assert_eq!(
+        session
+            .predict_message_with_signal("dynamic prompt".into(), source, None, AbortSignal::new(),)
+            .await
+            .unwrap(),
+        Some("Check main model".into())
+    );
+    assert_eq!(aux_calls.load(Ordering::SeqCst), 0);
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[1].model, "main-session-model");
+        assert_eq!(recorded[2].model, "main-session-model");
+    }
+    session.shutdown_and_wait().await.unwrap();
 }

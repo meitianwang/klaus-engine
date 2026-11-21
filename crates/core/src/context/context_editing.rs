@@ -53,6 +53,16 @@ impl ContextEditState {
             reports: self.reports.load(Ordering::Relaxed),
         }
     }
+
+    pub fn snapshot_clone(&self) -> Self {
+        let totals = self.totals();
+        Self {
+            cleared_tool_uses: AtomicU64::new(totals.cleared_tool_uses),
+            cleared_input_tokens: AtomicU64::new(totals.cleared_input_tokens),
+            cleared_thinking_turns: AtomicU64::new(totals.cleared_thinking_turns),
+            reports: AtomicU64::new(totals.reports),
+        }
+    }
 }
 
 #[cfg(test)]
