@@ -19,9 +19,9 @@ const FLOW_TIMEOUT_MS: i64 = 300_000;
 const POLL_INTERVAL_SECONDS: i64 = 1;
 const REFRESH_SKEW_SECONDS: i64 = 3600;
 const HTTP_TIMEOUT_MS: u64 = 15_000;
-const CLIENT_VERSION: &str = "1.1.0";
-const CLIENT_RELEASE_VERSION: &str = "1.1.0-26091701";
-const CLIENT_BUILD: &str = "26091701";
+const CLIENT_VERSION: &str = "1.3.1";
+const CLIENT_RELEASE_VERSION: &str = "1.3.1-26101419";
+const CLIENT_BUILD: &str = "26101419";
 const VERIFIER_ALPHABET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 

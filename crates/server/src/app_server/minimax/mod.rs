@@ -71,7 +71,7 @@ pub(crate) fn config_root() -> PathBuf {
 /// safe, so it cannot serve the low tier, which is what session titles run on.
 /// `minimax_tiers` pins an unmapped low tier to a measured M2.x model instead; see
 /// [`catalog::structured_safe_fallback`].
-pub const DEFAULT_SELECTION: &str = "MiniMax-M3.1-Flash-Preview";
+pub const DEFAULT_SELECTION: &str = "MiniMax-M3.1-Flash";
 
 /// The catalog key a `minimax:<key>` selection puts on the wire.
 ///

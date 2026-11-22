@@ -100,7 +100,7 @@ async fn model_selection_resolve_pins_the_source_without_requiring_credentials()
         // routes even though every tier serves it, which is why the catalog injects
         // it rather than resolving it away to whatever the live list happens to
         // head with; with no catalog reachable the same name is the answer.
-        (json!({"source":"minimax", "selection":"auto"}), "minimax:MiniMax-M3.1-Flash-Preview"),
+        (json!({"source":"minimax", "selection":"auto"}), "minimax:MiniMax-M3.1-Flash"),
         (json!({"source":"minimax", "selection":"high", "modelTierSelections":{"high":"MiniMax-M3"}}), "minimax:MiniMax-M3"),
         (json!({"source":"minimax", "selection":"minimax:MiniMax-M2.7"}), "minimax:MiniMax-M2.7"),
         // Zhipu has no routing model by the name `auto` — asking the gateway for it

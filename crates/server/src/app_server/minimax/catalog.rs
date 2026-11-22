@@ -41,7 +41,7 @@ const MAX_PAGES: u8 = 10;
 /// thinking budget (low→47, medium→30, high→28, max→52 thinking tokens on the
 /// same prompt). It is injected into the catalog rather than read from it — see
 /// the module note — so a bare selection always lands on a model the key serves.
-const DEFAULT_SELECTION: &str = "MiniMax-M3.1-Flash-Preview";
+const DEFAULT_SELECTION: &str = "MiniMax-M3.1-Flash";
 
 /// The documented effort ladder. Measured accepted on `MiniMax-M3.1-Flash-Preview`
 /// at every rung (`low`, `medium`, `high`, `xhigh`, `max`); `none` is refused with
@@ -100,7 +100,7 @@ fn facts(model: &str) -> ModelFacts {
         // structured path and cannot be offered a thinking-off rung. Its effort
         // ladder is the one measured to change the thinking budget, so it is the
         // only model here that declares one.
-        "MiniMax-M3.1-Flash-Preview" => ModelFacts {
+        "MiniMax-M3.1-Flash" | "MiniMax-M3.1-Flash-Preview" => ModelFacts {
             reasoning_known: true,
             context_tokens: 1_000_000,
             can_disable_thinking: false,
@@ -785,7 +785,9 @@ mod tests {
         // for the low tier and silently loses every conversation's title.
         assert!(facts("MiniMax-M3").can_disable_thinking);
         assert!(!facts("MiniMax-M3").structured_safe);
-        // M3.1 refuses disabled outright, so it is neither.
+        // M3.1 (GA and retired preview alias) refuses disabled outright, so it is neither.
+        assert!(!facts("MiniMax-M3.1-Flash").can_disable_thinking);
+        assert!(!facts("MiniMax-M3.1-Flash").structured_safe);
         assert!(!facts("MiniMax-M3.1-Flash-Preview").can_disable_thinking);
         assert!(!facts("MiniMax-M3.1-Flash-Preview").structured_safe);
         // The M2.x family is the structured-safe set.
@@ -820,6 +822,10 @@ mod tests {
         // not measured to change M3 or the M2.x models, so offering it there would
         // be a control that does nothing.
         assert_eq!(
+            facts("MiniMax-M3.1-Flash").ladder,
+            Some(&FULL_LADDER[..])
+        );
+        assert_eq!(
             facts("MiniMax-M3.1-Flash-Preview").ladder,
             Some(&FULL_LADDER[..])
         );
@@ -829,7 +835,7 @@ mod tests {
 
     #[test]
     fn the_entry_carries_the_host_flags_but_the_capabilities_do_not() {
-        let entry = catalog_entry(&row("MiniMax-M3.1-Flash-Preview")).expect("entry");
+        let entry = catalog_entry(&row("MiniMax-M3.1-Flash")).expect("entry");
         assert_eq!(entry["canDisableThinking"], json!(false));
         assert_eq!(entry["structuredSafe"], json!(false));
         assert_eq!(entry["contextTokens"], json!(1_000_000));
@@ -837,7 +843,7 @@ mod tests {
         assert_eq!(entry["efforts"], json!(FULL_LADDER));
         assert_eq!(entry["defaultEffort"], json!("max"));
 
-        let caps = capabilities_of(Some(&entry), "MiniMax-M3.1-Flash-Preview");
+        let caps = capabilities_of(Some(&entry), "MiniMax-M3.1-Flash");
         // A strict capability decoder rejects unknown fields, so these must NOT
         // leak into the capability set even though they ride on the entry.
         assert!(caps.get("canDisableThinking").is_none());

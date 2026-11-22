@@ -120,6 +120,7 @@ pub(super) fn canonical_antigravity_model_id(model: &str) -> &str {
     match model.trim() {
         "gemini-pro-orchestrator" => "gemini-4-carbon-high",
         "gemini-pro-orchestrator-argon" => "gemini-4-argon-high",
+        "gemini-pro-orchestrator-neon" => "gemini-4-neon-high",
         "gemini-flash-worker-agy" => "gemini-4-hydrogen-xhigh",
         other => other,
     }
@@ -254,6 +255,8 @@ fn dedicated_identity(source: &str, key: &str) -> bool {
             "qwen-image-",
             "doubao-seedance-",
             "doubao-seedream-",
+            "doubao-embedding-",
+            "doubao-seed3d-",
         ]
         .iter()
         .any(|prefix| key.starts_with(prefix))

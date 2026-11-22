@@ -230,7 +230,7 @@ fn normalize_model_name(name: &str) -> String {
 
 /// The normalized display name of the model a bare default lands on. Produced by
 /// [`normalize_model_name`] from the name as the picker paints it.
-const DEFAULT_MODEL_NAME: &str = "qwen38max";
+const DEFAULT_MODEL_NAME: &str = "qwen4max";
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()

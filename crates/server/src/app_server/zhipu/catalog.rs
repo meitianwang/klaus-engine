@@ -97,7 +97,7 @@ fn facts(model: &str) -> ModelFacts {
         // the only model in the set that actually READ an image — asked to name the
         // colours of a purple field with a white square in it, it answered
         // `BG=#9C0BA8, CENTER=#FFFFFF`, while every other model invented colours.
-        "glm-5.3-flash" => ModelFacts {
+        "glm-5.3-flash" | "glm-5.3-flashx" | "glm-5.3-flashx-legal" => ModelFacts {
             reasoning_known: true,
             context_tokens: 1_048_576,
             can_disable_thinking: false,

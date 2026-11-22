@@ -18,7 +18,7 @@ const WARM_TIMEOUT_MS: u64 = 1500;
 
 /// The product identifier required by authenticated service routes.
 /// The catalog additionally declares its CLI profile when fetching definitions.
-const CLIENT_VERSION: &str = "5.6.2";
+const CLIENT_VERSION: &str = "5.9.2";
 
 /// The entry the service marks as the default. A selection that names no model
 /// resolves here rather than to a hard-coded id, so a service-side change of

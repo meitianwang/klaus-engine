@@ -109,7 +109,7 @@ const CODEX_LEGACY_MAIN_MODEL: &str = "gpt-6-sol";
 /// which lineup the picker can show at all. Pinned below `0.166.0` the account's
 /// `gpt-6.2-sol` and `gpt-6.2-astra` rows are withheld, so follow the current
 /// service gate rather than waiting for requests to fail.
-const CODEX_CLIENT_VERSION: &str = "0.169.1";
+const CODEX_CLIENT_VERSION: &str = "0.171.0";
 
 /// The client version every Codex call announces: the override when it looks like
 /// a version, else the pinned fallback. One reader, because the session's request

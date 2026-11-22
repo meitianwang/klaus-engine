@@ -1132,7 +1132,7 @@ async fn realtime_subscription_capability_selects_the_live_session_protocol() {
     .await;
     assert_eq!(caps["result"]["available"], true, "{caps}");
     assert_eq!(caps["result"]["protocol"], "frameless", "{caps}");
-    assert_eq!(caps["result"]["model"], "gpt-live-1-codex", "{caps}");
+    assert_eq!(caps["result"]["model"], "gpt-live-1.1-codex", "{caps}");
     client.close().await;
 }
 

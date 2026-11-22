@@ -369,7 +369,7 @@ async fn provider(
                     account_id: Some(token.account_id),
                     source_id: "subscription:codex".into(),
                     protocol: Protocol::Frameless,
-                    model: Some("gpt-live-1-codex".into()),
+                    model: Some("gpt-live-1.1-codex".into()),
                     voice: Some("cove".into()),
                     transcription_model: None,
                     extra_headers: Vec::new(),
@@ -774,7 +774,7 @@ async fn start(
         if params.auth_mode.as_deref() == Some("codex") {
             source.model = Some(
                 if protocol == Protocol::Frameless {
-                    "gpt-live-1-codex"
+                    "gpt-live-1.1-codex"
                 } else {
                     "gpt-realtime-1.5"
                 }

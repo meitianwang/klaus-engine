@@ -45,8 +45,8 @@ pub(super) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
 
 /// Hub build claimed by the protocol identity when no installed application
 /// can be inspected. Bump these alongside any re-captured wire baseline.
-const FALLBACK_HUB_VERSION: &str = "2.32.1";
-const FALLBACK_HUB_CL: &str = "1021296516";
+const FALLBACK_HUB_VERSION: &str = "2.34.0";
+const FALLBACK_HUB_CL: &str = "1026637980";
 
 /// The token endpoint sees the Go HTTP stack's default client identity rather
 /// than the hub protocol user agent that every v1internal call carries.
