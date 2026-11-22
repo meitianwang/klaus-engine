@@ -82,10 +82,17 @@ const FULL_LADDER: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// What `glm-5.3` actually accepts. Measured: low/high/max return 200, and
 /// medium/xhigh return 400 `InvalidParameter`.
 const GLM_53_LADDER: [&str; 3] = ["low", "high", "max"];
+/// Documented `output_config.effort` rungs for `qwen4-max` on the Anthropic
+/// Messages wire (`low`, `high` default, `xhigh`; `medium` maps to `high` and
+/// `max` maps to `xhigh`).
+const QWEN4_MAX_LADDER: [&str; 3] = ["low", "high", "xhigh"];
+/// Documented reasoning effort rungs for `qwen4-max-preview` (alias
+/// `qwen4.0-max-preview`): `low`, `medium` and `xhigh` (default).
+const QWEN4_PREVIEW_LADDER: [&str; 3] = ["low", "medium", "xhigh"];
 
-/// One measured model: context window, whether thinking can be turned off,
-/// whether it reads images, which effort rungs it accepts, and whether it takes
-/// the native structured-output shape.
+/// One measured or documented model: context window, whether thinking can be
+/// turned off, whether it reads images, which effort rungs it accepts, and
+/// whether it takes the native structured-output shape.
 struct ModelFacts {
     reasoning_known: bool,
     context_tokens: i64,
@@ -93,19 +100,50 @@ struct ModelFacts {
     vision: bool,
     /// `None` means the full ladder.
     ladder: Option<&'static [&'static str]>,
+    /// `None` means the top rung of `ladder`.
+    default_effort: Option<&'static str>,
     native_structured_output: bool,
 }
 
-/// The measured matrix.
+/// The measured and documented matrix.
 ///
 /// Context windows are the service's OWN stated input ceiling, read out of its
-/// refusal message (`Range of input length should be [1, N]`) rather than from a
-/// marketing page — that is the number the engine must not pack past, because
-/// overshooting it kills a turn with a provider 400 instead of compacting. The
-/// qwen family's 983616 independently matches the value Bailian's own Claude Code
-/// preset sets for `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
+/// refusal message (`Range of input length should be [1, N]`) or published
+/// thinking-mode input limit rather than from a marketing page — that is the
+/// number the engine must not pack past, because overshooting it kills a turn
+/// with a provider 400 instead of compacting. The qwen family's 983616
+/// independently matches the value Bailian's own Claude Code preset sets for
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
 fn facts(model: &str) -> ModelFacts {
     match model {
+        // Documented flagship multimodal model: accepts text, image and video
+        // input, 1M context with 983,616 max input tokens in thinking mode,
+        // `thinking: {"type": "disabled"}` on the Anthropic Messages wire, and
+        // `output_config.effort` rungs `low` / `high` (default) / `xhigh`.
+        "qwen4-max" | "qwen4.0-max" => ModelFacts {
+            reasoning_known: true,
+            context_tokens: 983_616,
+            can_disable_thinking: true,
+            vision: true,
+            ladder: Some(&QWEN4_MAX_LADDER),
+            default_effort: Some("high"),
+            native_structured_output: false,
+        },
+        // Documented Token Plan preview multimodal model (and its billing alias):
+        // accepts text, image and video input, 1M context, and reasoning effort
+        // rungs `low` / `medium` / `xhigh` (default). Disabling thinking is not
+        // documented on the preview page, so leave it false so the picker does
+        // not offer an unverified off rung and an unmapped low tier pins titles
+        // to `qwen3.8-flash`.
+        "qwen4-max-preview" | "qwen4.0-max-preview" => ModelFacts {
+            reasoning_known: true,
+            context_tokens: 983_616,
+            can_disable_thinking: false,
+            vision: true,
+            ladder: Some(&QWEN4_PREVIEW_LADDER),
+            default_effort: Some("xhigh"),
+            native_structured_output: false,
+        },
         // `auto` is the platform's routing model: it accepted every rung, took an
         // image and answered its colour, turned thinking off cleanly, and honoured
         // the native JSON schema.
@@ -115,6 +153,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: true,
             ladder: None,
+            default_effort: None,
             native_structured_output: true,
         },
         // Measured: rejects an image block outright ("Unexpected item type in
@@ -125,6 +164,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: false,
             ladder: None,
+            default_effort: None,
             native_structured_output: true,
         },
         // Measured: refuses `thinking:{"type":"disabled"}` with
@@ -138,6 +178,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: false,
             vision: false,
             ladder: Some(&GLM_53_LADDER),
+            default_effort: None,
             native_structured_output: true,
         },
         "glm-5.2" => ModelFacts {
@@ -146,6 +187,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: false,
             ladder: None,
+            default_effort: None,
             native_structured_output: true,
         },
         "deepseek-v4-pro" => ModelFacts {
@@ -154,6 +196,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: false,
             ladder: None,
+            default_effort: None,
             native_structured_output: true,
         },
         "deepseek-v4-flash-0731" => ModelFacts {
@@ -162,6 +205,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: false,
             ladder: None,
+            default_effort: None,
             native_structured_output: true,
         },
         // The mirror image of glm-5.3: it refused the NATIVE shape with
@@ -173,6 +217,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: true,
             ladder: None,
+            default_effort: None,
             native_structured_output: false,
         },
         // An unknown model — a team-edition key lists kimi/glm-5.1/MiniMax that a
@@ -189,6 +234,7 @@ fn facts(model: &str) -> ModelFacts {
             can_disable_thinking: true,
             vision: false,
             ladder: None,
+            default_effort: None,
             native_structured_output: false,
         },
     }
@@ -312,6 +358,21 @@ async fn fetch_live_models() -> Result<Vec<Value>, BailianError> {
     Ok(models)
 }
 
+fn apply_facts(facts: &ModelFacts, entry: &mut Map<String, Value>) {
+    entry.insert("contextTokens".into(), json!(facts.context_tokens));
+    entry.insert("is_vl".into(), json!(facts.vision));
+    if facts.reasoning_known {
+        entry.insert(
+            "canDisableThinking".into(),
+            json!(facts.can_disable_thinking),
+        );
+        let ladder: &[&str] = facts.ladder.unwrap_or(&FULL_LADDER);
+        let default_effort = facts.default_effort.unwrap_or(ladder[ladder.len() - 1]);
+        entry.insert("efforts".into(), json!(ladder));
+        entry.insert("defaultEffort".into(), json!(default_effort));
+    }
+}
+
 /// Project one catalog row onto the entry the picker and capability reader use.
 ///
 /// Rows for models that cannot serve a conversation are dropped here, so no caller
@@ -330,23 +391,29 @@ fn catalog_entry(model: &Value) -> Option<Value> {
     entry.insert("key".into(), json!(key));
     // The catalog carries no display name, so the id is the label.
     entry.insert("display_name".into(), json!(key));
-    entry.insert("contextTokens".into(), json!(facts.context_tokens));
-    entry.insert("is_vl".into(), json!(facts.vision));
-    if facts.reasoning_known {
-        entry.insert(
-            "canDisableThinking".into(),
-            json!(facts.can_disable_thinking),
-        );
-    }
-    if facts.reasoning_known {
-        let ladder: &[&str] = facts.ladder.unwrap_or(&FULL_LADDER);
-        entry.insert("efforts".into(), json!(ladder));
-        // Every model in the measured set thinks by default and honours the top rung,
-        // so the ladder's head is a sensible default rather than an invented one.
-        entry.insert("defaultEffort".into(), json!(ladder[ladder.len() - 1]));
-    }
+    apply_facts(&facts, &mut entry);
     super::super::conversation_catalog::mark_purpose("bailian", model, &mut entry);
     Some(Value::Object(entry))
+}
+
+fn refresh_known_entry(mut model: Value) -> Value {
+    let Some(key) = model
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return model;
+    };
+    let facts = facts(&key);
+    if !facts.reasoning_known {
+        return model;
+    }
+    if let Some(entry) = model.as_object_mut() {
+        apply_facts(&facts, entry);
+    }
+    model
 }
 
 fn owned_catalog_path() -> std::path::PathBuf {
@@ -366,6 +433,9 @@ fn read_local_models() -> Vec<Value> {
         })
         .and_then(|value| value.get("models").and_then(Value::as_array).cloned())
         .unwrap_or_default()
+        .into_iter()
+        .map(refresh_known_entry)
+        .collect()
 }
 
 fn write_owned_catalog(models: &[Value], fingerprint: &str) {
@@ -687,7 +757,11 @@ pub async fn model_capabilities(key: &str) -> Value {
 /// measured matrix rather than against a copy of this code.
 pub fn capabilities_of(entry: Option<&Value>, key: &str) -> Value {
     let facts = facts(key);
-    let window = context_window(entry);
+    let window = entry
+        .and_then(|model| model.get("contextTokens"))
+        .and_then(Value::as_i64)
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(facts.context_tokens);
     let mut capabilities = json!({
         "vision": facts.vision,
         "contextWindow": window,
@@ -736,6 +810,13 @@ pub fn capabilities_of(entry: Option<&Value>, key: &str) -> Value {
             }
             capabilities["effort"] = effort;
         }
+    } else if facts.reasoning_known {
+        let ladder: &[&str] = facts.ladder.unwrap_or(&FULL_LADDER);
+        let default_effort = facts.default_effort.unwrap_or(ladder[ladder.len() - 1]);
+        capabilities["effort"] = json!({
+            "levels": ladder,
+            "default": default_effort,
+        });
     }
     // `canDisableThinking` is deliberately NOT carried into the capability set: the
     // engine's capability decoder is strict and rejects an unknown field, which
@@ -867,6 +948,10 @@ mod tests {
         // qwen3.7-max refused the image block outright and the glm/deepseek rows
         // answered "White"/"unanswerable", i.e. they did not see it.
         for sees in [
+            "qwen4-max",
+            "qwen4.0-max",
+            "qwen4-max-preview",
+            "qwen4.0-max-preview",
             "qwen3.8-max",
             "qwen3.8-flash",
             "qwen3.7-plus",
@@ -874,6 +959,11 @@ mod tests {
             "deepseek-v4.1-flash",
         ] {
             assert_eq!(entry_of(sees)["is_vl"], json!(true), "{sees} reads images");
+            assert_eq!(
+                capabilities_of(Some(&entry_of(sees)), sees)["vision"],
+                json!(true),
+                "{sees} declares vision capability"
+            );
         }
         for blind in ["qwen3.7-max", "glm-5.3", "glm-5.2", "deepseek-v4-pro"] {
             assert_eq!(entry_of(blind)["is_vl"], json!(false), "{blind} does not");
@@ -951,6 +1041,8 @@ mod tests {
             "geminiThinking",
         ];
         for model in [
+            "qwen4-max",
+            "qwen4-max-preview",
             "qwen3.8-max",
             "glm-5.3",
             "glm-5.2",
@@ -1011,7 +1103,13 @@ mod tests {
             !structured_output_safe("glm-5.3"),
             "glm-5.3 refuses the shape a structured request must send"
         );
+        assert!(
+            !structured_output_safe("qwen4-max-preview"),
+            "preview leaves disabling thinking undocumented so unmapped low tier pins to flash"
+        );
         for model in [
+            "qwen4-max",
+            "qwen4.0-max",
             "qwen3.8-flash",
             "qwen3.8-max",
             "qwen3.7-plus",
@@ -1097,5 +1195,81 @@ mod tests {
         assert!(entry.get("efforts").is_none());
         assert!(entry.get("defaultEffort").is_none());
         assert!(entry.get("canDisableThinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn qwen4_lineup_declares_documented_capabilities_and_upgrades_stale_snapshots() {
+        use crate::app_server::catalog_test_support::store_credential;
+
+        for id in ["qwen4-max", "qwen4.0-max"] {
+            let entry = entry_of(id);
+            assert_eq!(entry["is_vl"], json!(true));
+            assert_eq!(entry["contextTokens"], json!(983_616));
+            assert_eq!(entry["canDisableThinking"], json!(true));
+            assert_eq!(entry["efforts"], json!(["low", "high", "xhigh"]));
+            assert_eq!(entry["defaultEffort"], json!("high"));
+            let caps = capabilities_of(None, id);
+            assert_eq!(caps["vision"], json!(true));
+            assert_eq!(caps["contextWindow"], json!(983_616));
+            assert_eq!(
+                caps["effort"],
+                json!({ "levels": ["low", "high", "xhigh"], "default": "high" })
+            );
+        }
+
+        for id in ["qwen4-max-preview", "qwen4.0-max-preview"] {
+            let entry = entry_of(id);
+            assert_eq!(entry["is_vl"], json!(true));
+            assert_eq!(entry["contextTokens"], json!(983_616));
+            assert_eq!(entry["canDisableThinking"], json!(false));
+            assert_eq!(entry["efforts"], json!(["low", "medium", "xhigh"]));
+            assert_eq!(entry["defaultEffort"], json!("xhigh"));
+            let caps = capabilities_of(None, id);
+            assert_eq!(caps["vision"], json!(true));
+            assert_eq!(caps["contextWindow"], json!(983_616));
+            assert_eq!(
+                caps["effort"],
+                json!({ "levels": ["low", "medium", "xhigh"], "default": "xhigh" })
+            );
+        }
+
+        // A snapshot written before qwen4 entered the table stored fallback
+        // defaults (`contextTokens: 200000`, `is_vl: false`, no efforts). Reading
+        // it upgrades known qwen4 rows in place while preserving unknown rows.
+        let _lock = super::super::test_env_lock().lock().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        super::super::set_config_root(temp.path());
+        store_credential("bailian", temp.path(), "qwen4-snapshot");
+        let stale = vec![
+            json!({
+                "key": "qwen4-max",
+                "display_name": "qwen4-max",
+                "contextTokens": 200_000,
+                "is_vl": false,
+            }),
+            json!({
+                "key": "qwen4-max-preview",
+                "display_name": "qwen4-max-preview",
+                "contextTokens": 200_000,
+                "is_vl": false,
+            }),
+            json!({
+                "key": "custom-team-model",
+                "display_name": "Custom",
+                "contextTokens": 200_000,
+                "is_vl": false,
+            }),
+        ];
+        seed_owned_catalog(&stale);
+        let loaded = read_local_models();
+        assert_eq!(loaded[0]["is_vl"], json!(true));
+        assert_eq!(loaded[0]["contextTokens"], json!(983_616));
+        assert_eq!(loaded[0]["efforts"], json!(["low", "high", "xhigh"]));
+        assert_eq!(loaded[0]["defaultEffort"], json!("high"));
+        assert_eq!(loaded[1]["is_vl"], json!(true));
+        assert_eq!(loaded[1]["contextTokens"], json!(983_616));
+        assert_eq!(loaded[1]["efforts"], json!(["low", "medium", "xhigh"]));
+        assert_eq!(loaded[1]["defaultEffort"], json!("xhigh"));
+        assert_eq!(loaded[2], stale[2]);
     }
 }
