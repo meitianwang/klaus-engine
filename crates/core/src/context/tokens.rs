@@ -221,11 +221,21 @@ pub fn estimate_prefix_tokens(system: &[SystemPromptPart], tools: &[ToolSpec]) -
 /// Once compaction rewrites that request history, those anchors are stale; clear
 /// them until the next real model response supplies a new authoritative usage.
 pub fn invalidate_context_usage(messages: &mut [Message]) {
+    let _ = invalidate_context_usage_changed(messages);
+}
+
+/// Clear cached provider usage anchors and return whether at least one anchor
+/// changed from `Some(_)` to `None`.
+pub fn invalidate_context_usage_changed(messages: &mut [Message]) -> bool {
+    let mut changed = false;
     for message in messages {
         if let Message::Assistant(assistant) = message {
-            assistant.usage = None;
+            if assistant.usage.take().is_some() {
+                changed = true;
+            }
         }
     }
+    changed
 }
 
 #[cfg(test)]

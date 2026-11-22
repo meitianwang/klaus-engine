@@ -78,6 +78,11 @@ struct FrozenHintResults {
     replacements: HashMap<RuntimeString, RuntimeString>,
     persisted: Option<(RuntimeString, Vec<(RuntimeString, RuntimeString)>)>,
     unsupported_models: HashSet<RuntimeString>,
+    /// One-shot flag armed when a main-thread turn starts after the prompt
+    /// cache lifetime has elapsed; consumed before building the cold turn's
+    /// outgoing request so aged reads and images are reclaimed without
+    /// mutating warm prefixes on later turns.
+    cold_reclaim_armed: bool,
 }
 
 /// Session-owned frozen request replacements. Sharing this state across one
@@ -104,9 +109,22 @@ impl ContextHintState {
     }
 
     pub fn snapshot_clone(&self) -> Self {
+        let mut copy = self.inner.lock().unwrap().clone();
+        copy.cold_reclaim_armed = false;
         Self {
-            inner: Mutex::new(self.inner.lock().unwrap().clone()),
+            inner: Mutex::new(copy),
         }
+    }
+
+    /// Arm a one-shot cold-cache reclaim pass for the next main-thread turn.
+    pub fn arm_cold_reclaim(&self) {
+        self.inner.lock().unwrap().cold_reclaim_armed = true;
+    }
+
+    /// Consume the one-shot cold-cache reclaim flag.
+    pub fn take_cold_reclaim_arm(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::replace(&mut inner.cold_reclaim_armed, false)
     }
 
     /// Returns true when a previously bound model changes. The query owner can
@@ -457,7 +475,9 @@ fn result_tokens(content: &[OutputBlock]) -> u64 {
         .iter()
         .map(|block| match block {
             OutputBlock::Text(text) => (text.text.len_utf16() as u64).saturating_add(2) / 4,
-            OutputBlock::Image(_) => 2_000,
+            OutputBlock::Image(image) => {
+                crate::context::images::estimate_image_tokens(image).max(2_000)
+            }
         })
         .sum()
 }
@@ -623,6 +643,78 @@ pub async fn project_hint_edits(
         keep_recent = CONTEXT_HINT_KEEP_RECENT,
         "context hint projection replaced old reconstructible tool results"
     );
+    projection
+}
+
+/// Reclaim aged `read` outputs and image blocks once the provider prompt cache
+/// has expired. Unlike server-hint fallback, cold-cache clearing applies
+/// whenever any aged read/media result sits outside the recent working window
+/// (`keep_recent`, floored at `1`), while leaving non-`read` text results to
+/// [`crate::context::tool_result_budget::ColdReclaim`] so their preview spills
+/// remain intact.
+pub fn project_cold_read_and_media_reclaim(
+    messages: &[Message],
+    keep_recent: usize,
+) -> ContextHintProjection {
+    let keep_recent = keep_recent.max(1);
+    let mut eligible_calls: Vec<(RuntimeString, bool)> = Vec::new();
+    for message in messages {
+        if let Message::Assistant(assistant) = message {
+            for block in &assistant.content {
+                if let ContentBlock::ToolUse(tool) = block {
+                    if eligible_tool(&tool.name) {
+                        let is_read = matches!(
+                            tool.name.try_to_utf8().ok().as_deref(),
+                            Some("Read" | "read")
+                        );
+                        eligible_calls.push((tool.id.clone(), is_read));
+                    }
+                }
+            }
+        }
+    }
+    let keep: HashSet<RuntimeString> = eligible_calls
+        .iter()
+        .rev()
+        .take(keep_recent)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let clear_reads: HashMap<RuntimeString, bool> = eligible_calls
+        .into_iter()
+        .filter(|(id, _)| !keep.contains(id))
+        .collect();
+    if clear_reads.is_empty() {
+        return ContextHintProjection::default();
+    }
+
+    let mut projection = ContextHintProjection::default();
+    visit_results(messages, |id, content| {
+        let Some(&is_read) = clear_reads.get(id) else {
+            return;
+        };
+        if already_replaced(content) {
+            return;
+        }
+        let has_image = content
+            .iter()
+            .any(|block| matches!(block, OutputBlock::Image(_)));
+        if is_read || has_image {
+            projection.estimated_tokens_saved = projection
+                .estimated_tokens_saved
+                .saturating_add(result_tokens(content));
+            projection
+                .replacements
+                .insert(id.clone(), RuntimeString::from(CONTEXT_HINT_CLEARED_MARKER));
+        }
+    });
+    if !projection.replacements.is_empty() {
+        tracing::debug!(
+            cleared = projection.replacements.len(),
+            estimated_tokens_saved = projection.estimated_tokens_saved,
+            keep_recent,
+            "cold-cache pass cleared aged read and image tool results"
+        );
+    }
     projection
 }
 

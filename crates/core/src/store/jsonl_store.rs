@@ -3826,6 +3826,14 @@ pub(crate) struct RolloutMetadataAccumulator {
 }
 
 impl RolloutMetadataAccumulator {
+    pub(crate) fn push_message_id(&mut self, uuid: &RuntimeString) {
+        if let Some(turn_id) = &self.current_turn {
+            self.turn_index
+                .message_turn
+                .insert(uuid.clone(), turn_id.clone());
+        }
+    }
+
     pub(crate) fn push(&mut self, item: &RolloutItem) {
         let Self {
             meta,

@@ -102,6 +102,16 @@ fn check(cancelled: &AtomicBool) -> io::Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkimmedMessageKind {
+    User,
+    Assistant,
+    ToolResult,
+    System,
+    CompactBoundary,
+    Other,
+}
+
 #[derive(Debug)]
 struct Row {
     offset: u64,
@@ -111,6 +121,8 @@ struct Row {
     replacement: bool,
     approval: bool,
     message_id: Option<RuntimeString>,
+    msg_kind: Option<SkimmedMessageKind>,
+    has_question_answer: bool,
 }
 
 /// A bounded line reader prevents malformed JSON from consuming a following row.
@@ -272,37 +284,64 @@ struct Header {
     replacement: bool,
     approval: bool,
     message_id: Option<RuntimeString>,
+    msg_kind: Option<SkimmedMessageKind>,
+    has_question_answer: bool,
 }
-fn message_id(reader: &mut impl BufRead) -> io::Result<Option<RuntimeString>> {
+fn runtime_string_literal(reader: &mut impl BufRead) -> io::Result<RuntimeString> {
+    let mut value = Vec::new();
+    string(reader, Some(&mut value))?;
+    let source = NodeBufferUtf8::decode(&value);
+    crate::runtime_values::runtime_json::parse(&source)
+        .ok()
+        .and_then(|parsed| parsed.as_string().cloned())
+        .ok_or_else(invalid)
+}
+fn message_meta(
+    reader: &mut impl BufRead,
+) -> io::Result<(Option<RuntimeString>, Option<SkimmedMessageKind>, bool)> {
     if peek(reader)? != b'{' {
         skip(reader, 0)?;
-        return Ok(None);
+        return Ok((None, None, false));
     }
     expect(reader, b'{')?;
     if peek(reader)? == b'}' {
         reader.consume(1);
-        return Ok(None);
+        return Ok((None, None, false));
     }
     let mut id = None;
+    let mut msg_kind = None;
+    let mut has_question_answer = false;
     loop {
         let mut key = Vec::new();
         string(reader, Some(&mut key))?;
         let key: String = serde_json::from_slice(&key).map_err(|_| invalid())?;
         expect(reader, b':')?;
         if key == "uuid" && peek(reader)? == b'"' {
-            let mut value = Vec::new();
-            string(reader, Some(&mut value))?;
-            let value = String::from_utf8(value).map_err(|_| invalid())?;
-            id = crate::runtime_values::runtime_json::parse(&RuntimeString::from(value))
-                .ok()
-                .and_then(|value| value.as_string().cloned());
+            id = Some(runtime_string_literal(reader)?);
+        } else if key == "type" && peek(reader)? == b'"' {
+            let mut raw_type = Vec::new();
+            string(reader, Some(&mut raw_type))?;
+            let parsed_type: String = serde_json::from_slice(&raw_type).map_err(|_| invalid())?;
+            msg_kind = Some(match parsed_type.as_str() {
+                "user" => SkimmedMessageKind::User,
+                "assistant" => SkimmedMessageKind::Assistant,
+                "tool_result" => SkimmedMessageKind::ToolResult,
+                "system" => SkimmedMessageKind::System,
+                "compact_boundary" => SkimmedMessageKind::CompactBoundary,
+                _ => SkimmedMessageKind::Other,
+            });
+        } else if key == "questionAnswer" {
+            if peek(reader)? != b'n' {
+                has_question_answer = true;
+            }
+            skip(reader, 0)?;
         } else {
             skip(reader, 0)?;
         }
         let byte = peek(reader)?;
         reader.consume(1);
         if byte == b'}' {
-            return Ok(id);
+            return Ok((id, msg_kind, has_question_answer));
         }
         if byte != b',' {
             return Err(invalid());
@@ -316,6 +355,8 @@ fn header(reader: &mut impl BufRead) -> io::Result<Header> {
     let mut replacement = false;
     let mut approval = false;
     let mut uuid = None;
+    let mut msg_kind = None;
+    let mut has_question_answer = false;
     if peek(reader)? == b'}' {
         reader.consume(1);
         return Ok(Header {
@@ -324,6 +365,8 @@ fn header(reader: &mut impl BufRead) -> io::Result<Header> {
             replacement,
             approval,
             message_id: uuid,
+            msg_kind,
+            has_question_answer,
         });
     }
     loop {
@@ -345,7 +388,10 @@ fn header(reader: &mut impl BufRead) -> io::Result<Header> {
                 skip(reader, 0)?;
             }
         } else if key == "message" {
-            uuid = message_id(reader)?;
+            let (parsed_id, parsed_kind, parsed_qa) = message_meta(reader)?;
+            uuid = parsed_id;
+            msg_kind = parsed_kind;
+            has_question_answer = parsed_qa;
         } else {
             if key == "replacementHistory" {
                 replacement = peek(reader)? != b'n';
@@ -370,6 +416,8 @@ fn header(reader: &mut impl BufRead) -> io::Result<Header> {
         replacement,
         approval,
         message_id: uuid,
+        msg_kind,
+        has_question_answer,
     })
 }
 
@@ -398,12 +446,16 @@ fn rows(source: &File, cancelled: &AtomicBool) -> io::Result<Vec<Row>> {
             replacement,
             approval,
             message_id,
+            msg_kind,
+            has_question_answer,
         } = header.unwrap_or(Header {
             kind: String::new(),
             event: None,
             replacement: false,
             approval: false,
             message_id: None,
+            msg_kind: None,
+            has_question_answer: false,
         });
         // Unknown routing must reach the original tolerant decoder. A valid
         // complex row must never disappear solely because the skimmer refused it.
@@ -415,6 +467,8 @@ fn rows(source: &File, cancelled: &AtomicBool) -> io::Result<Vec<Row>> {
             replacement,
             approval,
             message_id,
+            msg_kind,
+            has_question_answer,
         });
         offset += line.len;
     }
@@ -449,6 +503,214 @@ fn read_row(file: &mut File, row: &Row, cancelled: &AtomicBool) -> io::Result<Op
     Ok(parse_rollout_line(&text))
 }
 
+struct CancelTake<'a, R> {
+    reader: io::Take<R>,
+    cancelled: &'a AtomicBool,
+}
+impl<R: Read> Read for CancelTake<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        check(self.cancelled)?;
+        self.reader.read(out)
+    }
+}
+
+fn read_u64_scalar(reader: &mut impl BufRead) -> io::Result<u64> {
+    let mut digits = Vec::new();
+    let first = peek(reader)?;
+    if !first.is_ascii_digit() {
+        return Err(invalid());
+    }
+    loop {
+        let bytes = reader.fill_buf()?;
+        let take_len = bytes
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(bytes.len());
+        if take_len == 0 {
+            break;
+        }
+        digits.extend_from_slice(&bytes[..take_len]);
+        reader.consume(take_len);
+    }
+    std::str::from_utf8(&digits)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(invalid)
+}
+
+fn skim_obsolete_compacted(
+    file: &mut File,
+    row: &Row,
+    cancelled: &AtomicBool,
+    slots: &mut Vec<QuestionSlot>,
+) -> io::Result<bool> {
+    check(cancelled)?;
+    file.seek(SeekFrom::Start(row.offset))?;
+    let bounded = CancelTake {
+        reader: Read::by_ref(file).take(row.len),
+        cancelled,
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, bounded);
+    struct SkimmedCompacted {
+        replaced_range: (u64, u64),
+        replacement_ids: Option<Vec<RuntimeString>>,
+        source_ids: Option<HashSet<RuntimeString>>,
+    }
+    let result = (|| -> io::Result<Option<SkimmedCompacted>> {
+        expect(&mut reader, b'{')?;
+        let mut is_compacted = false;
+        let mut has_summary = false;
+        let mut replaced_range = None;
+        let mut replacement_ids: Option<Vec<RuntimeString>> = None;
+        let mut source_ids: Option<HashSet<RuntimeString>> = None;
+        if peek(&mut reader)? == b'}' {
+            return Ok(None);
+        }
+        loop {
+            let mut key_bytes = Vec::new();
+            string(&mut reader, Some(&mut key_bytes))?;
+            let field: String = serde_json::from_slice(&key_bytes).map_err(|_| invalid())?;
+            expect(&mut reader, b':')?;
+            match field.as_str() {
+                "kind" if peek(&mut reader)? == b'"' => {
+                    let mut val = Vec::new();
+                    string(&mut reader, Some(&mut val))?;
+                    let kind: String = serde_json::from_slice(&val).map_err(|_| invalid())?;
+                    is_compacted = kind == "compacted";
+                }
+                "summary" if peek(&mut reader)? == b'"' => {
+                    string(&mut reader, None)?;
+                    has_summary = true;
+                }
+                "replacedRange" if peek(&mut reader)? == b'[' => {
+                    expect(&mut reader, b'[')?;
+                    let start = read_u64_scalar(&mut reader)?;
+                    expect(&mut reader, b',')?;
+                    let end = read_u64_scalar(&mut reader)?;
+                    expect(&mut reader, b']')?;
+                    replaced_range = Some((start, end));
+                }
+                "sourceMessageIds" if peek(&mut reader)? == b'[' => {
+                    expect(&mut reader, b'[')?;
+                    let mut set = HashSet::new();
+                    if peek(&mut reader)? == b']' {
+                        reader.consume(1);
+                    } else {
+                        loop {
+                            set.insert(runtime_string_literal(&mut reader)?);
+                            let sep = peek(&mut reader)?;
+                            reader.consume(1);
+                            if sep == b']' {
+                                break;
+                            }
+                            if sep != b',' {
+                                return Err(invalid());
+                            }
+                        }
+                    }
+                    source_ids = Some(set);
+                }
+                "replacementHistory" if peek(&mut reader)? == b'[' => {
+                    expect(&mut reader, b'[')?;
+                    let mut ids = Vec::new();
+                    if peek(&mut reader)? == b']' {
+                        reader.consume(1);
+                    } else {
+                        loop {
+                            let (msg_id, msg_kind, has_qa) = message_meta(&mut reader)?;
+                            if has_qa {
+                                // Fall back to full decode so questionAnswer messages are retained.
+                                return Ok(None);
+                            }
+                            let (Some(msg_id), Some(kind)) = (msg_id, msg_kind) else {
+                                return Ok(None);
+                            };
+                            if kind == SkimmedMessageKind::Other {
+                                return Ok(None);
+                            }
+                            ids.push(msg_id);
+                            let sep = peek(&mut reader)?;
+                            reader.consume(1);
+                            if sep == b']' {
+                                break;
+                            }
+                            if sep != b',' {
+                                return Err(invalid());
+                            }
+                        }
+                    }
+                    replacement_ids = Some(ids);
+                }
+                _ => skip(&mut reader, 0)?,
+            }
+            let sep = peek(&mut reader)?;
+            reader.consume(1);
+            if sep == b'}' {
+                break;
+            }
+            if sep != b',' {
+                return Err(invalid());
+            }
+        }
+        let Some(range) = replaced_range else {
+            return Ok(None);
+        };
+        if !is_compacted || !has_summary {
+            return Ok(None);
+        }
+        Ok(Some(SkimmedCompacted {
+            replaced_range: range,
+            replacement_ids,
+            source_ids,
+        }))
+    })();
+    match result {
+        Ok(Some(SkimmedCompacted {
+            replaced_range,
+            replacement_ids,
+            source_ids,
+        })) => {
+            if let Some(ids) = replacement_ids {
+                let mut next: Vec<QuestionSlot> = ids
+                    .into_iter()
+                    .map(|id| QuestionSlot { id, answer: None })
+                    .collect();
+                if let Some(source) = source_ids {
+                    let mut retained: HashSet<RuntimeString> =
+                        next.iter().map(|slot| slot.id.clone()).collect();
+                    for slot in slots.drain(..) {
+                        if slot.answer.is_some()
+                            && !source.contains(&slot.id)
+                            && retained.insert(slot.id.clone())
+                        {
+                            next.push(slot);
+                        }
+                    }
+                }
+                *slots = next;
+            } else {
+                let start = usize::try_from(replaced_range.0)
+                    .unwrap_or(usize::MAX)
+                    .min(slots.len());
+                let end = usize::try_from(replaced_range.1)
+                    .unwrap_or(usize::MAX)
+                    .clamp(start, slots.len());
+                slots.splice(
+                    start..end,
+                    [QuestionSlot {
+                        id: format!("compact-{}-{}", replaced_range.0, replaced_range.1).into(),
+                        answer: None,
+                    }],
+                );
+            }
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(error),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Reconstruct all lifetime state while decoding at most one obsolete snapshot:
 /// the newest authoritative review checkpoint. Rollbacks retain complete real
 /// model input so review boundary resolution never receives a sparse prefix.
@@ -465,17 +727,28 @@ pub(crate) fn load(
         .any(|row| row.kind == "rollback" || row.kind.is_empty());
     let mut approval_start = None;
     let mut model_start = None;
+    let mut cached_rows: HashMap<usize, Option<RolloutItem>> = HashMap::new();
     for (index, row) in rows.iter().enumerate().rev() {
         check(cancelled)?;
         if approval_start.is_none()
             && (row.event.as_deref() == Some("approval_parent_history")
                 || (row.kind == "compacted" && row.approval))
-            && read_row(&mut source, row, cancelled)?.is_some()
         {
-            approval_start = Some(index);
+            if let std::collections::hash_map::Entry::Vacant(entry) = cached_rows.entry(index) {
+                let decoded = read_row(&mut source, row, cancelled)?;
+                entry.insert(decoded);
+            }
+            if cached_rows.get(&index).and_then(Option::as_ref).is_some() {
+                approval_start = Some(index);
+            }
         }
         if model_start.is_none() && row.kind == "compacted" && row.replacement && row.approval {
-            if let Some(RolloutItem::Compacted(compacted)) = read_row(&mut source, row, cancelled)?
+            if let std::collections::hash_map::Entry::Vacant(entry) = cached_rows.entry(index) {
+                let decoded = read_row(&mut source, row, cancelled)?;
+                entry.insert(decoded);
+            }
+            if let Some(RolloutItem::Compacted(compacted)) =
+                cached_rows.get(&index).and_then(Option::as_ref)
             {
                 if let Some(checkpoint) = &compacted.approval_parent_history {
                     crate::engine::approval_capture::ReviewParentCheckpoint::from_runtime_value(
@@ -520,7 +793,39 @@ pub(crate) fn load(
         {
             continue;
         }
-        let Some(item) = read_row(&mut source, row, cancelled)? else {
+        if index < model_start && index < evidence_start {
+            if row.kind == "message" {
+                if let (Some(id), Some(msg_kind)) = (&row.message_id, row.msg_kind) {
+                    let skippable = matches!(
+                        msg_kind,
+                        SkimmedMessageKind::ToolResult
+                            | SkimmedMessageKind::System
+                            | SkimmedMessageKind::CompactBoundary
+                    ) || (msg_kind == SkimmedMessageKind::User
+                        && !row.has_question_answer);
+                    if skippable {
+                        state.push_message_id(id);
+                        if msg_kind == SkimmedMessageKind::User {
+                            users.insert(id.clone());
+                        }
+                        question_slots.push(QuestionSlot {
+                            id: id.clone(),
+                            answer: None,
+                        });
+                        continue;
+                    }
+                }
+            } else if row.kind == "compacted"
+                && skim_obsolete_compacted(&mut source, row, cancelled, &mut question_slots)?
+            {
+                continue;
+            }
+        }
+        let decoded = match cached_rows.remove(&index) {
+            Some(cached) => cached,
+            None => read_row(&mut source, row, cancelled)?,
+        };
+        let Some(item) = decoded else {
             continue;
         };
         if !billing_meta_seen {
@@ -547,12 +852,17 @@ pub(crate) fn load(
         }
         match &item {
             RolloutItem::Message { .. } | RolloutItem::Compacted(_) | RolloutItem::Rollback(_) => {
-                if index >= model_start {
-                    model_items.push(item.clone());
-                }
+                let keep_model = index >= model_start;
                 let original_answer = matches!(&item, RolloutItem::Message { message: Message::User(user) } if user.question_answer.is_some());
-                if index >= evidence_start || original_answer {
-                    recovery_items.push(item);
+                let keep_recovery = index >= evidence_start || original_answer;
+                match (keep_model, keep_recovery) {
+                    (true, true) => {
+                        model_items.push(item.clone());
+                        recovery_items.push(item);
+                    }
+                    (true, false) => model_items.push(item),
+                    (false, true) => recovery_items.push(item),
+                    (false, false) => {}
                 }
             }
             _ => {

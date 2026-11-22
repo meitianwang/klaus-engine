@@ -1081,6 +1081,7 @@ async fn claude(
 /// something actually needs to disable thinking here.
 fn claude_capabilities(model: &str) -> Value {
     let base = |effort_levels: &[&str],
+                default_effort: Option<&str>,
                 one_million: bool,
                 task_budgets: bool,
                 context_window: i64,
@@ -1099,42 +1100,64 @@ fn claude_capabilities(model: &str) -> Value {
             "thinking": {
                 "adaptive": !effort_levels.is_empty(),
                 "interleaved": true,
-                "canDisableThinking": true,
+                "canDisableThinking": !matches!(
+                    model,
+                    CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_HAIKU | "claude-fable-5-1"
+                ),
             },
         });
         if !effort_levels.is_empty() {
-            caps["effort"] = json!({ "levels": effort_levels });
+            let mut effort = json!({ "levels": effort_levels });
+            if let Some(default) = default_effort {
+                effort["default"] = json!(default);
+            }
+            caps["effort"] = effort;
         }
         caps
     };
     let mut caps = match model {
         "claude-sonnet-5" => base(
             &["low", "medium", "high", "xhigh", "max"],
+            Some("high"),
             true,
             false,
             1_000_000,
             128_000,
         ),
-        "claude-haiku-4-5" => base(&[], false, false, 200_000, 64_000),
-        // Known current models share this measured capability set.
-        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU | "claude-fable-5-1"
-        | "claude-opus-5" | "claude-opus-4-8" => base(
+        "claude-haiku-4-5" => base(&[], None, false, false, 200_000, 64_000),
+        // Current 5.2 / 5.5 generation defaults to `medium` effort to balance
+        // multi-step tool latency and adaptive reasoning depth while keeping
+        // `high`, `xhigh`, and `max` selectable on the ladder.
+        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU => base(
             &["low", "medium", "high", "xhigh", "max"],
+            Some("medium"),
+            true,
+            true,
+            1_000_000,
+            128_000,
+        ),
+        "claude-fable-5-1" | "claude-opus-5" | "claude-opus-4-8" => base(
+            &["low", "medium", "high", "xhigh", "max"],
+            Some("high"),
             true,
             true,
             1_000_000,
             128_000,
         ),
         // A newly discovered id must not inherit another model's reasoning ladder.
-        _ => base(&[], true, true, 1_000_000, 128_000),
+        _ => base(&[], None, true, true, 1_000_000, 128_000),
     };
     caps["fastMode"] = json!(matches!(
         model,
         "claude-fable-5-2" | "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8"
     ));
+    let max_image_dim = match model {
+        CLAUDE_FABLE | CLAUDE_OPUS | CLAUDE_SONNET | CLAUDE_HAIKU => 2576,
+        _ => 2000,
+    };
     caps["imageLimits"] = json!({
-        "maxWidth": 2000,
-        "maxHeight": 2000,
+        "maxWidth": max_image_dim,
+        "maxHeight": max_image_dim,
         "maxBase64Size": 5_242_880,
     });
     // Only the source's known extended-context models advertise the larger
@@ -1278,6 +1301,13 @@ fn claude_lineup_entry(alias: &str, label: &str, model: &str, tier: Option<&str>
             .map(|thinking| !thinking.is_null())
             .unwrap_or(false),
     });
+    if let Some(default_effort) = caps
+        .get("effort")
+        .and_then(|effort| effort.get("default"))
+        .and_then(Value::as_str)
+    {
+        entry["defaultEffort"] = json!(default_effort);
+    }
     if let Some(tier) = tier {
         entry["tier"] = json!(tier);
     }
@@ -2567,6 +2597,12 @@ mod tests {
                 "{}",
                 entry["model"]
             );
+            assert_eq!(
+                entry["defaultEffort"],
+                json!("medium"),
+                "{}",
+                entry["model"]
+            );
         }
         assert_eq!(models[0]["label"], json!("Fable 5.2"));
         assert_eq!(models[1]["label"], json!("Opus 5.5"));
@@ -2604,17 +2640,25 @@ mod tests {
 
     #[test]
     fn claude_source_declares_media_limits_from_known_model_facts() {
-        for model in [
-            CLAUDE_FABLE,
-            CLAUDE_OPUS,
-            CLAUDE_SONNET,
-            CLAUDE_HAIKU,
-            "claude-sonnet-5",
+        for (model, expected_dim) in [
+            (CLAUDE_FABLE, 2_576),
+            (CLAUDE_OPUS, 2_576),
+            (CLAUDE_SONNET, 2_576),
+            (CLAUDE_HAIKU, 2_576),
+            ("claude-sonnet-5", 2_000),
         ] {
             let caps = claude_capabilities(model);
             assert_eq!(caps["maxMediaBlocks"], json!(600), "{model}");
-            assert_eq!(caps["imageLimits"]["maxWidth"], json!(2_000));
-            assert_eq!(caps["imageLimits"]["maxHeight"], json!(2_000));
+            assert_eq!(
+                caps["imageLimits"]["maxWidth"],
+                json!(expected_dim),
+                "{model}"
+            );
+            assert_eq!(
+                caps["imageLimits"]["maxHeight"],
+                json!(expected_dim),
+                "{model}"
+            );
             assert_eq!(caps["imageLimits"]["maxBase64Size"], json!(5_242_880));
             assert!(caps["imageLimits"].get("targetRawSize").is_none());
         }

@@ -837,3 +837,6 @@ mod r20261122_mcp_reply_post_ack;
 
 #[path = "regressions/r20261122_repair_boundary_cold_ratelimit_compact_and_prediction_storm.rs"]
 mod r20261122_repair_boundary_cold_ratelimit_compact_and_prediction_storm;
+
+#[path = "regressions/r20261122_image_budget_and_large_rollout_resume.rs"]
+mod r20261122_image_budget_and_large_rollout_resume;

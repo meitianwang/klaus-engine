@@ -1839,15 +1839,20 @@ impl Session {
         // prompt cache has certainly expired, so the whole prefix re-sends
         // regardless and the budget pass may trade aged full-size results down
         // to their persisted previews at no extra cache cost.
-        if initial_bundle.config.effective_aggregate_tool_results()
-            && this.config.reclaim_tool_results_when_cache_cold
+        let cold_reclaim_due = this.config.reclaim_tool_results_when_cache_cold
             && this
                 .turn
-                .cold_cache_reclaim_due((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS)
-        {
+                .cold_cache_reclaim_due((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS);
+        if initial_bundle.config.effective_aggregate_tool_results() && cold_reclaim_due {
             this.tool_result_budget_state()
                 .lock_recover()
                 .arm_cold_reclaim();
+        }
+        if initial_bundle.config.context_hints
+            && this.meta.role != Some(crate::schemas::rollout::SessionRole::SideTask)
+            && cold_reclaim_due
+        {
+            this.context_hint_state.arm_cold_reclaim();
         }
         let params = QueryParams {
             reply_gate: Some(main_reply_gate.clone()),

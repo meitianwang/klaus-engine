@@ -1360,10 +1360,7 @@ impl ModelProvider for AnthropicProvider {
                 }
             };
 
-            let effort_level = req
-                .effort
-                .clone()
-                .and_then(|e| resolve_effort_level(e, &capabilities));
+            let effort_level = effective_effort_level(&req, &capabilities, is_first_party);
             let wire_thinking = resolve_wire_thinking(
                 &req,
                 &capabilities,
@@ -3628,6 +3625,33 @@ fn build_params_with_media_limits(
     Ok(map)
 }
 
+fn effective_effort_level(
+    req: &ModelRequest,
+    capabilities: &ModelCapabilities,
+    is_first_party: bool,
+) -> Option<EffortLevel> {
+    if let Some(explicit) = req
+        .effort
+        .clone()
+        .and_then(|effort| resolve_effort_level(effort, capabilities))
+    {
+        return Some(explicit);
+    }
+    if is_first_party
+        && matches!(
+            req.thinking,
+            Some(ThinkingConfig::Adaptive | ThinkingConfig::Enabled { .. })
+        )
+    {
+        return capabilities
+            .effort
+            .as_ref()
+            .and_then(|effort| effort.default)
+            .and_then(|default| resolve_effort_level(EffortValue::Level(default), capabilities));
+    }
+    None
+}
+
 fn build_output_config(
     req: &ModelRequest,
     capabilities: &ModelCapabilities,
@@ -3635,11 +3659,7 @@ fn build_output_config(
     is_first_party: bool,
 ) -> Map {
     let mut output_config = Map::new();
-    if let Some(level) = req
-        .effort
-        .clone()
-        .and_then(|effort| resolve_effort_level(effort, capabilities))
-    {
+    if let Some(level) = effective_effort_level(req, capabilities, is_first_party) {
         output_config.insert("effort", vs(level.as_str()));
     }
     if use_native {

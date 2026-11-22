@@ -673,7 +673,7 @@ async fn run_turn(
     }
     if let Some(state) = &shared.params.context_hint_state {
         let model = shared.turn_context.lock_recover().model.clone();
-        if state.bind_model(&model) {
+        if state.bind_model(&model) && !messages.is_empty() {
             let source_ids = messages
                 .iter()
                 .map(super::query_message_uuid)
@@ -681,6 +681,36 @@ async fn run_turn(
                 .collect();
             invalidate_context_usage(&mut messages);
             persist_history_repair(&shared.params, &messages, source_ids).await;
+        }
+        // Always consume the one-shot cold-cache arm so a mid-session config
+        // flip cannot fire a stale reclaim on a warm turn.
+        let cold_armed = state.take_cold_reclaim_arm();
+        if cold_armed
+            && shared.params.agent_id.is_none()
+            && shared.config().reclaim_tool_results_when_cache_cold
+        {
+            let projection = crate::context::context_hints::project_cold_read_and_media_reclaim(
+                &messages,
+                shared.config().reclaim_tool_results_keep_recent as usize,
+            );
+            if !projection.replacements.is_empty() {
+                let permission_cwd = shared.cwd.clone();
+                let intent = crate::context::context_hints::ContextHintRequest {
+                    enabled: true,
+                    main_thread: true,
+                    artifact_dir: None,
+                    cwd: permission_cwd,
+                    read_state: shared.params.file_state.clone(),
+                    state: state.clone(),
+                };
+                state.record_projection(&model, &projection);
+                crate::context::context_hints::invalidate_cleared_reads(
+                    &messages,
+                    &projection,
+                    &intent,
+                );
+                let _ = crate::context::tokens::invalidate_context_usage_changed(&mut messages);
+            }
         }
     }
     let turn_user_uuid = messages.iter().rev().find_map(|message| match message {

@@ -42,8 +42,10 @@ const DEFAULT_MAX_BYTES: u64 = 256 * 1024;
 /// whose numbered output would exceed this is refused with guidance to narrow it
 /// via `offset`/`limit`.
 const DEFAULT_MAX_TOKENS: usize = 25_000;
-/// Cap for image files read as base64 blocks (5 MB default).
-const DEFAULT_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Safety cap on raw source image files read from disk (32 MiB default).
+/// Decodable images within this ceiling are resized and compressed to fit the
+/// per-image token and byte budgets instead of failing at 5 MB.
+const DEFAULT_MAX_IMAGE_BYTES: u64 = crate::context::images::READ_IMAGE_MAX_SOURCE_BYTES;
 
 /// The static, model-facing description (becomes the ToolSpec description).
 const READ_DESCRIPTION: &str = "Read a file. Text files return contents prefixed with line numbers; image files (png/jpg/jpeg/gif/webp) return an image. Small PDFs can be delivered natively when the model supports PDFs; use pages with a bounded, 1-based range to render selected PDF pages as images when needed (requires vision). Large PDFs require selected page ranges. Other binary formats are refused. For a large text file, read only the range you need with offset/limit rather than the whole file. Avoid redundant reads solely to confirm that a successful edit/write call completed; inspect the current contents when needed to validate the requested behavior, resolve uncertainty, or account for concurrent changes.";
@@ -309,6 +311,21 @@ impl Tool for ReadTool {
         // and the request layer swaps in a per-request omission note, so
         // switching to a vision model restores the image without a re-read.
         if let Some(mime_type) = image_mime(&ext) {
+            if size == 0 {
+                return Ok(text_result(
+                    read_output(
+                        &abs,
+                        true,
+                        Some("image"),
+                        [("mimeType", RuntimeJson::from(mime_type))],
+                    ),
+                    concat_runtime(&[
+                        RuntimeString::from("Image file is empty (0 bytes): "),
+                        path.clone(),
+                    ]),
+                    true,
+                ));
+            }
             if size > self.max_image_bytes {
                 return Ok(text_result(
                     read_output(
@@ -331,7 +348,49 @@ impl Tool for ReadTool {
             let buf = tokio::fs::read(&os_abs)
                 .await
                 .map_err(|e| ToolError::new(e.to_string()))?;
-            let b64 = BASE64_STANDARD.encode(&buf);
+            let prepared_result =
+                if buf.len() <= crate::context::images::IMAGE_BEST_EFFORT_RAW_BYTES {
+                    crate::context::images::prepare_read_image_bytes(
+                        &buf,
+                        mime_type,
+                        crate::context::images::ImageLimits::default(),
+                        crate::context::images::IMAGE_BEST_EFFORT_RAW_BYTES,
+                        crate::context::images::READ_IMAGE_MAX_TOKENS,
+                    )
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        crate::context::images::prepare_read_image_bytes(
+                            &buf,
+                            mime_type,
+                            crate::context::images::ImageLimits::default(),
+                            crate::context::images::IMAGE_BEST_EFFORT_RAW_BYTES,
+                            crate::context::images::READ_IMAGE_MAX_TOKENS,
+                        )
+                    })
+                    .await
+                    .map_err(|e| ToolError::new(format!("Image worker failed: {e}")))?
+                };
+            let prepared = match prepared_result {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    return Ok(text_result(
+                        read_output(
+                            &abs,
+                            true,
+                            Some("image"),
+                            [("mimeType", RuntimeJson::from(mime_type))],
+                        ),
+                        concat_runtime(&[
+                            RuntimeString::from(reason),
+                            RuntimeString::from(": "),
+                            path.clone(),
+                        ]),
+                        true,
+                    ));
+                }
+            };
+            let effective_mime = prepared.mime_type.as_str();
+            let b64 = BASE64_STANDARD.encode(&prepared.bytes);
             // The envelope flag is UI-only: the transcript can tell the user
             // that the ACTIVE model cannot see this image, while the stored
             // result itself stays correct across a model switch.
@@ -341,7 +400,7 @@ impl Tool for ReadTool {
                     true,
                     Some("image"),
                     [
-                        ("mimeType", RuntimeJson::from(mime_type)),
+                        ("mimeType", RuntimeJson::from(effective_mime)),
                         ("imageUnsupportedByModel", RuntimeJson::Bool(true)),
                     ],
                 )
@@ -350,10 +409,11 @@ impl Tool for ReadTool {
                     &abs,
                     true,
                     Some("image"),
-                    [("mimeType", RuntimeJson::from(mime_type))],
+                    [("mimeType", RuntimeJson::from(effective_mime))],
                 )
             };
-            return Ok(image_result(output, mime_type, b64));
+            let source_path = posix_rendered_runtime(&abs).as_runtime_string().clone();
+            return Ok(image_result(output, effective_mime, b64, Some(source_path)));
         }
 
         // PDF path. A PDF is binary, so it MUST be handled before the
@@ -867,7 +927,12 @@ fn to_state_encoding(e: FsEncoding) -> StateEncoding {
 }
 
 /// A tool result carrying an image block for the model.
-fn image_result(output: Json, mime_type: &str, base64: String) -> ToolResult {
+fn image_result(
+    output: Json,
+    mime_type: &str,
+    base64: String,
+    source_path: Option<RuntimeString>,
+) -> ToolResult {
     ToolResult {
         serializable: ToolResultSerializable {
             output,
@@ -875,7 +940,7 @@ fn image_result(output: Json, mime_type: &str, base64: String) -> ToolResult {
                 mime_type: RuntimeString::from(mime_type),
                 base64: RuntimeString::from(base64),
                 detail: None,
-                source_path: None,
+                source_path,
             })],
             is_error: Some(false),
             mcp_meta: None,

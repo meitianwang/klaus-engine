@@ -23,6 +23,12 @@ pub const IMAGE_MAX_BASE64_CHARS: usize = 5_242_880;
 pub const IMAGE_TARGET_RAW_BYTES: usize = 3_932_160;
 /// Best-effort raw-byte target after preparing an API-sized image.
 pub const IMAGE_BEST_EFFORT_RAW_BYTES: usize = 512_000;
+/// Maximum raw file size accepted by `read` before image downscaling (32 MiB).
+pub const READ_IMAGE_MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+/// Per-image token budget enforced when `read` ingests an image file.
+pub const READ_IMAGE_MAX_TOKENS: u64 = 25_000;
+/// Patch width/height used for vision token budgeting (`ceil(w/28) * ceil(h/28)`).
+const IMAGE_PATCH_SIZE: u32 = 28;
 
 /// Model/source constraints. The raw target is independent from the final
 /// base64 ceiling so a provider can reserve additional per-image headroom.
@@ -167,6 +173,7 @@ fn rejection_marker(reason: &str) -> RuntimeString {
     ))
 }
 
+#[derive(Clone)]
 struct PreparedImage {
     bytes: Vec<u8>,
     format: image::ImageFormat,
@@ -426,6 +433,254 @@ where
         }
     }
     Ok(best.unwrap_or(smallest))
+}
+
+/// Prepared image payload returned to the `read` tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedReadImage {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub unchanged: bool,
+}
+
+fn patch_image_tokens(dimensions: ImageDimensions) -> u64 {
+    let patches_w = u64::from(dimensions.width.div_ceil(IMAGE_PATCH_SIZE).max(1));
+    let patches_h = u64::from(dimensions.height.div_ceil(IMAGE_PATCH_SIZE).max(1));
+    patches_w.saturating_mul(patches_h)
+}
+
+fn fit_dimensions_to_token_budget(dimensions: ImageDimensions, max_tokens: u64) -> ImageDimensions {
+    if max_tokens == 0 || patch_image_tokens(dimensions) <= max_tokens {
+        return dimensions;
+    }
+    let current = patch_image_tokens(dimensions) as f64;
+    let mut scale = (max_tokens as f64 / current).sqrt().min(1.0);
+    for _ in 0..8 {
+        let candidate = ImageDimensions {
+            width: ((f64::from(dimensions.width) * scale).floor() as u32).max(1),
+            height: ((f64::from(dimensions.height) * scale).floor() as u32).max(1),
+        };
+        if patch_image_tokens(candidate) <= max_tokens
+            || (candidate.width == 1 && candidate.height == 1)
+        {
+            return candidate;
+        }
+        scale *= 0.92;
+    }
+    ImageDimensions {
+        width: 1,
+        height: 1,
+    }
+}
+
+/// Prepare a file-read image under API dimension limits, a raw-byte target
+/// (`512 KB` default), and a vision-patch token budget (`25_000` default).
+///
+/// Decodable images above the byte or token budget are progressively downscaled
+/// (`[1.0, 0.75, 0.5, 0.25]` with indexed-palette PNG for PNG sources and JPEG
+/// quality search, followed by an `800 -> 600 -> 400` fallback ladder). Small
+/// synthetic or undecodable inputs that already fit within the single-image API
+/// ceiling pass through unchanged so lightweight fixtures remain intact.
+pub fn prepare_read_image_bytes(
+    bytes: &[u8],
+    declared_mime: &str,
+    limits: ImageLimits,
+    raw_byte_budget: usize,
+    max_image_tokens: u64,
+) -> Result<PreparedReadImage, String> {
+    if bytes.is_empty() {
+        return Err("Image file is empty (0 bytes)".to_string());
+    }
+    if limits.max_width == 0 || limits.max_height == 0 || limits.max_base64_chars == 0 {
+        return Err("Invalid image limits".to_string());
+    }
+    let raw_target = raw_byte_budget.min(limits.target_raw_bytes).max(1);
+    let guessed_format = image::guess_format(bytes).ok();
+    let decoded = match image::load_from_memory(bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            if let Some(dimensions) = encoded_dimensions(bytes) {
+                if !limits.contains(dimensions) {
+                    return Err(format!(
+                        "Image processing failed ({error}) and dimensions {}x{} exceed {}x{}",
+                        dimensions.width, dimensions.height, limits.max_width, limits.max_height
+                    ));
+                }
+            }
+            let b64_len = bytes.len().div_ceil(3) * 4;
+            if bytes.len() > limits.target_raw_bytes || b64_len > limits.max_base64_chars {
+                return Err(format!(
+                    "Image processing failed ({error}) and payload ({} bytes) exceeds the per-image limit",
+                    bytes.len()
+                ));
+            }
+            return Ok(PreparedReadImage {
+                bytes: bytes.to_vec(),
+                mime_type: declared_mime.to_string(),
+                unchanged: true,
+            });
+        }
+    };
+
+    let source_format = guessed_format.unwrap_or(match declared_mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/gif" => image::ImageFormat::Gif,
+        "image/webp" => image::ImageFormat::WebP,
+        _ => image::ImageFormat::Jpeg,
+    });
+    let (width, height) = decoded.dimensions();
+    let dimensions = ImageDimensions { width, height };
+    let within_token_budget =
+        max_image_tokens == 0 || patch_image_tokens(dimensions) <= max_image_tokens;
+    let b64_len = bytes.len().div_ceil(3) * 4;
+    if limits.contains(dimensions)
+        && within_token_budget
+        && bytes.len() <= raw_target
+        && b64_len <= limits.max_base64_chars
+    {
+        return Ok(PreparedReadImage {
+            bytes: bytes.to_vec(),
+            mime_type: source_format.to_mime_type().to_string(),
+            unchanged: true,
+        });
+    }
+
+    let base_dims = fit_dimensions_to_token_budget(
+        fit_dimensions(dimensions, limits.max_width, limits.max_height),
+        max_image_tokens,
+    );
+
+    let mut smallest: Option<PreparedImage> = None;
+    let mut record_candidate = |candidate: PreparedImage| -> Option<PreparedImage> {
+        let valid_b64 = candidate.bytes.len().div_ceil(3) * 4 <= limits.max_base64_chars;
+        if valid_b64
+            && smallest
+                .as_ref()
+                .is_none_or(|prev| candidate.bytes.len() < prev.bytes.len())
+        {
+            smallest = Some(candidate.clone());
+        }
+        (valid_b64 && candidate.bytes.len() <= raw_target).then_some(candidate)
+    };
+
+    for scale in [1.0_f64, 0.75, 0.5, 0.25] {
+        let scaled = ImageDimensions {
+            width: ((f64::from(base_dims.width) * scale).round() as u32).max(1),
+            height: ((f64::from(base_dims.height) * scale).round() as u32).max(1),
+        };
+        let working = if scaled == dimensions {
+            std::borrow::Cow::Borrowed(&decoded)
+        } else {
+            std::borrow::Cow::Owned(decoded.resize_exact(
+                scaled.width,
+                scaled.height,
+                image::imageops::FilterType::Triangle,
+            ))
+        };
+
+        let area = u64::from(scaled.width) * u64::from(scaled.height);
+        if source_format == image::ImageFormat::Png && area <= 900_000 {
+            if let Ok(png_bytes) = palette_png_bytes(&working) {
+                if let Some(hit) = record_candidate(PreparedImage {
+                    bytes: png_bytes,
+                    format: image::ImageFormat::Png,
+                }) {
+                    return Ok(PreparedReadImage {
+                        mime_type: hit.format.to_mime_type().to_string(),
+                        bytes: hit.bytes,
+                        unchanged: false,
+                    });
+                }
+            }
+        } else if scale == 1.0 && scaled != dimensions && source_format != image::ImageFormat::Png {
+            if let Ok(encoded) = encode_in_source_format(&working, source_format) {
+                if let Some(hit) = record_candidate(encoded) {
+                    return Ok(PreparedReadImage {
+                        mime_type: hit.format.to_mime_type().to_string(),
+                        bytes: hit.bytes,
+                        unchanged: false,
+                    });
+                }
+            }
+        }
+
+        let first_jpeg = jpeg_bytes(&working, 80)?;
+        if let Some(hit) = record_candidate(PreparedImage {
+            bytes: first_jpeg.clone(),
+            format: image::ImageFormat::Jpeg,
+        }) {
+            return Ok(PreparedReadImage {
+                mime_type: hit.format.to_mime_type().to_string(),
+                bytes: hit.bytes,
+                unchanged: false,
+            });
+        }
+        // If q=80 is already > 2.5x the target budget, step straight down in
+        // resolution on the next iteration rather than burning extra codecs at
+        // this pixel count.
+        let follow_qualities: &[u8] = if first_jpeg.len() <= raw_target.saturating_mul(2) {
+            &[55, 35]
+        } else if first_jpeg.len() <= raw_target.saturating_mul(3) {
+            &[35]
+        } else {
+            &[]
+        };
+        for &quality in follow_qualities {
+            let candidate_jpeg = jpeg_bytes(&working, quality)?;
+            if let Some(hit) = record_candidate(PreparedImage {
+                bytes: candidate_jpeg,
+                format: image::ImageFormat::Jpeg,
+            }) {
+                return Ok(PreparedReadImage {
+                    mime_type: hit.format.to_mime_type().to_string(),
+                    bytes: hit.bytes,
+                    unchanged: false,
+                });
+            }
+        }
+    }
+
+    // Fallback ladder for ultra-dense high-entropy frames (`800 -> 600 -> 400`).
+    let fallback_steps: [(u32, Option<u8>); 3] = [(800, None), (600, Some(50)), (400, Some(20))];
+    for (cap, jpeg_q) in fallback_steps {
+        let dims = fit_dimensions(base_dims, cap, cap);
+        let resized = decoded.resize_exact(
+            dims.width,
+            dims.height,
+            image::imageops::FilterType::Triangle,
+        );
+        let candidate = match jpeg_q {
+            None => PreparedImage {
+                bytes: palette_png_bytes(&resized).or_else(|_| jpeg_bytes(&resized, 60))?,
+                format: image::ImageFormat::Png,
+            },
+            Some(quality) => PreparedImage {
+                bytes: jpeg_bytes(&resized, quality)?,
+                format: image::ImageFormat::Jpeg,
+            },
+        };
+        let actual_format = image::guess_format(&candidate.bytes).unwrap_or(candidate.format);
+        if let Some(hit) = record_candidate(PreparedImage {
+            bytes: candidate.bytes,
+            format: actual_format,
+        }) {
+            return Ok(PreparedReadImage {
+                mime_type: hit.format.to_mime_type().to_string(),
+                bytes: hit.bytes,
+                unchanged: false,
+            });
+        }
+    }
+
+    if let Some(best) = smallest {
+        return Ok(PreparedReadImage {
+            mime_type: best.format.to_mime_type().to_string(),
+            bytes: best.bytes,
+            unchanged: false,
+        });
+    }
+
+    Err("Image payload exceeds the maximum base64 size after compression".to_string())
 }
 
 /// Apply default source constraints to one image.
