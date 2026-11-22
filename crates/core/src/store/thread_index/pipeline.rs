@@ -230,22 +230,33 @@ fn prepare(
             reader: Read::by_ref(source).take(len),
             cancelled: cancelled.clone(),
         };
-        let summary = scan::compaction(&mut BufReader::with_capacity(64 * 1024, reader))?;
-        if summary.is_empty() {
-            let bytes = load::record_raw(source, offset, len)?;
-            let is_repair = std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(parse_rollout_line)
-                .is_some_and(
-                    |item| matches!(item, RolloutItem::Compacted(c) if c.is_history_repair()),
-                );
-            if is_repair {
-                step.skip_item = true;
-            } else {
-                step.summary = Some(summary);
+        match scan::compaction_info(&mut BufReader::with_capacity(64 * 1024, reader)) {
+            Ok((summary, is_repair)) => {
+                if is_repair {
+                    step.skip_item = true;
+                } else {
+                    step.summary = Some(summary);
+                }
             }
-        } else {
-            step.summary = Some(summary);
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+            Err(_) => {
+                let bytes = load::record_raw(source, offset, len)?;
+                let parsed = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(parse_rollout_line);
+                if let Some(RolloutItem::Compacted(compacted)) = parsed {
+                    if compacted.is_history_repair() {
+                        step.skip_item = true;
+                    } else {
+                        step.summary = Some(compacted.summary);
+                    }
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid rollout JSON",
+                    ));
+                }
+            }
         }
     } else if header.event.as_deref() == Some("tool_result_output") {
         step.payload = Some(field(

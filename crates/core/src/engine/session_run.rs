@@ -2983,6 +2983,38 @@ impl Session {
                             index.turn_error_details.remove(turn_id);
                         }
                     }
+                    match &ev {
+                        EngineEvent::TurnFailed { inference, error }
+                            if matches!(
+                                error.provider_kind,
+                                Some(
+                                    crate::types::errors::ProviderErrorKind::RateLimit
+                                        | crate::types::errors::ProviderErrorKind::Quota
+                                        | crate::types::errors::ProviderErrorKind::Overloaded
+                                        | crate::types::errors::ProviderErrorKind::PromptTooLong
+                                        | crate::types::errors::ProviderErrorKind::RequestTooLarge
+                                )
+                            ) =>
+                        {
+                            let active = this.inference_snapshot();
+                            let provider_name = active.provider.info().name.clone();
+                            let model = inference.as_ref().map_or_else(
+                                || active.config.model.clone(),
+                                |identity| identity.model.clone(),
+                            );
+                            *this.turn.last_capacity_failed_turn.lock_recover() =
+                                Some(crate::engine::session::CapacityFailedTurn {
+                                    turn_id: turn_id.clone(),
+                                    provider_name,
+                                    model,
+                                    account_id: active.provider.credential_account_id(),
+                                });
+                        }
+                        _ if status == "completed" => {
+                            *this.turn.last_capacity_failed_turn.lock_recover() = None;
+                        }
+                        _ => {}
+                    }
                     if let Some(r) = this.persistence.rollout() {
                         let mut payload = RuntimeObject::new();
                         payload.insert("status", RuntimeJson::String(status.into()));

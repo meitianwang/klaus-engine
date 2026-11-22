@@ -1226,6 +1226,7 @@ async fn run_turn(
             &mut prepared,
             &mut fallback_chain,
             &mut loop_detector,
+            has_attempted_reactive_compact,
         )
         .await;
         append_admitted_messages(&mut messages, &admitted_messages);
@@ -1356,10 +1357,17 @@ async fn run_turn(
             }
             Outcome::Error {
                 error,
-                emitted_text: _,
+                emitted_text,
                 partial_uuid: _,
             } => {
                 let e = error;
+                let cold_switch_rate_limit_recovery = !prediction_query
+                    && !private_review
+                    && !emitted_text
+                    && e.kind == ProviderErrorKind::RateLimit
+                    && !shared.config().compaction_disabled
+                    && shared.config().auto_compaction
+                    && is_cold_switch_prefill_pressure(&messages, &prepared.request);
                 if !private_review
                     && !prediction_query
                     && e.kind == ProviderErrorKind::PromptTooLong
@@ -1399,7 +1407,7 @@ async fn run_turn(
                     }
                     return;
                 }
-                if is_reactive_rejection(&e) {
+                if is_reactive_rejection(&e) || cold_switch_rate_limit_recovery {
                     if prediction_query {
                         emit_provider_failure(
                             &shared,
@@ -1428,10 +1436,17 @@ async fn run_turn(
                         emit_provider_failure(&shared, e, "reactive-compaction-disabled");
                         return;
                     }
-                    shared
-                        .deps()
-                        .compactor
-                        .prepare_request(&prepared.request, &signal);
+                    if cold_switch_rate_limit_recovery {
+                        shared
+                            .deps()
+                            .compactor
+                            .prepare_rate_limited_recovery(&prepared.request, &signal);
+                    } else {
+                        shared
+                            .deps()
+                            .compactor
+                            .prepare_request(&prepared.request, &signal);
+                    }
                     shared
                         .deps()
                         .compactor
@@ -2890,6 +2905,38 @@ fn record_provider_failure(shared: &Arc<Shared>, error: &ProviderError, recovery
     .record();
 }
 
+/// Minimum rendered-context estimate at which a cold model switch (zero prior
+/// assistant replies on `request.model`, with prior conversation history from
+/// another model or compaction checkpoint) treats a pre-output `RateLimit`
+/// rejection as cold-prefill capacity pressure eligible for reactive compaction.
+const COLD_SWITCH_PREFILL_RATE_LIMIT_COMPACT_FLOOR_TOKENS: u64 = 32_000;
+
+fn is_cold_switch_prefill_pressure(
+    messages: &[Message],
+    request: &crate::types::provider::ModelRequest,
+) -> bool {
+    let mut saw_unwarmed_prior_history = false;
+    for message in messages {
+        match message {
+            Message::Assistant(assistant) => {
+                if assistant.model == request.model {
+                    return false;
+                }
+                if !assistant.model.is_empty() {
+                    saw_unwarmed_prior_history = true;
+                }
+            }
+            Message::CompactBoundary(_) => {
+                saw_unwarmed_prior_history = true;
+            }
+            _ => {}
+        }
+    }
+    saw_unwarmed_prior_history
+        && super::request::rendered_context_tokens(request)
+            >= COLD_SWITCH_PREFILL_RATE_LIMIT_COMPACT_FLOOR_TOKENS
+}
+
 fn is_reactive_rejection(error: &ProviderError) -> bool {
     let message = error.message.try_to_utf8().unwrap_or_default();
     matches!(
@@ -2949,12 +2996,18 @@ async fn run_turn_stream_with_retry(
     prepared: &mut PreparedModelRequest,
     fallback_chain: &mut Vec<RuntimeString>,
     loop_detector: &mut Option<LoopDetector>,
+    has_attempted_reactive_compact: bool,
 ) -> StreamTurnResult {
     let private_review = shared
         .params
         .agent_type
         .as_ref()
         .is_some_and(|kind| kind == "approval-review");
+    let prediction_query = shared
+        .params
+        .agent_type
+        .as_ref()
+        .is_some_and(|kind| kind == "prediction");
     let outcome;
     let mut admitted_messages = Vec::new();
     let mut admitted_system = Vec::new();
@@ -3047,7 +3100,8 @@ async fn run_turn_stream_with_retry(
             partial_uuid,
         } = &out
         {
-            if !hint_fallback_used && !private_review && !signal.is_cancelled() {
+            if !hint_fallback_used && !private_review && !prediction_query && !signal.is_cancelled()
+            {
                 if let Some(next) =
                     crate::context::context_hints::stream_fallback_request(&prepared.request, error)
                         .await
@@ -3071,7 +3125,7 @@ async fn run_turn_stream_with_retry(
                 outcome = out;
                 break;
             }
-            if !private_review && !signal.is_cancelled() {
+            if !private_review && !prediction_query && !signal.is_cancelled() {
                 if let Some(reason) = media_recovery.heal(
                     &mut prepared.request,
                     error,
@@ -3126,6 +3180,7 @@ async fn run_turn_stream_with_retry(
             // Retrying the SAME account on a quota refusal would only burn the
             // retry budget, so this branch sits ahead of the same-model retry.
             if !private_review
+                && !prediction_query
                 && !signal.is_cancelled()
                 && crate::provider::rotation::is_quota_rotation_error(error)
             {
@@ -3223,7 +3278,18 @@ async fn run_turn_stream_with_retry(
             // A locally enforced full stream timeout may already have cost ten
             // minutes. Re-sample once; explicit gateway 408 responses use the
             // normal retry budget because they can arrive within seconds.
-            let retry_limit = if private_review {
+            let cold_switch_compactable = !private_review
+                && !prediction_query
+                && !has_attempted_reactive_compact
+                && !*emitted_text
+                && error.kind == ProviderErrorKind::RateLimit
+                && shared.deps().compactor.reactive_enabled()
+                && !shared.config().compaction_disabled
+                && shared.config().auto_compaction
+                && is_cold_switch_prefill_pressure(messages, &prepared.request);
+            let retry_limit = if prediction_query || cold_switch_compactable {
+                0
+            } else if private_review {
                 u32::from(
                     error.failure_phase() == crate::types::errors::ProviderFailurePhase::Streaming
                         && error.status.is_none(),
@@ -3320,7 +3386,12 @@ async fn run_turn_stream_with_retry(
                 "retries-exhausted"
             };
             // Model fallback: rotate to a backup and re-stream THIS request.
-            if !private_review && !oversized && !signal.is_cancelled() && !fallback_chain.is_empty()
+            if !private_review
+                && !prediction_query
+                && !cold_switch_compactable
+                && !oversized
+                && !signal.is_cancelled()
+                && !fallback_chain.is_empty()
             {
                 if let Some(reason) = classify_model_fallback_error(error) {
                     let from = {

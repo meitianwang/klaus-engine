@@ -125,6 +125,7 @@ pub struct FullCompactor {
     precompute_context: Mutex<Option<crate::types::provider::NativeCompactionContext>>,
     output: Mutex<Option<CompactionOutputSink>>,
     session_memory: Mutex<Option<Arc<dyn SessionMemoryCompactProvider>>>,
+    prefer_pruned_lean_summary: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for FullCompactor {
@@ -148,6 +149,7 @@ pub fn create_full_compactor(options: FullCompactorOptions) -> FullCompactor {
         precompute_context: Mutex::new(None),
         output: Mutex::new(None),
         session_memory: Mutex::new(None),
+        prefer_pruned_lean_summary: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -170,6 +172,7 @@ impl FullCompactor {
             precompute_context: Mutex::new(None),
             output: Mutex::new(None),
             session_memory: Mutex::new(None),
+            prefer_pruned_lean_summary: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -244,6 +247,15 @@ impl FullCompactor {
     pub fn prepare_request(&self, request: &ModelRequest, signal: &AbortSignal) {
         *self.request.lock().unwrap() = Some(request.clone());
         *self.signal.lock().unwrap() = signal.clone();
+        self.prefer_pruned_lean_summary
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn prepare_rate_limited_recovery(&self, request: &ModelRequest, signal: &AbortSignal) {
+        *self.request.lock().unwrap() = Some(request.clone());
+        *self.signal.lock().unwrap() = signal.clone();
+        self.prefer_pruned_lean_summary
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn full_compact(
@@ -462,13 +474,23 @@ impl FullCompactor {
                 }
             }
         }
-        let (mut request, mut using_cache_safe_fork) =
-            self.initial_summary_request(&messages, config, instructions);
+        let prefer_pruned_lean = self
+            .prefer_pruned_lean_summary
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        let (mut request, mut using_cache_safe_fork) = if prefer_pruned_lean {
+            (
+                self.lean_fallback_summary_request(&messages, config, instructions, true, true),
+                false,
+            )
+        } else {
+            self.initial_summary_request(&messages, config, instructions)
+        };
+        let mut has_tried_pruned_lean_fallback = prefer_pruned_lean;
         loop {
             if signal.is_cancelled() {
                 return failed(messages, "Context compaction was interrupted.", None);
             }
-            let result = if using_cache_safe_fork {
+            let result = if using_cache_safe_fork || !has_tried_pruned_lean_fallback {
                 self.run_cache_safe_stage(
                     request.clone(),
                     &messages,
@@ -492,11 +514,15 @@ impl FullCompactor {
                 .iter()
                 .any(|diagnostic| diagnostic.kind == CompactionDiagnosticKind::PromptTooLong);
             let rate_limited = is_cache_safe_fork_rate_limited(&result);
-            if using_cache_safe_fork
-                && !signal.is_cancelled()
-                && (is_cache_safe_fork_structural_failure(&result, overflow) || rate_limited)
+            if !signal.is_cancelled()
+                && ((using_cache_safe_fork
+                    && is_cache_safe_fork_structural_failure(&result, overflow))
+                    || (!has_tried_pruned_lean_fallback && rate_limited))
             {
                 using_cache_safe_fork = false;
+                if rate_limited {
+                    has_tried_pruned_lean_fallback = true;
+                }
                 request = self.lean_fallback_summary_request(
                     &messages,
                     config,

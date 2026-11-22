@@ -434,21 +434,29 @@ impl CompactedItem {
         let Some(replacement) = &self.replacement_history else {
             return false;
         };
-        if !self.summary.is_empty() {
-            return false;
-        }
         let prior_ids: std::collections::HashSet<_> = self
             .source_message_ids
             .as_deref()
             .unwrap_or_default()
             .iter()
             .collect();
-        !replacement.iter().any(|message| {
+        let has_new_boundary = replacement.iter().any(|message| {
             matches!(
                 message,
                 Message::CompactBoundary(boundary) if !prior_ids.contains(&boundary.uuid)
             )
-        })
+        });
+        if has_new_boundary {
+            return false;
+        }
+        self.summary.is_empty()
+            || replacement.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::CompactBoundary(boundary)
+                        if prior_ids.contains(&boundary.uuid) && boundary.summary == self.summary
+                )
+            })
     }
 
     fn encode_fields(&self) -> Result<RuntimeObject, RuntimeCodecError> {

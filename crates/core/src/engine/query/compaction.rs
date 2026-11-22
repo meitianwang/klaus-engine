@@ -104,7 +104,11 @@ async fn persist_checkpoint(
     if let Some(cb) = &params.on_compaction {
         if let Err(error) = cb(CompactionRecord {
             retires_context,
-            summary: compaction_summary_of(snapshot),
+            summary: if retires_context {
+                compaction_summary_of(snapshot)
+            } else {
+                RuntimeString::default()
+            },
             replaced_range: (0, source_message_ids.len()),
             replacement_history: snapshot.to_vec(),
             source_message_ids,

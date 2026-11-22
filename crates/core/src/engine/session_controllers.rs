@@ -4414,6 +4414,7 @@ mod thinking_context_cold_tests {
             padded_retired_tokens: AtomicU64::new(0),
             padded_high_water_tokens: AtomicU64::new(0),
             user_interrupted_turn: Mutex::new(None),
+            last_capacity_failed_turn: Mutex::new(None),
         }
     }
 

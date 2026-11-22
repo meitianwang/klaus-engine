@@ -3707,7 +3707,12 @@ impl Session {
         if !self.prediction_source_is_current(&source_turn_id) {
             return Ok(None);
         }
-        let query = self.run_prediction_query(Input::Text(prompt.into()), effort, signal.clone());
+        let query = self.run_prediction_query(
+            &source_turn_id,
+            Input::Text(prompt.into()),
+            effort,
+            signal.clone(),
+        );
         // Admission changes before provider IO or while it is streaming invalidate
         // this snapshot. Dropping the losing query future releases its capture.
         let changed = async {
@@ -4497,6 +4502,7 @@ impl Session {
 
     async fn run_prediction_query(
         self: &Arc<Self>,
+        source_turn_id: &str,
         input: Input,
         effort: Option<crate::schemas::effort::EffortValue>,
         signal: AbortSignal,
@@ -4510,6 +4516,20 @@ impl Session {
             return Err("prediction cancelled".to_string());
         }
         let model = bundle.config.model.clone();
+        if self
+            .turn
+            .last_capacity_failed_turn
+            .lock_recover()
+            .as_ref()
+            .is_some_and(|failed| {
+                failed.turn_id == source_turn_id
+                    && failed.provider_name == bundle.provider.info().name
+                    && failed.model == model
+                    && failed.account_id == bundle.provider.credential_account_id()
+            })
+        {
+            return Err("prediction suppressed after provider capacity failure".to_string());
+        }
         let requirements = bundle
             .load_review_requirements()
             .await
@@ -4643,7 +4663,8 @@ impl Session {
             is_meta: None,
         }));
 
-        let config = bundle.config_for_model(&model);
+        let mut config = bundle.config_for_model(&model);
+        config.max_retries = 0;
         let approvals_reviewer = step_policy.approvals_reviewer;
         let task_plan = crate::tasks::task_store::TaskPlanBinding::capture(&self.task_list_id());
         let tool_context_base: ToolContextFactory = {

@@ -834,3 +834,6 @@ mod r20261121_call_mcp_tool_single_lifecycle;
 
 #[path = "regressions/r20261122_mcp_reply_post_ack.rs"]
 mod r20261122_mcp_reply_post_ack;
+
+#[path = "regressions/r20261122_repair_boundary_cold_ratelimit_compact_and_prediction_storm.rs"]
+mod r20261122_repair_boundary_cold_ratelimit_compact_and_prediction_storm;

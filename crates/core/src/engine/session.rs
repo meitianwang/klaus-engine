@@ -748,6 +748,20 @@ pub(crate) struct SessionTurnState {
     /// overlapping or already-settled turn cannot inherit the marker. The turn's
     /// terminal writer takes it, so the guidance is persisted exactly once.
     user_interrupted_turn: Mutex<Option<RuntimeString>>,
+    /// Most recent turn that failed due to upstream rate-limit, quota,
+    /// overload, or context-size refusal, along with the `(provider, model,
+    /// account)` tuple that rejected it. Suppresses speculative composer
+    /// predictions on that exact failed turn until the user switches model,
+    /// provider, or credential account, or completes a new turn.
+    pub(crate) last_capacity_failed_turn: Mutex<Option<CapacityFailedTurn>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapacityFailedTurn {
+    pub(crate) turn_id: RuntimeString,
+    pub(crate) provider_name: RuntimeString,
+    pub(crate) model: RuntimeString,
+    pub(crate) account_id: Option<String>,
 }
 
 /// The session's conversation-history cluster: the live message transcript,

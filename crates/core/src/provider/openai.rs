@@ -7640,6 +7640,11 @@ impl ModelProvider for OpenAIProvider {
     }
 
     fn stream(&self, mut req: ModelRequest, signal: AbortSignal) -> ModelStream {
+        if crate::provider::retry::take_single_attempt_establishment_scope() {
+            let mut selected = self.clone();
+            selected.retry = selected.retry.for_single_attempt();
+            return selected.stream(req, signal);
+        }
         if self.api != OpenAiApi::Responses
             && crate::provider::native_compaction::contains_native_checkpoint(&req.messages)
         {

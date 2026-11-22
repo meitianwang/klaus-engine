@@ -225,12 +225,7 @@ fn skip(reader: &mut impl BufRead, depth: usize) -> io::Result<()> {
 
 /// Keep only routing fields. Whole message content, output objects and prompt
 /// replacement snapshots are skipped in chunks, even when they precede UUIDs.
-fn object(
-    reader: &mut impl BufRead,
-    scope: &str,
-    out: &mut Vec<u8>,
-    summary: bool,
-) -> io::Result<()> {
+fn object(reader: &mut impl BufRead, scope: &str, out: &mut Vec<u8>) -> io::Result<()> {
     expect(reader, b'{')?;
     out.push(b'{');
     let mut first = true;
@@ -247,10 +242,7 @@ fn object(
         let nested =
             scope.is_empty() && matches!(name.as_str(), "meta" | "ctx" | "message" | "payload");
         let keep = match scope {
-            "" => {
-                matches!(name.as_str(), "kind" | "event" | "turnId" | "numTurns")
-                    || (summary && name == "summary")
-            }
+            "" => matches!(name.as_str(), "kind" | "event" | "turnId" | "numTurns"),
             "meta" => name == "role",
             "ctx" => name == "turnId",
             "message" => matches!(
@@ -271,7 +263,7 @@ fn object(
             out.extend_from_slice(&key);
             out.push(b':');
             if nested && peek(reader)? == b'{' {
-                object(reader, &name, out, summary)?;
+                object(reader, &name, out)?;
             } else if peek(reader)? == b'"' {
                 string(reader, Some(out))?;
             } else {
@@ -305,26 +297,153 @@ fn object(
 
 pub(super) fn header(reader: &mut impl BufRead) -> io::Result<Option<Header>> {
     let mut bytes = Vec::new();
-    match object(reader, "", &mut bytes, false) {
+    match object(reader, "", &mut bytes) {
         Ok(()) => Ok(serde_json::from_slice(&bytes).ok()),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-pub(super) fn compaction(
+fn runtime_string_literal(
     reader: &mut impl BufRead,
 ) -> io::Result<crate::runtime_values::RuntimeString> {
     let mut bytes = Vec::new();
-    object(reader, "", &mut bytes, true)?;
+    string(reader, Some(&mut bytes))?;
     let source = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
     let value =
         crate::runtime_values::runtime_json::parse(&source.into()).map_err(|_| invalid())?;
-    value
-        .get("summary")
-        .and_then(|value| value.as_string())
-        .cloned()
-        .ok_or_else(invalid)
+    value.as_string().cloned().ok_or_else(invalid)
+}
+
+fn replacement_boundaries(
+    reader: &mut impl BufRead,
+) -> io::Result<
+    Vec<(
+        crate::runtime_values::RuntimeString,
+        crate::runtime_values::RuntimeString,
+    )>,
+> {
+    expect(reader, b'[')?;
+    let mut boundaries = Vec::new();
+    if peek(reader)? == b']' {
+        reader.consume(1);
+        return Ok(boundaries);
+    }
+    loop {
+        expect(reader, b'{')?;
+        let mut msg_type = None;
+        let mut msg_uuid = None;
+        let mut msg_summary = None;
+        if peek(reader)? == b'}' {
+            reader.consume(1);
+        } else {
+            loop {
+                let field = key(reader)?;
+                expect(reader, b':')?;
+                if field == "type" && peek(reader)? == b'"' {
+                    msg_type = Some(runtime_string_literal(reader)?);
+                } else if field == "uuid" && peek(reader)? == b'"' {
+                    msg_uuid = Some(runtime_string_literal(reader)?);
+                } else if field == "summary" && peek(reader)? == b'"' {
+                    msg_summary = Some(runtime_string_literal(reader)?);
+                } else {
+                    skip(reader, 0)?;
+                }
+                let sep = peek(reader)?;
+                reader.consume(1);
+                if sep == b'}' {
+                    break;
+                }
+                if sep != b',' {
+                    return Err(invalid());
+                }
+            }
+        }
+        if msg_type
+            .as_ref()
+            .is_some_and(|kind| *kind == "compact_boundary")
+        {
+            let uuid = msg_uuid.ok_or_else(invalid)?;
+            let summary = msg_summary.unwrap_or_default();
+            boundaries.push((uuid, summary));
+        }
+        let sep = peek(reader)?;
+        reader.consume(1);
+        if sep == b']' {
+            return Ok(boundaries);
+        }
+        if sep != b',' {
+            return Err(invalid());
+        }
+    }
+}
+
+fn runtime_string_set(
+    reader: &mut impl BufRead,
+) -> io::Result<std::collections::HashSet<crate::runtime_values::RuntimeString>> {
+    expect(reader, b'[')?;
+    let mut values = std::collections::HashSet::new();
+    if peek(reader)? == b']' {
+        reader.consume(1);
+        return Ok(values);
+    }
+    loop {
+        values.insert(runtime_string_literal(reader)?);
+        let sep = peek(reader)?;
+        reader.consume(1);
+        if sep == b']' {
+            return Ok(values);
+        }
+        if sep != b',' {
+            return Err(invalid());
+        }
+    }
+}
+
+/// Extract `(summary, is_history_repair)` from a `compacted` rollout record
+/// while streaming past non-boundary message bodies in `replacementHistory`.
+pub(super) fn compaction_info(
+    reader: &mut impl BufRead,
+) -> io::Result<(crate::runtime_values::RuntimeString, bool)> {
+    expect(reader, b'{')?;
+    let mut summary = None;
+    let mut has_replacement = false;
+    let mut boundaries = Vec::new();
+    let mut prior_ids = std::collections::HashSet::new();
+    if peek(reader)? == b'}' {
+        reader.consume(1);
+        return Err(invalid());
+    }
+    loop {
+        let field = key(reader)?;
+        expect(reader, b':')?;
+        if field == "summary" && peek(reader)? == b'"' {
+            summary = Some(runtime_string_literal(reader)?);
+        } else if field == "replacementHistory" && peek(reader)? == b'[' {
+            has_replacement = true;
+            boundaries = replacement_boundaries(reader)?;
+        } else if field == "sourceMessageIds" && peek(reader)? == b'[' {
+            prior_ids = runtime_string_set(reader)?;
+        } else {
+            skip(reader, 0)?;
+        }
+        let sep = peek(reader)?;
+        reader.consume(1);
+        if sep == b'}' {
+            break;
+        }
+        if sep != b',' {
+            return Err(invalid());
+        }
+    }
+    let summary = summary.ok_or_else(invalid)?;
+    let has_new_boundary = boundaries.iter().any(|(id, _)| !prior_ids.contains(id));
+    let summary_from_prior_boundary = summary.is_empty()
+        || boundaries
+            .iter()
+            .any(|(id, boundary_summary)| prior_ids.contains(id) && *boundary_summary == summary);
+    let is_repair = has_replacement && !has_new_boundary && summary_from_prior_boundary;
+    Ok((summary, is_repair))
 }
 
 pub(super) struct ImageReplacement {

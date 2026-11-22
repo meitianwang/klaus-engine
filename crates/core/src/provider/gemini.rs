@@ -527,6 +527,11 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn stream(&self, mut req: ModelRequest, signal: AbortSignal) -> ModelStream {
+        if crate::provider::retry::take_single_attempt_establishment_scope() {
+            let mut selected = self.clone();
+            selected.retry = selected.retry.for_single_attempt();
+            return selected.stream(req, signal);
+        }
         if self.adapter_policy.scope_signatures_to_model {
             clear_foreign_model_signatures(&mut req);
         }

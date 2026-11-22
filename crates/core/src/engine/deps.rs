@@ -178,6 +178,16 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    /// Supply the failed live request for rate-limited cold-context recovery so
+    /// summarization can start directly with a pruned lean summary request.
+    fn prepare_rate_limited_recovery(
+        &self,
+        request: &crate::types::provider::ModelRequest,
+        signal: &crate::types::abort::AbortSignal,
+    ) {
+        self.prepare_request(request, signal);
+    }
+
     fn bind_capabilities_provider(
         &self,
         _provider: Arc<dyn crate::types::provider::ModelProvider>,

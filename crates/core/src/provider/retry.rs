@@ -121,6 +121,32 @@ pub fn observe_retries(
     (opts, rx)
 }
 
+std::thread_local! {
+    static SINGLE_ATTEMPT_ESTABLISHMENT_SCOPE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run synchronous stream construction (`call_model` -> `provider.stream`) in a
+/// single-attempt establishment scope so speculative background calls cap
+/// transport retries to one attempt while keeping injected `call_model` seams intact.
+pub fn with_single_attempt_establishment<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SINGLE_ATTEMPT_ESTABLISHMENT_SCOPE.with(|flag| flag.set(self.0));
+        }
+    }
+    let previous = SINGLE_ATTEMPT_ESTABLISHMENT_SCOPE.with(|flag| flag.replace(true));
+    let _reset = Reset(previous);
+    f()
+}
+
+/// Atomically consume an active single-attempt establishment scope when an HTTP
+/// provider constructs its `ModelStream`.
+pub(crate) fn take_single_attempt_establishment_scope() -> bool {
+    SINGLE_ATTEMPT_ESTABLISHMENT_SCOPE.with(|flag| flag.replace(false))
+}
+
 /// One step of an establishment that surfaces its retries as stream events.
 pub(crate) enum EstablishmentStep<T> {
     /// A retry decision, already shaped as the stream event to yield.
@@ -217,6 +243,14 @@ impl RetryOptions {
         self.max_attempts = Some(total_attempts.max(1));
         self.retry_class_policy = Some(RetryClassPolicy::ApprovalReview);
         self.base_delay_ms = Some(200);
+        self.congestion_hold_ms = Some(0);
+        self.unbounded_network_retries = Some(false);
+        self
+    }
+
+    pub(crate) fn for_single_attempt(mut self) -> Self {
+        self.max_attempts = Some(1);
+        self.max_timeout_attempts = Some(1);
         self.congestion_hold_ms = Some(0);
         self.unbounded_network_retries = Some(false);
         self

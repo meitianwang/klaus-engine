@@ -684,7 +684,17 @@ async fn stream_and_dispatch_inner(
         *slot.lock_recover() = Some(wire_req.clone());
     }
     let deps = shared.deps();
+    let prediction_query = shared
+        .params
+        .agent_type
+        .as_ref()
+        .is_some_and(|kind| kind == "prediction");
     let provider_stream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if prediction_query {
+            return crate::provider::retry::with_single_attempt_establishment(|| {
+                (deps.call_model)(wire_req, attempt.clone())
+            });
+        }
         (deps.call_model)(wire_req, attempt.clone())
     }));
     let mut stream = match provider_stream {

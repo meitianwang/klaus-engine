@@ -156,6 +156,14 @@ pub trait Compactor: Send + Sync {
     ) {
     }
 
+    fn prepare_rate_limited_recovery(
+        &self,
+        request: &crate::types::provider::ModelRequest,
+        signal: &crate::types::abort::AbortSignal,
+    ) {
+        self.prepare_request(request, signal);
+    }
+
     /// Proactive compaction. `estimated_tokens` is the caller's estimate of the
     /// full request context, including fixed prefix and protected messages that
     /// are not present in `messages`.
@@ -293,6 +301,14 @@ impl Compactor for RealCompactor {
         signal: &AbortSignal,
     ) {
         self.full.prepare_request(request, signal);
+    }
+
+    fn prepare_rate_limited_recovery(
+        &self,
+        request: &crate::types::provider::ModelRequest,
+        signal: &AbortSignal,
+    ) {
+        self.full.prepare_rate_limited_recovery(request, signal);
     }
 
     async fn maybe_compact(

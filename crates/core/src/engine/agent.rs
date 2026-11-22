@@ -664,6 +664,9 @@ impl Compactor for RealCompactorBridge {
     fn prepare_request(&self, request: &ModelRequest, signal: &AbortSignal) {
         self.0.prepare_request(request, signal);
     }
+    fn prepare_rate_limited_recovery(&self, request: &ModelRequest, signal: &AbortSignal) {
+        self.0.prepare_rate_limited_recovery(request, signal);
+    }
     fn bind_capabilities_provider(&self, provider: Arc<dyn ModelProvider>) {
         self.0.bind_capabilities_provider(provider);
     }
