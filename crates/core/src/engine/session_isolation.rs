@@ -81,11 +81,10 @@ use crate::worktree::worktree::build_worktree_notice;
 use crate::worktree::worktree::count_worktree_changes;
 use crate::worktree::worktree::find_canonical_git_root;
 use crate::worktree::worktree::get_or_create_worktree;
-use crate::worktree::worktree::register_worktree_holder;
-use crate::worktree::worktree::release_worktree_holder;
 use crate::worktree::worktree::remove_worktree;
 use crate::worktree::worktree::validate_worktree_slug;
 use crate::worktree::worktree::worktree_has_other_holders;
+use crate::worktree::worktree::WorktreeHolderGuard;
 use crate::worktree::worktree::WorktreeSession;
 use async_stream::stream;
 use futures::stream::StreamExt;
@@ -707,6 +706,27 @@ impl SessionWorkspaceState {
         *self.original_cwd.write_recover() = v;
     }
 
+    pub(crate) fn new(
+        cwd: RuntimePath,
+        original_cwd: RuntimePath,
+        current_worktree: Option<WorktreeSession>,
+        session_id: &RuntimeString,
+    ) -> Self {
+        let holder_prefix = format!("session:{}", session_id.try_to_utf8().unwrap_or_default());
+        let active = current_worktree.map(|session| {
+            let holder = (session.hook_based != Some(true)).then(|| {
+                WorktreeHolderGuard::acquire_unique(session.worktree_path.clone(), &holder_prefix)
+            });
+            super::ActiveSessionWorktree { session, holder }
+        });
+        Self {
+            cwd: std::sync::RwLock::new(cwd),
+            original_cwd: std::sync::RwLock::new(original_cwd),
+            current_worktree: std::sync::Mutex::new(active),
+            holder_prefix,
+        }
+    }
+
     /// Whether an isolated worktree is currently active.
     pub(crate) fn is_in_worktree(&self) -> bool {
         self.current_worktree.lock_recover().is_some()
@@ -714,12 +734,37 @@ impl SessionWorkspaceState {
 
     /// A clone of the active worktree session, if any.
     pub(crate) fn worktree_snapshot(&self) -> Option<WorktreeSession> {
-        self.current_worktree.lock_recover().clone()
+        self.current_worktree
+            .lock_recover()
+            .as_ref()
+            .map(|active| active.session.clone())
     }
 
-    /// Install or clear the active worktree session.
+    /// Install or clear the active worktree session, acquiring or dropping its
+    /// live holder guard atomically with the state change.
     pub(crate) fn set_worktree(&self, wt: Option<WorktreeSession>) {
-        *self.current_worktree.lock_recover() = wt;
+        let next = wt.map(|session| {
+            let holder = (session.hook_based != Some(true)).then(|| {
+                WorktreeHolderGuard::acquire_unique(
+                    session.worktree_path.clone(),
+                    &self.holder_prefix,
+                )
+            });
+            super::ActiveSessionWorktree { session, holder }
+        });
+        let prev = std::mem::replace(&mut *self.current_worktree.lock_recover(), next);
+        drop(prev);
+    }
+
+    /// Release the live worktree holder claim when the session finishes shutting
+    /// down, even if callers still retain an `Arc<Session>` handle.
+    pub(crate) fn release_worktree_holder(&self) {
+        let guard = self
+            .current_worktree
+            .lock_recover()
+            .as_mut()
+            .and_then(|active| active.holder.take());
+        drop(guard);
     }
 }
 
@@ -875,10 +920,9 @@ impl Session {
             }
         };
         let created = get_or_create_worktree(&self.process_context, &root, &slug, None).await?;
-        // A resumed slug means a sibling session may already stand in this
-        // checkout: record this session as a holder so neither exit can force
-        // the tree away from the other.
-        register_worktree_holder(&created.worktree_path, &self.worktree_holder_token());
+        // `set_worktree` acquires a live holder guard for git worktrees so a
+        // sibling session resuming the same slug cannot force-remove the checkout
+        // underneath us, and `set_worktree(None)` / shutdown releases it.
         self.workspace.set_worktree(Some(WorktreeSession {
             original_cwd: original.clone(),
             worktree_path: created.worktree_path.clone(),
@@ -919,21 +963,22 @@ impl Session {
             None => return Err("Not currently in a worktree managed by this session.".to_string()),
         };
         let original_cwd = wt.original_cwd.clone();
-        // Clear the worktree flag BEFORE rebuilding the prompt (so switchCwd drops the notice).
+        // Clear the worktree flag BEFORE rebuilding the prompt (so switchCwd drops
+        // the notice); this also drops this session's live holder guard on both
+        // `Keep` and `Remove` exits.
         self.workspace.set_worktree(None);
         // Restore cwd, so we never stand inside a directory we then remove.
         self.switch_cwd(original_cwd.clone());
         self.workspace.set_original_cwd(original_cwd.clone());
 
-        let holder = self.worktree_holder_token();
         let mut action = action;
         let mut removal_blocked = false;
-        if action == WorktreeExitAction::Remove && wt.hook_based != Some(true) {
-            release_worktree_holder(&wt.worktree_path, &holder);
-            if worktree_has_other_holders(&wt.worktree_path, &holder) {
-                action = WorktreeExitAction::Keep;
-                removal_blocked = true;
-            }
+        if action == WorktreeExitAction::Remove
+            && wt.hook_based != Some(true)
+            && worktree_has_other_holders(&wt.worktree_path, "")
+        {
+            action = WorktreeExitAction::Keep;
+            removal_blocked = true;
         }
 
         if action == WorktreeExitAction::Remove {
@@ -974,11 +1019,6 @@ impl Session {
                     .concat(&RuntimeString::from("\" (kept on disk).")),
             },
         })
-    }
-
-    /// The holder-registry token for this session's worktree claims.
-    fn worktree_holder_token(&self) -> String {
-        format!("session:{}", self.id.try_to_utf8().unwrap_or_default())
     }
 
     /// Fire a WorktreeCreate hook; returns its `worktree_path` if a handler claimed it.
@@ -1057,8 +1097,10 @@ impl Session {
             }
         };
         let wt = get_or_create_worktree(&self.process_context, &root, &slug, None).await?;
-        let holder = format!("subagent:{slug}");
-        register_worktree_holder(&wt.worktree_path, &holder);
+        let holder = std::sync::Mutex::new(Some(WorktreeHolderGuard::acquire_unique(
+            wt.worktree_path.clone(),
+            &format!("subagent:{slug}"),
+        )));
         Ok(AgentIsolation {
             cwd_override: Some(wt.worktree_path.clone()),
             worktree: Some(AgentWorktree::Git {
@@ -1089,8 +1131,9 @@ impl Session {
         else {
             return;
         };
-        release_worktree_holder(path, holder);
-        if worktree_has_other_holders(path, holder) {
+        let guard = holder.lock_recover().take();
+        drop(guard);
+        if worktree_has_other_holders(path, "") {
             return;
         }
         let changes = count_worktree_changes(&self.process_context, path, head.as_ref()).await;
@@ -2910,5 +2953,141 @@ mod workflow_capture_tests {
             "{sent:?}"
         );
         session.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_holders_release_on_keep_exit_and_shutdown_while_blocking_live_siblings() {
+        let repo = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "user.name", "Test"][..],
+            &["commit", "--allow-empty", "-m", "init", "-q"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let repo_path = super::super::runtime_path_from_host_path(repo.path());
+        let cfg_path = super::super::runtime_path_from_host_path(cfg.path());
+        let make_session = || {
+            let agent = Agent::new(AgentOptions {
+                process_context: crate::runtime_process::test_runtime_process_context(),
+                provider: Arc::new(fake_provider()),
+                config: Some(serde_json::json!({
+                    "model": "fake-model",
+                    "prewarm": false,
+                    "fork": false,
+                    "memory": {"enabled": false},
+                    "autoMemory": false,
+                    "autoDream": false,
+                    "memoryRecall": false,
+                    "speculativeCompaction": false,
+                    "earlyMicrocompact": false,
+                    "idleMicrocompact": false,
+                    "compactionSelfCheck": false,
+                    "loopDetection": false,
+                })),
+                tools: Some(Vec::new()),
+                observer: Some(None),
+                include_default_agents: Some(false),
+                web_fetch_page: None,
+                browser_runtime: None,
+                capability_roots: Vec::new(),
+                cwd: None,
+                deps: EngineDepsOverrides::default(),
+                compactor: None,
+                approval_handler: None,
+                approval_reviewer: None,
+                elicit_handler: None,
+                credential_store: None,
+                hooks: Vec::new(),
+                logger: None,
+                pricing: None,
+                agents: None,
+                skills: None,
+                output_styles: None,
+                workflows: None,
+                mcp_catalog: None,
+                plugin_catalog: None,
+                lsp_servers: None,
+                agent_memory: None,
+                mcp_clients: None,
+                mcp_server_configs: Vec::new(),
+                mcp_tools: None,
+                refresh_tools: None,
+                system_prompt_provider: None,
+                plugins: Vec::new(),
+                plugin_load_report: None,
+            });
+            agent.start_session(StartSessionOptions {
+                cwd: Some(repo_path.clone()),
+                user_config_dir: Some(cfg_path.clone()),
+                ..Default::default()
+            })
+        };
+
+        let session_a = make_session();
+        let session_b = make_session();
+        let session_c = make_session();
+        let session_d = make_session();
+
+        let entered = session_a
+            .enter_worktree(Some("shared-wt".into()))
+            .await
+            .unwrap();
+        let wt_path = entered.worktree_path.clone();
+        let wt_host = std::path::PathBuf::from(wt_path.as_runtime_string().try_to_utf8().unwrap());
+        assert!(wt_host.exists());
+
+        session_b
+            .enter_worktree(Some("shared-wt".into()))
+            .await
+            .unwrap();
+        session_c
+            .enter_worktree(Some("shared-wt".into()))
+            .await
+            .unwrap();
+        session_d
+            .enter_worktree(Some("shared-wt".into()))
+            .await
+            .unwrap();
+
+        // `Keep` exit and `shutdown_and_wait` (with `session_c` still retained
+        // in scope) must both release their claims immediately.
+        let keep_exit = session_a
+            .exit_worktree(WorktreeExitAction::Keep)
+            .await
+            .unwrap();
+        assert_eq!(keep_exit.action, WorktreeExitAction::Keep);
+        session_c.shutdown_and_wait().await.unwrap();
+
+        // `session_d` is still standing in the worktree, so `session_b`'s
+        // `Remove` exit must downgrade to `Keep` instead of yanking the tree.
+        let blocked_remove = session_b
+            .exit_worktree(WorktreeExitAction::Remove)
+            .await
+            .unwrap();
+        assert_eq!(blocked_remove.action, WorktreeExitAction::Keep);
+        assert!(wt_host.exists());
+
+        // Once the last live holder (`session_d`) removes the worktree, neither
+        // `session_a`'s prior `Keep` exit nor `session_c`'s retained `Arc`
+        // blocks deletion, and no leaked ledger entry remains.
+        let final_remove = session_d
+            .exit_worktree(WorktreeExitAction::Remove)
+            .await
+            .unwrap();
+        assert_eq!(final_remove.action, WorktreeExitAction::Remove);
+        assert!(!wt_host.exists());
+        assert!(!worktree_has_other_holders(&wt_path, ""));
+
+        session_a.shutdown_and_wait().await.unwrap();
+        session_b.shutdown_and_wait().await.unwrap();
+        session_d.shutdown_and_wait().await.unwrap();
     }
 }

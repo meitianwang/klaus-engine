@@ -1787,14 +1787,40 @@ const MID_CONVO_EFFORT_MODELS: [&str; 7] = [
     "gpt-6.2-sol",
 ];
 
-/// The top-level `reasoning.effort` held constant while `configuration_update`
-/// items carry the declared level.
+/// The fallback top-level `reasoning.effort` held constant while
+/// `configuration_update` items carry the declared level when a model's
+/// capabilities do not specify `default_reasoning_effort`.
 const CONFIGURATION_UPDATE_PINNED_EFFORT: &str = "medium";
 
 fn model_takes_configuration_update_effort(model: &RuntimeString) -> bool {
     model
         .try_to_utf8()
         .is_ok_and(|id| MID_CONVO_EFFORT_MODELS.contains(&id.as_str()))
+}
+
+fn pinned_configuration_update_effort(
+    caps: &ModelCapabilities,
+    dialect: OpenAiReasoningDialect,
+) -> RuntimeString {
+    if let Some(raw) = &caps.default_reasoning_effort {
+        if let Some(EffortValue::Level(level)) = EffortValue::from_raw(raw) {
+            if !level.is_ultra() {
+                let clamped = caps
+                    .effort
+                    .as_ref()
+                    .and_then(|cap| cap.clamp(level))
+                    .unwrap_or(level);
+                return RuntimeString::from(dialect.spell(clamped));
+            }
+        }
+    }
+    if let Some(cap) = &caps.effort {
+        if let Some(default_level) = cap.default.filter(|level| !level.is_ultra()) {
+            let clamped = cap.clamp(default_level).unwrap_or(default_level);
+            return RuntimeString::from(dialect.spell(clamped));
+        }
+    }
+    RuntimeString::from(CONFIGURATION_UPDATE_PINNED_EFFORT)
 }
 
 #[cfg(test)]
@@ -2098,21 +2124,30 @@ fn build_responses_params_with_tool_mode(
     }
 
     let effort = raw_effort_for_request(req, caps, dialect);
-    // GPT-6 family: a declared effort level rides a `configuration_update`
-    // item appended at the transcript tail instead of rewriting the top-level
-    // `reasoning.effort`. Editing the top-level parameter mid-conversation
-    // re-prices the whole prompt cache on these backends; the item form leaves
-    // the cached prefix byte-identical and the backend applies the level to
-    // the next reply. Custom/numeric efforts are passthrough spellings the
-    // backend expects top-level, so they never take the item path.
-    let configuration_update_effort = effort
+    // GPT-6 family: both the default (absent override) and any declared effort
+    // level keep the top-level `reasoning.effort` pinned to the model's catalog
+    // default while a `configuration_update` item at the transcript tail
+    // carries the effective level for this turn. Pinning from turn 1 even when
+    // `req.effort` is `None` prevents the first mid-conversation level switch
+    // (or switching back to default) from mutating top-level `reasoning`,
+    // which would otherwise invalidate the prompt cache and reset stateful
+    // WebSocket response chains. Custom/numeric efforts are passthrough
+    // spellings the backend expects top-level, so they never take the item path.
+    let takes_configuration_update = caps
+        .effort
         .as_ref()
-        .filter(|_| {
-            dialect == OpenAiReasoningDialect::OpenAi
-                && matches!(req.effort, Some(EffortValue::Level(_)))
-                && model_takes_configuration_update_effort(&req.model)
-        })
-        .cloned();
+        .is_some_and(|cap| !cap.levels.is_empty())
+        && dialect == OpenAiReasoningDialect::OpenAi
+        && !matches!(
+            req.effort,
+            Some(EffortValue::Custom(_) | EffortValue::Number(_))
+        )
+        && model_takes_configuration_update_effort(&req.model);
+    let pinned_effort =
+        takes_configuration_update.then(|| pinned_configuration_update_effort(caps, dialect));
+    let configuration_update_effort = pinned_effort
+        .as_ref()
+        .map(|pinned| effort.clone().unwrap_or_else(|| pinned.clone()));
     // On the Responses path a declared effort knob is exactly what marks a
     // reasoning model: it gets the reasoning block (summary + encrypted content
     // for stateless replay), whether or not an effort value is pinned this turn.
@@ -2130,11 +2165,7 @@ fn build_responses_params_with_tool_mode(
         let mut reasoning = Map::new();
         // With a configuration_update item carrying the real level, the
         // top-level effort stays pinned so it never re-prices the cache.
-        let wire_effort = if configuration_update_effort.is_some() {
-            Some(RuntimeString::from(CONFIGURATION_UPDATE_PINNED_EFFORT))
-        } else {
-            effort.clone()
-        };
+        let wire_effort = pinned_effort.or_else(|| effort.clone());
         if let Some(e) = wire_effort {
             reasoning.insert("effort", vs(e));
         }
@@ -10304,8 +10335,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_and_absent_effort_never_take_the_item_path() {
-        let caps = caps_with_levels(&[EffortLevel::Low, EffortLevel::High]);
+    fn custom_and_absent_effort_preserve_gpt6_prefix_invariants() {
+        let mut caps =
+            caps_with_levels(&[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High]);
+        caps.default_reasoning_effort = Some("low".into());
         // A custom spelling is a passthrough the backend expects top-level.
         let mut request = matrix_request("gpt-6.2-sol");
         request.effort = Some(EffortValue::Custom("custom-budget".into()));
@@ -10313,11 +10346,19 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], json!("custom-budget"));
         assert_no_configuration_update(&body, "gpt-6.2-sol");
 
-        // No declared effort: no reasoning parameter and no item.
+        // Absent effort (default session selection) pins top-level `reasoning.effort`
+        // to the model's catalog default ("low") and rides the tail item so a
+        // subsequent mid-conversation switch to High and back to None never
+        // mutates top-level `reasoning`.
         request.effort = None;
-        let body = responses_body(&request, &caps);
-        assert!(body["reasoning"].get("effort").is_none());
-        assert_no_configuration_update(&body, "gpt-6.2-sol");
+        let default_body = responses_body(&request, &caps);
+        assert_eq!(default_body["reasoning"]["effort"], json!("low"));
+        assert_trailing_configuration_update(&default_body, "low");
+
+        request.effort = Some(EffortValue::Level(EffortLevel::High));
+        let high_body = responses_body(&request, &caps);
+        assert_eq!(high_body["reasoning"], default_body["reasoning"]);
+        assert_trailing_configuration_update(&high_body, "high");
     }
 
     #[test]

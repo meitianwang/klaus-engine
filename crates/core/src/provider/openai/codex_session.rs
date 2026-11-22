@@ -293,9 +293,12 @@ impl CodexTransportState {
         // The engine drives the API statelessly and never reads the echo, so
         // ask the backend to omit it; on tool-heavy requests this trims a
         // fixed per-response payload that scales with the declaration size.
-        headers
-            .entry("x-codex-exclude".to_string())
-            .or_insert_with(|| "tools".to_string());
+        if !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-codex-exclude"))
+        {
+            headers.insert("x-codex-exclude".to_string(), "tools".to_string());
+        }
         if let Some(token) = turn_state.filter(|token| !token.is_empty()) {
             headers.insert("x-codex-turn-state".to_string(), token.to_string());
         }
@@ -583,6 +586,21 @@ pub(super) fn response_create_props(full_body: &Value) -> Value {
     Value::Object(props)
 }
 
+fn is_ephemeral_configuration_update(item: &Value) -> bool {
+    item.get("type")
+        .and_then(Value::as_str)
+        .and_then(|s| s.try_to_utf8().ok())
+        .is_some_and(|kind| kind == "configuration_update")
+}
+
+fn strip_trailing_configuration_updates(items: &[Value]) -> &[Value] {
+    let mut end = items.len();
+    while end > 0 && is_ephemeral_configuration_update(&items[end - 1]) {
+        end -= 1;
+    }
+    &items[..end]
+}
+
 pub(super) fn build_ws_response_create_payload(
     full_body: &Value,
     anchor: Option<&LastResponseAnchor>,
@@ -601,14 +619,20 @@ pub(super) fn build_ws_response_create_payload(
         if prev.response_id.is_empty() || prev.props != current_props {
             return None;
         }
-        let req_len = prev.request_input.len();
+        // Ephemeral `configuration_update` items are appended to the tail of
+        // each request without entering conversation history; compare against
+        // the transcript prefix before that tail so incremental continuation
+        // carries only the newly appended items plus the current turn's
+        // `configuration_update`.
+        let prev_transcript = strip_trailing_configuration_updates(&prev.request_input);
+        let req_len = prev_transcript.len();
         let expected_replayed = filter_replayed_server_outputs(&prev.output_items);
         let out_len = expected_replayed.len();
         let prefix_len = req_len + out_len;
         if full_input.len() < prefix_len {
             return None;
         }
-        if full_input[..req_len] != prev.request_input[..] {
+        if full_input[..req_len] != prev_transcript[..] {
             return None;
         }
         for (server_item, replayed_item) in expected_replayed
@@ -1360,7 +1384,7 @@ pub(super) async fn drive_codex_websocket_turn(
             let full_input = full_body
                 .get("input")
                 .and_then(Value::as_array)
-                .cloned()
+                .map(|items| strip_trailing_configuration_updates(items).to_vec())
                 .unwrap_or_default();
             active.last_response = Some(LastResponseAnchor {
                 response_id,

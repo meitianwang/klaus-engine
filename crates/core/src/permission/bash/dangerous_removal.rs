@@ -61,7 +61,7 @@ pub fn is_dangerous_removal_path(resolved_path: &str, home_dir: &str) -> bool {
 }
 
 /// Expand a leading `~` / `~/` AND `$HOME` / `${HOME}` to `home_dir`.
-fn expand_home(p: &str, home_dir: &str) -> String {
+pub(crate) fn expand_home(p: &str, home_dir: &str) -> String {
     if home_dir.is_empty() {
         return p.to_string();
     }
@@ -102,7 +102,7 @@ pub fn extract_removal_paths(args: &[String]) -> Vec<String> {
     out
 }
 
-fn unquote(raw: &str) -> String {
+pub(crate) fn unquote(raw: &str) -> String {
     let mut s = raw;
     if s.starts_with('\'') || s.starts_with('"') {
         s = &s[1..];
@@ -117,6 +117,21 @@ fn unquote(raw: &str) -> String {
 /// path (resolved); otherwise `None`. Resolution is cwd-relative and does NOT
 /// follow symlinks.
 pub fn check_dangerous_removal(subcommand: &str, cwd: &str, home_dir: &str) -> Option<String> {
+    check_dangerous_removal_in_cwd(subcommand, Some(cwd), cwd, home_dir)
+}
+
+/// Variant of [`check_dangerous_removal`] for compound commands where an
+/// earlier `cd` moved the subcommand's resolution directory to `effective_cwd`
+/// while `protected_cwd` remains the session's own working directory. When
+/// `effective_cwd` is `None` (a preceding `cd` whose destination cannot be
+/// resolved statically, such as `cd -` or `cd "$DIR"`), any `rm`/`rmdir` with a
+/// non-absolute operand is conservatively treated as dangerous.
+pub(crate) fn check_dangerous_removal_in_cwd(
+    subcommand: &str,
+    effective_cwd: Option<&str>,
+    protected_cwd: &str,
+    home_dir: &str,
+) -> Option<String> {
     let stripped = strip_safe_wrappers(subcommand.trim());
     let tokens: Vec<String> = stripped.split_whitespace().map(String::from).collect();
     // Peel a leading `xargs [flags]` prefix.
@@ -140,27 +155,33 @@ pub fn check_dangerous_removal(subcommand: &str, cwd: &str, home_dir: &str) -> O
         let expanded = expand_home(&unquoted, home_dir);
         let abs = if node_path::is_absolute(&expanded) {
             node_path::resolve(&[&expanded])
+        } else if let Some(resolve_cwd) = effective_cwd {
+            node_path::resolve(&[resolve_cwd, &expanded])
         } else {
-            node_path::resolve(&[cwd, &expanded])
+            return Some(expanded);
         };
-        if is_dangerous_removal_path(&abs, home_dir) || is_working_dir_removal(&abs, cwd) {
+        if is_dangerous_removal_path(&abs, home_dir) || is_working_dir_removal(&abs, protected_cwd)
+        {
             return Some(abs);
         }
     }
     None
 }
 
-/// Whether the resolved removal target is the working directory itself.
-/// Wiping the tree the session stands in pulls every later relative path out
-/// from under the turn, so it prompts in the same class as the home directory
-/// even when it sits deep below the root and no other rule catches it.
+/// Whether the resolved removal target is the working directory itself or one
+/// of its ancestors. Wiping the tree the session stands in pulls every later
+/// relative path out from under the turn, so it prompts in the same class as
+/// the home directory even when it sits deep below the root and no other rule
+/// catches it.
 pub fn is_working_dir_removal(resolved_path: &str, cwd: &str) -> bool {
     if cwd.trim().is_empty() {
         return false;
     }
     let target = strip_trailing_slash(&normalize_separators(resolved_path));
     let base = strip_trailing_slash(&normalize_separators(&node_path::resolve(&[cwd])));
-    !target.is_empty() && !base.is_empty() && target == base
+    !target.is_empty()
+        && !base.is_empty()
+        && (target == base || base.starts_with(&format!("{target}/")))
 }
 
 #[cfg(test)]

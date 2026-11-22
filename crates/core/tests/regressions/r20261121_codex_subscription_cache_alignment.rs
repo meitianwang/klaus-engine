@@ -1041,3 +1041,299 @@ async fn codex_subagents_keep_parent_cache_key_for_same_model_and_isolate_specia
         "specialized Explore sub-agent must not replay uncached parent history unless fork_turns is explicit"
     );
 }
+
+#[tokio::test]
+async fn codex_gpt6_websocket_incremental_continuation_survives_default_and_switched_efforts_and_mixed_case_exclude(
+) {
+    use klaus_agent_core::schemas::effort::EffortValue;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let raw_header_lines: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let ws_frames_log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let raw_clone = raw_header_lines.clone();
+    let frames_clone = ws_frames_log.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener
+            .accept()
+            .await
+            .expect("accept persistent ws for gpt-6.2-sol");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let end = loop {
+            let n = tcp.read(&mut chunk).await.expect("read ws upgrade");
+            assert!(n > 0);
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let header_str = String::from_utf8_lossy(&buf[..end]).to_string();
+        let lines: Vec<String> = header_str.lines().map(str::to_owned).collect();
+        raw_clone.lock().unwrap().push(lines.clone());
+        let ws_key = lines
+            .iter()
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("sec-websocket-key");
+        let accept = derive_accept_key(ws_key.as_bytes());
+        let upgrade_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        tcp.write_all(upgrade_resp.as_bytes()).await.unwrap();
+        let mut ws = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+
+        // Frame 0: Turn 1 Step 1 (default effort -> tool call)
+        let msg0 = ws.next().await.unwrap().unwrap();
+        frames_clone
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(msg0.to_text().unwrap()).unwrap());
+        for ev in [
+            json!({"type": "response.created", "response": {"id": "resp_g6_1"}}),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "id": "fc_g6_1",
+                    "type": "function_call",
+                    "call_id": "call_g6_1",
+                    "name": "echo_probe",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_g6_1",
+                "delta": "{\"tag\":\"g6\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "fc_g6_1",
+                    "type": "function_call",
+                    "call_id": "call_g6_1",
+                    "name": "echo_probe",
+                    "arguments": "{\"tag\":\"g6\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_g6_1",
+                    "status": "completed",
+                    "usage": {"input_tokens": 600, "output_tokens": 20, "total_tokens": 620}
+                }
+            }),
+        ] {
+            ws.send(WsMessage::Text(ev.to_string())).await.unwrap();
+        }
+
+        // Frame 1..=3: Step 2 tool output, Turn 2 (High effort), Turn 3 (back to default None)
+        for (idx, resp_id, reply) in [
+            (2, "resp_g6_2", "Turn 1 done."),
+            (3, "resp_g6_3", "Turn 2 high done."),
+            (4, "resp_g6_4", "Turn 3 default done."),
+        ] {
+            let msg = ws.next().await.unwrap().unwrap();
+            frames_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(msg.to_text().unwrap()).unwrap());
+            let mid = format!("m_g6_{idx}");
+            for ev in [
+                json!({"type": "response.created", "response": {"id": resp_id}}),
+                json!({"type": "response.output_item.added", "item": {"id": mid, "type": "message", "role": "assistant"}}),
+                json!({"type": "response.output_text.delta", "item_id": mid, "delta": reply}),
+                json!({"type": "response.output_item.done", "item": {"id": mid, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": reply}]}}),
+                json!({"type": "response.completed", "response": {"id": resp_id, "status": "completed", "usage": {"input_tokens": 650, "output_tokens": 12, "total_tokens": 662}}}),
+            ] {
+                ws.send(WsMessage::Text(ev.to_string())).await.unwrap();
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_dir = tempfile::tempdir().expect("cfgdir");
+    let base_url = format!("http://{addr}/backend-api/codex");
+
+    let mut caps = codex_model_capabilities();
+    caps.effort = Some(EffortCapability {
+        levels: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+        default: Some(EffortLevel::Low),
+    });
+    caps.default_reasoning_effort = Some("low".into());
+    let mut by_model = HashMap::new();
+    by_model.insert("gpt-6.2-sol".to_string(), caps.clone());
+    let mut extra = HashMap::new();
+    extra.insert("originator".to_string(), "codex_cli_rs".to_string());
+    extra.insert("X-Codex-Exclude".to_string(), "tools,metadata".to_string());
+    let compat = OpenAICompatibilityOptions::try_new(extra, None).expect("compat headers");
+    let provider: Arc<dyn ModelProvider> = Arc::new(
+        OpenAIProvider::new(OpenAIProviderOptions {
+            remote_compaction: RemoteCompactionSupport::ResponsesV1,
+            api_key: None,
+            base_url: Some(base_url),
+            default_model: Some("gpt-6.2-sol".to_string()),
+            api: Some(OpenAiApi::Responses),
+            retry: None,
+            auth_source: Some(Arc::new(SyntheticCodexOAuth {
+                base_url: format!("http://{addr}/backend-api/codex"),
+                account_id: "acct_test_codex_g6".to_string(),
+            })),
+            http_client: None,
+            classifier_http_client_factory: None,
+            compatibility: Some(compat),
+            interceptor: None,
+            capabilities: Some(caps),
+            capabilities_by_model: Some(by_model),
+            reasoning_dialect: None,
+            fast_mode: false,
+            bridge_fast_mode: None,
+        })
+        .with_responses_websocket(Some(true)),
+    );
+
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let mut opts = agent_options(process);
+    opts.provider = provider;
+    opts.config = Some(json!({
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "model": "gpt-6.2-sol",
+        "thinking": true,
+        "modelSource": {
+            "source": "codex",
+            "modelId": "gpt-6.2-sol"
+        },
+        "prewarm": false,
+        "autoMemory": false,
+        "autoDream": false,
+        "memoryRecall": false,
+        "checkpointing": false
+    }));
+    opts.tools = Some(vec![Arc::new(EchoProbeTool { payload_chars: 24 })]);
+    let agent = Agent::new(opts);
+    let session = agent
+        .try_start_session_async(StartSessionOptions {
+            cwd: Some(RuntimePath::from(dir.path().to_string_lossy().as_ref())),
+            user_config_dir: Some(RuntimePath::from(cfg_dir.path().to_string_lossy().as_ref())),
+            ..Default::default()
+        })
+        .await
+        .expect("start gpt-6.2-sol session");
+
+    // Turn 1: default session effort (None -> catalog default "low") + tool loop
+    let out1 = session
+        .run(
+            Input::Text("Run default probe".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(out1.error.is_none(), "turn 1 failed: {:?}", out1.error);
+
+    // Turn 2: switch mid-conversation to High effort
+    let out2 = session
+        .run(
+            Input::Text("Switch to high".into()),
+            TurnOptions {
+                effort: Some(EffortValue::Level(EffortLevel::High)),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(out2.error.is_none(), "turn 2 failed: {:?}", out2.error);
+
+    // Turn 3: reset mid-conversation back to default (None -> "low")
+    let out3 = session
+        .run(
+            Input::Text("Back to default".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(out3.error.is_none(), "turn 3 failed: {:?}", out3.error);
+
+    server.await.expect("server");
+
+    // Mixed-case `X-Codex-Exclude` caller override must not produce a second header line.
+    let hs_lines = raw_header_lines.lock().unwrap();
+    let exclude_headers: Vec<&String> = hs_lines[0]
+        .iter()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("x-codex-exclude"))
+        })
+        .collect();
+    assert_eq!(
+        exclude_headers.len(),
+        1,
+        "caller-supplied X-Codex-Exclude must not be duplicated: {exclude_headers:?}"
+    );
+    assert!(exclude_headers[0].ends_with("tools,metadata"));
+
+    let frames = ws_frames_log.lock().unwrap();
+    assert_eq!(frames.len(), 4);
+
+    // Top-level `reasoning` stays byte-identical across all 4 frames (`effort` pinned to "low").
+    let pinned_reasoning = &frames[0]["reasoning"];
+    assert_eq!(pinned_reasoning["effort"], "low");
+    for (idx, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            &frame["reasoning"], pinned_reasoning,
+            "frame {idx} mutated top-level reasoning"
+        );
+    }
+
+    // Frame 0: initial full payload, trailing `configuration_update` = "low".
+    assert!(frames[0].get("previous_response_id").is_none());
+    let f0_input = frames[0]["input"].as_array().unwrap();
+    assert_eq!(
+        f0_input.last().unwrap(),
+        &json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
+    );
+
+    // Frame 1: incremental tool-output continuation (`previous_response_id == "resp_g6_1"`).
+    assert_eq!(frames[1]["previous_response_id"], "resp_g6_1");
+    let f1_input = frames[1]["input"].as_array().unwrap();
+    assert_eq!(
+        f1_input.len(),
+        2,
+        "GPT-6 tool step must send only function_call_output + configuration_update: {f1_input:?}"
+    );
+    assert_eq!(f1_input[0]["type"], "function_call_output");
+    assert_eq!(
+        f1_input[1],
+        json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
+    );
+
+    // Frame 2: incremental continuation across None -> High effort switch!
+    assert_eq!(frames[2]["previous_response_id"], "resp_g6_2");
+    let f2_input = frames[2]["input"].as_array().unwrap();
+    assert!(
+        f2_input
+            .iter()
+            .all(|item| item.get("type") != Some(&json!("function_call"))),
+        "switching effort to High must keep incremental continuation without resending history"
+    );
+    assert_eq!(
+        f2_input.last().unwrap(),
+        &json!({"type": "configuration_update", "reasoning": {"effort": "high"}})
+    );
+
+    // Frame 3: incremental continuation across High -> default (None) switch, actively resetting to "low"!
+    assert_eq!(frames[3]["previous_response_id"], "resp_g6_3");
+    let f3_input = frames[3]["input"].as_array().unwrap();
+    assert_eq!(
+        f3_input.last().unwrap(),
+        &json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
+    );
+}

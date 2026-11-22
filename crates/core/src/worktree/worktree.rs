@@ -23,6 +23,7 @@ use crate::runtime_values::{
 use crate::sync_ext::MutexExt;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 // A conservative safe-filename charset for each path segment, plus a length cap.
@@ -515,13 +516,63 @@ pub async fn count_worktree_changes(
 static WORKTREE_HOLDERS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static NEXT_WORKTREE_HOLDER_SEQ: AtomicU64 = AtomicU64::new(1);
+
 fn holder_key(path: &RuntimePath) -> String {
     let raw = path.as_runtime_string().try_to_utf8().unwrap_or_default();
-    let trimmed = raw.trim_end_matches('/');
+    let trimmed = raw.trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
         raw
     } else {
         trimmed.to_string()
+    }
+}
+
+/// Allocate a process-unique holder token with a human-readable prefix so two
+/// concurrent claims under the same session or sub-agent slug never alias into
+/// one `HashSet` entry.
+pub fn next_worktree_holder_token(prefix: &str) -> String {
+    let seq = NEXT_WORKTREE_HOLDER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}:{seq}")
+}
+
+/// RAII claim in [`WORKTREE_HOLDERS`]. Releases its holder entry automatically
+/// when dropped (covering `ExitWorktree(keep)`, session shutdown/drop, early
+/// initialization errors, and cancelled or panicking sub-agent tasks) and also
+/// supports explicit early release before querying [`worktree_has_other_holders`].
+#[derive(Debug)]
+pub struct WorktreeHolderGuard {
+    path: RuntimePath,
+    holder: String,
+    released: bool,
+}
+
+impl WorktreeHolderGuard {
+    pub fn acquire(path: RuntimePath, holder: impl Into<String>) -> Self {
+        let holder = holder.into();
+        register_worktree_holder(&path, &holder);
+        Self {
+            path,
+            holder,
+            released: false,
+        }
+    }
+
+    pub fn acquire_unique(path: RuntimePath, prefix: &str) -> Self {
+        Self::acquire(path, next_worktree_holder_token(prefix))
+    }
+
+    pub fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            release_worktree_holder(&self.path, &self.holder);
+        }
+    }
+}
+
+impl Drop for WorktreeHolderGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -996,11 +1047,23 @@ mod tests {
     fn holder_ledger_keys_tolerate_trailing_slash_and_stay_per_path() {
         let plain = RuntimePath::from("/tmp/klaus-ledger-test/tree-b");
         let slashed = RuntimePath::from("/tmp/klaus-ledger-test/tree-b/");
+        let backslashed = RuntimePath::from(r"C:\tmp\klaus-ledger-test\tree-win\");
+        let win_plain = RuntimePath::from(r"C:\tmp\klaus-ledger-test\tree-win");
         register_worktree_holder(&plain, "session-d");
         assert!(worktree_has_other_holders(&slashed, "session-e"));
         let sibling = RuntimePath::from("/tmp/klaus-ledger-test/tree-c");
         assert!(!worktree_has_other_holders(&sibling, "session-e"));
         release_worktree_holder(&slashed, "session-d");
         assert!(!worktree_has_other_holders(&plain, "session-e"));
+
+        let g1 = WorktreeHolderGuard::acquire_unique(backslashed.clone(), "subagent:shared-slug");
+        let g2 = WorktreeHolderGuard::acquire_unique(win_plain.clone(), "subagent:shared-slug");
+        drop(g1);
+        assert!(
+            worktree_has_other_holders(&win_plain, ""),
+            "concurrent claims sharing a prefix must hold distinct tokens until every guard drops"
+        );
+        drop(g2);
+        assert!(!worktree_has_other_holders(&backslashed, ""));
     }
 }

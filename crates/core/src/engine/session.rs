@@ -763,13 +763,19 @@ pub(crate) struct SessionConversationState {
     queue: Arc<MessageQueue>,
 }
 
+pub(crate) struct ActiveSessionWorktree {
+    pub(crate) session: WorktreeSession,
+    pub(crate) holder: Option<crate::worktree::worktree::WorktreeHolderGuard>,
+}
+
 /// The session's working-tree cluster: the LIVE working directory (switches
 /// when a worktree is entered), the cwd before the active worktree was
-/// entered, and the active worktree session.
+/// entered, and the active worktree session alongside its live holder guard.
 pub(crate) struct SessionWorkspaceState {
     cwd: RwLock<RuntimePath>,
     original_cwd: RwLock<RuntimePath>,
-    current_worktree: Mutex<Option<WorktreeSession>>,
+    current_worktree: Mutex<Option<ActiveSessionWorktree>>,
+    holder_prefix: String,
 }
 
 /// The session's teardown-lifecycle cluster: the dispose flag shared with

@@ -3,7 +3,9 @@
 //! independently so a per-subcommand DENY beats a whole-command allow and a
 //! whole-command allow cannot admit a trailing `&& rm -rf /`.
 
-use crate::permission::bash::dangerous_removal::check_dangerous_removal;
+use crate::permission::bash::dangerous_removal::{
+    check_dangerous_removal_in_cwd, expand_home, unquote,
+};
 use crate::permission::bash::match_rule::{
     match_bash_rule, strip_safe_wrappers, BashRuleEntry, RuleClass,
 };
@@ -105,10 +107,7 @@ pub fn evaluate_bash_command(
                 dangerous_removal: false,
             };
         }
-        if subs
-            .iter()
-            .any(|s| check_dangerous_removal(s, &opts.cwd, &home_dir).is_some())
-        {
+        if has_compound_dangerous_removal(&subs, &opts.cwd, &home_dir) {
             return BashDecision::Ask {
                 from_rule: false,
                 dangerous_removal: true,
@@ -150,13 +149,11 @@ pub fn evaluate_bash_command(
     }
 
     // STEP D2.7: catastrophic `rm`/`rmdir` forces ASK, ALLOW-RULE-immune.
-    for sub in &subcommands {
-        if check_dangerous_removal(sub, &opts.cwd, &home_dir).is_some() {
-            return BashDecision::Ask {
-                from_rule: false,
-                dangerous_removal: true,
-            };
-        }
+    if has_compound_dangerous_removal(&subcommands, &opts.cwd, &home_dir) {
+        return BashDecision::Ask {
+            from_rule: false,
+            dangerous_removal: true,
+        };
     }
 
     // STEP D3: too many subcommands → unreliable analysis → ASK.
@@ -325,6 +322,62 @@ fn is_cd_command(sub: &str) -> bool {
     w == "cd" || w == "pushd" || w == "popd"
 }
 
+fn has_compound_dangerous_removal(subcommands: &[String], cwd: &str, home_dir: &str) -> bool {
+    let mut effective_cwd = Some(cwd.to_string());
+    for sub in subcommands {
+        if check_dangerous_removal_in_cwd(sub, effective_cwd.as_deref(), cwd, home_dir).is_some() {
+            return true;
+        }
+        if is_cd_command(sub) {
+            effective_cwd = advance_effective_cwd(sub, effective_cwd.as_deref(), home_dir);
+        }
+    }
+    false
+}
+
+fn advance_effective_cwd(sub: &str, current_cwd: Option<&str>, home_dir: &str) -> Option<String> {
+    let toks = normalized_tokens(sub);
+    let cmd = toks.first().map(String::as_str)?;
+    if cmd == "popd" {
+        return None;
+    }
+    let mut args = Vec::new();
+    let mut positional_only = false;
+    for tok in toks.iter().skip(1) {
+        if !positional_only && tok == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && (tok == "-L" || tok == "-P") {
+            continue;
+        }
+        if !positional_only && tok.starts_with('-') && tok != "-" {
+            return None;
+        }
+        args.push(tok.as_str());
+    }
+    match (cmd, args.as_slice()) {
+        ("cd", []) => (!home_dir.is_empty()).then(|| node_path::resolve(&[home_dir])),
+        ("cd" | "pushd", ["-"]) => None,
+        ("cd" | "pushd", [raw]) => {
+            let unquoted = unquote(raw);
+            if unquoted.is_empty() {
+                return current_cwd.map(str::to_owned);
+            }
+            let expanded = expand_home(&unquoted, home_dir);
+            if expanded.contains(['$', '`', '*', '?']) || expanded.starts_with('~') {
+                return None;
+            }
+            if node_path::is_absolute(&expanded) {
+                Some(node_path::resolve(&[&expanded]))
+            } else {
+                current_cwd.map(|base| node_path::resolve(&[base, &expanded]))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn is_git_command(sub: &str) -> bool {
     let toks = normalized_tokens(sub);
     if toks.first().map(String::as_str) == Some("git") {
@@ -436,5 +489,56 @@ mod tests {
     fn safe_rm_allowed_by_rule() {
         let d = evaluate_bash_command("rm -rf ./build", &sets(&["rm"], &[], &[]), &opts());
         assert!(matches!(d, BashDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn compound_cd_tracks_effective_cwd_for_working_dir_removal_guard() {
+        let mut deep_opts = opts();
+        deep_opts.cwd = "/work/project/checkout".into();
+        let allow_cd_rm = sets(&["cd *", "rm *"], &[], &[]);
+
+        // `cd build && rm -rf ..` resolves `..` from `/work/project/checkout/build`
+        // back to `/work/project/checkout` (the session's working directory itself)
+        // and must prompt even when `cd *` and `rm *` are allowed.
+        assert_eq!(
+            evaluate_bash_command("cd build && rm -rf ..", &allow_cd_rm, &deep_opts),
+            BashDecision::Ask {
+                from_rule: false,
+                dangerous_removal: true,
+            }
+        );
+
+        // `rm -rf ..` or `cd .. && rm -rf .` removes an ancestor of the working
+        // directory, destroying `/work/project/checkout` along with it.
+        assert_eq!(
+            evaluate_bash_command("rm -rf ..", &allow_cd_rm, &deep_opts),
+            BashDecision::Ask {
+                from_rule: false,
+                dangerous_removal: true,
+            }
+        );
+        assert_eq!(
+            evaluate_bash_command("cd .. && rm -rf .", &allow_cd_rm, &deep_opts),
+            BashDecision::Ask {
+                from_rule: false,
+                dangerous_removal: true,
+            }
+        );
+
+        // Conversely, `cd build && rm -rf .` only cleans the child `build`
+        // directory and must not misfire the working-directory guard.
+        assert!(matches!(
+            evaluate_bash_command("cd build && rm -rf .", &allow_cd_rm, &deep_opts),
+            BashDecision::Allow { .. }
+        ));
+
+        // An unresolvable `cd -` followed by relative `rm` fails closed.
+        assert_eq!(
+            evaluate_bash_command("cd - && rm -rf .", &allow_cd_rm, &deep_opts),
+            BashDecision::Ask {
+                from_rule: false,
+                dangerous_removal: true,
+            }
+        );
     }
 }

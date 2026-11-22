@@ -3838,6 +3838,10 @@ impl Session {
         // unrelated LSP/MCP/Host cleanup before the persistence reserve.
         self.run_shutdown_cleanup_phase(cleanup_deadline, &mut outcome)
             .await;
+        // All turns, sub-agents, background processes, and workspace adapters in
+        // this session have settled; release any worktree holder claim even if
+        // callers still retain an `Arc<Session>`.
+        self.workspace.release_worktree_holder();
 
         // Descendants may settle their last provider sample while cancellation drains.
         match tokio::time::timeout_at(flush_deadline, self.flush_stopped_goal_progress()).await {

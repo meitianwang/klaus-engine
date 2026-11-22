@@ -95,10 +95,10 @@ pub(crate) enum AgentWorktree {
         root: RuntimePath,
         branch: RuntimeString,
         head: Option<RuntimeString>,
-        /// Ledger token this spawn registered under in the worktree holder
-        /// registry; teardown releases it and skips removal while any other
-        /// holder still stands in the tree.
-        holder: String,
+        /// RAII claim in the worktree holder registry; teardown releases it
+        /// explicitly before checking remaining holders, and dropping the enum
+        /// also releases it on any early abort path.
+        holder: Mutex<Option<crate::worktree::worktree::WorktreeHolderGuard>>,
     },
 }
 

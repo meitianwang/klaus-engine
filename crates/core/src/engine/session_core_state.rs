@@ -762,17 +762,11 @@ impl Session {
         if let Some(wt) = init.current_worktree {
             cwd = wt.worktree_path.clone();
             original_cwd = wt.original_cwd.clone();
-            // A resumed session stands in the worktree exactly like a fresh
-            // enter: record the holder so a sibling session's exit cannot
-            // force the checkout away underneath it.
-            if wt.hook_based != Some(true) {
-                crate::worktree::worktree::register_worktree_holder(
-                    &wt.worktree_path,
-                    &format!("session:{}", id.try_to_utf8().unwrap_or_default()),
-                );
-            }
             current_worktree = Some(wt);
         }
+        let is_worktree = current_worktree.is_some();
+        let workspace =
+            SessionWorkspaceState::new(cwd.clone(), original_cwd, current_worktree, &id);
 
         if init.config.task_resource_scope.is_some() {
             if init.config.sandbox_mode
@@ -1272,7 +1266,7 @@ impl Session {
                         config: init.config.clone(),
                         model_messages: initial_model_messages,
                         now_ms: Some(created_at),
-                        is_worktree: current_worktree.is_some(),
+                        is_worktree,
                         mcp_instructions: if mcp_instructions.is_empty() {
                             None
                         } else {
@@ -1458,11 +1452,7 @@ impl Session {
             config: init.config.clone(),
             tools: init.tools.clone(),
             host_refresh_tools: init.refresh_tools,
-            workspace: SessionWorkspaceState {
-                cwd: RwLock::new(cwd.clone()),
-                original_cwd: RwLock::new(original_cwd),
-                current_worktree: Mutex::new(current_worktree),
-            },
+            workspace,
             workflow_journal_log: Mutex::new(init.prior_workflow_journal.unwrap_or_default()),
             has_workflow_tool,
             swarm_identity: Mutex::new(swarm_identity),
