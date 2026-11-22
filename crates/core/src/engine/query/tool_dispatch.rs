@@ -564,17 +564,19 @@ async fn interrupted_tool_result(
     shared: &Arc<Shared>,
     call: &ResolvedToolCall,
 ) -> ToolResultMessage {
-    let persistence = record_tool_lifecycle(
-        shared,
-        call,
-        ToolLifecyclePhase::Cancelled,
-        Some(call.initial_internal_input.clone()),
-        Some(true),
-        Some("Tool execution was interrupted.".into()),
-    )
-    .await;
-    if let Err(error) = persistence {
-        report_tool_persistence_failure(shared, &error);
+    if !call.suppresses_own_lifecycle() {
+        let persistence = record_tool_lifecycle(
+            shared,
+            call,
+            ToolLifecyclePhase::Cancelled,
+            Some(call.initial_internal_input.clone()),
+            Some(true),
+            Some("Tool execution was interrupted.".into()),
+        )
+        .await;
+        if let Err(error) = persistence {
+            report_tool_persistence_failure(shared, &error);
+        }
     }
     ToolResultMessage {
         uuid: (shared.deps.uuid)().into(),
@@ -899,8 +901,8 @@ fn execute_tool_call_body(
         {
             let s = Arc::clone(&shared);
             let q = Arc::clone(&shared.q);
-            let id = call.visible.id.clone();
-            let tool_name = call.internal_name.clone();
+            let id = call.effective_tool_use_id().clone();
+            let tool_name = call.effective_tool_name().clone();
             let turn_state = shared.turn_state.clone();
             let failure = persistence_failure.clone();
             let persistence = persistence.clone();
@@ -1095,11 +1097,16 @@ fn execute_tool_call_body(
                                 thought_signature: None,
                             };
                             let is_code = owner == "exec";
+                            let is_indirect_bridge =
+                                owner == crate::tools::builtins::tool_search::CALL_MCP_TOOL_NAME;
                             let mut inner_call = ResolvedToolCall::from_internal(
                                 inner_block,
                                 profile.clone(),
                                 owner,
                             );
+                            if is_indirect_bridge {
+                                inner_call.parent_tool_use_id = Some(owner_id.clone());
+                            }
                             if is_code {
                                 inner_call.approval_call_source =
                                     crate::types::permission::ApprovalActionCallSource::CodeMode {
@@ -1107,19 +1114,23 @@ fn execute_tool_call_body(
                                         runtime_tool_call_id: inner_call.visible.id.clone(),
                                     };
                             }
-                            record_tool_lifecycle_parts(
-                                &s,
-                                ToolLifecycleRecordParts {
-                                    tool_use_id: &inner_call.visible.id,
-                                    tool_name: &inner_call.internal_name,
-                                    phase: ToolLifecyclePhase::Requested,
-                                    source: Some(tool_lifecycle_source_for_tool(inner.as_ref())),
-                                    arguments: Some(inner_call.initial_internal_input.clone()),
-                                    is_error: None,
-                                    error: None,
-                                },
-                            )
-                            .await?;
+                            if !inner_call.suppresses_own_lifecycle() {
+                                record_tool_lifecycle_parts(
+                                    &s,
+                                    ToolLifecycleRecordParts {
+                                        tool_use_id: &inner_call.visible.id,
+                                        tool_name: &inner_call.internal_name,
+                                        phase: ToolLifecyclePhase::Requested,
+                                        source: Some(tool_lifecycle_source_for_tool(
+                                            inner.as_ref(),
+                                        )),
+                                        arguments: Some(inner_call.initial_internal_input.clone()),
+                                        is_error: None,
+                                        error: None,
+                                    },
+                                )
+                                .await?;
+                            }
                             match execute_tool_call(Arc::clone(&s), inner_call).await {
                                 Ok(res) => Ok(InvokeToolResult {
                                     is_error: res.message.is_error,
@@ -1421,9 +1432,9 @@ fn execute_tool_call_body(
             None
         };
         let progress_q = Arc::clone(&shared.q);
-        let progress_id = call.visible.id.clone();
+        let progress_id = call.effective_tool_use_id().clone();
         let progress_shared = Arc::clone(&shared);
-        let progress_tool_name = call.internal_name.clone();
+        let progress_tool_name = call.effective_tool_name().clone();
         let progress_turn_state = shared.turn_state.clone();
         let progress_failure = persistence_failure.clone();
         let progress_persistence = persistence.clone();
@@ -1510,58 +1521,60 @@ fn execute_tool_call_body(
                 // any later provider-aware text rendering can alter model content.
                 let (result_tool_kind, native_tool_output) =
                     successful_result_provider_metadata(&call, &result.serializable.output);
-                let terminal_persistence = record_tool_lifecycle(
-                    &shared,
-                    &call,
-                    if is_error {
-                        // A tool the user's stop killed did not fail on its own
-                        // merits. Recorded as `failed` it is indistinguishable
-                        // from a real failure, and a reopened thread then shows
-                        // the stop as a red error the user never caused.
-                        tool_failure_phase(&shared)
+                if !call.suppresses_own_lifecycle() {
+                    let terminal_persistence = record_tool_lifecycle(
+                        &shared,
+                        &call,
+                        if is_error {
+                            // A tool the user's stop killed did not fail on its own
+                            // merits. Recorded as `failed` it is indistinguishable
+                            // from a real failure, and a reopened thread then shows
+                            // the stop as a red error the user never caused.
+                            tool_failure_phase(&shared)
+                        } else {
+                            ToolLifecyclePhase::Completed
+                        },
+                        is_error.then(|| call.initial_internal_input.clone()),
+                        Some(is_error),
+                        reported_error.clone(),
+                    )
+                    .await;
+                    if let Err(error) = terminal_persistence {
+                        report_tool_persistence_failure(&shared, &error);
+                        reported_error = Some(partial_tool_persistence_error(&error));
+                        persistence_error = Some(error);
+                        is_error = true;
+                    }
+                    shared.q.push(if is_error {
+                        EngineEvent::ItemUpdated {
+                            inference: None,
+                            item: ThreadItem::ToolCall {
+                                id: call.visible.id.clone(),
+                                tool_name: call.internal_name.clone(),
+                                arguments: arguments_json.clone(),
+                                result: Some(to_json_safe(&result.serializable.output)),
+                                error: Some(ItemError {
+                                    message: reported_error
+                                        .clone()
+                                        .expect("is_error has an extracted detail"),
+                                }),
+                                status: ItemStatus::Failed,
+                            },
+                        }
                     } else {
-                        ToolLifecyclePhase::Completed
-                    },
-                    is_error.then(|| call.initial_internal_input.clone()),
-                    Some(is_error),
-                    reported_error.clone(),
-                )
-                .await;
-                if let Err(error) = terminal_persistence {
-                    report_tool_persistence_failure(&shared, &error);
-                    reported_error = Some(partial_tool_persistence_error(&error));
-                    persistence_error = Some(error);
-                    is_error = true;
+                        EngineEvent::ItemCompleted {
+                            inference: None,
+                            item: ThreadItem::ToolCall {
+                                id: call.visible.id.clone(),
+                                tool_name: call.internal_name.clone(),
+                                arguments: arguments_json.clone(),
+                                result: Some(to_json_safe(&result.serializable.output)),
+                                error: None,
+                                status: ItemStatus::Completed,
+                            },
+                        }
+                    });
                 }
-                shared.q.push(if is_error {
-                    EngineEvent::ItemUpdated {
-                        inference: None,
-                        item: ThreadItem::ToolCall {
-                            id: call.visible.id.clone(),
-                            tool_name: call.internal_name.clone(),
-                            arguments: arguments_json.clone(),
-                            result: Some(to_json_safe(&result.serializable.output)),
-                            error: Some(ItemError {
-                                message: reported_error
-                                    .clone()
-                                    .expect("is_error has an extracted detail"),
-                            }),
-                            status: ItemStatus::Failed,
-                        },
-                    }
-                } else {
-                    EngineEvent::ItemCompleted {
-                        inference: None,
-                        item: ThreadItem::ToolCall {
-                            id: call.visible.id.clone(),
-                            tool_name: call.internal_name.clone(),
-                            arguments: arguments_json.clone(),
-                            result: Some(to_json_safe(&result.serializable.output)),
-                            error: None,
-                            status: ItemStatus::Completed,
-                        },
-                    }
-                });
 
                 // PostToolUse hook — may REPLACE the model-visible output, append
                 // context, or halt the turn.
@@ -1765,7 +1778,9 @@ pub(super) async fn push_tool_call_started(
     let tools = shared.tools.lock_recover().clone();
     let mut call = call.clone();
     let tool = call.bind_resolved_tool(&tools);
-    if !tool_call_authorized(shared, &call, tool.as_deref(), &call.initial_internal_input) {
+    if !tool_call_authorized(shared, &call, tool.as_deref(), &call.initial_internal_input)
+        || call.suppresses_own_lifecycle()
+    {
         return Ok(());
     }
     record_tool_lifecycle(
@@ -1992,8 +2007,8 @@ async fn record_tool_lifecycle_approval(
         let _persistence = super::tool_tasks::ToolPersistence::enter_current(false)?;
         cb(ToolLifecycleRecord {
             turn_id: shared.turn_state.turn_id.clone(),
-            tool_use_id: call.visible.id.clone(),
-            tool_name: call.internal_name.clone(),
+            tool_use_id: call.effective_tool_use_id().clone(),
+            tool_name: call.effective_tool_name().clone(),
             phase: ToolLifecyclePhase::Approved,
             source: tool_lifecycle_source_from_pool(shared, &call.internal_name),
             arguments: Some(arguments),
@@ -2482,37 +2497,38 @@ pub(super) async fn error_result(
     mut message: RuntimeString,
     extra_context: &[RuntimeString],
 ) -> ToolResultMessage {
-    let persistence = record_tool_lifecycle(
-        shared,
-        call,
-        tool_failure_phase(shared),
-        Some(call.initial_internal_input.clone()),
-        Some(true),
-        Some(message.clone()),
-    )
-    .await;
-    if let Err(error) = persistence {
-        report_tool_persistence_failure(shared, &error);
-        message = message
-            .concat(&RuntimeString::from(
-                "
-Tool lifecycle persistence failed: ",
-            ))
-            .concat(&error.message);
+    if !call.suppresses_own_lifecycle() {
+        let persistence = record_tool_lifecycle(
+            shared,
+            call,
+            tool_failure_phase(shared),
+            Some(call.initial_internal_input.clone()),
+            Some(true),
+            Some(message.clone()),
+        )
+        .await;
+        if let Err(error) = persistence {
+            report_tool_persistence_failure(shared, &error);
+            message = message
+                .concat(&RuntimeString::from(
+                    "\nTool lifecycle persistence failed: ",
+                ))
+                .concat(&error.message);
+        }
+        shared.q.push(EngineEvent::ItemUpdated {
+            inference: None,
+            item: ThreadItem::ToolCall {
+                id: call.visible.id.clone(),
+                tool_name: call.internal_name.clone(),
+                arguments: call.initial_internal_input.clone(),
+                result: None,
+                error: Some(ItemError {
+                    message: message.clone(),
+                }),
+                status: ItemStatus::Failed,
+            },
+        });
     }
-    shared.q.push(EngineEvent::ItemUpdated {
-        inference: None,
-        item: ThreadItem::ToolCall {
-            id: call.visible.id.clone(),
-            tool_name: call.internal_name.clone(),
-            arguments: call.initial_internal_input.clone(),
-            result: None,
-            error: Some(ItemError {
-                message: message.clone(),
-            }),
-            status: ItemStatus::Failed,
-        },
-    });
     let mut content: Vec<OutputBlock> = vec![text_out_exact(message)];
     if !extra_context.is_empty() {
         content.push(OutputBlock::Text(TextBlock {

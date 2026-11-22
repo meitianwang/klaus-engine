@@ -1096,6 +1096,12 @@ struct ResolvedToolCall {
     /// any search and not visible on this request's wire. Refused with load
     /// guidance instead of executed.
     not_loaded: bool,
+    /// Set when a 1:1 indirect bridge (`call_mcp_tool`) delegates to its
+    /// resolved target tool. The outer `ToolCall` item and lifecycle already
+    /// represent the single model invocation, so the inner execution routes
+    /// progress and approval records onto `parent_tool_use_id` without
+    /// emitting a duplicate `ToolCall` item or duplicate lifecycle frames.
+    parent_tool_use_id: Option<RuntimeString>,
 }
 
 impl ResolvedToolCall {
@@ -1113,6 +1119,7 @@ impl ResolvedToolCall {
             profile,
             server_output: None,
             not_loaded: false,
+            parent_tool_use_id: None,
         }
     }
 
@@ -1133,7 +1140,24 @@ impl ResolvedToolCall {
             profile,
             server_output: None,
             not_loaded: false,
+            parent_tool_use_id: None,
         }
+    }
+
+    fn effective_tool_use_id(&self) -> &RuntimeString {
+        self.parent_tool_use_id.as_ref().unwrap_or(&self.visible.id)
+    }
+
+    fn effective_tool_name(&self) -> &RuntimeString {
+        if self.suppresses_own_lifecycle() {
+            self.trusted_caller.as_ref().unwrap_or(&self.internal_name)
+        } else {
+            &self.internal_name
+        }
+    }
+
+    fn suppresses_own_lifecycle(&self) -> bool {
+        self.parent_tool_use_id.is_some()
     }
 
     fn replace_effective_input(&mut self, input: Json) {
