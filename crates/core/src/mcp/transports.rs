@@ -1134,12 +1134,17 @@ impl Transport for HttpTransport {
             .unwrap()
             .clone()
             .ok_or_else(|| McpError::new("HttpTransport is not started"))?;
-        // A JSON-RPC response to a server-initiated request carries an id and
-        // a result or error but no method. Its POST expects a bare
-        // acknowledgement; any payload riding on it belongs to no request this
-        // client is waiting for.
-        let reply = message.get("method").is_none()
-            && matches!(message.get("id"), Some(id) if !id.is_null())
+        // Only a JSON-RPC request (carries a method and a non-null id) awaits
+        // a server response on the shared router. Outbound replies (including
+        // `"id": null` error replies) and outbound notifications (`method`
+        // without `id`) are one-way messages with no pending waiter.
+        let is_request = message
+            .get("method")
+            .and_then(RuntimeJson::as_str)
+            .is_some()
+            && matches!(message.get("id"), Some(id) if !id.is_null());
+        let is_reply = message.get("method").is_none()
+            && message.get("id").is_some()
             && (message.get("result").is_some() || message.get("error").is_some());
         let headers = self.headers.lock().unwrap().clone();
         let body = runtime_json::stringify(&message).to_node_utf8();
@@ -1174,22 +1179,28 @@ impl Transport for HttpTransport {
         }
         let status = resp.status();
         if status == reqwest::StatusCode::ACCEPTED
-            || (reply && status == reqwest::StatusCode::NO_CONTENT)
+            || (!is_request && status == reqwest::StatusCode::NO_CONTENT)
         {
             return Ok(());
         }
         if !status.is_success() {
             return Err(http_error(status, "HTTP POST failed"));
         }
-        if reply {
-            // Both peers assign JSON-RPC ids independently, so decoding a body
-            // here could hand the router a response whose id collides with an
-            // unrelated pending request of this client and falsely resolve it.
-            // Reject unexpected reply-POST payloads before any decoding.
-            return Err(McpError::new(format!(
-                "HTTP reply POST returned unexpected status {}",
-                status.as_u16()
-            )));
+        if !is_request {
+            if is_reply {
+                // Both peers assign JSON-RPC ids independently, so decoding a
+                // body here could hand the router a response whose id collides
+                // with an unrelated pending request of this client and falsely
+                // resolve it. Reject unexpected reply-POST payloads up front.
+                return Err(McpError::new(format!(
+                    "HTTP reply POST returned unexpected status {}",
+                    status.as_u16()
+                )));
+            }
+            // Outbound notifications have no pending waiter. Accept a generic
+            // 2xx acknowledgement while dropping any body or stream before it
+            // can fail empty-body decoding or enter the shared message router.
+            return Ok(());
         }
         let content_type = resp
             .headers()

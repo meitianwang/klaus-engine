@@ -105,12 +105,16 @@ impl SilentCloseServer {
                                 "jsonrpc":"2.0","id":frame["id"],"result":result
                             }).to_string());
                             let socket = reader.get_mut();
-                            if method == "notifications/initialized" && ask_roots {
-                                let event = format!("data: {}\n\n", json!({"jsonrpc":"2.0","id":41,"method":"roots/list","params":{}}));
-                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
-                                socket.write_all(event.as_bytes()).await.unwrap();
+                            if method == "initialize" && ask_roots {
+                                let init_body = response.expect("initialize response");
+                                let events = format!(
+                                    "data: {init_body}\n\ndata: {}\n\n",
+                                    json!({"jsonrpc":"2.0","id":41,"method":"roots/list","params":{}})
+                                );
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nmcp-session-id: fixture-session\r\nConnection: close\r\n\r\n").await.unwrap();
+                                socket.write_all(events.as_bytes()).await.unwrap();
                                 socket.flush().await.unwrap();
-                                // An open response stream also has to be released locally.
+                                // An open request event stream also has to be released locally.
                                 let mut byte = [0];
                                 let _ = reader.read(&mut byte).await;
                                 streaming.notify_one();

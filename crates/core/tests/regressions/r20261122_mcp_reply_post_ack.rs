@@ -8,6 +8,7 @@
 //! responses and accept only `202`/`204` acknowledgements for them, rejecting
 //! any other successful status before decoding its body.
 
+use klaus_agent_core::mcp::client::{Client, RequestOptions};
 use klaus_agent_core::mcp::transports::{HttpTransport, Transport, TransportEvent};
 use klaus_agent_core::runtime_values::{runtime_json, RuntimeString};
 use std::collections::HashMap;
@@ -219,4 +220,94 @@ async fn a_request_post_still_delivers_the_response_body() {
         }
         other => panic!("unexpected transport event: {other:?}"),
     }
+}
+
+/// A JSON-RPC 2.0 error reply carrying `"id": null` is still a one-way reply
+/// POST and must reject any `200` body before it can reach the message router.
+#[tokio::test]
+async fn a_null_id_error_reply_post_rejects_a_response_body_before_dispatch() {
+    let server = StubServer::start(vec![(
+        200,
+        "application/json",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"poison":"null-id-collides"}}"#,
+    )])
+    .await;
+    let (transport, mut rx) = started_transport(&server.url).await;
+    let outcome = transport
+        .send(message(
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"#,
+        ))
+        .await;
+    let error = outcome.expect_err("a null-id error reply POST body must be rejected");
+    assert!(
+        format!("{error}").contains("reply POST"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the rejected null-id reply payload must never reach the message router"
+    );
+}
+
+/// Outbound notifications (`notifications/initialized`, `notifications/cancelled`)
+/// must succeed on `204 No Content` and drop unexpected `200` JSON or SSE
+/// payloads without routing them into in-flight request waiters.
+#[tokio::test]
+async fn outbound_notifications_accept_204_and_drop_200_bodies_without_dispatch() {
+    let handshake_server = StubServer::start(vec![
+        (
+            200,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"stub","version":"1"}}}"#,
+        ),
+        (204, "application/json", ""),
+    ])
+    .await;
+    let client = Client::new(None);
+    let handshake_transport = Arc::new(HttpTransport::new(
+        handshake_server.url.clone(),
+        HashMap::new(),
+    ));
+    client
+        .connect(
+            handshake_transport,
+            RequestOptions {
+                timeout_ms: 5_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("notifications/initialized answered with 204 No Content must succeed");
+
+    let notif_server = StubServer::start(vec![
+        (
+            200,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"poison":"cancelled-json"}}"#,
+        ),
+        (
+            200,
+            "text/event-stream",
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"poison\":\"cancelled-sse\"}}\n\n",
+        ),
+    ])
+    .await;
+    let (transport, mut rx) = started_transport(&notif_server.url).await;
+    transport
+        .send(message(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#,
+        ))
+        .await
+        .expect("notification POST with 200 JSON ack must succeed");
+    transport
+        .send(message(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":10}}"#,
+        ))
+        .await
+        .expect("notification POST with 200 SSE ack must succeed");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "notification acknowledgements must never dispatch frames into the router"
+    );
 }
