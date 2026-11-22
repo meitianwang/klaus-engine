@@ -831,3 +831,6 @@ mod r20261121_anthropic_silent_thinking_and_hint_beta;
 
 #[path = "regressions/r20261121_call_mcp_tool_single_lifecycle.rs"]
 mod r20261121_call_mcp_tool_single_lifecycle;
+
+#[path = "regressions/r20261122_mcp_reply_post_ack.rs"]
+mod r20261122_mcp_reply_post_ack;

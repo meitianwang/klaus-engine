@@ -1134,6 +1134,13 @@ impl Transport for HttpTransport {
             .unwrap()
             .clone()
             .ok_or_else(|| McpError::new("HttpTransport is not started"))?;
+        // A JSON-RPC response to a server-initiated request carries an id and
+        // a result or error but no method. Its POST expects a bare
+        // acknowledgement; any payload riding on it belongs to no request this
+        // client is waiting for.
+        let reply = message.get("method").is_none()
+            && matches!(message.get("id"), Some(id) if !id.is_null())
+            && (message.get("result").is_some() || message.get("error").is_some());
         let headers = self.headers.lock().unwrap().clone();
         let body = runtime_json::stringify(&message).to_node_utf8();
         let mut req = self
@@ -1166,11 +1173,23 @@ impl Transport for HttpTransport {
             }
         }
         let status = resp.status();
-        if status == reqwest::StatusCode::ACCEPTED {
+        if status == reqwest::StatusCode::ACCEPTED
+            || (reply && status == reqwest::StatusCode::NO_CONTENT)
+        {
             return Ok(());
         }
         if !status.is_success() {
             return Err(http_error(status, "HTTP POST failed"));
+        }
+        if reply {
+            // Both peers assign JSON-RPC ids independently, so decoding a body
+            // here could hand the router a response whose id collides with an
+            // unrelated pending request of this client and falsely resolve it.
+            // Reject unexpected reply-POST payloads before any decoding.
+            return Err(McpError::new(format!(
+                "HTTP reply POST returned unexpected status {}",
+                status.as_u16()
+            )));
         }
         let content_type = resp
             .headers()
