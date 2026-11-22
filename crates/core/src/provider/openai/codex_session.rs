@@ -289,6 +289,13 @@ impl CodexTransportState {
                 "true".to_string(),
             );
         }
+        // A Responses reply echoes the request's tool catalog back by default.
+        // The engine drives the API statelessly and never reads the echo, so
+        // ask the backend to omit it; on tool-heavy requests this trims a
+        // fixed per-response payload that scales with the declaration size.
+        headers
+            .entry("x-codex-exclude".to_string())
+            .or_insert_with(|| "tools".to_string());
         if let Some(token) = turn_state.filter(|token| !token.is_empty()) {
             headers.insert("x-codex-turn-state".to_string(), token.to_string());
         }

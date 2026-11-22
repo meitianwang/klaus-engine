@@ -1772,6 +1772,31 @@ fn flush_media(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
 
 // ---- Responses API request building ----
 
+/// GPT-6 family models whose Responses backend applies `configuration_update`
+/// input items. For these models a mid-conversation change of the top-level
+/// `reasoning.effort` invalidates the prompt cache for the whole request; the
+/// item form carries the new level at the transcript tail and the backend
+/// applies it to the next reply, leaving the cached prefix intact.
+const MID_CONVO_EFFORT_MODELS: [&str; 7] = [
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+];
+
+/// The top-level `reasoning.effort` held constant while `configuration_update`
+/// items carry the declared level.
+const CONFIGURATION_UPDATE_PINNED_EFFORT: &str = "medium";
+
+fn model_takes_configuration_update_effort(model: &RuntimeString) -> bool {
+    model
+        .try_to_utf8()
+        .is_ok_and(|id| MID_CONVO_EFFORT_MODELS.contains(&id.as_str()))
+}
+
 #[cfg(test)]
 fn build_responses_params(
     req: &ModelRequest,
@@ -2073,6 +2098,21 @@ fn build_responses_params_with_tool_mode(
     }
 
     let effort = raw_effort_for_request(req, caps, dialect);
+    // GPT-6 family: a declared effort level rides a `configuration_update`
+    // item appended at the transcript tail instead of rewriting the top-level
+    // `reasoning.effort`. Editing the top-level parameter mid-conversation
+    // re-prices the whole prompt cache on these backends; the item form leaves
+    // the cached prefix byte-identical and the backend applies the level to
+    // the next reply. Custom/numeric efforts are passthrough spellings the
+    // backend expects top-level, so they never take the item path.
+    let configuration_update_effort = effort
+        .as_ref()
+        .filter(|_| {
+            dialect == OpenAiReasoningDialect::OpenAi
+                && matches!(req.effort, Some(EffortValue::Level(_)))
+                && model_takes_configuration_update_effort(&req.model)
+        })
+        .cloned();
     // On the Responses path a declared effort knob is exactly what marks a
     // reasoning model: it gets the reasoning block (summary + encrypted content
     // for stateless replay), whether or not an effort value is pinned this turn.
@@ -2088,7 +2128,14 @@ fn build_responses_params_with_tool_mode(
     // reasoning blob so it can be replayed across the stateless tool loop.
     if reasoning_model {
         let mut reasoning = Map::new();
-        if let Some(e) = effort {
+        // With a configuration_update item carrying the real level, the
+        // top-level effort stays pinned so it never re-prices the cache.
+        let wire_effort = if configuration_update_effort.is_some() {
+            Some(RuntimeString::from(CONFIGURATION_UPDATE_PINNED_EFFORT))
+        } else {
+            effort.clone()
+        };
+        if let Some(e) = wire_effort {
             reasoning.insert("effort", vs(e));
         }
         let summary_mode = codex_session::effective_reasoning_summary(req, caps);
@@ -2211,6 +2258,18 @@ fn build_responses_params_with_tool_mode(
             items.push(vobj([
                 ("role", vs("developer")),
                 ("content", vs(part.text.clone())),
+            ]));
+        }
+    }
+    // The declared thinking level for this request, as an item the backend
+    // applies to the next reply. Last in the input: it must follow every
+    // transcript entry it configures, and appending keeps the cached prefix
+    // above it byte-identical across level switches.
+    if let Some(level) = &configuration_update_effort {
+        if let Value::Array(items) = &mut input {
+            items.push(vobj([
+                ("type", vs("configuration_update")),
+                ("reasoning", vobj([("effort", vs(level.clone()))])),
             ]));
         }
     }
@@ -5611,6 +5670,45 @@ fn map_responses_event(ev: &Value, state: &mut ResponsesState) -> (Vec<ModelStre
             state.terminal_received = true;
             if let Some(response) = ev.get("response") {
                 update_responses_usage(ev, state);
+                // The backend reports replayed reasoning it withheld from the
+                // model in `input_transformations`: reasoning that follows an
+                // edit of earlier input, or that was created under another
+                // organization, end user, or model. `turn_boundary` removals
+                // are the normal every-turn report on models that only use
+                // current-turn reasoning; surfacing them would bury the real
+                // signal, so they are filtered at this edge.
+                if let Some(transformations) = response
+                    .get("input_transformations")
+                    .and_then(Value::as_array)
+                {
+                    let mut removed = 0u32;
+                    let mut reasons: Vec<RuntimeString> = Vec::new();
+                    for transformation in transformations {
+                        let dominated_by_reasoning = transformation
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind == "reasoning");
+                        let was_removed = transformation
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .is_some_and(|action| action == "removed");
+                        let reason = transformation
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !dominated_by_reasoning || !was_removed || reason == "turn_boundary" {
+                            continue;
+                        }
+                        removed += 1;
+                        if !reasons.contains(&reason) {
+                            reasons.push(reason);
+                        }
+                    }
+                    if removed > 0 {
+                        events.push(ModelStreamEvent::ReasoningReplayDropped { removed, reasons });
+                    }
+                }
                 state.stop_reason = if state.review_continuations {
                     map_review_responses_stop_reason(response)
                 } else {
@@ -10104,6 +10202,124 @@ mod tests {
         );
     }
 
+    /// Build a Responses body for an arbitrary request through the production
+    /// assembly path (same shape `matrix_body` pins, minus the fixed request).
+    fn responses_body(request: &ModelRequest, caps: &ModelCapabilities) -> Value {
+        build_responses_params_with_tool_mode(
+            request,
+            caps,
+            OpenAiReasoningDialect::OpenAi,
+            ResponsesToolAssembly {
+                function_tools: false,
+                tool_batches_allowed: true,
+                tool_namespaces_allowed: true,
+                instructions_item: true,
+                first_party_metadata: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_trailing_configuration_update(body: &Value, expected_effort: &str) {
+        let input = body["input"].as_array().expect("input array");
+        let last = input.last().expect("input items");
+        // The local `json!` is a stringify-literal macro and RuntimeJson
+        // indexing panics on absent keys — probe through `get` + strings.
+        assert_eq!(
+            last.get("type")
+                .and_then(Value::as_str)
+                .and_then(|kind| kind.try_to_utf8().ok()),
+            Some("configuration_update".to_string()),
+        );
+        assert_eq!(
+            last.get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str)
+                .and_then(|level| level.try_to_utf8().ok()),
+            Some(expected_effort.to_string()),
+        );
+    }
+
+    fn assert_no_configuration_update(body: &Value, model: &str) {
+        let input = body["input"].as_array().expect("input array");
+        // RuntimeJson indexing panics on absent keys, and transcript message
+        // items carry no "type" — probe through `get` instead.
+        assert!(
+            !input.iter().any(|item| item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "configuration_update")),
+            "{model}: no configuration_update item expected"
+        );
+    }
+
+    #[test]
+    fn gpt6_family_pins_top_level_effort_and_rides_configuration_update_items() {
+        let caps = caps_with_levels(&[
+            EffortLevel::None,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+        ]);
+        for model in MID_CONVO_EFFORT_MODELS {
+            let mut request = matrix_request(model);
+            request.effort = Some(EffortValue::Level(EffortLevel::High));
+            let body = responses_body(&request, &caps);
+            assert_eq!(
+                body["reasoning"]["effort"],
+                json!("medium"),
+                "{model}: top-level effort must stay pinned"
+            );
+            assert_trailing_configuration_update(&body, "high");
+
+            // Switching the level only rewrites the tail item: the pinned
+            // top-level parameter is what kept the cached prefix stable.
+            request.effort = Some(EffortValue::Level(EffortLevel::Low));
+            let body = responses_body(&request, &caps);
+            assert_eq!(body["reasoning"]["effort"], json!("medium"), "{model}");
+            assert_trailing_configuration_update(&body, "low");
+
+            // Thinking switched off still rides the item path, as `none`.
+            request.effort = Some(EffortValue::Level(EffortLevel::None));
+            let body = responses_body(&request, &caps);
+            assert_eq!(body["reasoning"]["effort"], json!("medium"), "{model}");
+            assert_trailing_configuration_update(&body, "none");
+        }
+    }
+
+    #[test]
+    fn configuration_update_path_skips_models_outside_the_family() {
+        let caps = caps_with_levels(&[EffortLevel::Low, EffortLevel::High]);
+        for model in ["gpt-5.5", "gpt-5.6-sol", "gpt-5.1-codex"] {
+            let mut request = matrix_request(model);
+            request.effort = Some(EffortValue::Level(EffortLevel::High));
+            let body = responses_body(&request, &caps);
+            assert_eq!(
+                body["reasoning"]["effort"],
+                json!("high"),
+                "{model}: pre-family models keep the level top-level"
+            );
+            assert_no_configuration_update(&body, model);
+        }
+    }
+
+    #[test]
+    fn custom_and_absent_effort_never_take_the_item_path() {
+        let caps = caps_with_levels(&[EffortLevel::Low, EffortLevel::High]);
+        // A custom spelling is a passthrough the backend expects top-level.
+        let mut request = matrix_request("gpt-6.2-sol");
+        request.effort = Some(EffortValue::Custom("custom-budget".into()));
+        let body = responses_body(&request, &caps);
+        assert_eq!(body["reasoning"]["effort"], json!("custom-budget"));
+        assert_no_configuration_update(&body, "gpt-6.2-sol");
+
+        // No declared effort: no reasoning parameter and no item.
+        request.effort = None;
+        let body = responses_body(&request, &caps);
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_no_configuration_update(&body, "gpt-6.2-sol");
+    }
+
     #[test]
     fn effort_clamps_to_declared_ladder() {
         // A ladder without xhigh clamps an xhigh request down to high.
@@ -14079,6 +14295,87 @@ mod tests {
                 {"role":"assistant","content":"Checking","phase":"commentary"},
                 {"role":"assistant","content":"Answer","phase":"final_answer"}
             ])
+        );
+    }
+
+    #[test]
+    fn input_transformations_report_withheld_reasoning_replays() {
+        let mut state = ResponsesState::default();
+        let ev = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "input_transformations": [
+                    {"type":"reasoning","id":"rs_1","action":"removed","reason":"prefix_mismatch"},
+                    {"type":"reasoning","id":"rs_2","action":"removed","reason":"prefix_mismatch"},
+                    {"type":"reasoning","id":"rs_3","action":"removed","reason":"turn_boundary"},
+                    {"type":"message","id":"m_1","action":"removed","reason":"prefix_mismatch"},
+                    {"type":"reasoning","id":"rs_4","action":"removed","reason":"different_model"},
+                    {"type":"reasoning","id":"rs_5","action":"kept","reason":"prefix_mismatch"}
+                ]
+            }
+        });
+        let (events, _) = map_responses_event(&ev, &mut state);
+        let (removed, reasons) = events
+            .iter()
+            .find_map(|event| match event {
+                ModelStreamEvent::ReasoningReplayDropped { removed, reasons } => {
+                    Some((*removed, reasons.clone()))
+                }
+                _ => None,
+            })
+            .expect("withheld reasoning replays must surface");
+        assert_eq!(
+            removed, 3,
+            "turn_boundary, non-reasoning and kept entries are filtered"
+        );
+        let spelled: Vec<String> = reasons
+            .iter()
+            .map(|reason| reason.try_to_utf8().expect("wire reasons are scalar"))
+            .collect();
+        assert_eq!(
+            spelled,
+            vec!["prefix_mismatch".to_string(), "different_model".to_string()]
+        );
+    }
+
+    #[test]
+    fn routine_turn_boundary_removals_stay_silent() {
+        // Models that only use current-turn reasoning report every earlier
+        // turn on every request; that is normal and must not spam the stream.
+        let mut state = ResponsesState::default();
+        let ev = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "input_transformations": [
+                    {"type":"reasoning","id":"rs_1","action":"removed","reason":"turn_boundary"},
+                    {"type":"reasoning","id":"rs_2","action":"removed","reason":"turn_boundary"}
+                ]
+            }
+        });
+        let (events, _) = map_responses_event(&ev, &mut state);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::ReasoningReplayDropped { .. })),
+            "turn_boundary-only reports must not raise the diagnostic"
+        );
+
+        // Older servers and proxies omit the field entirely.
+        let mut state = ResponsesState::default();
+        let ev = json!({
+            "type": "response.completed",
+            "response": { "status": "completed", "output": [] }
+        });
+        let (events, _) = map_responses_event(&ev, &mut state);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelStreamEvent::ReasoningReplayDropped { .. })),
+            "a missing report must not raise the diagnostic"
         );
     }
 

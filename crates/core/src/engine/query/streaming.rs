@@ -1278,6 +1278,17 @@ async fn stream_and_dispatch_inner(
                     "server-side context editing applied"
                 );
             }
+            ModelStreamEvent::ReasoningReplayDropped { removed, reasons } => {
+                // The backend withheld replayed reasoning: the model answers
+                // without the thinking it produced on those earlier turns.
+                // Loud enough to find in a diagnostic log, quiet enough not to
+                // interrupt the turn — the stream itself stays healthy.
+                tracing::warn!(
+                    removed,
+                    reasons = ?reasons,
+                    "backend withheld replayed reasoning items (input_transformations)"
+                );
+            }
             ModelStreamEvent::MessageStop {
                 stop_reason: sr,
                 usage: u,

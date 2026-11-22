@@ -1309,6 +1309,17 @@ pub enum ModelStreamEvent {
         /// "waiting for network" status instead of a numbered retry.
         network_wait: bool,
     },
+    /// The backend withheld replayed reasoning items from the model (its
+    /// `input_transformations` report): reasoning following an edit of earlier
+    /// input, or reasoning created under another organization, end user, or
+    /// model. Routine `turn_boundary` removals are filtered at the provider
+    /// edge; what arrives here is a real replay gap worth diagnosing.
+    ReasoningReplayDropped {
+        /// How many replayed reasoning items the backend withheld.
+        removed: u32,
+        /// The distinct reported reasons, wire spelling preserved.
+        reasons: Vec<RuntimeString>,
+    },
 }
 
 impl RuntimeEncode for ModelStreamEvent {
@@ -1473,6 +1484,12 @@ impl RuntimeEncode for ModelStreamEvent {
                 fields.field("networkWait", network_wait)?;
                 ("retry_scheduled", fields)
             }
+            Self::ReasoningReplayDropped { removed, reasons } => {
+                let mut fields = RuntimeObjectEncoder::new();
+                fields.field("removed", removed)?;
+                fields.field("reasons", reasons)?;
+                ("reasoning_replay_dropped", fields)
+            }
         };
         runtime_codec::encode_internal(out, "type", &[], tag, &fields.finish())
     }
@@ -1505,6 +1522,7 @@ impl RuntimeDecode for ModelStreamEvent {
                 RuntimeEnumVariant::new("text_message_completed", &[]),
                 RuntimeEnumVariant::new("context_edits_applied", &[]),
                 RuntimeEnumVariant::new("server_tool_search_output", &[]),
+                RuntimeEnumVariant::new("reasoning_replay_dropped", &[]),
             ],
             |variant, object| match variant {
                 0 => Ok(Self::MessageStart {
@@ -1586,6 +1604,10 @@ impl RuntimeDecode for ModelStreamEvent {
                 18 => Ok(Self::ServerToolSearchOutput {
                     id: object.required("id", &[])?,
                     payload: object.required("payload", &[])?,
+                }),
+                19 => Ok(Self::ReasoningReplayDropped {
+                    removed: object.required("removed", &[])?,
+                    reasons: object.required("reasons", &[])?,
                 }),
                 _ => Err(RuntimeCodecError::new(
                     RuntimeCodecErrorKind::UnknownEnumVariant,

@@ -457,6 +457,7 @@ fn event_kind(event: &ModelStreamEvent) -> &'static str {
         ModelStreamEvent::Citation { .. } => "citation",
         ModelStreamEvent::UsageSnapshot { .. } => "usage_snapshot",
         ModelStreamEvent::ContextEditsApplied { .. } => "context_edits_applied",
+        ModelStreamEvent::ReasoningReplayDropped { .. } => "reasoning_replay_dropped",
         ModelStreamEvent::MessageStop { .. } => "message_stop",
         ModelStreamEvent::Error { .. } => "error",
         ModelStreamEvent::RetryScheduled { .. } => "retry_scheduled",

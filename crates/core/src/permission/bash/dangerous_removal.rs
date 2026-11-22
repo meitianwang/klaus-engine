@@ -1,7 +1,8 @@
 //! Catastrophic-removal guard: an `rm`/`rmdir` whose operand resolves to a path
 //! that destroys the machine or workspace root (`/`, the home dir, a direct
-//! child of root, a Windows drive root/child, or a glob-root) must always
-//! prompt — even when a user allow rule would otherwise auto-run it.
+//! child of root, a Windows drive root/child, a glob-root, or the session's
+//! working directory itself) must always prompt — even when a user allow rule
+//! would otherwise auto-run it.
 
 use crate::permission::bash::match_rule::strip_safe_wrappers;
 use crate::permission::bash::node_path;
@@ -142,11 +143,24 @@ pub fn check_dangerous_removal(subcommand: &str, cwd: &str, home_dir: &str) -> O
         } else {
             node_path::resolve(&[cwd, &expanded])
         };
-        if is_dangerous_removal_path(&abs, home_dir) {
+        if is_dangerous_removal_path(&abs, home_dir) || is_working_dir_removal(&abs, cwd) {
             return Some(abs);
         }
     }
     None
+}
+
+/// Whether the resolved removal target is the working directory itself.
+/// Wiping the tree the session stands in pulls every later relative path out
+/// from under the turn, so it prompts in the same class as the home directory
+/// even when it sits deep below the root and no other rule catches it.
+pub fn is_working_dir_removal(resolved_path: &str, cwd: &str) -> bool {
+    if cwd.trim().is_empty() {
+        return false;
+    }
+    let target = strip_trailing_slash(&normalize_separators(resolved_path));
+    let base = strip_trailing_slash(&normalize_separators(&node_path::resolve(&[cwd])));
+    !target.is_empty() && !base.is_empty() && target == base
 }
 
 #[cfg(test)]
@@ -299,5 +313,42 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn flags_removal_of_the_working_directory_itself() {
+        let home = host(HOME);
+        // A deep working directory: no root/home/top-level rule catches it, so
+        // without the working-dir comparison `rm -rf .` would sail through.
+        let cwd = host("/work/project/checkout");
+        let absolute = format!("rm -rf {}", cwd);
+        let absolute_slash = format!("rm -rf {}/", cwd);
+        for command in [
+            "rm -rf .",
+            "rm -rf ./",
+            "rmdir .",
+            absolute.as_str(),
+            absolute_slash.as_str(),
+        ] {
+            assert_eq!(
+                check_dangerous_removal(command, &cwd, &home).as_deref(),
+                Some(cwd.as_str()),
+                "{command}"
+            );
+        }
+        // Children of the working directory stay allowed: pruning build output
+        // or a dependency cache is an everyday operation.
+        assert_eq!(check_dangerous_removal("rm -rf build", &cwd, &home), None);
+        assert_eq!(
+            check_dangerous_removal("rm -rf ./node_modules", &cwd, &home),
+            None
+        );
+        assert!(is_working_dir_removal(&cwd, &cwd));
+        assert!(is_working_dir_removal(&format!("{cwd}/"), &cwd));
+        assert!(!is_working_dir_removal(
+            &host("/work/project/checkout/build"),
+            &cwd
+        ));
+        assert!(!is_working_dir_removal(&cwd, ""));
     }
 }

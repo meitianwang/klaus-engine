@@ -81,8 +81,11 @@ use crate::worktree::worktree::build_worktree_notice;
 use crate::worktree::worktree::count_worktree_changes;
 use crate::worktree::worktree::find_canonical_git_root;
 use crate::worktree::worktree::get_or_create_worktree;
+use crate::worktree::worktree::register_worktree_holder;
+use crate::worktree::worktree::release_worktree_holder;
 use crate::worktree::worktree::remove_worktree;
 use crate::worktree::worktree::validate_worktree_slug;
+use crate::worktree::worktree::worktree_has_other_holders;
 use crate::worktree::worktree::WorktreeSession;
 use async_stream::stream;
 use futures::stream::StreamExt;
@@ -872,6 +875,10 @@ impl Session {
             }
         };
         let created = get_or_create_worktree(&self.process_context, &root, &slug, None).await?;
+        // A resumed slug means a sibling session may already stand in this
+        // checkout: record this session as a holder so neither exit can force
+        // the tree away from the other.
+        register_worktree_holder(&created.worktree_path, &self.worktree_holder_token());
         self.workspace.set_worktree(Some(WorktreeSession {
             original_cwd: original.clone(),
             worktree_path: created.worktree_path.clone(),
@@ -900,7 +907,9 @@ impl Session {
     }
 
     /// Leave the active worktree, restoring the original cwd. `remove` deletes the
-    /// worktree + branch (git) or fires `WorktreeRemove` (hook).
+    /// worktree + branch (git) or fires `WorktreeRemove` (hook). A git worktree
+    /// another live session or spawned agent still stands in is downgraded to
+    /// `keep`: forced removal would yank the checkout out from under that holder.
     pub(crate) async fn exit_worktree(
         self: &Arc<Self>,
         action: WorktreeExitAction,
@@ -915,6 +924,17 @@ impl Session {
         // Restore cwd, so we never stand inside a directory we then remove.
         self.switch_cwd(original_cwd.clone());
         self.workspace.set_original_cwd(original_cwd.clone());
+
+        let holder = self.worktree_holder_token();
+        let mut action = action;
+        let mut removal_blocked = false;
+        if action == WorktreeExitAction::Remove && wt.hook_based != Some(true) {
+            release_worktree_holder(&wt.worktree_path, &holder);
+            if worktree_has_other_holders(&wt.worktree_path, &holder) {
+                action = WorktreeExitAction::Keep;
+                removal_blocked = true;
+            }
+        }
 
         if action == WorktreeExitAction::Remove {
             if wt.hook_based == Some(true) {
@@ -942,11 +962,23 @@ impl Session {
                 WorktreeExitAction::Remove => RuntimeString::from("Exited and removed worktree \"")
                     .concat(&wt.worktree_name)
                     .concat(&RuntimeString::from("\".")),
+                WorktreeExitAction::Keep if removal_blocked => {
+                    RuntimeString::from("Exited worktree \"")
+                        .concat(&wt.worktree_name)
+                        .concat(&RuntimeString::from(
+                            "\". It was NOT removed: another session is still working in it.",
+                        ))
+                }
                 WorktreeExitAction::Keep => RuntimeString::from("Exited worktree \"")
                     .concat(&wt.worktree_name)
                     .concat(&RuntimeString::from("\" (kept on disk).")),
             },
         })
+    }
+
+    /// The holder-registry token for this session's worktree claims.
+    fn worktree_holder_token(&self) -> String {
+        format!("session:{}", self.id.try_to_utf8().unwrap_or_default())
     }
 
     /// Fire a WorktreeCreate hook; returns its `worktree_path` if a handler claimed it.
@@ -1025,6 +1057,8 @@ impl Session {
             }
         };
         let wt = get_or_create_worktree(&self.process_context, &root, &slug, None).await?;
+        let holder = format!("subagent:{slug}");
+        register_worktree_holder(&wt.worktree_path, &holder);
         Ok(AgentIsolation {
             cwd_override: Some(wt.worktree_path.clone()),
             worktree: Some(AgentWorktree::Git {
@@ -1033,12 +1067,15 @@ impl Session {
                 root,
                 branch: wt.worktree_branch,
                 head: wt.head_commit,
+                holder,
             }),
         })
     }
 
     /// Reclaim a spawned agent's worktree after it finishes. A hook-managed worktree
-    /// is always KEPT; a git worktree is removed only when left pristine.
+    /// is always KEPT; a git worktree is removed only when left pristine and no
+    /// other live holder (a sibling session or agent that resumed the same slug)
+    /// still stands in it.
     pub(crate) async fn teardown_agent_isolation(&self, wt: &Option<AgentWorktree>) {
         let Some(wt) = wt else { return };
         let AgentWorktree::Git {
@@ -1046,11 +1083,16 @@ impl Session {
             root,
             branch,
             head,
+            holder,
             ..
         } = wt
         else {
             return;
         };
+        release_worktree_holder(path, holder);
+        if worktree_has_other_holders(path, holder) {
+            return;
+        }
         let changes = count_worktree_changes(&self.process_context, path, head.as_ref()).await;
         if let Some(c) = changes {
             if c.changed_files == 0 && c.commits == 0 {

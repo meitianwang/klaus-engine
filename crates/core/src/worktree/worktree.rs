@@ -20,8 +20,10 @@ use crate::runtime_values::{
     runtime_codec, RuntimeCodecError, RuntimeDecode, RuntimeEncode, RuntimeEncoder, RuntimeJson,
     RuntimeObjectEncoder, RuntimePath, RuntimeString,
 };
+use crate::sync_ext::MutexExt;
 use regex::Regex;
-use std::sync::LazyLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 // A conservative safe-filename charset for each path segment, plus a length cap.
 static VALID_SLUG_SEGMENT: LazyLock<Regex> =
@@ -503,6 +505,67 @@ pub async fn count_worktree_changes(
     })
 }
 
+/// Process-wide ledger of the live sessions and spawned agents that currently
+/// stand in an engine-managed git worktree, keyed by the worktree path.
+/// Worktrees are created-or-resumed by slug, so two holders can share one
+/// checkout, and removal is forced: without this ledger a holder that exits
+/// first would yank the tree out from under a sibling mid-turn. Callers that
+/// enter, resume, or spawn into a worktree register here; callers that remove
+/// one consult the ledger first and keep the tree while anyone else holds it.
+static WORKTREE_HOLDERS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn holder_key(path: &RuntimePath) -> String {
+    let raw = path.as_runtime_string().try_to_utf8().unwrap_or_default();
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        raw
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Record `holder` (a session id or a spawn-scoped agent tag) as standing in
+/// the worktree at `path`. Idempotent per holder.
+pub fn register_worktree_holder(path: &RuntimePath, holder: &str) {
+    if holder.is_empty() {
+        return;
+    }
+    let key = holder_key(path);
+    if key.is_empty() {
+        return;
+    }
+    WORKTREE_HOLDERS
+        .lock_recover()
+        .entry(key)
+        .or_default()
+        .insert(holder.to_string());
+}
+
+/// Drop `holder` from the worktree's holder set; the entry disappears when the
+/// last holder leaves.
+pub fn release_worktree_holder(path: &RuntimePath, holder: &str) {
+    let key = holder_key(path);
+    let mut ledger = WORKTREE_HOLDERS.lock_recover();
+    if let Some(set) = ledger.get_mut(&key) {
+        set.remove(holder);
+        if set.is_empty() {
+            ledger.remove(&key);
+        }
+    }
+}
+
+/// Whether any holder OTHER than `holder` is still registered for the worktree
+/// at `path`. A removal caller uses its own token here: `true` means someone
+/// else is standing in the tree and it must not be removed.
+pub fn worktree_has_other_holders(path: &RuntimePath, holder: &str) -> bool {
+    let key = holder_key(path);
+    WORKTREE_HOLDERS
+        .lock_recover()
+        .get(&key)
+        .is_some_and(|set| set.iter().any(|other| other != holder))
+}
+
 /// Remove a worktree and delete its branch (best-effort; ignores failures).
 pub async fn remove_worktree(
     process: &RuntimeProcessContext,
@@ -906,5 +969,38 @@ mod tests {
             ),
             ""
         );
+    }
+
+    // -- worktree holder ledger --
+
+    #[test]
+    fn holder_ledger_tracks_and_releases_per_path() {
+        let path = RuntimePath::from("/tmp/klaus-ledger-test/tree-a");
+        register_worktree_holder(&path, "session-a");
+        register_worktree_holder(&path, "session-a"); // idempotent per holder
+        assert!(!worktree_has_other_holders(&path, "session-a"));
+        register_worktree_holder(&path, "session-b");
+        assert!(
+            worktree_has_other_holders(&path, "session-a"),
+            "a second holder must block the first holder's removal"
+        );
+        assert!(worktree_has_other_holders(&path, "session-b"));
+        release_worktree_holder(&path, "session-b");
+        assert!(!worktree_has_other_holders(&path, "session-a"));
+        release_worktree_holder(&path, "session-a");
+        // An unknown holder never sees ghosts.
+        assert!(!worktree_has_other_holders(&path, "session-c"));
+    }
+
+    #[test]
+    fn holder_ledger_keys_tolerate_trailing_slash_and_stay_per_path() {
+        let plain = RuntimePath::from("/tmp/klaus-ledger-test/tree-b");
+        let slashed = RuntimePath::from("/tmp/klaus-ledger-test/tree-b/");
+        register_worktree_holder(&plain, "session-d");
+        assert!(worktree_has_other_holders(&slashed, "session-e"));
+        let sibling = RuntimePath::from("/tmp/klaus-ledger-test/tree-c");
+        assert!(!worktree_has_other_holders(&sibling, "session-e"));
+        release_worktree_holder(&slashed, "session-d");
+        assert!(!worktree_has_other_holders(&plain, "session-e"));
     }
 }

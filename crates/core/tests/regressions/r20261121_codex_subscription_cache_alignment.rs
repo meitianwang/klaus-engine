@@ -568,6 +568,11 @@ async fn codex_websocket_incremental_continuation_and_sticky_affinity_headers() 
         hs.get("x-codex-routing-hint").map(String::as_str),
         Some("model=gpt-5.4")
     );
+    assert_eq!(
+        hs.get("x-codex-exclude").map(String::as_str),
+        Some("tools"),
+        "the engine never reads the echoed tool catalog; the backend must omit it"
+    );
     let sid = session.id.try_to_utf8().unwrap();
     assert_eq!(hs.get("session-id"), Some(&sid));
     assert_eq!(hs.get("thread-id"), Some(&sid));
@@ -856,6 +861,11 @@ async fn codex_websocket_upgrade_rejection_falls_back_to_http_sse_with_affinity_
             .map(String::as_str),
         Some("http-turn-token-77"),
         "Step 2 HTTP SSE request must forward x-codex-turn-state captured from Step 1"
+    );
+    assert_eq!(
+        http_headers[0].get("x-codex-exclude").map(String::as_str),
+        Some("tools"),
+        "HTTP SSE requests carry the same tool-catalog exclusion as the WS handshake"
     );
 }
 

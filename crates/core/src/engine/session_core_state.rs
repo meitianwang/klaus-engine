@@ -762,6 +762,15 @@ impl Session {
         if let Some(wt) = init.current_worktree {
             cwd = wt.worktree_path.clone();
             original_cwd = wt.original_cwd.clone();
+            // A resumed session stands in the worktree exactly like a fresh
+            // enter: record the holder so a sibling session's exit cannot
+            // force the checkout away underneath it.
+            if wt.hook_based != Some(true) {
+                crate::worktree::worktree::register_worktree_holder(
+                    &wt.worktree_path,
+                    &format!("session:{}", id.try_to_utf8().unwrap_or_default()),
+                );
+            }
             current_worktree = Some(wt);
         }
 
