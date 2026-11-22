@@ -2613,8 +2613,7 @@ impl Session {
                 },
                 skip_cache_write: if fork_path
                     || resuming_fork
-                    || (opts.memory_dir.is_some()
-                        && resolved_max_turns.is_some_and(|turns| turns <= 5)
+                    || (opts.skip_cache_write == Some(true)
                         && bundle.provider.info().name != "openai")
                 {
                     Some(true)

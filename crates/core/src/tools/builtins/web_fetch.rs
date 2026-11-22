@@ -1352,6 +1352,7 @@ async fn summarize_overflow(
     let outcome = match spawn(SpawnSubAgentOptions {
         prompt: extraction_prompt,
         tools: Some(Vec::new()),
+        skip_cache_write: Some(true),
         ..SpawnSubAgentOptions::default()
     })
     .await
@@ -1431,6 +1432,7 @@ async fn apply_prompt_to_markdown(
     let run = spawn(SpawnSubAgentOptions {
         prompt: extraction_prompt,
         tools: Some(Vec::new()),
+        skip_cache_write: Some(true),
         ..SpawnSubAgentOptions::default()
     })
     .await

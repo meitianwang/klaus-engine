@@ -432,6 +432,9 @@ pub struct SpawnSubAgentOptions {
     /// Scope this sub-agent to a memory directory (the auto-memory extraction
     /// fork).
     pub memory_dir: Option<RuntimePath>,
+    /// Skip writing a new prompt-cache tail entry for strictly one-shot helper
+    /// calls that never execute a second model step.
+    pub skip_cache_write: Option<bool>,
 }
 
 /// A foreground sub-agent run: its externally visible `agent_id` plus its events.

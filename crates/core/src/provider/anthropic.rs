@@ -3369,7 +3369,10 @@ fn build_params_with_media_limits(
     } else {
         Vec::new()
     };
-    let deferred_plan = if defer_loading_supported && !structured_replacement {
+    let deferred_plan = if defer_loading_supported
+        && !structured_replacement
+        && (!req.tools.is_empty() || !req.deferred_tools.is_empty())
+    {
         req.wire_caps
             .as_ref()
             .and_then(|caps| caps.deferred_announcements.clone())

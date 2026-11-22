@@ -1822,22 +1822,34 @@ fn tool_inventory_diff(
     }
 }
 
-fn first_user_side_uuid(messages: &[Message]) -> Option<RuntimeString> {
-    messages.iter().find_map(|message| match message {
+fn user_side_uuid(message: &Message) -> Option<RuntimeString> {
+    match message {
         Message::CompactBoundary(m) => Some(m.uuid.clone()),
         Message::User(m) => Some(m.uuid.clone()),
         Message::ToolResult(m) => Some(m.uuid.clone()),
         Message::Assistant(_) | Message::System(_) => None,
-    })
+    }
+}
+
+fn first_user_side_uuid(messages: &[Message]) -> Option<RuntimeString> {
+    messages
+        .iter()
+        .filter(|message| {
+            !crate::context::instruction_policy::is_workspace_instruction_projection(message)
+        })
+        .find_map(user_side_uuid)
+        .or_else(|| messages.iter().find_map(user_side_uuid))
 }
 
 fn last_user_side_uuid(messages: &[Message]) -> Option<RuntimeString> {
-    messages.iter().rev().find_map(|message| match message {
-        Message::CompactBoundary(m) => Some(m.uuid.clone()),
-        Message::User(m) => Some(m.uuid.clone()),
-        Message::ToolResult(m) => Some(m.uuid.clone()),
-        Message::Assistant(_) | Message::System(_) => None,
-    })
+    messages
+        .iter()
+        .rev()
+        .filter(|message| {
+            !crate::context::instruction_policy::is_workspace_instruction_projection(message)
+        })
+        .find_map(user_side_uuid)
+        .or_else(|| messages.iter().rev().find_map(user_side_uuid))
 }
 
 fn fold_deferred_names(

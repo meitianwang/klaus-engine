@@ -860,6 +860,7 @@ impl FullCompactor {
         }));
         if let Some(wire_caps) = request.wire_caps.as_mut() {
             wire_caps.transport_session_id = None;
+            wire_caps.deferred_announcements = None;
         }
         request.tools.clear();
         request.deferred_tools.clear();
@@ -1938,7 +1939,14 @@ mod tests {
             native_deferred_tools: None,
             deferred_tools: Vec::new(),
             surfaced_deferred_names: Vec::new(),
-            wire_caps: None,
+            wire_caps: Some(crate::types::provider::WireCapabilityPolicy {
+                deferred_announcements: Some(crate::types::provider::DeferredAnnouncementPlan {
+                    baseline_anchor_uuid: Some("u1".into()),
+                    baseline_names: vec!["mcp__demo__alpha".into()],
+                    deltas: Vec::new(),
+                }),
+                ..Default::default()
+            }),
             frozen_tools: None,
             frozen_instructions: None,
             tool_inventory_events: Vec::new(),
@@ -1978,10 +1986,20 @@ mod tests {
         assert_eq!(requests[0].max_output_tokens, 32_000);
         assert_eq!(requests[0].skip_cache_write, Some(true));
         assert_eq!(requests[0].cache_key, Some("session-live-1".into()));
+        assert!(requests[0]
+            .wire_caps
+            .as_ref()
+            .and_then(|caps| caps.deferred_announcements.as_ref())
+            .is_some());
         assert_eq!(&requests[0].messages[..3], live_messages.as_slice());
 
-        // Stage 2 strips tools, disables thinking, and removes runtime-reminder steps.
+        // Stage 2 strips tools, disables thinking, clears deferred announcements, and removes runtime-reminder steps.
         assert!(requests[1].tools.is_empty());
+        assert!(requests[1]
+            .wire_caps
+            .as_ref()
+            .and_then(|caps| caps.deferred_announcements.as_ref())
+            .is_none());
         assert_eq!(requests[1].thinking, Some(ThinkingConfig::Disabled));
         assert!(!requests[1]
             .messages

@@ -18,6 +18,9 @@ use async_trait::async_trait;
 use futures::stream;
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};
 use klaus_agent_core::engine::session::{Input, TurnOptions};
+use klaus_agent_core::memory::agent_memory::{
+    AgentMemoryHost, AgentMemoryLayout, AgentMemoryScope,
+};
 use klaus_agent_core::memory::store::{
     NewMemoryRecord, RecallSemanticOptions, TypedMemoryStore, TypedMemoryStoreOptions,
 };
@@ -32,6 +35,12 @@ use klaus_agent_core::tools::build_tool::{
     text_result, DEFAULT_IS_CONCURRENCY_SAFE, DEFAULT_IS_DESTRUCTIVE, DEFAULT_IS_ENABLED,
     DEFAULT_IS_READ_ONLY,
 };
+use klaus_agent_core::tools::builtins::read::create_read_tool;
+use klaus_agent_core::tools::builtins::web_fetch::{
+    create_web_fetch_tool, PageFetcher, PageResult, WebFetchToolOptions,
+};
+use klaus_agent_core::tools::builtins::web_fetch_redirect::FetchError;
+use klaus_agent_core::tools::builtins::write::create_write_tool;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::errors::{ProviderError, ToolError};
 use klaus_agent_core::types::json::Json;
@@ -1120,4 +1129,376 @@ async fn one_shot_memory_recall_skips_cache_write_and_claude_subscription_aggreg
     let unset_cfg = EngineConfig::default();
     assert!(!unset_cfg.is_claude_subscription_source());
     assert!(!unset_cfg.effective_aggregate_tool_results());
+}
+
+struct StaticPageFetcher;
+
+#[async_trait]
+impl PageFetcher for StaticPageFetcher {
+    async fn fetch_page(
+        &self,
+        url: &RuntimeString,
+        _signal: &AbortSignal,
+        _max_chars: usize,
+    ) -> Result<PageResult, FetchError> {
+        Ok(PageResult {
+            text: RuntimeString::from("# Release Notes\n\nVersion 3.1.0 ships today."),
+            final_url: Some(url.clone()),
+            status: Some(200),
+            truncated: Some(false),
+        })
+    }
+}
+
+struct TempMemoryHost {
+    dir: String,
+}
+
+impl AgentMemoryLayout for TempMemoryHost {
+    fn dir_for(&self, _agent_type: &str, _scope: AgentMemoryScope) -> String {
+        self.dir.clone()
+    }
+
+    fn snapshot_dir_for(&self, _agent_type: &str) -> String {
+        self.dir.clone()
+    }
+}
+
+impl AgentMemoryHost for TempMemoryHost {
+    fn layout(&self) -> &dyn AgentMemoryLayout {
+        self
+    }
+}
+
+#[tokio::test]
+async fn multi_step_memory_extraction_keeps_ephemeral_cache_while_web_fetch_and_lean_compaction_shed_dead_tokens(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let mem_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "# Workspace Policy\n\nKeep code concise.\n",
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let parent_step = Arc::new(AtomicUsize::new(0));
+    let parent_step_clone = parent_step.clone();
+    let mem_step = Arc::new(AtomicUsize::new(0));
+    let mem_step_clone = mem_step.clone();
+    let compact_step = Arc::new(AtomicUsize::new(0));
+    let compact_step_clone = compact_step.clone();
+    let mem_root_for_server = mem_dir.path().to_path_buf();
+
+    let server = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let Some((_headers, body)) = read_one_http_json_request(&mut sock).await else {
+                continue;
+            };
+            let model = body["model"]
+                .as_str()
+                .unwrap_or("claude-opus-4-6")
+                .to_string();
+            let last_msg_str = body["messages"]
+                .as_array()
+                .and_then(|msgs| msgs.last())
+                .map(|m| m.to_string())
+                .unwrap_or_default();
+            let tools_len = body["tools"].as_array().map(Vec::len).unwrap_or(0);
+            captured_clone.lock().unwrap().push(body.clone());
+
+            let sse = if last_msg_str.contains("Answer the user's prompt using only the Markdown") {
+                // One-shot web_fetch prompt processor (zero tools).
+                anthropic_sse_text_reply(&model, "Version 3.1.0 ships today.")
+            } else if last_msg_str.contains("session-memory")
+                || last_msg_str.contains("session_memory")
+                || body["messages"].to_string().contains("session-memory")
+            {
+                // Multi-step session memory update fork: step 1 writes notes file, step 2 finishes.
+                match mem_step_clone.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        let sm_dir = mem_root_for_server.join("session-memory");
+                        let notes_path = std::fs::read_dir(&sm_dir)
+                            .ok()
+                            .and_then(|mut it| it.next())
+                            .and_then(|entry| entry.ok())
+                            .map(|entry| entry.path().join("summary.md"))
+                            .unwrap_or_else(|| mem_root_for_server.join("MEMORY.md"))
+                            .to_string_lossy()
+                            .into_owned();
+                        anthropic_sse_tool_call(
+                            &model,
+                            "toolu_mem_write",
+                            "write",
+                            &json!({
+                                "path": notes_path,
+                                "content": "# Session Notes\n\n- Verified release 3.1.0.\n"
+                            }),
+                        )
+                    }
+                    _ => anthropic_sse_text_reply(&model, "Updated session notes."),
+                }
+            } else if last_msg_str.contains("CUSTOM_COMPACT_SENTINEL_8899") {
+                // Manual compaction: Stage 1 stops on a tool_use to force Stage 2 lean fallback.
+                match compact_step_clone.fetch_add(1, Ordering::SeqCst) {
+                    0 if tools_len > 0 => anthropic_sse_tool_call(
+                        &model,
+                        "toolu_unexpected_in_compact",
+                        "echo_probe",
+                        &json!({}),
+                    ),
+                    _ => anthropic_sse_text_reply(
+                        &model,
+                        "<summary>Compacted conversation summary for release 3.1.0.</summary>",
+                    ),
+                }
+            } else {
+                match parent_step_clone.fetch_add(1, Ordering::SeqCst) {
+                    0 => anthropic_sse_tool_call(
+                        &model,
+                        "toolu_webfetch",
+                        "web_fetch",
+                        &json!({
+                            "url": "https://docs.example/releases",
+                            "prompt": "What version ships today?"
+                        }),
+                    ),
+                    _ => anthropic_sse_text_reply(&model, "Confirmed release 3.1.0."),
+                }
+            };
+            write_sse_ok(&mut sock, &sse).await;
+        }
+    });
+
+    let alpha_enabled = Arc::new(AtomicBool::new(true));
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let mut opts = agent_options(process);
+    opts.provider = build_first_party_claude_provider(&base_url, "claude-opus-4-6");
+    let mut cfg = claude_subscription_config("claude-opus-4-6");
+    cfg["agentMemory"] = json!(true);
+    opts.config = Some(cfg);
+    opts.agent_memory = Some(Arc::new(TempMemoryHost {
+        dir: mem_dir.path().to_string_lossy().into_owned(),
+    }));
+    opts.tools = Some(vec![
+        Arc::new(SimpleActiveTool),
+        create_read_tool(),
+        create_write_tool(),
+        create_web_fetch_tool(WebFetchToolOptions {
+            fetch_page: Some(Arc::new(StaticPageFetcher)),
+            ..Default::default()
+        }),
+        Arc::new(ToggleDeferredTool {
+            name: "mcp__demo__alpha",
+            enabled: alpha_enabled,
+        }),
+    ]);
+
+    let agent = Agent::new(opts);
+    let session = agent
+        .try_start_session_async(StartSessionOptions {
+            cwd: Some(RuntimePath::from(dir.path().to_string_lossy().as_ref())),
+            user_config_dir: Some(RuntimePath::from(cfg_dir.path().to_string_lossy().as_ref())),
+            ..Default::default()
+        })
+        .await
+        .expect("start session");
+
+    // Turn 1 triggers web_fetch (which spawns a one-shot zero-tool helper).
+    let turn1 = session
+        .run(
+            Input::Text("TURN1_PERSISTED_SENTINEL_8811".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(turn1.error.is_none(), "turn 1 failed: {:?}", turn1.error);
+
+    // Turn 2 verifies messages[0] with AGENTS.md + persisted user anchor stays byte-identical.
+    let turn2 = session
+        .run(
+            Input::Text("TURN2_FOLLOWUP_8812".into()),
+            TurnOptions::default(),
+        )
+        .await;
+    assert!(turn2.error.is_none(), "turn 2 failed: {:?}", turn2.error);
+
+    // Manual compaction first (before session-memory fusion summarizes history):
+    // Stage 1 hits tool_use stop -> Stage 2 lean fallback runs tool-less.
+    let compact_res = session
+        .compact(Some("CUSTOM_COMPACT_SENTINEL_8899".into()))
+        .await;
+    assert!(
+        compact_res.is_ok() && compact_res.as_ref().unwrap().compacted,
+        "manual compact failed: {compact_res:?}"
+    );
+
+    // Multi-step session memory update must retain 5-minute intra-run caching on Step 1.
+    let notes_res = session.extract_session_memory_now().await;
+    assert!(
+        notes_res.is_ok(),
+        "extract_session_memory_now failed: {notes_res:?}"
+    );
+    server.abort();
+
+    let bodies = captured.lock().unwrap();
+
+    // 1. Workspace instructions + persisted Turn 1 user message + deferred baseline order is
+    //    `[AGENTS.md, TURN1_PERSISTED_SENTINEL_8811, <system-reminder>Deferred tools...]`
+    //    and remains byte-identical (ignoring cache_control) across Turn 1 and Turn 2.
+    let strip_cc = |blocks: &Value| -> Value {
+        Value::Array(
+            blocks
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    let mut cloned = b.clone();
+                    if let Some(obj) = cloned.as_object_mut() {
+                        obj.remove("cache_control");
+                    }
+                    cloned
+                })
+                .collect(),
+        )
+    };
+    let parent_turn1 = &bodies[0];
+    let msg0_blocks = parent_turn1["messages"][0]["content"].as_array().unwrap();
+    let workspace_pos = msg0_blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("Workspace Policy"))
+        })
+        .expect("AGENTS.md projection block in messages[0]");
+    let user1_pos = msg0_blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("TURN1_PERSISTED_SENTINEL_8811"))
+        })
+        .expect("persisted Turn 1 user block in messages[0]");
+    let deferred_pos = msg0_blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("mcp__demo__alpha"))
+        })
+        .expect("deferred baseline block in messages[0]");
+    assert!(
+        workspace_pos < user1_pos && user1_pos < deferred_pos,
+        "deferred baseline must anchor after the persisted user block rather than before it: workspace={workspace_pos}, user1={user1_pos}, deferred={deferred_pos}"
+    );
+    let parent_turn2 = bodies
+        .iter()
+        .find(|b| {
+            b["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .is_some_and(|last| last.to_string().contains("TURN2_FOLLOWUP_8812"))
+        })
+        .expect("parent turn 2 request");
+    assert_eq!(
+        strip_cc(&parent_turn2["messages"][0]["content"]),
+        strip_cc(&parent_turn1["messages"][0]["content"]),
+        "messages[0] content must stay byte-identical across turns"
+    );
+
+    // 2. One-shot web_fetch prompt helper must skip trailing message cache_control write
+    //    and must not inherit parent conversation history.
+    let web_fetch_req = bodies
+        .iter()
+        .find(|b| {
+            b["messages"]
+                .to_string()
+                .contains("Answer the user's prompt using only the Markdown")
+        })
+        .expect("web_fetch helper request");
+    assert!(
+        !web_fetch_req["messages"]
+            .to_string()
+            .contains("TURN1_PERSISTED_SENTINEL_8811"),
+        "web_fetch one-shot helper must not inherit parent history"
+    );
+    let wf_last_block = web_fetch_req["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert!(
+        wf_last_block.get("cache_control").is_none(),
+        "one-shot web_fetch helper must set skip_cache_write so its ephemeral tail is not cached: {wf_last_block}"
+    );
+
+    // 3. Multi-step session memory update must write a 5m message cache breakpoint on Step 1
+    //    so Step 2+ reuses the prefix instead of re-prefilling uncached on every step.
+    let mem_step1 = bodies
+        .iter()
+        .find(|b| {
+            b["messages"].as_array().is_some_and(|msgs| {
+                msgs.len() == 1 && b["messages"].to_string().contains("session-memory")
+            })
+        })
+        .expect("session memory step 1 request");
+    let mem_step1_last_block = mem_step1["messages"][0]["content"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(
+        mem_step1_last_block["cache_control"]["type"], "ephemeral",
+        "multi-step memory fork must keep 5m intra-run prompt caching enabled on step 1: {mem_step1_last_block}"
+    );
+    assert!(
+        mem_step1_last_block["cache_control"].get("ttl").is_none(),
+        "isolated memory fork must use 5m cache rather than 1h cache: {mem_step1_last_block}"
+    );
+
+    // 4. Stage 1 compaction preserves deferred announcements for prefix reuse, while
+    //    Stage 2 lean compaction (tools == []) strips `<system-reminder>Deferred tools...`.
+    let stage1_compact_req = bodies
+        .iter()
+        .find(|b| {
+            b.get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty())
+                && b["messages"]
+                    .to_string()
+                    .contains("CUSTOM_COMPACT_SENTINEL_8899")
+        })
+        .expect("stage 1 cache-preserving compaction request");
+    assert!(
+        stage1_compact_req["messages"]
+            .to_string()
+            .contains("mcp__demo__alpha"),
+        "Stage 1 compaction must retain deferred-tool baseline for 1h prefix cache hit"
+    );
+    let lean_compact_req = bodies
+        .iter()
+        .find(|b| {
+            b.get("tools")
+                .is_none_or(|t| t.as_array().is_some_and(Vec::is_empty))
+                && b["messages"]
+                    .to_string()
+                    .contains("CUSTOM_COMPACT_SENTINEL_8899")
+        })
+        .expect("stage 2 tool-less lean compaction request");
+    assert!(
+        !lean_compact_req["messages"]
+            .to_string()
+            .contains("mcp__demo__alpha"),
+        "tool-less Stage 2 lean compaction must strip deferred-tool directory announcements: {lean_compact_req}"
+    );
 }
