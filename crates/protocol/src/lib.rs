@@ -61,7 +61,7 @@ pub use server::{
     ArchiveSession, BindSession, CreateSession, CreateSessionArgs, CreateSessionFuture,
     DeleteSession, InstalledPluginLedgerMutation, ListSessions, LoadSubagentTranscript,
     ProtocolLifecycle, ProtocolPluginAdmin, ProtocolServer, ProtocolServerOptions,
-    UnarchiveSession, UnarchiveSessionFuture, UpdateTitle,
+    ProtocolShutdownOutcome, UnarchiveSession, UnarchiveSessionFuture, UpdateTitle,
 };
 
 pub use client::{

@@ -4141,30 +4141,36 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                         .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
                         .await;
                 }
-                match handle.ps.shutdown_and_wait().await {
-                    Ok(()) => {
+                let outcome = handle.ps.shutdown_and_wait_detailed().await;
+                if outcome.drained() {
+                    if let Some(error) = outcome.error_message() {
+                        eprintln!(
+                            "[app-server] session close for {} finished draining with persistence errors: {error}",
+                            params.session_id
+                        );
+                    }
+                    {
+                        let mut sessions = state.sessions.lock().unwrap();
+                        if sessions
+                            .get(&params.session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &handle))
                         {
-                            let mut sessions = state.sessions.lock().unwrap();
-                            if sessions
-                                .get(&params.session_id)
-                                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                            {
-                                sessions.remove(&params.session_id);
-                            }
+                            sessions.remove(&params.session_id);
                         }
-                        session_unload::discard_session_bookkeeping(&state, &params.session_id)
-                            .await;
-                        state.send(wire::response(&id, serde_json::json!({}))).await
                     }
-                    Err(error) => {
-                        state
-                            .send(wire::error_response(
-                                &id,
-                                wire::ENGINE_ERROR,
-                                &format!("session close did not drain: {error}"),
-                            ))
-                            .await
-                    }
+                    session_unload::discard_session_bookkeeping(&state, &params.session_id).await;
+                    state.send(wire::response(&id, serde_json::json!({}))).await
+                } else {
+                    let error = outcome
+                        .error_message()
+                        .unwrap_or_else(|| "shutdown did not finish draining".into());
+                    state
+                        .send(wire::error_response(
+                            &id,
+                            wire::ENGINE_ERROR,
+                            &format!("session close did not drain: {error}"),
+                        ))
+                        .await
                 }
             });
         }

@@ -210,10 +210,45 @@ impl ProtocolShutdownFailure {
     }
 }
 
+/// Typed protocol shutdown completion so callers can distinguish an undrained
+/// teardown (a task or rollout writer timed out or panicked before fencing
+/// completed) from a fully drained teardown that surfaced persistence or
+/// transport errors.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolShutdownOutcome {
+    pub errors: Vec<String>,
+    pub timed_out: bool,
+    pub undrained: bool,
+}
+
+impl ProtocolShutdownOutcome {
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty() && !self.timed_out && !self.undrained
+    }
+
+    pub fn drained(&self) -> bool {
+        !self.timed_out && !self.undrained
+    }
+
+    pub fn error_message(&self) -> Option<String> {
+        (!self.errors.is_empty()).then(|| self.errors.join("; "))
+    }
+
+    pub fn into_result(self) -> Result<(), String> {
+        match self.error_message() {
+            Some(error) => Err(error),
+            None if self.timed_out => Err("protocol shutdown timed out".into()),
+            None if self.undrained => Err("protocol shutdown did not finish draining".into()),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProtocolShutdownFailures {
     errors: Vec<String>,
     timed_out: bool,
+    undrained: bool,
 }
 
 impl ProtocolShutdownFailures {
@@ -231,9 +266,22 @@ impl ProtocolShutdownFailures {
         self.errors.push(error.into());
     }
 
+    fn push_undrained(&mut self, error: impl Into<String>) {
+        self.undrained = true;
+        self.errors.push(error.into());
+    }
+
     fn extend_core(&mut self, outcome: SessionShutdownOutcome) {
         self.timed_out |= outcome.timed_out;
         self.errors.extend(outcome.errors);
+    }
+
+    fn into_outcome(self) -> ProtocolShutdownOutcome {
+        ProtocolShutdownOutcome {
+            errors: self.errors,
+            timed_out: self.timed_out,
+            undrained: self.undrained,
+        }
     }
 }
 
@@ -1762,7 +1810,8 @@ pub struct ProtocolServer {
     /// Shares one teardown result across `start()` and every explicit close
     /// caller.  In particular, a second close must not return while the first
     /// caller is still awaiting Session/MCP/LSP/rollout teardown.
-    shutdown_result: std::sync::OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+    shutdown_result:
+        std::sync::OnceLock<tokio::sync::watch::Receiver<Option<ProtocolShutdownOutcome>>>,
     start_state: StdMutex<StartState>,
     start_finished_notify: Notify,
     shutdown_timings: ProtocolShutdownTimings,
@@ -2537,6 +2586,13 @@ impl ProtocolServer {
     /// persistent Session (including MCP, LSP, background tasks, hooks, and
     /// rollout storage) have fully shut down.
     pub async fn shutdown_and_wait(self: &Arc<Self>) -> Result<(), String> {
+        self.shutdown_and_wait_detailed().await.into_result()
+    }
+
+    /// Stop accepting work and return the typed shutdown outcome so endpoint
+    /// supervisors can distinguish undrained resources from completed drains
+    /// that surfaced persistence errors.
+    pub async fn shutdown_and_wait_detailed(self: &Arc<Self>) -> ProtocolShutdownOutcome {
         // Signal synchronously even when another caller already owns the async
         // completion cell.  This also makes a close before `start()` safe.
         self.stop();
@@ -2557,7 +2613,11 @@ impl ProtocolServer {
                     let result = std::panic::AssertUnwindSafe(server.finish_shutdown())
                         .catch_unwind()
                         .await
-                        .unwrap_or_else(|_| Err("protocol shutdown task panicked".into()));
+                        .unwrap_or_else(|_| ProtocolShutdownOutcome {
+                            errors: vec!["protocol shutdown task panicked".into()],
+                            timed_out: false,
+                            undrained: true,
+                        });
                     let _ = send.send(Some(result));
                 });
                 receive
@@ -2568,12 +2628,16 @@ impl ProtocolServer {
                 return result;
             }
             if completion.changed().await.is_err() {
-                return Err("protocol shutdown task ended without a completion".into());
+                return ProtocolShutdownOutcome {
+                    errors: vec!["protocol shutdown task ended without a completion".into()],
+                    timed_out: false,
+                    undrained: true,
+                };
             }
         }
     }
 
-    async fn finish_shutdown(&self) -> Result<(), String> {
+    async fn finish_shutdown(&self) -> ProtocolShutdownOutcome {
         let started_at = tokio::time::Instant::now();
         let grace_deadline = started_at + self.shutdown_timings.grace;
         let force_deadline = started_at + self.shutdown_timings.force;
@@ -2719,7 +2783,7 @@ impl ProtocolServer {
             match tokio::time::timeout_at(force_deadline, &mut *cleanup).await {
                 Ok(Ok(outcome)) => failures.extend_core(outcome),
                 Ok(Err(error)) => {
-                    failures.push_error(format!("core session cleanup task failed: {error}"));
+                    failures.push_undrained(format!("core session cleanup task failed: {error}"));
                 }
                 Err(_) => {
                     cleanup.abort();
@@ -3010,11 +3074,7 @@ impl ProtocolServer {
         if let Err(error) = close_result {
             failures.push_failure(error);
         }
-        if failures.errors.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.errors.join("; "))
-        }
+        failures.into_outcome()
     }
 
     fn mark_start_finished(&self) {

@@ -427,16 +427,16 @@ async fn unload_session(
         if let Err(error) = realtime::stop_session(&state, &session_id).await {
             eprintln!("[app-server] failed to stop realtime state for session {session_id} before unload: {error}");
         }
-        handle.ps.shutdown_and_wait().await
+        handle.ps.shutdown_and_wait_detailed().await
     };
     tokio::pin!(shutdown);
-    let result = match tokio::time::timeout(
+    let outcome = match tokio::time::timeout(
         Duration::from_secs(SHUTDOWN_SLOW_WARN_SECS),
         &mut shutdown,
     )
     .await
     {
-        Ok(result) => result,
+        Ok(outcome) => outcome,
         Err(_) => {
             eprintln!(
                     "[app-server] session {session_id} shutdown is taking longer than expected; continuing to wait"
@@ -444,60 +444,63 @@ async fn unload_session(
             shutdown.await
         }
     };
-    match result {
-        Ok(()) => {
-            let removed = {
-                let mut sessions = state.sessions.lock().unwrap();
-                if sessions
-                    .get(&session_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                {
-                    sessions.remove(&session_id);
-                    true
-                } else {
-                    false
-                }
-            };
-            if !removed {
-                // A delayed unload can finish after the session was replaced
-                // or closed under the same id; only the load that scheduled
-                // this unload may publish the teardown.
-                eprintln!(
-                    "[app-server] session {session_id} was replaced or removed before unload finalized"
-                );
-                state
-                    .pending_session_unloads
-                    .lock()
-                    .unwrap()
-                    .remove(&session_id);
-                return;
-            }
-            discard_session_bookkeeping(&state, &session_id).await;
-            state
-                .notify(
-                    "session/closed",
-                    serde_json::to_value(wire::SessionClosedNotification {
-                        session_id: session_id.clone(),
-                    })
-                    .expect("session/closed notification serializes"),
-                )
-                .await;
-            state
-                .pending_session_unloads
-                .lock()
-                .unwrap()
-                .remove(&session_id);
-        }
-        Err(error) => {
-            state
-                .pending_session_unloads
-                .lock()
-                .unwrap()
-                .remove(&session_id);
+    if outcome.drained() {
+        if let Some(error) = outcome.error_message() {
             eprintln!(
-                "[app-server] failed to shut down session {session_id} for idle unload: {error}"
+                "[app-server] idle unload for session {session_id} finished draining with persistence errors: {error}"
             );
         }
+        let removed = {
+            let mut sessions = state.sessions.lock().unwrap();
+            if sessions
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                sessions.remove(&session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if !removed {
+            // A delayed unload can finish after the session was replaced
+            // or closed under the same id; only the load that scheduled
+            // this unload may publish the teardown.
+            eprintln!(
+                "[app-server] session {session_id} was replaced or removed before unload finalized"
+            );
+            state
+                .pending_session_unloads
+                .lock()
+                .unwrap()
+                .remove(&session_id);
+            return;
+        }
+        discard_session_bookkeeping(&state, &session_id).await;
+        state
+            .notify(
+                "session/closed",
+                serde_json::to_value(wire::SessionClosedNotification {
+                    session_id: session_id.clone(),
+                })
+                .expect("session/closed notification serializes"),
+            )
+            .await;
+        state
+            .pending_session_unloads
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+    } else {
+        let error = outcome
+            .error_message()
+            .unwrap_or_else(|| "shutdown did not finish draining".into());
+        state
+            .pending_session_unloads
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        eprintln!("[app-server] idle unload did not drain session {session_id}: {error}");
     }
 }
 

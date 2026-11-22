@@ -3559,3 +3559,455 @@ async fn side_task_reads_hide_parent_prefix_and_fork_session_cuts_by_turn_id() {
 
     client.close().await;
 }
+
+#[tokio::test]
+async fn rollout_persistence_failure_evicts_drained_session_on_close_and_unload_allowing_resume() {
+    use async_trait::async_trait;
+    use klaus_agent_core::runtime_values::{RuntimeJson, RuntimeString};
+    use klaus_agent_core::schemas::message::Message;
+    use klaus_agent_core::schemas::rollout::{SessionMeta, TurnContextSnapshot, UsageLedgerItem};
+    use klaus_agent_core::schemas::subagent_lifecycle::SubagentLifecycleRecord;
+    use klaus_agent_core::store::jsonl_store::{JsonlSessionStore, JsonlSessionStoreOptions};
+    use klaus_agent_core::store::session_store::{
+        AppendEventOptions, CheckpointRecord, CompactionRecord, ListOptions, LiveRollout,
+        PreparedRolloutBatch, ResumeResult, ResumedLiveRollout, RollbackRecord, SessionStore,
+        SubAgentMeta, SubAgentTranscript, ThreadPage, UnarchiveSessionResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct EnospcRollout {
+        inner: Box<dyn LiveRollout>,
+        enospc: Arc<AtomicBool>,
+        poisoned: AtomicBool,
+    }
+
+    impl EnospcRollout {
+        fn wrap(inner: Box<dyn LiveRollout>, enospc: Arc<AtomicBool>) -> Box<dyn LiveRollout> {
+            Box::new(Self {
+                inner,
+                enospc,
+                poisoned: AtomicBool::new(false),
+            })
+        }
+
+        fn check_poison(&self) -> bool {
+            if self.enospc.load(Ordering::SeqCst) {
+                self.poisoned.store(true, Ordering::SeqCst);
+            }
+            self.poisoned.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LiveRollout for EnospcRollout {
+        async fn prepare_batch(
+            &self,
+            maximum_records: usize,
+        ) -> std::io::Result<PreparedRolloutBatch<'_>> {
+            if self.check_poison() {
+                return Ok(PreparedRolloutBatch::new(|_| {}));
+            }
+            self.inner.prepare_batch(maximum_records).await
+        }
+
+        async fn append_message(&self, message: Message) {
+            if !self.check_poison() {
+                self.inner.append_message(message).await;
+            }
+        }
+
+        async fn append_turn_context(&self, ctx: TurnContextSnapshot) {
+            if !self.check_poison() {
+                self.inner.append_turn_context(ctx).await;
+            }
+        }
+
+        async fn append_compaction(&self, record: CompactionRecord) {
+            if !self.check_poison() {
+                self.inner.append_compaction(record).await;
+            }
+        }
+
+        async fn append_event(&self, event: RuntimeString, opts: Option<AppendEventOptions>) {
+            if !self.check_poison() {
+                self.inner.append_event(event, opts).await;
+            }
+        }
+
+        async fn append_rollback(&self, record: RollbackRecord) {
+            if !self.check_poison() {
+                self.inner.append_rollback(record).await;
+            }
+        }
+
+        async fn append_checkpoint(&self, record: CheckpointRecord) {
+            if !self.check_poison() {
+                self.inner.append_checkpoint(record).await;
+            }
+        }
+
+        async fn append_usage(&self, record: UsageLedgerItem) {
+            if !self.check_poison() {
+                self.inner.append_usage(record).await;
+            }
+        }
+
+        async fn append_subagent_lifecycle(&self, record: SubagentLifecycleRecord) {
+            if !self.check_poison() {
+                self.inner.append_subagent_lifecycle(record).await;
+            }
+        }
+
+        async fn flush(&self) -> std::io::Result<()> {
+            if self.check_poison() {
+                let _ = self.inner.flush().await;
+                return Err(std::io::Error::other(
+                    "No space left on device (os error 28)",
+                ));
+            }
+            self.inner.flush().await
+        }
+
+        async fn shutdown(&self) -> std::io::Result<()> {
+            let inner_res = self.inner.shutdown().await;
+            if self.poisoned.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other(
+                    "No space left on device (os error 28)",
+                ));
+            }
+            inner_res
+        }
+    }
+
+    struct EnospcSessionStore {
+        inner: JsonlSessionStore,
+        enospc: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SessionStore for EnospcSessionStore {
+        async fn create(&self, meta: SessionMeta) -> std::io::Result<Box<dyn LiveRollout>> {
+            Ok(EnospcRollout::wrap(
+                self.inner.create(meta).await?,
+                self.enospc.clone(),
+            ))
+        }
+
+        async fn resume(&self, thread_id: &str) -> std::io::Result<ResumeResult> {
+            self.inner.resume(thread_id).await
+        }
+
+        async fn resume_for_write(&self, thread_id: &str) -> std::io::Result<ResumedLiveRollout> {
+            let resumed = self.inner.resume_for_write(thread_id).await?;
+            Ok(ResumedLiveRollout {
+                resume: resumed.resume,
+                rollout: EnospcRollout::wrap(resumed.rollout, self.enospc.clone()),
+            })
+        }
+
+        async fn reopen(&self, thread_id: &str) -> std::io::Result<Box<dyn LiveRollout>> {
+            Ok(EnospcRollout::wrap(
+                self.inner.reopen(thread_id).await?,
+                self.enospc.clone(),
+            ))
+        }
+
+        async fn list(&self, options: ListOptions) -> std::io::Result<ThreadPage> {
+            self.inner.list(options).await
+        }
+
+        async fn archive(&self, thread_id: &str) -> std::io::Result<String> {
+            self.inner.archive(thread_id).await
+        }
+
+        async fn unarchive(&self, thread_id: &str) -> UnarchiveSessionResult {
+            self.inner.unarchive(thread_id).await
+        }
+
+        async fn delete(&self, thread_id: &str) -> std::io::Result<()> {
+            self.inner.delete(thread_id).await
+        }
+
+        async fn update_title(&self, thread_id: &str, title: &str) -> std::io::Result<()> {
+            self.inner.update_title(thread_id, title).await
+        }
+
+        async fn update_host_metadata(
+            &self,
+            thread_id: &str,
+            host_metadata: Option<RuntimeJson>,
+        ) -> std::io::Result<()> {
+            self.inner
+                .update_host_metadata(thread_id, host_metadata)
+                .await
+        }
+
+        async fn open_sub_agent(
+            &self,
+            thread_id: &str,
+            agent_id: &str,
+            meta: SubAgentMeta,
+        ) -> std::io::Result<Box<dyn LiveRollout>> {
+            self.inner.open_sub_agent(thread_id, agent_id, meta).await
+        }
+
+        async fn load_sub_agent(
+            &self,
+            thread_id: &str,
+            agent_id: &str,
+        ) -> std::io::Result<SubAgentTranscript> {
+            self.inner.load_sub_agent(thread_id, agent_id).await
+        }
+
+        async fn list_sub_agents(&self, thread_id: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_sub_agents(thread_id).await
+        }
+
+        async fn count_sessions_touched_since(
+            &self,
+            since_ms: f64,
+            exclude_id: Option<&str>,
+        ) -> std::io::Result<usize> {
+            self.inner
+                .count_sessions_touched_since(since_ms, exclude_id)
+                .await
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let sessions_dir = root.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+
+    let enospc = Arc::new(AtomicBool::new(false));
+    let store: Arc<dyn SessionStore> = Arc::new(EnospcSessionStore {
+        inner: JsonlSessionStore::new(JsonlSessionStoreOptions {
+            dir: Some(sessions_dir.to_string_lossy().into_owned()),
+            archive_dir: None,
+        }),
+        enospc: enospc.clone(),
+    });
+    let agent = make_agent_for_tests(vec![
+        text_turn("seed reply"),
+        text_turn("failed before close"),
+        text_turn("resumed after close"),
+        text_turn("failed before unload"),
+        text_turn("resumed after unload"),
+    ]);
+    let create = crate::lifecycle::engine_sessions(agent, Some(store)).create_session;
+    let mut client = TestClient::start_with_unload_delay(create, Duration::from_millis(50));
+    client
+        .send(json!({
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": { "productEvents": true } }
+        }))
+        .await;
+    let (init_ack, _) = client.response_for(1).await;
+    assert!(init_ack.get("result").is_some(), "{init_ack}");
+
+    // Seed a genuine persistent rollout on disk.
+    client
+        .send(json!({
+            "id": 100,
+            "method": "session/start",
+            "params": { "init": { "threadId": "recover-thread", "cwd": root.path() } }
+        }))
+        .await;
+    let (seeded_start, _) = client.response_for(100).await;
+    assert_eq!(seeded_start["result"]["sessionId"], json!("recover-thread"));
+
+    client
+        .send(json!({
+            "id": 101,
+            "method": "turn/start",
+            "params": { "sessionId": "recover-thread", "input": "seed" }
+        }))
+        .await;
+    let (_, mut seed_events) = client.response_for(101).await;
+    while !seed_events
+        .iter()
+        .any(|m| m.get("method").and_then(Value::as_str) == Some("turn/completed"))
+    {
+        seed_events.push(client.next_message().await);
+    }
+
+    let turn_failed_persistence = |m: &Value| {
+        m.get("method").and_then(Value::as_str) == Some("turn/failed") && {
+            let err = &m["params"]["detail"]["error"];
+            err.as_str()
+                .or_else(|| err["message"].as_str())
+                .is_some_and(|msg| msg.contains("Failed to persist the turn completion boundary:"))
+        }
+    };
+
+    // 1. Trigger ENOSPC on the active rollout writer, free disk space while the
+    //    live rollout remains latched in its poisoned state, and verify explicit
+    //    `session/close` drains, releases the lock, and permits resuming cleanly.
+    enospc.store(true, Ordering::SeqCst);
+
+    client
+        .send(json!({
+            "id": 3,
+            "method": "turn/start",
+            "params": {
+                "sessionId": "recover-thread",
+                "input": "trigger persistence failure"
+            }
+        }))
+        .await;
+    let (turn_ack, mut events) = client.response_for(3).await;
+    assert!(turn_ack.get("result").is_some(), "{turn_ack}");
+    while !events.iter().any(turn_failed_persistence) {
+        events.push(
+            tokio::time::timeout(Duration::from_secs(20), client.next_message())
+                .await
+                .expect("turn/failed after rollout write error"),
+        );
+    }
+
+    enospc.store(false, Ordering::SeqCst);
+
+    client
+        .send(json!({
+            "id": 4,
+            "method": "session/close",
+            "params": { "sessionId": "recover-thread" }
+        }))
+        .await;
+    let (closed, _) = client.response_for(4).await;
+    assert!(
+        closed.get("error").is_none(),
+        "drained session with earlier persistence failure must close cleanly: {closed}"
+    );
+
+    client
+        .send(json!({
+            "id": 5,
+            "method": "session/start",
+            "params": { "init": { "cwd": root.path() }, "resume": "recover-thread" }
+        }))
+        .await;
+    let (resumed_after_close, _) = client.response_for(5).await;
+    assert_eq!(
+        resumed_after_close["result"]["sessionId"],
+        json!("recover-thread"),
+        "{resumed_after_close}"
+    );
+
+    client
+        .send(json!({
+            "id": 6,
+            "method": "turn/start",
+            "params": {
+                "sessionId": "recover-thread",
+                "input": "continue after close"
+            }
+        }))
+        .await;
+    let (_, mut completed_events) = client.response_for(6).await;
+    while !completed_events
+        .iter()
+        .any(|m| m.get("method").and_then(Value::as_str) == Some("turn/completed"))
+    {
+        completed_events.push(
+            tokio::time::timeout(Duration::from_secs(20), client.next_message())
+                .await
+                .expect("turn/completed after resuming from close"),
+        );
+    }
+
+    // 2. Poison the resumed rollout writer again and verify idle unload evicts
+    //    the drained handle and broadcasts `session/closed` instead of leaving a
+    //    dead zombie session behind.
+    enospc.store(true, Ordering::SeqCst);
+
+    client
+        .send(json!({
+            "id": 9,
+            "method": "turn/start",
+            "params": {
+                "sessionId": "recover-thread",
+                "input": "trigger unload persistence failure"
+            }
+        }))
+        .await;
+    let (_, mut fail_events) = client.response_for(9).await;
+    while !fail_events.iter().any(turn_failed_persistence) {
+        fail_events.push(
+            tokio::time::timeout(Duration::from_secs(20), client.next_message())
+                .await
+                .expect("turn/failed before idle unload"),
+        );
+    }
+
+    enospc.store(false, Ordering::SeqCst);
+
+    client
+        .send(json!({
+            "id": 10,
+            "method": "session/unsubscribe",
+            "params": { "sessionId": "recover-thread" }
+        }))
+        .await;
+    let (unsub, _) = client.response_for(10).await;
+    assert_eq!(unsub["result"]["subscribed"], json!(false));
+
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(20), client.next_message())
+            .await
+            .expect("session/closed notification after poisoned session idle unload");
+        if message.get("method").and_then(Value::as_str) == Some("session/closed") {
+            assert_eq!(message["params"]["sessionId"], json!("recover-thread"));
+            break;
+        }
+    }
+
+    client
+        .send(json!({
+            "id": 11,
+            "method": "session/subscribe",
+            "params": { "sessionId": "recover-thread" }
+        }))
+        .await;
+    let (gone, _) = client.response_for(11).await;
+    assert_eq!(gone["error"]["code"], json!(-32004), "{gone}");
+
+    client
+        .send(json!({
+            "id": 12,
+            "method": "session/start",
+            "params": { "init": { "cwd": root.path() }, "resume": "recover-thread" }
+        }))
+        .await;
+    let (resumed_after_unload, _) = client.response_for(12).await;
+    assert_eq!(
+        resumed_after_unload["result"]["sessionId"],
+        json!("recover-thread"),
+        "{resumed_after_unload}"
+    );
+
+    client
+        .send(json!({
+            "id": 13,
+            "method": "turn/start",
+            "params": {
+                "sessionId": "recover-thread",
+                "input": "continue after unload"
+            }
+        }))
+        .await;
+    let (_, mut after_unload_events) = client.response_for(13).await;
+    while !after_unload_events
+        .iter()
+        .any(|m| m.get("method").and_then(Value::as_str) == Some("turn/completed"))
+    {
+        after_unload_events.push(
+            tokio::time::timeout(Duration::from_secs(20), client.next_message())
+                .await
+                .expect("turn/completed after resuming from idle unload"),
+        );
+    }
+
+    client.close().await;
+}
