@@ -821,10 +821,7 @@ mod tests {
         // Measured: the effort knob visibly changes M3.1's thinking budget, but was
         // not measured to change M3 or the M2.x models, so offering it there would
         // be a control that does nothing.
-        assert_eq!(
-            facts("MiniMax-M3.1-Flash").ladder,
-            Some(&FULL_LADDER[..])
-        );
+        assert_eq!(facts("MiniMax-M3.1-Flash").ladder, Some(&FULL_LADDER[..]));
         assert_eq!(
             facts("MiniMax-M3.1-Flash-Preview").ladder,
             Some(&FULL_LADDER[..])

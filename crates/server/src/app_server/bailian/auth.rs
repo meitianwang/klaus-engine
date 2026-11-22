@@ -632,7 +632,9 @@ pub fn media_credential() -> Value {
 }
 
 /// Read the stored plan key, region and media gateway root for a specific config root.
-pub(crate) fn media_credential_for_root(root: &std::path::Path) -> Option<(String, String, String)> {
+pub(crate) fn media_credential_for_root(
+    root: &std::path::Path,
+) -> Option<(String, String, String)> {
     let raw = std::fs::read_to_string(root.join("bailian-tokenplan.json")).ok()?;
     let store: Value = serde_json::from_str(&raw).ok()?;
     let key = string_field(&store, "apiKey")?;
