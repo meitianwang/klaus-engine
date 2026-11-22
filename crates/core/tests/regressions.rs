@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261123_open_plan_periodic_reminder_and_hash_task_ids.rs"]
+mod r20261123_open_plan_periodic_reminder_and_hash_task_ids;
+
 #[path = "regressions/r20261121_cross_source_cjk_compaction_and_rate_limit_fallback.rs"]
 mod r20261121_cross_source_cjk_compaction_and_rate_limit_fallback;
 

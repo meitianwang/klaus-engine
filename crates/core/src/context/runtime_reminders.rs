@@ -16,6 +16,11 @@ const PHASE: &str = "antigravity-runtime-reminders";
 const ID_PREFIX: &str = "runtime-reminder-step:";
 const SNAPSHOT_PREFIX: &str = "<system-reminder>\nRuntime reminder update. This snapshot supersedes all earlier runtime reminder snapshots; only the entries below remain active.\n";
 const SNAPSHOT_SUFFIX: &str = "\n</system-reminder>";
+const OPEN_PLAN_REMINDER_MARKER: &str = "task(s) still open in your task list:\n";
+/// Completed tool rounds between append-only re-injections of an unchanged
+/// open-plan reminder so long tool loops do not bury checklist maintenance
+/// while keeping earlier history prefixes byte-stable.
+pub(crate) const OPEN_PLAN_REMINDER_CADENCE_ROUNDS: usize = 10;
 
 pub(crate) fn is_antigravity_source(config: &ResolvedConfig) -> bool {
     config
@@ -93,6 +98,28 @@ fn is_dynamic(part: &SystemPromptPart, include_all_non_cacheable: bool) -> bool 
                 || part.name == "hook-context"))
 }
 
+fn has_open_plan_reminder(parts: &[SystemPromptPart]) -> bool {
+    parts.iter().any(|part| {
+        part.name == "task-plan-reminder" && part.text.contains(OPEN_PLAN_REMINDER_MARKER)
+    })
+}
+
+fn tool_rounds_since(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if assistant
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+            )
+        })
+        .count()
+}
+
 pub(crate) fn is_step(message: &Message) -> bool {
     matches!(message, Message::User(user)
         if user.is_meta == Some(true)
@@ -155,11 +182,8 @@ fn project_with_mode(request: &mut ModelRequest, active: bool, include_all_non_c
         request.messages.retain(|message| !is_step(message));
         return;
     }
-    let previous = request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| is_step(message));
+    let previous_index = request.messages.iter().rposition(is_step);
+    let previous = previous_index.map(|index| &request.messages[index]);
     let has_current = request
         .system
         .iter()
@@ -167,15 +191,20 @@ fn project_with_mode(request: &mut ModelRequest, active: bool, include_all_non_c
     if !has_current && previous.is_none() {
         return;
     }
+    let has_open_plan = has_open_plan_reminder(&request.system);
     let text = snapshot(&request.system, include_all_non_cacheable);
     request
         .system
         .retain(|part| !is_dynamic(part, include_all_non_cacheable));
-    if previous.is_some_and(|message| {
-        matches!(message, Message::User(user)
+    if let (Some(index), Some(message)) = (previous_index, previous) {
+        if matches!(message, Message::User(user)
             if matches!(&user.content[0], ContentBlock::Text(previous) if previous.text == text))
-    }) {
-        return;
+        {
+            let rounds_since_previous = tool_rounds_since(&request.messages[index + 1..]);
+            if !has_open_plan || rounds_since_previous < OPEN_PLAN_REMINDER_CADENCE_ROUNDS {
+                return;
+            }
+        }
     }
     let mut digest = Sha256::new();
     if let Some(last) = request.messages.last() {

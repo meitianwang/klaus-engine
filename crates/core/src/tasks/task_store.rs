@@ -2833,6 +2833,33 @@ fn is_truthy(v: &RuntimeJson) -> bool {
     }
 }
 
+fn completed_tool_rounds_for_active_plan(messages: &[Message]) -> usize {
+    let mut rounds = 0usize;
+    for message in messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        let mut has_tool_use = false;
+        let mut replaced_plan = false;
+        for block in &assistant.content {
+            if let crate::schemas::content::ContentBlock::ToolUse(tool) = block {
+                has_tool_use = true;
+                if tool.name == "TaskWrite"
+                    && tool.input.get("merge") != Some(&RuntimeJson::Bool(true))
+                {
+                    replaced_plan = true;
+                }
+            }
+        }
+        if replaced_plan {
+            rounds = 1;
+        } else if has_tool_use {
+            rounds += 1;
+        }
+    }
+    rounds
+}
+
 pub struct TaskReminderProvider;
 
 impl TaskReminderProvider {
@@ -2841,7 +2868,8 @@ impl TaskReminderProvider {
         ctx: &ReminderContext,
         completed_tool_rounds: usize,
     ) -> io::Result<Option<RuntimeString>> {
-        if completed_tool_rounds == 0 {
+        let history_rounds = completed_tool_rounds_for_active_plan(&ctx.messages);
+        if completed_tool_rounds == 0 && history_rounds < REMINDER_TURN_THRESHOLD {
             return Ok(None);
         }
         let list_id = match ctx.task_list_id.as_ref() {
@@ -2859,18 +2887,21 @@ impl TaskReminderProvider {
             })
             .collect();
         if visible.is_empty() {
+            if completed_tool_rounds == 0 {
+                return Ok(None);
+            }
             return Ok(Some(RuntimeString::from(
                 "No progress checklist is currently tracked for this work. Use TaskWrite if a checklist would help carry out the current request; simple answers and straightforward actions do not require one.",
             )));
-        }
-        if completed_tool_rounds < REMINDER_TURN_THRESHOLD {
-            return Ok(None);
         }
         let open: Vec<Task> = visible
             .into_iter()
             .filter(|task| task.status != TaskStatus::Completed)
             .collect();
         if open.is_empty() {
+            return Ok(None);
+        }
+        if completed_tool_rounds.max(history_rounds) < REMINDER_TURN_THRESHOLD {
             return Ok(None);
         }
         let lines: Vec<RuntimeString> = open

@@ -49,6 +49,16 @@ fn hash(id: &RuntimeString) -> RuntimeString {
     RuntimeString::from("#").concat(id)
 }
 
+/// Strip a leading `#` when a caller echoes the `#<id>` display prefix back
+/// into `taskId` or dependency-edge arguments.
+fn normalize_task_id(raw: &RuntimeString) -> RuntimeString {
+    if raw.starts_with("#") {
+        raw.slice_utf16(1..)
+    } else {
+        raw.clone()
+    }
+}
+
 /// Loose truthiness for a metadata flag (`false`, `0`, `""`, `null` are falsy).
 fn is_truthy(v: &RuntimeJson) -> bool {
     match v {
@@ -346,7 +356,7 @@ impl Tool for TaskGetTool {
         let task_id = input
             .get("taskId")
             .and_then(RuntimeJson::as_str)
-            .cloned()
+            .map(normalize_task_id)
             .unwrap_or_default();
         let task = get_task_bound(&list_id_of(ctx), &task_id, ctx.task_plan.as_ref())
             .await
@@ -531,7 +541,7 @@ impl Tool for TaskUpdateTool {
         let id = input
             .get("taskId")
             .and_then(RuntimeJson::as_str)
-            .cloned()
+            .map(normalize_task_id)
             .unwrap_or_default();
         Some(RuntimeString::from("Updating task #").concat(&id))
     }
@@ -546,7 +556,7 @@ impl Tool for TaskUpdateTool {
         let task_id = input
             .get("taskId")
             .and_then(RuntimeJson::as_str)
-            .cloned()
+            .map(normalize_task_id)
             .unwrap_or_default();
         let operation_binding = ctx
             .task_plan
@@ -726,8 +736,14 @@ impl Tool for TaskUpdateTool {
                 .map_err(store_err)?;
         }
         // Dependency edges (bidirectional). addBlockedBy is the reverse direction.
-        let add_blocks = string_array(input.get("addBlocks"));
-        let add_blocked_by = string_array(input.get("addBlockedBy"));
+        let add_blocks: Vec<RuntimeString> = string_array(input.get("addBlocks"))
+            .iter()
+            .map(normalize_task_id)
+            .collect();
+        let add_blocked_by: Vec<RuntimeString> = string_array(input.get("addBlockedBy"))
+            .iter()
+            .map(normalize_task_id)
+            .collect();
         for id in &add_blocks {
             if !current.blocks.iter().any(|b| b == id) {
                 block_task_bound(&list_id, &task_id, id, Some(&operation_binding))
@@ -1330,13 +1346,14 @@ mod tests {
         let update = create_task_update_tool();
         let res = update
             .call(
-                rjson!({ "taskId": "42", "status": "completed" }),
+                rjson!({ "taskId": "#42", "status": "completed" }),
                 &ctx,
                 None,
             )
             .await
             .unwrap();
         assert_eq!(res.serializable.is_error, Some(false));
+        assert_eq!(text_of(&res), "Task #42 does not exist.");
         assert_eq!(
             res.serializable.output,
             rjson!({ "success": false, "taskId": "42", "error": "not found" })
