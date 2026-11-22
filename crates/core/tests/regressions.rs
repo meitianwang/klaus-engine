@@ -362,6 +362,10 @@ mod r01a0745e_host_recreates_completed_goal;
 #[path = "regressions/rca43230_context_estimate_counts_the_request_prefix.rs"]
 mod rca43230_context_estimate_counts_the_request_prefix;
 
+#[cfg(feature = "testing")]
+#[path = "regressions/r20261121_claude_subscription_cache_budget.rs"]
+mod r20261121_claude_subscription_cache_budget;
+
 #[path = "regressions/rb6903ac_sandbox_does_not_deny_user_credentials.rs"]
 mod rb6903ac_sandbox_does_not_deny_user_credentials;
 

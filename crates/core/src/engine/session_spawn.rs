@@ -281,6 +281,18 @@ impl Session {
         let agent_type_slot = forwarded_agent_type(opts);
         let agent_type_is_raw = agent_type_slot.is_raw();
         let requested_type = agent_type_slot.runtime_string_value();
+        let mut fork_path = fork_path;
+        if fork_path
+            && resumed_agent_type.is_none()
+            && creation_snapshot.is_none()
+            && !opts.fork_context_explicit
+            && !opts.feature_target_model
+            && capture.bundle.config.is_claude_subscription_source()
+        {
+            // Claude subscription subagents start in an isolated context unless
+            // the caller explicitly requested conversation inheritance.
+            fork_path = false;
+        }
         let type_name = if let Some(snapshot) = creation_snapshot {
             snapshot.agent_type.clone()
         } else if fork_path && !agent_type_slot.is_present() {
@@ -349,10 +361,24 @@ impl Session {
             .unwrap_or_else(|| opts.effective_effort(None, bundle.config.effort.clone()));
         let mut child_bundle = bundle.clone();
         if creation_snapshot.is_none() {
-            let selection = opts
+            let explore_low_tier = RuntimeString::from("low");
+            let force_claude_explore_low_tier = bundle.config.is_claude_subscription_source()
+                && !bundle.config.subagent_model_catalog
+                && !opts.feature_target_model
+                && !opts.orchestrator_target_model
+                && def
+                    .as_ref()
+                    .and_then(|definition| definition.builtin_identity.as_ref())
+                    .is_some_and(|id| id == "klaus:builtin:explore:1");
+            let raw_selection = opts
                 .model
                 .as_ref()
                 .or(bundle.config.default_subagent_model.as_ref());
+            let selection = if force_claude_explore_low_tier && raw_selection.is_none() {
+                Some(&explore_low_tier)
+            } else {
+                raw_selection
+            };
             let requested_effort = opts
                 .effort
                 .clone()
@@ -390,10 +416,15 @@ impl Session {
                 } else {
                     Ok(())
                 };
+                let effective_selection = if force_claude_explore_low_tier {
+                    &explore_low_tier
+                } else {
+                    selection
+                };
                 child_bundle = match if let Err(error) = selection_policy {
                     Err(error)
                 } else {
-                    self.prepare_subagent_inference(&bundle, selection, signal)
+                    self.prepare_subagent_inference(&bundle, effective_selection, signal)
                         .await
                 } {
                     Ok(selected) => selected,
@@ -484,7 +515,6 @@ impl Session {
                     .map_err(RuntimeString::from)?;
             }
         }
-        let mut fork_path = fork_path;
         let diverges_from_parent_prefix = opts.tools.is_some()
             || child_bundle.config.model != bundle.config.model
             || child_bundle.source != bundle.source
@@ -542,7 +572,10 @@ impl Session {
             .map(Ok)
             .unwrap_or_else(|| self.begin_inference_activity().map(Arc::new))
             .map_err(RuntimeString::from)?;
-        let fork_path = run_opts.fork_conversation.is_some();
+        let fork_path = run_opts.fork_conversation.is_some()
+            && !(!opts.fork_context_explicit
+                && !opts.feature_target_model
+                && capture.bundle.config.is_claude_subscription_source());
         if fork_path
             && (run_opts.parent_agent_id.is_some() || run_opts.initiating_turn_id.is_some())
             && opts.inherited_context.is_none()
@@ -2578,12 +2611,19 @@ impl Session {
                 } else {
                     None
                 },
-                skip_cache_write: if fork_path || resuming_fork {
+                skip_cache_write: if fork_path
+                    || resuming_fork
+                    || (opts.memory_dir.is_some()
+                        && resolved_max_turns.is_some_and(|turns| turns <= 5)
+                        && bundle.provider.info().name != "openai")
+                {
                     Some(true)
                 } else {
                     None
                 },
-                cache_ttl: if this.config.cache1h_ttl {
+                cache_ttl: if fork_path || resuming_fork {
+                    this.effective_session_cache_ttl(&bundle.config)
+                } else if this.config.cache1h_ttl {
                     Some(CacheTtl::OneHour)
                 } else {
                     None

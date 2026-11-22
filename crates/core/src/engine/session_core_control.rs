@@ -22,7 +22,6 @@ use super::title_output_schema;
 use super::to_content_blocks;
 use super::validate_native_pdf_provider;
 use super::BackgroundAgentInfo;
-use super::CacheTtl;
 use super::CompactOutcome;
 use super::DreamInProgressGuard;
 use super::DreamNowCompletion;
@@ -4121,11 +4120,7 @@ impl Session {
                 None
             },
             skip_cache_write: Some(true),
-            cache_ttl: if self.config.cache1h_ttl {
-                Some(CacheTtl::OneHour)
-            } else {
-                None
-            },
+            cache_ttl: self.effective_session_cache_ttl(&bundle.config),
             cache_domain: None,
             cache_key: Some(self.id.clone()),
             plan_file_path: None,
@@ -4774,11 +4769,7 @@ impl Session {
                 None
             },
             skip_cache_write,
-            cache_ttl: if self.config.cache1h_ttl {
-                Some(CacheTtl::OneHour)
-            } else {
-                None
-            },
+            cache_ttl: self.effective_session_cache_ttl(&bundle.config),
             cache_domain: None,
             cache_key: Some(self.id.clone()),
             plan_file_path: self.plan_file_context(None).map(|p| p.path),

@@ -767,6 +767,11 @@ impl Shared {
                 prepared.request.deferred_tools = self.deferred_request_specs(&prepared.profile);
                 prepared.request.surfaced_deferred_names =
                     self.surfaced_deferred_request_names(messages, &prepared.profile);
+                self.attach_deferred_announcement_projection(
+                    &mut prepared.request,
+                    messages,
+                    &prepared.profile,
+                );
             }
             self.attach_frozen_tool_projection(&mut prepared.request, messages);
         }
@@ -849,6 +854,114 @@ impl Shared {
             return Vec::new();
         }
         render_tool_specs_for_behavior(&internal, profile)
+    }
+
+    /// Full deferred-exposure name pool (including already-surfaced entries),
+    /// rendered for the request's provider profile. Unlocking a tool via
+    /// `tool_search` must not mutate this pool: keeping the initial baseline
+    /// stable preserves the cached conversation prefix across steps.
+    pub(super) fn all_deferred_pool_names(
+        &self,
+        profile: &ProviderBehaviorProfile,
+    ) -> Vec<RuntimeString> {
+        if self.uses_static_deferred_tool_dispatch() {
+            return Vec::new();
+        }
+        let tools = self.tools.lock_recover().clone();
+        let internal: Vec<ToolSpec> = tools
+            .iter()
+            .filter(|tool| tool.exposure() == crate::types::tool::ToolExposure::Deferred)
+            .map(|tool| to_tool_spec(tool.as_ref()))
+            .collect();
+        if internal.is_empty() {
+            return Vec::new();
+        }
+        render_tool_specs_for_behavior(&internal, profile)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    /// Maintain the anchored deferred-tool announcement plan across steps and
+    /// turns so wire adapters place the baseline directory inside the cached
+    /// prefix at the first post-compaction user message and emit only `+`/`-`
+    /// deltas when MCP or skill inventory changes mid-session.
+    pub(super) fn attach_deferred_announcement_projection(
+        &self,
+        request: &mut ModelRequest,
+        messages: &[Message],
+        profile: &ProviderBehaviorProfile,
+    ) {
+        let native_active = request.native_deferred_tools == Some(true)
+            || (request.native_deferred_tools != Some(false)
+                && self.bundle().is_some_and(|bundle| {
+                    bundle
+                        .provider
+                        .native_deferred_loading_active(&request.model)
+                }));
+        if !native_active {
+            return;
+        }
+        let pool_names = self.all_deferred_pool_names(profile);
+        let oversized = self
+            .oversized_inventory_deferred
+            .load(std::sync::atomic::Ordering::Acquire);
+        let static_deferred_dispatch = self.uses_static_deferred_tool_dispatch();
+        let compact_boundaries = messages
+            .iter()
+            .filter(|message| matches!(message, Message::CompactBoundary(_)))
+            .count();
+        let mut state = self.tool_freeze.lock_deferred_recover();
+        if pool_names.is_empty() && state.is_none() {
+            return;
+        }
+        let need_rebase = match state.as_ref() {
+            None => true,
+            Some(epoch) => {
+                epoch.model != request.model
+                    || epoch.oversized != oversized
+                    || epoch.static_deferred_dispatch != static_deferred_dispatch
+                    || epoch.compact_boundaries != compact_boundaries
+                    || (epoch.prefix_len == 0 && !messages.is_empty())
+                    || messages.len() < epoch.prefix_len
+                    || super::precompute::history_hash(&messages[..epoch.prefix_len])
+                        != Some(epoch.prefix_hash)
+            }
+        };
+        if need_rebase {
+            let Some(prefix_hash) = super::precompute::history_hash(messages) else {
+                return;
+            };
+            *state = Some(super::DeferredAnnouncementEpoch {
+                model: request.model.clone(),
+                prefix_len: messages.len(),
+                prefix_hash,
+                compact_boundaries,
+                static_deferred_dispatch,
+                oversized,
+                plan: crate::types::provider::DeferredAnnouncementPlan {
+                    baseline_anchor_uuid: first_user_side_uuid(&request.messages),
+                    baseline_names: pool_names.clone(),
+                    deltas: Vec::new(),
+                },
+            });
+        }
+        let epoch = state.as_mut().expect("deferred epoch just established");
+        let expected = fold_deferred_names(&epoch.plan.baseline_names, &epoch.plan.deltas);
+        if let Some((added, removed)) = deferred_names_diff(&expected, &pool_names) {
+            epoch
+                .plan
+                .deltas
+                .push(crate::types::provider::DeferredAnnouncementDelta {
+                    anchor_uuid: last_user_side_uuid(&request.messages),
+                    added,
+                    removed,
+                });
+        }
+        request
+            .wire_caps
+            .get_or_insert_with(crate::types::provider::WireCapabilityPolicy::default)
+            .deferred_announcements = Some(epoch.plan.clone());
     }
 
     /// Names of already-surfaced deferred tools rendered for the request's
@@ -1702,6 +1815,61 @@ fn tool_inventory_diff(
             removed.push(spec.name.clone());
         }
     }
+    if added.is_empty() && removed.is_empty() {
+        None
+    } else {
+        Some((added, removed))
+    }
+}
+
+fn first_user_side_uuid(messages: &[Message]) -> Option<RuntimeString> {
+    messages.iter().find_map(|message| match message {
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::Assistant(_) | Message::System(_) => None,
+    })
+}
+
+fn last_user_side_uuid(messages: &[Message]) -> Option<RuntimeString> {
+    messages.iter().rev().find_map(|message| match message {
+        Message::CompactBoundary(m) => Some(m.uuid.clone()),
+        Message::User(m) => Some(m.uuid.clone()),
+        Message::ToolResult(m) => Some(m.uuid.clone()),
+        Message::Assistant(_) | Message::System(_) => None,
+    })
+}
+
+fn fold_deferred_names(
+    baseline: &[RuntimeString],
+    deltas: &[crate::types::provider::DeferredAnnouncementDelta],
+) -> Vec<RuntimeString> {
+    let mut active: Vec<RuntimeString> = baseline.to_vec();
+    for delta in deltas {
+        active.retain(|name| !delta.removed.contains(name));
+        for added in &delta.added {
+            if !active.contains(added) {
+                active.push(added.clone());
+            }
+        }
+    }
+    active
+}
+
+fn deferred_names_diff(
+    expected: &[RuntimeString],
+    actual: &[RuntimeString],
+) -> Option<(Vec<RuntimeString>, Vec<RuntimeString>)> {
+    let added: Vec<RuntimeString> = actual
+        .iter()
+        .filter(|name| !expected.contains(name))
+        .cloned()
+        .collect();
+    let removed: Vec<RuntimeString> = expected
+        .iter()
+        .filter(|name| !actual.contains(name))
+        .cloned()
+        .collect();
     if added.is_empty() && removed.is_empty() {
         None
     } else {

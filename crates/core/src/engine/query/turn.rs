@@ -2503,7 +2503,7 @@ async fn run_turn_tool_result_budget(
     turn_override: &TurnOverride,
     effective_max_output: u64,
 ) -> Result<(), crate::types::errors::ToolError> {
-    if !shared.config().aggregate_tool_results {
+    if !shared.config().effective_aggregate_tool_results() {
         return Ok(());
     }
     let Some(state) = shared.params.tool_result_budget_state.as_ref() else {

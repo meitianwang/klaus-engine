@@ -4248,7 +4248,7 @@ impl Session {
             let had_task = tools.iter().any(|tool| tool.name() == "task");
             tools.retain(|tool| tool.name() != "task" && tool.name() != "skill");
             if had_task {
-                tools.push(crate::tools::builtins::task::create_task_tool(
+                tools.push(crate::tools::builtins::task::create_task_tool_for_source(
                     crate::tools::builtins::task::TaskToolOptions {
                         model_catalog: subagent_config.subagent_model_catalog,
                         model_options: subagent_config.subagent_model_options.clone(),
@@ -4258,6 +4258,7 @@ impl Session {
                             .map(crate::tools::builtins::index::to_task_agent)
                             .collect(),
                     },
+                    subagent_config.is_claude_subscription_source(),
                 ));
             }
             if let Some(skills) = &update.skills {
@@ -4460,7 +4461,7 @@ impl Session {
     ) {
         if let Some(tool) = tools.iter_mut().find(|tool| tool.name() == "task") {
             let exposure = tool.exposure();
-            let mut rebuilt = crate::tools::builtins::task::create_task_tool(
+            let mut rebuilt = crate::tools::builtins::task::create_task_tool_for_source(
                 crate::tools::builtins::task::TaskToolOptions {
                     model_catalog: config.subagent_model_catalog,
                     model_options: config.subagent_model_options.clone(),
@@ -4471,6 +4472,7 @@ impl Session {
                         .map(crate::tools::builtins::index::to_task_agent)
                         .collect(),
                 },
+                config.is_claude_subscription_source(),
             );
             if rebuilt.exposure() != exposure {
                 rebuilt = crate::tools::builtins::tool_search::ExposureOverrideTool::wrap(
@@ -5176,6 +5178,25 @@ impl Session {
             );
         }
         self.flush_rollout().await
+    }
+
+    /// Prompt-cache TTL for this conversation's main prefix and prefix-sharing
+    /// side queries. Main Claude subscription sessions default to 1-hour
+    /// retention so natural multi-minute reading and thinking pauses do not
+    /// rewrite the entire conversation prefix; side tasks and isolated
+    /// subagents stay on the 5-minute default unless `cache1h_ttl` is set.
+    pub(crate) fn effective_session_cache_ttl(
+        &self,
+        config: &crate::schemas::config::EngineConfig,
+    ) -> Option<crate::types::provider::CacheTtl> {
+        if self.config.cache1h_ttl
+            || (self.meta.role != Some(crate::schemas::rollout::SessionRole::SideTask)
+                && config.is_claude_subscription_source())
+        {
+            Some(crate::types::provider::CacheTtl::OneHour)
+        } else {
+            None
+        }
     }
 
     pub fn visible_history(&self) -> Vec<Message> {

@@ -433,7 +433,7 @@ impl Session {
             effort,
             ultra_mode: false,
             thinking: (config.thinking && caps.thinking).then_some(ThinkingConfig::Adaptive),
-            skip_cache_write: None,
+            skip_cache_write: (provider.info().name != "openai").then_some(true),
             cache_ttl: None,
             cache_domain: None,
             cache_key: Some(cache_key),

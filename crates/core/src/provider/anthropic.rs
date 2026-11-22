@@ -756,6 +756,7 @@ impl AnthropicProvider {
             overlay!(prompt_cache_key_mode);
             overlay!(session_affinity_format);
             overlay!(cache_control_format);
+            overlay!(deferred_announcements);
         }
         policy
     }
@@ -3368,6 +3369,27 @@ fn build_params_with_media_limits(
     } else {
         Vec::new()
     };
+    let deferred_plan = if defer_loading_supported && !structured_replacement {
+        req.wire_caps
+            .as_ref()
+            .and_then(|caps| caps.deferred_announcements.clone())
+            .or_else(|| {
+                (!req.deferred_tools.is_empty()).then(|| {
+                    crate::types::provider::DeferredAnnouncementPlan {
+                        baseline_anchor_uuid: None,
+                        baseline_names: req
+                            .deferred_tools
+                            .iter()
+                            .map(|spec| spec.name.clone())
+                            .collect(),
+                        deltas: Vec::new(),
+                    }
+                })
+            })
+    } else {
+        None
+    };
+    let mut deferred_state = DeferredAnnouncementRenderState::new(deferred_plan.as_ref());
     let mut messages = to_api_messages_with_marked(
         &req.messages,
         &diagnostic_string(&req.model),
@@ -3376,6 +3398,7 @@ fn build_params_with_media_limits(
         tool_change_mode == ToolChangeMode::ByValue,
         defer_loading_supported && !structured_replacement,
         Some(&active_marked_names),
+        &mut deferred_state,
     );
     // Modern Claude models reject assistant message prefill (400 when the final
     // message has role="assistant"). Ensure empty-input continuations after a
@@ -3400,6 +3423,10 @@ fn build_params_with_media_limits(
             ),
         ]));
     }
+    // Flush any unanchored deferred-tool baseline (onto the first user message)
+    // and unanchored deltas (onto the trailing user message) BEFORE applying
+    // cache breakpoints so the entire directory stays inside the cached prefix.
+    deferred_state.flush_unmatched(&mut messages);
     // The final per-image ceiling precedes aggregate shedding. Otherwise an
     // invalid historical image could be silently discarded instead of refused.
     validate_final_images(&messages, image_limits.max_base64_chars)?;
@@ -3497,31 +3524,6 @@ fn build_params_with_media_limits(
         cache_scope_enabled,
         cache_control_on_tools,
     );
-
-    // Collapsed deferred tools are announced by name: appended AFTER cache
-    // breakpoints so the trailing user-message `cache_control` stays on the
-    // stable conversation prefix rather than shifting when tools are unlocked.
-    if defer_loading_supported && !req.deferred_tools.is_empty() && !structured_replacement {
-        if let Some(last_user) = messages.iter_mut().rev().find(|message| {
-            message
-                .get("role")
-                .and_then(Value::as_str)
-                .is_some_and(|role| role == "user")
-        }) {
-            let mut text = RuntimeString::from("<system-reminder>\n")
-                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_HEADER));
-            for spec in &req.deferred_tools {
-                text = text.concat(&RuntimeString::from("\n")).concat(&spec.name);
-            }
-            text = text
-                .concat(&RuntimeString::from("\n\n"))
-                .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE))
-                .concat(&RuntimeString::from("\n</system-reminder>"));
-            if let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut) {
-                blocks.push(vobj(vec![("type", vs("text")), ("text", vs(text))]));
-            }
-        }
-    }
 
     // Native deferred tool loading: folded (not-yet-unlocked) definitions
     // never ride the wire at all — the search channel announces them by name
@@ -4601,6 +4603,140 @@ fn downgrade_tool_protocol_body(
     }
 }
 
+struct DeferredAnnouncementRenderState<'a> {
+    plan: Option<&'a crate::types::provider::DeferredAnnouncementPlan>,
+    baseline_emitted: bool,
+    deltas_emitted: Vec<bool>,
+}
+
+impl<'a> DeferredAnnouncementRenderState<'a> {
+    fn new(plan: Option<&'a crate::types::provider::DeferredAnnouncementPlan>) -> Self {
+        let deltas_len = plan.map_or(0, |p| p.deltas.len());
+        let baseline_empty = plan.is_none_or(|p| p.baseline_names.is_empty());
+        Self {
+            plan,
+            baseline_emitted: baseline_empty,
+            deltas_emitted: vec![false; deltas_len],
+        }
+    }
+
+    fn flush_for_slice(&mut self, slice: &[Message], out: &mut Vec<Value>) {
+        let Some(plan) = self.plan else {
+            return;
+        };
+        if !self.baseline_emitted {
+            if let Some(anchor) = &plan.baseline_anchor_uuid {
+                if slice.iter().any(|m| message_has_uuid(m, anchor)) {
+                    push_user_content(
+                        out,
+                        vec![render_deferred_baseline_block(&plan.baseline_names)],
+                    );
+                    self.baseline_emitted = true;
+                }
+            }
+        }
+        for (idx, delta) in plan.deltas.iter().enumerate() {
+            if self.deltas_emitted[idx] {
+                continue;
+            }
+            if delta.added.is_empty() && delta.removed.is_empty() {
+                self.deltas_emitted[idx] = true;
+                continue;
+            }
+            if let Some(anchor) = &delta.anchor_uuid {
+                if slice.iter().any(|m| message_has_uuid(m, anchor)) {
+                    push_user_content(out, vec![render_deferred_delta_block(delta)]);
+                    self.deltas_emitted[idx] = true;
+                }
+            }
+        }
+    }
+
+    fn flush_unmatched(&mut self, messages: &mut [Value]) {
+        let Some(plan) = self.plan else {
+            return;
+        };
+        if !self.baseline_emitted {
+            if let Some(first_user) = messages.iter_mut().find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user")
+            }) {
+                if let Some(blocks) = first_user.get_mut("content").and_then(Value::as_array_mut) {
+                    blocks.push(render_deferred_baseline_block(&plan.baseline_names));
+                    self.baseline_emitted = true;
+                }
+            }
+        }
+        for (idx, delta) in plan.deltas.iter().enumerate() {
+            if self.deltas_emitted[idx] || (delta.added.is_empty() && delta.removed.is_empty()) {
+                continue;
+            }
+            if let Some(last_user) = messages.iter_mut().rev().find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user")
+            }) {
+                if let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut) {
+                    blocks.push(render_deferred_delta_block(delta));
+                    self.deltas_emitted[idx] = true;
+                }
+            }
+        }
+    }
+}
+
+fn message_has_uuid(message: &Message, target: &RuntimeString) -> bool {
+    match message {
+        Message::User(m) => &m.uuid == target,
+        Message::Assistant(m) => &m.uuid == target,
+        Message::ToolResult(m) => &m.uuid == target,
+        Message::System(m) => &m.uuid == target,
+        Message::CompactBoundary(m) => &m.uuid == target,
+    }
+}
+
+fn render_deferred_baseline_block(names: &[RuntimeString]) -> Value {
+    let mut text = RuntimeString::from("<system-reminder>\n")
+        .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_HEADER));
+    for name in names {
+        text = text.concat(&RuntimeString::from("\n")).concat(name);
+    }
+    text = text
+        .concat(&RuntimeString::from("\n\n"))
+        .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE))
+        .concat(&RuntimeString::from("\n</system-reminder>"));
+    vobj(vec![("type", vs("text")), ("text", vs(text))])
+}
+
+fn render_deferred_delta_block(delta: &crate::types::provider::DeferredAnnouncementDelta) -> Value {
+    let mut text = RuntimeString::from("<system-reminder>");
+    if !delta.added.is_empty() {
+        text = text.concat(&RuntimeString::from(
+            "\nDeferred tools added (use tool_search with query \"select:<name>[,<name>...]\" to load schemas before calling them):",
+        ));
+        for name in &delta.added {
+            text = text.concat(&RuntimeString::from("\n")).concat(name);
+        }
+        text = text
+            .concat(&RuntimeString::from("\n\n"))
+            .concat(&RuntimeString::from(DEFERRED_ANNOUNCEMENT_GUIDANCE));
+    }
+    if !delta.removed.is_empty() {
+        if !delta.added.is_empty() {
+            text = text.concat(&RuntimeString::from("\n"));
+        }
+        text = text.concat(&RuntimeString::from("\nDeferred tools removed:"));
+        for name in &delta.removed {
+            text = text.concat(&RuntimeString::from("\n")).concat(name);
+        }
+    }
+    text = text.concat(&RuntimeString::from("\n</system-reminder>"));
+    vobj(vec![("type", vs("text")), ("text", vs(text))])
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn to_api_messages(
@@ -4611,6 +4747,7 @@ fn to_api_messages(
     by_value: bool,
     reference_results: bool,
 ) -> Vec<Value> {
+    let mut deferred_state = DeferredAnnouncementRenderState::new(None);
     to_api_messages_with_marked(
         messages,
         target_model,
@@ -4619,6 +4756,7 @@ fn to_api_messages(
         by_value,
         reference_results,
         None,
+        &mut deferred_state,
     )
 }
 
@@ -4631,6 +4769,7 @@ fn to_api_messages_with_marked(
     by_value: bool,
     reference_results: bool,
     marked_names: Option<&std::collections::HashSet<RuntimeString>>,
+    deferred_state: &mut DeferredAnnouncementRenderState<'_>,
 ) -> Vec<Value> {
     let behavior_profile = resolve_provider_behavior_profile(
         Some(&ProviderInfo {
@@ -4687,6 +4826,7 @@ fn to_api_messages_with_marked(
                 }
                 content.extend(deferred);
                 push_user_content(&mut out, content);
+                deferred_state.flush_for_slice(&messages[start..i], &mut out);
                 collect_anchored_events(&messages[start..i], &anchored, &mut pending, &mut matched);
                 continue;
             }
@@ -4697,6 +4837,7 @@ fn to_api_messages_with_marked(
                 }
                 let content = map_blocks(&u.content, tools);
                 push_user_content(&mut out, content);
+                deferred_state.flush_for_slice(&messages[i..i + 1], &mut out);
             }
             Message::Assistant(a) => {
                 // A model switch leaves prior assistant turns carrying thinking
@@ -4752,6 +4893,7 @@ fn to_api_messages_with_marked(
                         ),
                     ])],
                 );
+                deferred_state.flush_for_slice(&messages[i..i + 1], &mut out);
             }
             Message::System(_) => {}
         }
@@ -6422,6 +6564,28 @@ mod tests {
             })
     }
 
+    fn matrix_first_user_text(body: &Value) -> RuntimeString {
+        let messages = body.get("messages").and_then(Value::as_array).unwrap();
+        let first_user = messages
+            .iter()
+            .find(|message| {
+                message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| role == "user")
+            })
+            .expect("leading user message");
+        let mut text = RuntimeString::from("");
+        if let Some(blocks) = first_user.get("content").and_then(Value::as_array) {
+            for block in blocks {
+                if let Some(part) = block.get("text").and_then(Value::as_str) {
+                    text = text.concat(part);
+                }
+            }
+        }
+        text
+    }
+
     fn matrix_last_user_text(body: &Value) -> RuntimeString {
         let messages = body.get("messages").and_then(Value::as_array).unwrap();
         let last_user = messages
@@ -6517,34 +6681,55 @@ mod tests {
             blocks,
             "{cell}: placeholder"
         );
-        // 6. Announcement: the current folded list with load guidance, only
-        //    while the native channel is armed.
-        let tail = matrix_last_user_text(body);
-        let tail_utf8 = tail.try_to_utf8().unwrap();
+        // 6. Announcement: anchored on the leading user turn inside the cached
+        //    prefix, never re-appended as uncached tail text on later user turns.
+        let lead = matrix_first_user_text(body);
+        let lead_utf8 = lead.try_to_utf8().unwrap();
+        let user_count = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r == "user")
+            })
+            .count();
         if defer {
             assert!(
-                tail_utf8.contains("<system-reminder>"),
+                lead_utf8.contains("<system-reminder>"),
                 "{cell}: announcement wrapper"
             );
             assert!(
-                tail_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
+                lead_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
                 "{cell}: announcement header"
             );
             assert!(
-                tail_utf8.contains(DEFERRED_ANNOUNCEMENT_GUIDANCE),
+                lead_utf8.contains(DEFERRED_ANNOUNCEMENT_GUIDANCE),
                 "{cell}: announcement guidance"
             );
             assert!(
-                tail_utf8.contains("mcp__alpha__two"),
+                lead_utf8.contains("mcp__alpha__two"),
                 "{cell}: folded name missing"
             );
             assert!(
-                !tail_utf8.contains("mcp__alpha__one"),
+                !lead_utf8.contains("mcp__alpha__one"),
                 "{cell}: unlocked name leaked into the announcement"
             );
+            if user_count > 1 {
+                let tail = matrix_last_user_text(body);
+                assert!(
+                    !tail
+                        .try_to_utf8()
+                        .unwrap()
+                        .contains(DEFERRED_ANNOUNCEMENT_HEADER),
+                    "{cell}: baseline announcement duplicated onto trailing user message"
+                );
+            }
         } else {
             assert!(
-                !tail_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
+                !lead_utf8.contains(DEFERRED_ANNOUNCEMENT_HEADER),
                 "{cell}: announcement without the native channel"
             );
         }
@@ -9042,8 +9227,22 @@ mod tests {
             .get("cache_control")
             .is_none());
 
-        // 3. Last user message carries `<system-reminder>` AFTER `cache_control` breakpoint,
-        // and `cache_ttl_1h = false` omits `"ttl": "1h"`.
+        // 3. First user message carries the baseline `<system-reminder>` inside the
+        // cached prefix; the trailing tool-result user message is not polluted with
+        // a repeated reminder, and `cache_ttl_1h = false` omits `"ttl": "1h"`.
+        let first_user_blocks = messages[0]
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(
+            first_user_blocks.iter().any(|b| {
+                b.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.try_to_utf8().ok())
+                    .is_some_and(|t| t.contains("<system-reminder>") && t.contains("write"))
+            }),
+            "baseline deferred reminder must anchor on the first user message"
+        );
         let last_user = messages
             .iter()
             .rev()
@@ -9054,20 +9253,20 @@ mod tests {
             })
             .unwrap();
         let user_blocks = last_user.get("content").and_then(Value::as_array).unwrap();
-        let reminder_idx = user_blocks
-            .iter()
-            .position(|b| {
+        assert!(
+            !user_blocks.iter().any(|b| {
                 b.get("text")
                     .and_then(Value::as_str)
                     .and_then(|s| s.try_to_utf8().ok())
                     .is_some_and(|t| t.contains("<system-reminder>"))
-            })
-            .expect("reminder block");
-        assert_eq!(reminder_idx, user_blocks.len() - 1);
-        assert!(user_blocks[reminder_idx].get("cache_control").is_none());
-        let cached_block = user_blocks[reminder_idx - 1]
+            }),
+            "trailing user message must not re-inject uncached deferred directory"
+        );
+        let cached_block = user_blocks
+            .last()
+            .unwrap()
             .get("cache_control")
-            .expect("cache breakpoint before reminder");
+            .expect("cache breakpoint on last user block");
         assert!(cached_block.get("ttl").is_none());
 
         // 4. Matched `read` mapped to rendered `Read` in tool_reference.

@@ -1088,7 +1088,7 @@ async fn anthropic_turn1_sends_search_beta_places_reminder_after_cache_and_flips
     assert_eq!(captured.len(), 2);
 
     // Attempt 0 sends the search beta from Turn 1 (even before any tool is marked defer_loading)
-    // and places the deferred announcement reminder AFTER the user cache breakpoint.
+    // and anchors the frozen deferred announcement inside the Turn 1 user cache prefix.
     let beta_0 = captured[0]
         .0
         .lines()
@@ -1100,8 +1100,8 @@ async fn anthropic_turn1_sends_search_beta_places_reminder_after_cache_and_flips
     );
     let user_blocks = captured[0].1["messages"][0]["content"].as_array().unwrap();
     assert_eq!(user_blocks.len(), 2);
-    assert!(user_blocks[0].get("cache_control").is_some());
-    assert!(user_blocks[1].get("cache_control").is_none());
+    assert!(user_blocks[0].get("cache_control").is_none());
+    assert!(user_blocks[1].get("cache_control").is_some());
     assert!(user_blocks[1]["text"]
         .as_str()
         .unwrap()

@@ -1384,10 +1384,10 @@ pub struct EngineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_budget_tokens: Option<u64>,
     /// API-level context editing (Anthropic `context-management` beta),
-    /// first-party Anthropic only. Enabled by default with every threshold
-    /// unset, so the server applies its own tuned defaults; set
-    /// `contextManagement: null` to opt out. Complements client-side
-    /// micro-compaction.
+    /// first-party Anthropic only. Disabled by default because an unthresholded
+    /// server policy shifts the cleared boundary on every request once past the
+    /// server floor, invalidating the cached prefix each step; opt in explicitly
+    /// with `triggerToolUses` when batched server-side clearing is desired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagementConfig>,
     /// Manage prior-turn thinking blocks server-side: normally pin every thinking
@@ -1742,7 +1742,7 @@ impl Default for EngineConfig {
             thinking: true,
             fast_mode: false,
             task_budget_tokens: None,
-            context_management: Some(ContextManagementConfig::default()),
+            context_management: None,
             allow: Vec::new(),
             deny: Vec::new(),
             ask: Vec::new(),
@@ -1846,6 +1846,20 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// Whether this configuration targets the Claude subscription model source.
+    pub fn is_claude_subscription_source(&self) -> bool {
+        self.model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
+            == Some("subscription")
+    }
+
+    /// Whether per-message tool-result spill budgeting and cold-cache reclaim
+    /// are active: explicit opt-in or Claude subscription sessions.
+    pub fn effective_aggregate_tool_results(&self) -> bool {
+        self.aggregate_tool_results || self.is_claude_subscription_source()
+    }
+
     /// Resident capacity is resolved from the configuration of each load request.
     pub fn effective_subagent_capacity(&self) -> usize {
         self.max_concurrent_threads_per_session
@@ -2228,14 +2242,11 @@ mod tests {
     }
 
     #[test]
-    fn context_management_parses_camel_case_and_defaults_to_enabled() {
+    fn context_management_parses_camel_case_and_defaults_to_absent() {
         let cfg: EngineConfig = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(
-            cfg.context_management,
-            Some(ContextManagementConfig::default())
-        );
+        assert!(cfg.context_management.is_none());
 
-        // An explicit null is the opt-out.
+        // An explicit null also leaves it unset.
         let cfg: EngineConfig = serde_json::from_value(json!({"contextManagement": null})).unwrap();
         assert!(cfg.context_management.is_none());
 
@@ -2276,6 +2287,7 @@ mod tests {
         // from the defaults document would have dropped.
         for key in [
             "modelTiers",
+            "contextManagement",
             "codeModeHost",
             "codeModeHostRequired",
             "effort",

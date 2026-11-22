@@ -721,23 +721,67 @@ pub(super) struct ToolFreezeEpoch {
     pub(super) instructions: Option<RuntimeString>,
 }
 
-/// Session-scoped holder for [`ToolFreezeEpoch`], shared across turns of the
-/// same conversation so tool freezing and incremental change batches persist
-/// until a history discontinuity (compaction, rollback, restore) resets them.
+/// Session-local baseline of the deferred-tool name pool plus incremental
+/// additions/removals anchored to user-side message uuids. Kept separate from
+/// [`ToolFreezeEpoch`] so transports that support native deferred loading
+/// without mid-conversation tool-change blocks still anchor the initial
+/// directory inside the cached prefix and emit only deltas thereafter.
+#[derive(Clone)]
+pub(super) struct DeferredAnnouncementEpoch {
+    pub(super) model: RuntimeString,
+    pub(super) prefix_len: usize,
+    pub(super) prefix_hash: [u8; 32],
+    pub(super) compact_boundaries: usize,
+    pub(super) static_deferred_dispatch: bool,
+    pub(super) oversized: bool,
+    pub(super) plan: crate::types::provider::DeferredAnnouncementPlan,
+}
+
+/// Session-scoped holder for [`ToolFreezeEpoch`] and
+/// [`DeferredAnnouncementEpoch`], shared across turns of the same conversation
+/// so tool freezing and incremental change batches persist until a history
+/// discontinuity (compaction, rollback, restore) resets them.
 #[derive(Default)]
-pub(crate) struct ToolFreezeState(Mutex<Option<ToolFreezeEpoch>>);
+pub(crate) struct ToolFreezeState {
+    tool_epoch: Mutex<Option<ToolFreezeEpoch>>,
+    deferred_epoch: Mutex<Option<DeferredAnnouncementEpoch>>,
+}
 
 impl ToolFreezeState {
     pub(crate) fn clear(&self) {
-        *self.0.lock_recover() = None;
+        *self.tool_epoch.lock_recover() = None;
+        *self.deferred_epoch.lock_recover() = None;
     }
 
     pub(crate) fn snapshot_clone(&self) -> Self {
-        Self(Mutex::new(self.0.lock_recover().clone()))
+        Self {
+            tool_epoch: Mutex::new(self.tool_epoch.lock_recover().clone()),
+            deferred_epoch: Mutex::new(self.deferred_epoch.lock_recover().clone()),
+        }
+    }
+
+    pub(crate) fn deferred_announcements_wire_caps(
+        &self,
+    ) -> Option<crate::types::provider::WireCapabilityPolicy> {
+        let plan = self
+            .deferred_epoch
+            .lock_recover()
+            .as_ref()
+            .map(|epoch| epoch.plan.clone())?;
+        Some(crate::types::provider::WireCapabilityPolicy {
+            deferred_announcements: Some(plan),
+            ..Default::default()
+        })
     }
 
     pub(super) fn lock_recover(&self) -> std::sync::MutexGuard<'_, Option<ToolFreezeEpoch>> {
-        self.0.lock_recover()
+        self.tool_epoch.lock_recover()
+    }
+
+    pub(super) fn lock_deferred_recover(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<DeferredAnnouncementEpoch>> {
+        self.deferred_epoch.lock_recover()
     }
 }
 

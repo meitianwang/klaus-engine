@@ -580,7 +580,7 @@ impl TypedMemoryStore {
             web_search: None,
             thinking: None,
             effort: None,
-            skip_cache_write: None,
+            skip_cache_write: Some(true),
             cache_ttl: None,
             cache_domain: None,
             cache_key: None,

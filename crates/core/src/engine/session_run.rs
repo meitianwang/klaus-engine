@@ -18,7 +18,6 @@ use super::tool_lifecycle_rollout_writer;
 use super::validate_native_pdf_provider;
 use super::ActiveTurnLease;
 use super::AnyTool;
-use super::CacheTtl;
 use super::EngineEventStream;
 use super::Input;
 use super::PermissionDecision;
@@ -1840,7 +1839,7 @@ impl Session {
         // prompt cache has certainly expired, so the whole prefix re-sends
         // regardless and the budget pass may trade aged full-size results down
         // to their persisted previews at no extra cache cost.
-        if this.config.aggregate_tool_results
+        if initial_bundle.config.effective_aggregate_tool_results()
             && this.config.reclaim_tool_results_when_cache_cold
             && this
                 .turn
@@ -1957,11 +1956,7 @@ impl Session {
                 None
             },
             skip_cache_write: None,
-            cache_ttl: if this.config.cache1h_ttl {
-                Some(CacheTtl::OneHour)
-            } else {
-                None
-            },
+            cache_ttl: this.effective_session_cache_ttl(&initial_bundle.config),
             cache_domain: None,
             cache_key: Some(this.id.clone()),
             // Only a BOUND document has a path. Nothing is derived from the mode,

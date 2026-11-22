@@ -3,7 +3,6 @@ use super::runtime_error_message_to_public_host;
 use super::runtime_trim;
 use super::validate_native_pdf_provider;
 use super::AnyTool;
-use super::CacheTtl;
 use super::Session;
 use super::SystemPromptResolvable;
 use super::SystemPromptThunk;
@@ -715,11 +714,7 @@ impl Session {
                 None
             },
             skip_cache_write: Some(true),
-            cache_ttl: if self.config.cache1h_ttl {
-                Some(CacheTtl::OneHour)
-            } else {
-                None
-            },
+            cache_ttl: self.effective_session_cache_ttl(&bundle.config),
             cache_domain: None,
             cache_key: Some(self.id.clone()),
             plan_file_path: None,

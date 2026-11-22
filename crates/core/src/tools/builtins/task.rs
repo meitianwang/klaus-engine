@@ -31,20 +31,42 @@ pub(crate) const MODEL_OVERRIDE_DESCRIPTION: &str = "Required for every new chil
 const REQUIRED_MODEL_ERROR: &str =
     "model is required for a new subagent: select from the advertised model policy; do not use inherit.";
 
+fn is_explore_agent_selection(input: &Json) -> bool {
+    let selected = input
+        .get("subagent_type")
+        .filter(|value| !value.is_null())
+        .or_else(|| input.get("agentType").filter(|value| !value.is_null()));
+    selected
+        .and_then(Json::as_str)
+        .and_then(|value| value.try_to_utf8().ok())
+        .is_some_and(|value| value.trim() == "Explore")
+}
+
 fn new_child_model(
     input: &Json,
     model_catalog: bool,
     has_models: bool,
+    claude_subscription_defaults: bool,
 ) -> Result<RuntimeString, ToolError> {
-    let model = input
-        .get("model")
-        .and_then(Json::as_str)
-        .filter(|model| {
-            model
-                .try_to_utf8()
-                .is_ok_and(|text| !text.trim().is_empty() && text.trim() != "inherit")
-        })
-        .ok_or_else(|| ToolError::new(REQUIRED_MODEL_ERROR))?;
+    let raw_model = input.get("model").and_then(Json::as_str).filter(|model| {
+        model
+            .try_to_utf8()
+            .is_ok_and(|text| !text.trim().is_empty() && text.trim() != "inherit")
+    });
+    let model = match raw_model {
+        Some(model) => model.clone(),
+        None if claude_subscription_defaults
+            && !model_catalog
+            && input
+                .get("model")
+                .and_then(Json::as_str)
+                .is_none_or(|m| m.try_to_utf8().is_ok_and(|t| t.trim() != "inherit"))
+            && is_explore_agent_selection(input) =>
+        {
+            RuntimeString::from("low")
+        }
+        None => return Err(ToolError::new(REQUIRED_MODEL_ERROR)),
+    };
     let tier = ["low", "medium", "high"].iter().any(|tier| model == *tier);
     if !model_catalog && !tier {
         return Err(ToolError::new(
@@ -57,7 +79,7 @@ fn new_child_model(
     if model_catalog && tier {
         return Err(ToolError::new("Model-directory mode requires a concrete source:modelId from the advertised directory, not a model tier."));
     }
-    Ok(model.clone())
+    Ok(model)
 }
 
 pub(crate) fn model_selection_description(
@@ -199,7 +221,11 @@ fn agent_type_schema(agent_names: &[RuntimeString]) -> RuntimeJson {
 }
 
 /// Build the tool's input JSON Schema.
-fn build_input_schema(agent_names: &[RuntimeString], opts: &TaskToolOptions) -> RuntimeJson {
+fn build_input_schema(
+    agent_names: &[RuntimeString],
+    opts: &TaskToolOptions,
+    claude_subscription_defaults: bool,
+) -> RuntimeJson {
     let agent_type = agent_type_schema(agent_names);
     let mut schema = runtime_json::parse(&RuntimeString::from(
         r#"{
@@ -228,6 +254,19 @@ fn build_input_schema(agent_names: &[RuntimeString], opts: &TaskToolOptions) -> 
         .expect("task schema properties are an object");
     properties.insert("subagent_type", agent_type.clone());
     properties.insert("agentType", agent_type);
+    if claude_subscription_defaults {
+        if let Some(fork_turns) = properties
+            .get_mut("fork_turns")
+            .and_then(RuntimeJson::as_object_mut)
+        {
+            fork_turns.insert(
+                "description",
+                RuntimeJson::from(
+                    "Conversation history to inherit: none (default) or all. Positive integer strings also inherit the full conversation.",
+                ),
+            );
+        }
+    }
     let model = properties
         .get_mut("model")
         .and_then(RuntimeJson::as_object_mut)
@@ -269,6 +308,7 @@ fn parse_task_input(
     agents: &[AgentDefinition],
     model_catalog: bool,
     has_models: bool,
+    claude_subscription_defaults: bool,
 ) -> Result<Json, ToolError> {
     let object = input.as_object().ok_or_else(|| {
         ToolError::new(format!(
@@ -359,9 +399,14 @@ fn parse_task_input(
             .is_none_or(|value| value.is_null() || value.is_string())
     {
         issues.extend(
-            new_child_model(input, model_catalog, has_models)
-                .err()
-                .map(|error| RuntimeString::from(error.to_string())),
+            new_child_model(
+                input,
+                model_catalog,
+                has_models,
+                claude_subscription_defaults,
+            )
+            .err()
+            .map(|error| RuntimeString::from(error.to_string())),
         );
     }
     if let Some(value) = object.get("reasoning_effort") {
@@ -422,7 +467,9 @@ fn parse_task_input(
             );
         }
     }
-    if let Err(error) = task_fork_turns(parsed.get("fork_turns")) {
+    if let Err(error) =
+        task_fork_turns_with_default(parsed.get("fork_turns"), claude_subscription_defaults)
+    {
         issues.push(error);
     }
     if let Some(value) = object.get("peer") {
@@ -465,7 +512,15 @@ fn parse_task_input(
     }
 }
 
+#[cfg(test)]
 fn task_fork_turns(value: Option<&Json>) -> Result<ForkContext, RuntimeString> {
+    task_fork_turns_with_default(value, false)
+}
+
+fn task_fork_turns_with_default(
+    value: Option<&Json>,
+    default_none: bool,
+) -> Result<ForkContext, RuntimeString> {
     if value.is_some_and(|value| !value.is_null() && !value.is_string()) {
         return Err("fork_turns must be `none` or `all`".into());
     }
@@ -478,7 +533,7 @@ fn task_fork_turns(value: Option<&Json>) -> Result<ForkContext, RuntimeString> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("all");
+        .unwrap_or(if default_none { "none" } else { "all" });
     if text.eq_ignore_ascii_case("none") {
         Ok(ForkContext::None)
     } else if text.eq_ignore_ascii_case("all") || text.parse::<NonZeroUsize>().is_ok() {
@@ -582,24 +637,36 @@ pub struct TaskTool {
     input_schema: RuntimeJson,
     model_catalog: bool,
     has_models: bool,
+    claude_subscription_defaults: bool,
 }
 
 impl TaskTool {
-    fn new(opts: TaskToolOptions) -> Self {
+    fn new(opts: TaskToolOptions, claude_subscription_defaults: bool) -> Self {
         let agent_names: Vec<RuntimeString> = opts.agents.iter().map(|a| a.name.clone()).collect();
         TaskTool {
             description: build_description(&opts.agents),
-            input_schema: build_input_schema(&agent_names, &opts),
+            input_schema: build_input_schema(&agent_names, &opts, claude_subscription_defaults),
             model_catalog: opts.model_catalog,
             has_models: !opts.model_options.is_empty(),
             agents: opts.agents,
+            claude_subscription_defaults,
         }
     }
 }
 
 /// Construct the `task` tool as an erased registry-side [`Tool`].
 pub fn create_task_tool(opts: TaskToolOptions) -> Arc<dyn Tool> {
-    Arc::new(TaskTool::new(opts))
+    create_task_tool_for_source(opts, false)
+}
+
+/// Construct the `task` tool with source-specific defaults (isolated
+/// `fork_turns: "none"` default and `Explore` low-tier fallback when bound to
+/// a Claude subscription session).
+pub fn create_task_tool_for_source(
+    opts: TaskToolOptions,
+    claude_subscription_defaults: bool,
+) -> Arc<dyn Tool> {
+    Arc::new(TaskTool::new(opts, claude_subscription_defaults))
 }
 
 #[async_trait]
@@ -685,7 +752,13 @@ impl Tool for TaskTool {
     }
 
     fn parse_input(&self, input: &Json) -> Result<Json, ToolError> {
-        parse_task_input(input, &self.agents, self.model_catalog, self.has_models)
+        parse_task_input(
+            input,
+            &self.agents,
+            self.model_catalog,
+            self.has_models,
+            self.claude_subscription_defaults,
+        )
     }
 
     fn summarize(&self, input: &Json) -> Option<RuntimeString> {
@@ -772,7 +845,12 @@ impl Tool for TaskTool {
                 ),
             });
         }
-        let model = new_child_model(&input, self.model_catalog, self.has_models)?;
+        let model = new_child_model(
+            &input,
+            self.model_catalog,
+            self.has_models,
+            self.claude_subscription_defaults,
+        )?;
         if input
             .get("fork_context")
             .is_some_and(|value| !value.is_null())
@@ -834,8 +912,14 @@ impl Tool for TaskTool {
         let peer = js_truthy_string(js_property(&input, "peer")?);
         let name = js_truthy_string(js_property(&input, "name")?).cloned();
         let raw_fork_turns = input.get("fork_turns");
-        let fork_context_explicit = raw_fork_turns.is_some_and(|value| !value.is_null());
-        let fork_context = Some(task_fork_turns(raw_fork_turns).map_err(ToolError::new)?);
+        let fork_context_explicit = raw_fork_turns
+            .and_then(Json::as_str)
+            .and_then(|s| s.try_to_utf8().ok())
+            .is_some_and(|s| !s.trim().is_empty());
+        let fork_context = Some(
+            task_fork_turns_with_default(raw_fork_turns, self.claude_subscription_defaults)
+                .map_err(ToolError::new)?,
+        );
         let background_slot = js_property(&input, "run_in_background")?;
         // Asked for detachment in so many words. Only the literal `true` counts:
         // `parse_input` rejects a non-boolean, so anything else is not a request

@@ -837,6 +837,31 @@ pub struct WireCapabilityPolicy {
     /// Dedicated transport session identity (parent thread or subagent thread) for
     /// stateful WebSocket continuation and turn-scoped affinity headers.
     pub transport_session_id: Option<RuntimeString>,
+    /// Anchored deferred-tool announcement plan for transports that advertise
+    /// deferred tool names inside message reminders rather than top-level
+    /// folded tool declarations. Internal only.
+    pub deferred_announcements: Option<DeferredAnnouncementPlan>,
+}
+
+/// Incremental delta of the session's deferred-tool name pool, anchored to the
+/// user-side message where the pool changed so earlier cached prefixes stay
+/// byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredAnnouncementDelta {
+    pub anchor_uuid: Option<RuntimeString>,
+    pub added: Vec<RuntimeString>,
+    pub removed: Vec<RuntimeString>,
+}
+
+/// Baseline plus incremental deltas for message-stream deferred-tool
+/// announcements. Anchoring the baseline at the first post-compaction user
+/// message places the full deferred-tool directory inside the cached prefix
+/// instead of re-sending uncached tail tokens on every step.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeferredAnnouncementPlan {
+    pub baseline_anchor_uuid: Option<RuntimeString>,
+    pub baseline_names: Vec<RuntimeString>,
+    pub deltas: Vec<DeferredAnnouncementDelta>,
 }
 
 impl WireCapabilityPolicy {
@@ -846,7 +871,8 @@ impl WireCapabilityPolicy {
     }
 
     /// Project resolved capabilities while preserving request-scoped fields set
-    /// earlier on the request (`transport_session_id`, `reasoning_summary_explicit`).
+    /// earlier on the request (`transport_session_id`, `reasoning_summary_explicit`,
+    /// `deferred_announcements`).
     pub fn from_capabilities_preserving(
         capabilities: &ModelCapabilities,
         existing: Option<&Self>,
@@ -868,6 +894,8 @@ impl WireCapabilityPolicy {
             reasoning_summary_explicit: existing
                 .is_some_and(|policy| policy.reasoning_summary_explicit),
             transport_session_id: existing.and_then(|policy| policy.transport_session_id.clone()),
+            deferred_announcements: existing
+                .and_then(|policy| policy.deferred_announcements.clone()),
         }
     }
 }

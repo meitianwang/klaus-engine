@@ -459,7 +459,7 @@ pub(super) async fn dispatch_tool_calls(
         .filter(|call| call.internal_name == "read")
         .map(|call| call.visible.id.clone())
         .collect();
-    if !shared.config().aggregate_tool_results {
+    if !shared.config().effective_aggregate_tool_results() {
         return Ok((results, post_result_notices));
     }
     let results = persist_per_message_budget(

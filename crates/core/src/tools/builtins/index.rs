@@ -83,7 +83,7 @@ use super::save_memory::create_save_memory_tool;
 use super::skill_search::{create_skill_search_tool, SkillSearchToolOptions};
 use super::sleep::create_sleep_tool;
 use super::swarm_tools::{create_send_message_tool, create_swarm_tools};
-use super::task::{create_task_tool, TaskToolOptions};
+use super::task::TaskToolOptions;
 use super::task_control::{create_task_output_tool, create_task_stop_tool};
 use super::task_tools::{
     create_task_create_tool, create_task_get_tool, create_task_list_tool, create_task_update_tool,
@@ -274,15 +274,18 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
     }
     // Sub-agent delegation via the `task` tool (advertises the engine's roles).
     if opts.task != Some(false) && config.max_sub_agent_depth > 0 {
-        tools.push(create_task_tool(TaskToolOptions {
-            model_catalog: config.subagent_model_catalog,
-            model_options: config.subagent_model_options.clone(),
-            agents: opts
-                .agents
-                .as_deref()
-                .map(|a| a.iter().map(to_task_agent).collect())
-                .unwrap_or_default(),
-        }));
+        tools.push(super::task::create_task_tool_for_source(
+            TaskToolOptions {
+                model_catalog: config.subagent_model_catalog,
+                model_options: config.subagent_model_options.clone(),
+                agents: opts
+                    .agents
+                    .as_deref()
+                    .map(|a| a.iter().map(to_task_agent).collect())
+                    .unwrap_or_default(),
+            },
+            config.is_claude_subscription_source(),
+        ));
     }
     // The `skill` tool runs a skill as a forked sub-agent; only useful when skills
     // exist. With a conditional-skill gate, only visible (unconditional +
