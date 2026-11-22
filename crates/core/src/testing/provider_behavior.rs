@@ -3927,7 +3927,7 @@ fn pinned_prompt_prefix(source: bool) -> Result<RuntimeJson, String> {
     } else {
         (
             include_str!("../../tests/fixtures/prompt_policy/shared-prefix.json"),
-            "6382f730b0e728868315b41b26f6bfdf668eb58925d163954aa15875e147fee9",
+            "1190ea2cdd5d52e913b43e025778aa9d32bedda32c781a7064280b2260a17e3e",
         )
     };
     let value = runtime_json::parse(&RuntimeString::from(text))

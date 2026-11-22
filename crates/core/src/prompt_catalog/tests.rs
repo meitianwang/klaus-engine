@@ -965,7 +965,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r10")
+        RuntimeString::from("bundled-r11")
     );
 }
 
@@ -1186,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r10"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r11"));
 }
 
 mod store_refresh {
@@ -1251,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r10"
+            "bundled-r11"
         );
 
         let v1 = document("distributed-v1");
@@ -1374,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r10"
+            "bundled-r11"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

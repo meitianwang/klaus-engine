@@ -747,7 +747,30 @@ mod tests {
 
     #[test]
     fn shared_behavior_policy_is_present_once_before_session_context() {
-        let parts = build_system_prompt(&input("/w"));
+        let default_inp = input("/w");
+        let default_parts = build_system_prompt(&default_inp);
+        let default_bases: Vec<_> = default_parts
+            .iter()
+            .filter(|part| part.name == "base")
+            .collect();
+        assert_eq!(default_bases.len(), 1);
+        assert_eq!(
+            default_bases[0].text,
+            crate::prompt_catalog::ModelFragments::for_config(&default_inp.config, None)
+                .base_instructions()
+        );
+        assert!(default_bases[0].text.contains("# Task execution"));
+        assert!(default_bases[0].text.contains("# Using skills"));
+        assert!(!default_bases[0].text.contains("functions.exec"));
+        assert!(default_parts
+            .iter()
+            .all(|part| part.name != "communication"));
+        assert_eq!(default_parts[0].name, "base");
+
+        // Unbound models resolve the generic engine-default base policy verbatim.
+        let mut generic_inp = input("/w");
+        generic_inp.config.model = "gpt-4o".into();
+        let parts = build_system_prompt(&generic_inp);
         let bases: Vec<_> = parts.iter().filter(|part| part.name == "base").collect();
         assert_eq!(bases.len(), 1);
         assert_eq!(bases[0].text, RuntimeString::from(BASE_INSTRUCTIONS));

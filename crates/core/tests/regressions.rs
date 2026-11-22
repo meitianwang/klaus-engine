@@ -13,6 +13,9 @@
 #[path = "regressions/r20261123_open_plan_periodic_reminder_and_hash_task_ids.rs"]
 mod r20261123_open_plan_periodic_reminder_and_hash_task_ids;
 
+#[path = "regressions/r20261122_claude_prompt_security_clause_removed.rs"]
+mod r20261122_claude_prompt_security_clause_removed;
+
 #[path = "regressions/r20261121_cross_source_cjk_compaction_and_rate_limit_fallback.rs"]
 mod r20261121_cross_source_cjk_compaction_and_rate_limit_fallback;
 
