@@ -111,7 +111,14 @@ pub(crate) fn is_keepalive_eligible_bundle(
     {
         return false;
     }
-    if is_antigravity_source(&bundle.config) {
+    if is_antigravity_source(&bundle.config)
+        || bundle
+            .config
+            .model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
+            == Some("codex")
+    {
         return false;
     }
     if !bundle.provider.has_prewarm_endpoints() {

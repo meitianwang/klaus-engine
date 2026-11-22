@@ -38,6 +38,10 @@ pub fn resolve_config_layers(layers: Vec<ConfigGovernanceLayer>) -> Result<Resol
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let reasoning_summary_explicit = layers.iter().any(|layer| {
+        layer.values.contains_key("reasoningSummary")
+            || layer.values.contains_key("reasoning_summary")
+    });
     let governed = govern_config(&engine_config_governance_schema(), &layers)
         .map_err(|error| error.to_string())?;
     let mut values = governed.to_json_object();
@@ -49,6 +53,7 @@ pub fn resolve_config_layers(layers: Vec<ConfigGovernanceLayer>) -> Result<Resol
     let cfg_value = serde_json::Value::Object(values);
     let config = ConfigJson::validate_config_document(cfg_value).map_err(|e| e.to_string())?;
     let mut cfg: EngineConfig = config.deserialize_config().map_err(|e| e.to_string())?;
+    cfg.reasoning_summary_explicit = reasoning_summary_explicit;
     // Backstop for a legacy `effort: "ultra"` that reached the struct without
     // passing a JSON layer (the layers above normalize with key presence, so an
     // explicit `ultraMode: false` already won before this point).

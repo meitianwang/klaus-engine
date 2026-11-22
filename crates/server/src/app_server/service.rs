@@ -3325,7 +3325,9 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                     Ok(mut result) => {
                         if let Some(targets) = params.model_tier_targets {
                             let mut init = serde_json::json!({"modelTierTargets": targets});
-                            if let Err(error) = resolve_model_provider(&state, &mut init).await {
+                            if let Err(error) =
+                                Box::pin(resolve_model_provider(&state, &mut init)).await
+                            {
                                 return state
                                     .send(wire::error_response(&id, wire::INVALID_PARAMS, &error))
                                     .await;
@@ -3721,7 +3723,7 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
             };
             tokio::spawn(async move {
                 let _guard = guard;
-                session_start(state, id, params).await;
+                Box::pin(session_start(state, id, params)).await;
             });
         }
         "session/prepare" => {
@@ -4633,7 +4635,7 @@ async fn resolve_raw_model_provider(
     }
     let before = projection.clone();
     let mut resolved = Value::Object(projection);
-    resolve_model_provider(state, &mut resolved).await?;
+    Box::pin(resolve_model_provider(state, &mut resolved)).await?;
     let resolved = resolved
         .as_object()
         .expect("model provider resolver preserves its object");
@@ -9162,7 +9164,7 @@ async fn session_start_impl(
     // A named selection that cannot be honoured fails the start. Continuing would
     // run the session on whatever provider the endpoint defaults to, which is a
     // different model and possibly a different account than the caller asked for.
-    if let Err(error) = resolve_raw_model_provider(&state, &mut init).await {
+    if let Err(error) = Box::pin(resolve_raw_model_provider(&state, &mut init)).await {
         remove_owned_session(&state, &session_id, &handle).await;
         let _ = handle.ps.shutdown_and_wait().await;
         state
@@ -9758,7 +9760,7 @@ async fn session_reconfigure_model(
         .unwrap_or_else(|| session.model_revision());
     let mut init = params.init;
     let prepare = async {
-        resolve_model_provider(&state, &mut init).await?;
+        Box::pin(resolve_model_provider(&state, &mut init)).await?;
         let init = klaus_agent_core::runtime_values::runtime_codec::decode_text(
             &RuntimeString::from(init.to_string()),
         )

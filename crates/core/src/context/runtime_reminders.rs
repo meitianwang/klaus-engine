@@ -54,8 +54,8 @@ pub(crate) fn is_prefix_cached_compat_source(
         .and_then(|source| source.source.as_deref());
     match source {
         Some(
-            "kimi" | "bailian" | "minimax" | "zhipu" | "ark" | "qoder" | "qwenwork" | "workbuddy"
-            | "trae",
+            "codex" | "kimi" | "bailian" | "minimax" | "zhipu" | "ark" | "qoder" | "qwenwork"
+            | "workbuddy" | "trae",
         ) => true,
         Some("custom") => provider_info
             .and_then(|info| info.base_url.as_ref())
@@ -351,7 +351,12 @@ mod tests {
             !enabled_with_provider(&custom_cfg, None),
             "custom without explicit third-party base_url stays inactive"
         );
-        for native_source in ["subscription", "codex", "gemini"] {
+        let codex_cfg = config_with_source(Some("codex"));
+        assert!(
+            enabled_with_provider(&codex_cfg, None),
+            "codex subscription uses append-only runtime reminder snapshots to preserve prefix cache hits"
+        );
+        for native_source in ["subscription", "gemini"] {
             let cfg = config_with_source(Some(native_source));
             assert!(!enabled_with_provider(&cfg, None));
         }

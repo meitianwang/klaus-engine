@@ -1169,8 +1169,12 @@ impl ModelProvider for CapturedModelProvider {
         }
         req.bind_media_capabilities(capabilities);
         req.native_deferred_tools = metadata.native_deferred_tools;
-        req.wire_caps =
-            Some(crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata));
+        req.wire_caps = Some(
+            crate::types::provider::WireCapabilityPolicy::from_capabilities_preserving(
+                &metadata,
+                req.wire_caps.as_ref(),
+            ),
+        );
         self.inner.stream(req, signal)
     }
 

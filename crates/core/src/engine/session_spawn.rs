@@ -484,6 +484,34 @@ impl Session {
                     .map_err(RuntimeString::from)?;
             }
         }
+        let mut fork_path = fork_path;
+        let diverges_from_parent_prefix = opts.tools.is_some()
+            || child_bundle.config.model != bundle.config.model
+            || child_bundle.source != bundle.source
+            || def.as_ref().is_some_and(|d| {
+                d.name != GENERAL_PURPOSE_AGENT
+                    || d.tools.is_some()
+                    || d.disallowed_tools.is_some()
+                    || d.mcp_servers.as_ref().is_some_and(|m| !m.is_empty())
+            });
+        if fork_path
+            && !resuming_fork
+            && creation_snapshot.is_none()
+            && !opts.fork_context_explicit
+            && !opts.feature_target_model
+            && bundle
+                .config
+                .model_source
+                .as_ref()
+                .and_then(|source| source.source.as_deref())
+                == Some("codex")
+            && diverges_from_parent_prefix
+        {
+            // Specialized role prompts, narrowed tool inventories, and cross-model
+            // targets change token index 0 of the request prefix, yielding zero
+            // cache reuse when full parent history is replayed by default.
+            fork_path = false;
+        }
         Ok(super::PreparedSubagentConfig {
             capture: capture.with_bundle(child_bundle),
             fork_path,
@@ -521,10 +549,13 @@ impl Session {
         {
             return Err("The initiating step's inherited context is unavailable.".into());
         }
-        run_opts.prepared = Some(
-            self.prepare_subagent_config(opts, capture.clone(), fork_path, None, None, signal)
-                .await?,
-        );
+        let prepared = self
+            .prepare_subagent_config(opts, capture.clone(), fork_path, None, None, signal)
+            .await?;
+        if !prepared.fork_path {
+            run_opts.fork_conversation = None;
+        }
+        run_opts.prepared = Some(prepared);
         run_opts.inference_capture = Some(capture);
         Ok(())
     }
@@ -1424,6 +1455,9 @@ impl Session {
                     }
                 },
             };
+            let fork_path = prepared.fork_path;
+            let fork_conversation = fork_conversation.filter(|_| fork_path);
+            let inherited_context = inherited_context.filter(|_| fork_path);
             let type_name = prepared.type_name;
             let resuming_fork = prepared.resuming_fork;
             let def: Option<AgentDefinition> = prepared.definition;
@@ -2544,7 +2578,11 @@ impl Session {
                 } else {
                     None
                 },
-                skip_cache_write: if fork_path || resuming_fork { Some(true) } else { None },
+                skip_cache_write: if fork_path || resuming_fork {
+                    Some(true)
+                } else {
+                    None
+                },
                 cache_ttl: if this.config.cache1h_ttl {
                     Some(CacheTtl::OneHour)
                 } else {
@@ -2589,7 +2627,11 @@ impl Session {
                 // advance it.
                 thinking_context_cold: this.turn.thinking_context_cold(),
                 context_edit_state: None,
-                tool_freeze_state: None,
+                tool_freeze_state: if fork_path || resuming_fork {
+                    Some(Arc::new(this.tool_freeze_state.snapshot_clone()))
+                } else {
+                    None
+                },
                 padded_countdown_spend: this.turn.padded_countdown_spend(),
                 task_countdown_anchor: None,
                 live_model_override: None,
@@ -2748,6 +2790,17 @@ impl Session {
                 .as_ref()
                 .map(|d| d.name.clone())
                 .unwrap_or_else(|| RuntimeString::from("agent"));
+            // On linear-prefix Responses backends, appending child role sections to
+            // the stable instructions item rewrites `input[1]` and invalidates the
+            // inherited conversation prefix. Marking them non-cacheable on a fork
+            // emits them as trailing `developer` guidance after the cached history.
+            let fork_trailing_role = inherited_system.is_some()
+                && inference_config
+                    .model_source
+                    .as_ref()
+                    .and_then(|source| source.source.as_deref())
+                    == Some("codex");
+            let role_cacheable = Some(!fork_trailing_role);
             let base_provider: SystemPromptThunk = match inherited_system {
                 Some(parts) => Arc::new(move || {
                     let parts = parts.clone();
@@ -2797,7 +2850,7 @@ impl Session {
                         parts.push(SystemPromptPart {
                             name: part_name,
                             text: ri.clone(),
-                            cacheable: Some(true),
+                            cacheable: role_cacheable,
                             cache_scope: None,
                         });
                     }
@@ -2808,7 +2861,7 @@ impl Session {
                         parts.push(SystemPromptPart {
                             name: part_name,
                             text: mt.clone().into(),
-                            cacheable: Some(true),
+                            cacheable: role_cacheable,
                             cache_scope: None,
                         });
                     }
@@ -2819,7 +2872,7 @@ impl Session {
                         parts.push(SystemPromptPart {
                             name: part_name,
                             text: teammate_prompt(&to.team, &to.peer),
-                            cacheable: Some(true),
+                            cacheable: role_cacheable,
                             cache_scope: None,
                         });
                     }
@@ -2830,7 +2883,7 @@ impl Session {
                         parts.push(SystemPromptPart {
                             name: part_name,
                             text: RuntimeString::from("IMPORTANT: ").concat(cr),
-                            cacheable: Some(true),
+                            cacheable: role_cacheable,
                             cache_scope: None,
                         });
                     }

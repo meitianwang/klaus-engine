@@ -52,6 +52,7 @@ use crate::types::provider::{
 };
 
 mod approval_classifier;
+mod codex_session;
 mod native_tool_loading;
 mod remote_compaction;
 
@@ -2090,10 +2091,11 @@ fn build_responses_params_with_tool_mode(
         if let Some(e) = effort {
             reasoning.insert("effort", vs(e));
         }
+        let summary_mode = codex_session::effective_reasoning_summary(req, caps);
         if caps.supports_reasoning_summary_parameter != Some(false)
-            && req.reasoning_summary != crate::types::provider::ReasoningSummary::None
+            && summary_mode != crate::types::provider::ReasoningSummary::None
         {
-            reasoning.insert("summary", vs(req.reasoning_summary.as_str()));
+            reasoning.insert("summary", vs(summary_mode.as_str()));
         }
         obj.insert("reasoning", Value::Object(reasoning));
         obj.insert(
@@ -2303,6 +2305,7 @@ fn retain_scoped_responses_context(
 ///   `{"detail":"Unsupported parameter: max_output_tokens"}`.
 ///
 /// The standard OpenAI Responses path never goes through this function.
+#[cfg(test)]
 fn adapt_codex_responses_params(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -4589,19 +4592,25 @@ fn chat_stream_error(chunk: &Value) -> Option<ProviderError> {
 /// How a Chat Completions response is consumed.
 enum ChatResponseBody {
     /// It said it is an event stream: read it as it arrives.
-    Stream(OpenAiByteStream),
+    Stream(OpenAiByteStream, reqwest::header::HeaderMap),
     /// It said it is something else: the whole body, in hand.
-    Buffered(bytes::Bytes),
+    Buffered(bytes::Bytes, reqwest::header::HeaderMap),
 }
 
 type OpenAiByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 impl ChatResponseBody {
+    fn headers(&self) -> &reqwest::header::HeaderMap {
+        match self {
+            Self::Stream(_, headers) | Self::Buffered(_, headers) => headers,
+        }
+    }
+
     fn into_stream(self) -> OpenAiByteStream {
         match self {
-            Self::Stream(stream) => stream,
-            Self::Buffered(bytes) => Box::pin(futures::stream::once(async move { Ok(bytes) })),
+            Self::Stream(stream, _) => stream,
+            Self::Buffered(bytes, _) => Box::pin(futures::stream::once(async move { Ok(bytes) })),
         }
     }
 }
@@ -4613,8 +4622,8 @@ impl ChatResponseBody {
 /// contains no event boundary to frame on. An endpoint that declares nothing is
 /// streamed, which is what it was already treated as.
 async fn chat_response_body(resp: reqwest::Response) -> Result<ChatResponseBody, ProviderError> {
-    let declares_event_stream = resp
-        .headers()
+    let headers = resp.headers().clone();
+    let declares_event_stream = headers
         .get(reqwest::header::CONTENT_TYPE)
         .is_none_or(|value| {
             value
@@ -4622,11 +4631,14 @@ async fn chat_response_body(resp: reqwest::Response) -> Result<ChatResponseBody,
                 .is_ok_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
         });
     if declares_event_stream {
-        return Ok(ChatResponseBody::Stream(Box::pin(resp.bytes_stream())));
+        return Ok(ChatResponseBody::Stream(
+            Box::pin(resp.bytes_stream()),
+            headers,
+        ));
     }
     resp.bytes()
         .await
-        .map(ChatResponseBody::Buffered)
+        .map(|bytes| ChatResponseBody::Buffered(bytes, headers))
         .map_err(|e| {
             classify_error(&RawProviderError {
                 message: error_with_source_chain(&e),
@@ -6305,8 +6317,8 @@ async fn inspect_instruction_role_refusal(
         }
         Some(error)
     };
-    let ChatResponseBody::Stream(mut stream) = body else {
-        if let ChatResponseBody::Buffered(bytes) = &body {
+    let ChatResponseBody::Stream(mut stream, headers) = body else {
+        if let ChatResponseBody::Buffered(bytes, _) = &body {
             if let Some(error) = check(bytes) {
                 return Err(error);
             }
@@ -6332,9 +6344,10 @@ async fn inspect_instruction_role_refusal(
                         return Err(error);
                     }
                     let first = bytes::Bytes::from(prefix);
-                    return Ok(ChatResponseBody::Stream(Box::pin(
-                        futures::stream::once(async move { Ok(first) }).chain(stream),
-                    )));
+                    return Ok(ChatResponseBody::Stream(
+                        Box::pin(futures::stream::once(async move { Ok(first) }).chain(stream)),
+                        headers,
+                    ));
                 }
                 if prefix.len() < 64 * 1024 {
                     continue;
@@ -6342,9 +6355,10 @@ async fn inspect_instruction_role_refusal(
             }
             Some(Err(error)) => {
                 let first = bytes::Bytes::from(prefix);
-                return Ok(ChatResponseBody::Stream(Box::pin(
-                    futures::stream::iter([Ok(first), Err(error)]).chain(stream),
-                )));
+                return Ok(ChatResponseBody::Stream(
+                    Box::pin(futures::stream::iter([Ok(first), Err(error)]).chain(stream)),
+                    headers,
+                ));
             }
             None => {
                 if let Some(error) = check(&prefix) {
@@ -6353,9 +6367,10 @@ async fn inspect_instruction_role_refusal(
             }
         }
         let first = bytes::Bytes::from(prefix);
-        return Ok(ChatResponseBody::Stream(Box::pin(
-            futures::stream::once(async move { Ok(first) }).chain(stream),
-        )));
+        return Ok(ChatResponseBody::Stream(
+            Box::pin(futures::stream::once(async move { Ok(first) }).chain(stream)),
+            headers,
+        ));
     }
 }
 
@@ -6442,6 +6457,7 @@ pub struct OpenAIProvider {
     native_tool_support: super::native_tools::NativeToolSupport,
     info: ProviderInfo,
     client: reqwest::Client,
+    ws_client: reqwest::Client,
     classifier_http_client_factory:
         Option<crate::provider::approval_classifier_transport::ClassifierHttpClientFactory>,
     classifier_requires_client_factory: bool,
@@ -6464,6 +6480,8 @@ pub struct OpenAIProvider {
     bridge_fast_mode: Option<bool>,
     review_effort: Option<RuntimeString>,
     reviewer_header_model: Option<RuntimeString>,
+    codex_transport: Arc<codex_session::CodexTransportState>,
+    responses_websocket: Option<bool>,
 }
 
 impl OpenAIProvider {
@@ -6478,6 +6496,10 @@ impl OpenAIProvider {
         let classifier_requires_client_factory =
             opts.http_client.is_some() && opts.classifier_http_client_factory.is_none();
         let client = opts.http_client.unwrap_or_default();
+        let ws_client = reqwest::Client::builder()
+            .http1_only()
+            .build()
+            .unwrap_or_else(|_| client.clone());
         let api_key = opts.api_key.clone();
         let api = opts.api.unwrap_or_default();
         let retry = opts.retry.unwrap_or_default();
@@ -6496,6 +6518,7 @@ impl OpenAIProvider {
             native_tool_support: Default::default(),
             info,
             client,
+            ws_client,
             classifier_http_client_factory: opts.classifier_http_client_factory,
             classifier_requires_client_factory,
             api,
@@ -6512,6 +6535,37 @@ impl OpenAIProvider {
             bridge_fast_mode: opts.bridge_fast_mode,
             review_effort: None,
             reviewer_header_model: None,
+            codex_transport: Arc::new(codex_session::CodexTransportState::default()),
+            responses_websocket: None,
+        }
+    }
+
+    /// Override whether stateful Responses WebSocket transport is enabled for
+    /// Codex subscription requests (`None` enables it automatically on HTTPS/WS
+    /// endpoints while leaving plain HTTP mocks on SSE unless opted in).
+    pub fn with_responses_websocket(mut self, enabled: Option<bool>) -> Self {
+        self.responses_websocket = enabled;
+        self
+    }
+
+    fn endpoint_origin(&self) -> String {
+        let normalized = self
+            .request_base_url
+            .strip_prefix("wss://")
+            .map(|rest| format!("https://{rest}"))
+            .or_else(|| {
+                self.request_base_url
+                    .strip_prefix("ws://")
+                    .map(|rest| format!("http://{rest}"))
+            })
+            .unwrap_or_else(|| self.request_base_url.clone());
+        match reqwest::Url::parse(&normalized) {
+            Ok(parsed) => match (parsed.host_str(), parsed.port()) {
+                (Some(host), Some(port)) => format!("{}://{host}:{port}", parsed.scheme()),
+                (Some(host), None) => format!("{}://{host}", parsed.scheme()),
+                _ => normalized,
+            },
+            Err(_) => normalized,
         }
     }
 
@@ -6546,7 +6600,17 @@ impl OpenAIProvider {
     }
 
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.request_base_url.trim_end_matches('/'), path)
+        let base = self
+            .request_base_url
+            .strip_prefix("wss://")
+            .map(|rest| format!("https://{rest}"))
+            .or_else(|| {
+                self.request_base_url
+                    .strip_prefix("ws://")
+                    .map(|rest| format!("http://{rest}"))
+            })
+            .unwrap_or_else(|| self.request_base_url.clone());
+        format!("{}{}", base.trim_end_matches('/'), path)
     }
 
     /// Resolved session-affinity header format: catalog policy, host
@@ -6607,10 +6671,7 @@ impl OpenAIProvider {
     }
 
     fn uses_responses_backend_format(&self) -> bool {
-        self.uses_subscription_wire_format()
-            || (self.retry.retry_class_policy
-                == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview)
-                && self.is_codex_subscription_backend())
+        self.uses_subscription_wire_format() || self.is_codex_subscription_backend()
     }
 
     /// Whether requests go directly to a first-party OpenAI surface (the
@@ -6733,8 +6794,8 @@ impl OpenAIProvider {
             // then read as one chunk below when the framer finds nothing in it.
             let body = resp;
             let buffered = match &body {
-                ChatResponseBody::Buffered(bytes) => Some(bytes.clone()),
-                ChatResponseBody::Stream(_) => None,
+                ChatResponseBody::Buffered(bytes, _) => Some(bytes.clone()),
+                ChatResponseBody::Stream(_, _) => None,
             };
             let mut byte_stream = body.into_stream();
             let mut mapped_any = false;
@@ -6871,6 +6932,7 @@ impl OpenAIProvider {
         let native_tool_support = self.native_tool_support.clone();
         let instruction_roles = self.instruction_roles.clone();
         let client = self.client.clone();
+        let ws_client = self.ws_client.clone();
         let url = self.endpoint("/responses");
         let auth = self.auth_source.clone();
         let native_scope = self.native_replay_scope(&req);
@@ -6899,6 +6961,10 @@ impl OpenAIProvider {
         let review_stream = self.retry.retry_class_policy
             == Some(crate::provider::retry::RetryClassPolicy::ApprovalReview);
         let reviewer_header_model = self.reviewer_header_model.clone();
+        let codex_transport = self.codex_transport.clone();
+        let raw_base_url = self.request_base_url.clone();
+        let origin = self.endpoint_origin();
+        let responses_websocket = self.responses_websocket;
         let mut req = req;
         req.max_output_tokens = capabilities.clamp_output_tokens(req.max_output_tokens);
         if capabilities.native_deferred_tools != Some(true) {
@@ -6949,13 +7015,20 @@ impl OpenAIProvider {
                 instructions_item: true,
                 first_party_metadata,
             };
+            let responses_lite =
+                codex_session::responses_lite_enabled(&req, &capabilities, codex_backend);
             let mut body = match build_responses_params_with_tool_mode(&req, &capabilities, reasoning_dialect, assembly) {
                 Ok(mut body) => {
                     retain_scoped_responses_context(&mut body, compatibility.as_ref(), &req.model);
                     // The codex-subscription backend rejects some standard
                     // Responses parameters; strip or rewrite only transport fields.
                     if codex_backend {
-                        adapt_codex_responses_params(&mut body);
+                        codex_session::adapt_codex_responses_request(
+                            &mut body,
+                            &req,
+                            &capabilities,
+                            responses_lite,
+                        );
                         if fast_mode {
                             body["service_tier"] = vs("priority");
                         }
@@ -6977,6 +7050,98 @@ impl OpenAIProvider {
                 extra_headers.insert("x-codex-guardian".to_string(), "reviewer".to_string());
             }
             apply_session_affinity_headers(&mut extra_headers, &req, &affinity_format);
+            let codex_session_key = codex_session::transport_session_key(&req);
+            let mut codex_auth_scope = String::new();
+            if codex_backend {
+                let (scope, _) = codex_session::resolve_codex_auth_scope(
+                    auth.as_ref(),
+                    api_key.as_deref(),
+                    &signal,
+                )
+                .await;
+                if signal.is_cancelled() {
+                    return;
+                }
+                let turn_state = codex_transport.prepare_turn_state(
+                    &req.messages,
+                    &scope,
+                    codex_session_key.as_deref(),
+                );
+                codex_transport.apply_codex_request_headers(
+                    &mut extra_headers,
+                    &req,
+                    &body,
+                    &origin,
+                    &scope,
+                    responses_lite,
+                    turn_state.as_deref(),
+                );
+                codex_auth_scope = scope;
+            }
+            if codex_backend
+                && codex_transport.should_use_websocket(
+                    &raw_base_url,
+                    &origin,
+                    responses_websocket,
+                    interceptor.is_some(),
+                    review_stream,
+                    &req,
+                )
+            {
+                let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+                let ws_fut = codex_session::drive_codex_websocket_turn(
+                    codex_transport.clone(),
+                    ws_client.clone(),
+                    url.clone(),
+                    origin.clone(),
+                    auth.clone(),
+                    api_key.clone(),
+                    req.clone(),
+                    body.clone(),
+                    extra_headers.clone(),
+                    review_stream,
+                    started,
+                    signal.clone(),
+                    ws_tx,
+                );
+                let mut ws_fut = std::pin::pin!(ws_fut);
+                let mut ws_outcome = None;
+                loop {
+                    tokio::select! {
+                        maybe_ev = ws_rx.recv() => {
+                            if let Some(ev) = maybe_ev {
+                                yield ev;
+                            } else {
+                                break;
+                            }
+                        }
+                        outcome = &mut ws_fut, if ws_outcome.is_none() => {
+                            ws_outcome = Some(outcome);
+                        }
+                    }
+                }
+                while let Some(ev) = ws_rx.recv().await {
+                    yield ev;
+                }
+                if matches!(ws_outcome, Some(codex_session::WsStreamOutcome::Completed)) {
+                    return;
+                }
+                // Refresh cookie/turn_state headers in case the WS upgrade response
+                // delivered updated affinity cookies before falling back to HTTP SSE.
+                let turn_state = codex_transport.current_turn_state(
+                    &codex_auth_scope,
+                    codex_session_key.as_deref(),
+                );
+                codex_transport.apply_codex_request_headers(
+                    &mut extra_headers,
+                    &req,
+                    &body,
+                    &origin,
+                    &codex_auth_scope,
+                    responses_lite,
+                    turn_state.as_deref(),
+                );
+            }
             // Surface every establishment retry while its backoff sleeps.
             let (retry, retry_rx) = observe_retries(retry);
             let establish = native_tool_loading::establish(native_tool_loading::Transport {
@@ -7005,6 +7170,14 @@ impl OpenAIProvider {
                 // The step stream always terminates with `Done`.
                 None => return,
             };
+            if codex_backend {
+                codex_transport.capture_http_headers(
+                    &origin,
+                    &codex_auth_scope,
+                    codex_session_key.as_deref(),
+                    resp.headers(),
+                );
+            }
             let mut byte_stream = resp.into_stream();
             let mut decoder = SseDecoder::new();
             let mut mapped_any = false;
@@ -7470,7 +7643,13 @@ impl ModelProvider for OpenAIProvider {
             .map_err(|error| error.message)?;
             retain_scoped_responses_context(&mut body, self.compatibility.as_ref(), &request.model);
             if self.uses_responses_backend_format() {
-                adapt_codex_responses_params(&mut body);
+                let lite = codex_session::responses_lite_enabled(&request, &capabilities, true);
+                codex_session::adapt_codex_responses_request(
+                    &mut body,
+                    &request,
+                    &capabilities,
+                    lite,
+                );
             }
             body
         } else {

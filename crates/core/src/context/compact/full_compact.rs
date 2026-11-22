@@ -629,6 +629,9 @@ impl FullCompactor {
             is_meta: Some(true),
             question_answer: None,
         }));
+        if let Some(wire_caps) = request.wire_caps.as_mut() {
+            wire_caps.transport_session_id = None;
+        }
         request.tool_choice = None;
         request.output_schema = None;
         request.skip_cache_write = Some(true);
@@ -855,6 +858,9 @@ impl FullCompactor {
             is_meta: Some(true),
             question_answer: None,
         }));
+        if let Some(wire_caps) = request.wire_caps.as_mut() {
+            wire_caps.transport_session_id = None;
+        }
         request.tools.clear();
         request.deferred_tools.clear();
         request.surfaced_deferred_names.clear();

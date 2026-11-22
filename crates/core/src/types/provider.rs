@@ -828,11 +828,29 @@ pub struct WireCapabilityPolicy {
     pub session_affinity_format: Option<RuntimeString>,
     /// Explicit cache marker format on OpenAI-compatible chat wires: "anthropic".
     pub cache_control_format: Option<RuntimeString>,
+    /// OpenAI Responses wire: compact reasoning/context lite mode (`responses-lite`).
+    pub responses_lite: Option<bool>,
+    /// Model-declared default reasoning summary when the caller left it implicit.
+    pub default_reasoning_summary: Option<ReasoningSummary>,
+    /// True when `reasoning_summary` was explicitly selected by configuration or runtime update.
+    pub reasoning_summary_explicit: bool,
+    /// Dedicated transport session identity (parent thread or subagent thread) for
+    /// stateful WebSocket continuation and turn-scoped affinity headers.
+    pub transport_session_id: Option<RuntimeString>,
 }
 
 impl WireCapabilityPolicy {
     /// Project the wire-capability fields of a resolved capability set.
     pub fn from_capabilities(capabilities: &ModelCapabilities) -> Self {
+        Self::from_capabilities_preserving(capabilities, None)
+    }
+
+    /// Project resolved capabilities while preserving request-scoped fields set
+    /// earlier on the request (`transport_session_id`, `reasoning_summary_explicit`).
+    pub fn from_capabilities_preserving(
+        capabilities: &ModelCapabilities,
+        existing: Option<&Self>,
+    ) -> Self {
         Self {
             mid_convo_system_messages: capabilities.mid_convo_system_messages,
             mid_convo_tool_changes: capabilities.mid_convo_tool_changes,
@@ -845,6 +863,11 @@ impl WireCapabilityPolicy {
             prompt_cache_key_mode: capabilities.prompt_cache_key_mode.clone(),
             session_affinity_format: capabilities.session_affinity_format.clone(),
             cache_control_format: capabilities.cache_control_format.clone(),
+            responses_lite: capabilities.responses_lite,
+            default_reasoning_summary: capabilities.default_reasoning_summary,
+            reasoning_summary_explicit: existing
+                .is_some_and(|policy| policy.reasoning_summary_explicit),
+            transport_session_id: existing.and_then(|policy| policy.transport_session_id.clone()),
         }
     }
 }
@@ -1952,6 +1975,8 @@ pub struct ModelCapabilities {
     pub multi_agent_reasoning_effort: Option<RuntimeString>,
     pub effective_context_window_percent: Option<i64>,
     pub auto_compact_token_limit: Option<u64>,
+    pub tool_output_token_limit: Option<u64>,
+    pub responses_lite: Option<bool>,
     pub used_fallback_model_metadata: bool,
     pub model_specialty: Option<RuntimeString>,
     pub supports_image_detail_original: bool,
@@ -2149,6 +2174,12 @@ impl RuntimeEncode for ModelCapabilities {
         if let Some(value) = &self.auto_compact_token_limit {
             object.field("autoCompactTokenLimit", value)?;
         }
+        if let Some(value) = &self.tool_output_token_limit {
+            object.field("toolOutputTokenLimit", value)?;
+        }
+        if let Some(value) = &self.responses_lite {
+            object.field("responsesLite", value)?;
+        }
         if let Some(value) = &self.effective_context_window_percent {
             object.field("effectiveContextWindowPercent", value)?;
         }
@@ -2276,6 +2307,9 @@ impl RuntimeDecode for ModelCapabilities {
                 )?,
                 auto_compact_token_limit: object
                     .optional("autoCompactTokenLimit", &["auto_compact_token_limit"])?,
+                tool_output_token_limit: object
+                    .optional("toolOutputTokenLimit", &["tool_output_token_limit"])?,
+                responses_lite: object.optional("responsesLite", &["responses_lite"])?,
                 effective_context_window_percent: object.optional(
                     "effectiveContextWindowPercent",
                     &["effective_context_window_percent"],

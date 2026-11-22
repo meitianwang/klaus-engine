@@ -717,9 +717,18 @@ impl Shared {
             .request
             .native_deferred_tools
             .or(metadata.native_deferred_tools);
-        prepared.request.wire_caps.get_or_insert_with(|| {
+        let wire_caps = prepared.request.wire_caps.get_or_insert_with(|| {
             crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
         });
+        let is_prediction_turn = self
+            .params
+            .turn_id
+            .try_to_utf8()
+            .is_ok_and(|turn_id| turn_id.starts_with("prediction:"));
+        if wire_caps.transport_session_id.is_none() && !is_prediction_turn {
+            wire_caps.transport_session_id = Some(self.params.thread_id.clone());
+        }
+        wire_caps.reasoning_summary_explicit |= config.reasoning_summary_explicit;
         prepared.request.max_output_tokens = prepared
             .request
             .max_output_tokens

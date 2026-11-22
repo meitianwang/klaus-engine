@@ -512,6 +512,8 @@ pub struct ModelLimits {
     pub multi_agent_reasoning_effort: Option<String>,
     pub effective_context_window_percent: Option<i64>,
     pub auto_compact_token_limit: Option<u64>,
+    pub tool_output_token_limit: Option<u64>,
+    pub responses_lite: Option<bool>,
     pub used_fallback_model_metadata: bool,
     pub model_specialty: Option<String>,
     pub supports_image_detail_original: bool,
@@ -616,6 +618,12 @@ pub(crate) fn limits_from_entry(entry: &Value) -> ModelLimits {
             .and_then(Value::as_str)
             .map(str::to_string),
         auto_compact_token_limit: entry.get("autoCompactTokenLimit").and_then(Value::as_u64),
+        tool_output_token_limit: declared_tool_output_token_limit(entry),
+        responses_lite: entry
+            .get("responsesLite")
+            .or_else(|| entry.get("use_responses_lite"))
+            .or_else(|| entry.get("useResponsesLite"))
+            .and_then(Value::as_bool),
         effective_context_window_percent: entry
             .get("effectiveContextWindowPercent")
             .and_then(Value::as_i64),
@@ -667,6 +675,29 @@ pub(crate) fn limits_from_entry(entry: &Value) -> ModelLimits {
             .get("defaultReasoningSummary")
             .filter(|value| !value.is_null())
             .cloned(),
+    }
+}
+
+fn declared_tool_output_token_limit(entry: &Value) -> Option<u64> {
+    if let Some(limit) = entry
+        .get("toolOutputTokenLimit")
+        .or_else(|| entry.get("tool_output_token_limit"))
+        .and_then(Value::as_u64)
+        .filter(|limit| *limit > 0)
+    {
+        return Some(limit);
+    }
+    let policy = entry
+        .get("truncation_policy")
+        .or_else(|| entry.get("truncationPolicy"))?;
+    let limit = policy
+        .get("limit")
+        .and_then(Value::as_u64)
+        .filter(|limit| *limit > 0)?;
+    match policy.get("mode").and_then(Value::as_str) {
+        Some("tokens") => Some(limit),
+        Some("bytes") => Some((limit / 4).max(1)),
+        _ => None,
     }
 }
 
@@ -918,6 +949,18 @@ pub(crate) fn parse(body: &Value) -> Vec<Value> {
             (
                 "autoCompactTokenLimit",
                 &["auto_compact_token_limit", "autoCompactTokenLimit"][..],
+            ),
+            (
+                "toolOutputTokenLimit",
+                &["tool_output_token_limit", "toolOutputTokenLimit"][..],
+            ),
+            (
+                "truncationPolicy",
+                &["truncation_policy", "truncationPolicy"][..],
+            ),
+            (
+                "responsesLite",
+                &["use_responses_lite", "useResponsesLite", "responsesLite"][..],
             ),
             (
                 "effectiveContextWindowPercent",

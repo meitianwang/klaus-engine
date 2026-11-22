@@ -8130,6 +8130,26 @@
         "flatten": false
       },
       {
+        "rustName": "model_tool_output_token_limit",
+        "rustType": "Option < u64 >",
+        "wireSerialize": "modelToolOutputTokenLimit",
+        "wireDeserialize": "modelToolOutputTokenLimit",
+        "default": false,
+        "skipSerialize": true,
+        "skipDeserialize": true,
+        "flatten": false
+      },
+      {
+        "rustName": "reasoning_summary_explicit",
+        "rustType": "bool",
+        "wireSerialize": "reasoningSummaryExplicit",
+        "wireDeserialize": "reasoningSummaryExplicit",
+        "default": false,
+        "skipSerialize": true,
+        "skipDeserialize": true,
+        "flatten": false
+      },
+      {
         "rustName": "auto_compact_window_source",
         "rustType": "Option < crate :: context :: compact :: window :: AutoWindowSource >",
         "wireSerialize": "autoCompactWindowSource",

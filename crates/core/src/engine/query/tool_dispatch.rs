@@ -13,7 +13,7 @@ use super::render_failed_tool_result_content;
 use super::render_interrupted_tool_result_content;
 use super::render_successful_tool_result_content_with_output;
 use super::result_trim::render_spilled_tool_result;
-use super::result_trim::tool_result_spill_limit;
+use super::result_trim::tool_result_spill_limit_with_model_cap;
 use super::safe_json_text;
 use super::successful_result_provider_metadata;
 use super::support::notify;
@@ -1607,7 +1607,11 @@ fn execute_tool_call_body(
 
                 // Level 1 — spill an oversized single result to disk, hand back a
                 // preview.
-                let max_chars = tool_result_spill_limit(tool.as_ref(), &call.internal_name);
+                let max_chars = tool_result_spill_limit_with_model_cap(
+                    tool.as_ref(),
+                    &call.internal_name,
+                    shared.config().model_tool_output_token_limit,
+                );
                 let spill_dir = path_join(
                     query_path_dialect(),
                     &[

@@ -3727,7 +3727,7 @@ impl ServerInner {
         // Initial publication has its own bounded future. Keeping it outside
         // the operation match avoids nesting both dispatch poll stack frames.
         if let OpKind::InitSession { init } = op {
-            self.dispatch_init_session(submission_id, init).await;
+            Box::pin(self.dispatch_init_session(submission_id, init)).await;
             return;
         }
         // Which of the two dispatchers below owns this op. The split is
@@ -12683,6 +12683,8 @@ fn model_capabilities_from_init(init: Option<&ModelCapabilitiesInit>) -> ModelCa
         multi_agent_reasoning_effort: init.multi_agent_reasoning_effort.clone(),
         effective_context_window_percent: init.effective_context_window_percent,
         auto_compact_token_limit: init.auto_compact_token_limit,
+        tool_output_token_limit: init.tool_output_token_limit,
+        responses_lite: init.responses_lite,
         used_fallback_model_metadata: init.used_fallback_model_metadata,
         model_specialty: init.model_specialty.clone(),
         supports_image_detail_original: init.supports_image_detail_original,

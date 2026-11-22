@@ -4387,6 +4387,8 @@ pub struct ModelCapabilitiesInitSchema {
     pub multi_agent_reasoning_effort: Option<String>,
     pub effective_context_window_percent: Option<i64>,
     pub auto_compact_token_limit: Option<u64>,
+    pub tool_output_token_limit: Option<u64>,
+    pub responses_lite: Option<bool>,
     #[serde(default)]
     pub used_fallback_model_metadata: bool,
     pub model_specialty: Option<String>,

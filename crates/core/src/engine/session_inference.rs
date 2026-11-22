@@ -218,9 +218,12 @@ impl InferenceBundle {
             request.native_deferred_tools = request
                 .native_deferred_tools
                 .or(metadata.native_deferred_tools);
-            request.wire_caps.get_or_insert_with(|| {
-                crate::types::provider::WireCapabilityPolicy::from_capabilities(&metadata)
-            });
+            request.wire_caps = Some(
+                crate::types::provider::WireCapabilityPolicy::from_capabilities_preserving(
+                    &metadata,
+                    request.wire_caps.as_ref(),
+                ),
+            );
             call_model(request, signal)
         });
         if let Some(targets) = &self.targets {
@@ -329,6 +332,8 @@ impl InferenceBundle {
         config.model_effective_context_window_percent =
             Some(self.provider.effective_context_window_percent(model));
         config.model_auto_compact_token_limit = self.provider.model_auto_compact_token_limit(model);
+        config.model_tool_output_token_limit =
+            self.provider.model_metadata(model).tool_output_token_limit;
         config.context_window = self
             .context_window_override
             .unwrap_or(capabilities.context_window);
@@ -486,6 +491,7 @@ impl Session {
         }
         if let Some(value) = reasoning_summary {
             next.config.reasoning_summary = value;
+            next.config.reasoning_summary_explicit = true;
         }
         if let Some(value) = web_search_access {
             next.config.web_search.set_access(value);
@@ -1424,6 +1430,7 @@ fn merge_inference_config(base: &ResolvedConfig, selected: &ResolvedConfig) -> R
     config.ultra_mode = selected.ultra_mode;
     config.model_verbosity = selected.model_verbosity;
     config.reasoning_summary = selected.reasoning_summary;
+    config.reasoning_summary_explicit = selected.reasoning_summary_explicit;
     config.web_search.set_access(selected.web_search.access);
     if selected.approval_review.is_some() {
         config.approval_review = selected.approval_review.clone();
@@ -1435,6 +1442,7 @@ fn merge_inference_config(base: &ResolvedConfig, selected: &ResolvedConfig) -> R
     config.model_context_window = selected.model_context_window;
     config.model_effective_context_window_percent = selected.model_effective_context_window_percent;
     config.model_auto_compact_token_limit = selected.model_auto_compact_token_limit;
+    config.model_tool_output_token_limit = selected.model_tool_output_token_limit;
     config.auto_compact_window_source = selected.auto_compact_window_source;
     config.max_output_tokens = selected.max_output_tokens;
     config.max_output_retry_tokens = selected.max_output_retry_tokens;

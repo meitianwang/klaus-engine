@@ -706,7 +706,15 @@ async fn run_precompute(
         notifications = outcome.notifications;
         instructions = outcome.instructions;
     }
-    arm.compactor.prepare_request(&arm.request, &entry.signal);
+    let mut prepared_request = arm.request.clone();
+    if prepared_request.cache_key.is_none() && !arm.session_id.is_empty() {
+        prepared_request.cache_key = Some(arm.session_id.clone());
+    }
+    if let Some(wire_caps) = prepared_request.wire_caps.as_mut() {
+        wire_caps.transport_session_id = None;
+    }
+    arm.compactor
+        .prepare_request(&prepared_request, &entry.signal);
     let staged = Arc::new(Mutex::new(Vec::<Message>::new()));
     arm.compactor.bind_output_observer(Some({
         let staged = staged.clone();
@@ -942,7 +950,7 @@ mod tests {
                 skip_cache_write: None,
                 cache_ttl: None,
                 cache_domain: None,
-                cache_key: None,
+                cache_key: Some("s1".into()),
                 context_management: None,
                 context_hints: None,
                 thinking_context: None,

@@ -818,3 +818,6 @@ mod r20261119_tool_loading_and_prefix_organization;
 #[cfg(unix)]
 #[path = "regressions/r20261120_background_task_lifecycle.rs"]
 mod r20261120_background_task_lifecycle;
+
+#[path = "regressions/r20261121_codex_subscription_cache_alignment.rs"]
+mod r20261121_codex_subscription_cache_alignment;

@@ -329,8 +329,16 @@ impl OpenAIProvider {
                 ..ResponsesToolAssembly::plain()
             },
         )?;
-        if self.uses_responses_backend_format() {
-            adapt_codex_responses_params(&mut body);
+        let codex_backend = self.uses_responses_backend_format();
+        let responses_lite =
+            super::codex_session::responses_lite_enabled(&request, &caps, codex_backend);
+        if codex_backend {
+            super::codex_session::adapt_codex_responses_request(
+                &mut body,
+                &request,
+                &caps,
+                responses_lite,
+            );
             if self.fast_mode {
                 body["service_tier"] = vs("priority");
             }
@@ -378,11 +386,42 @@ impl OpenAIProvider {
         let mut one_attempt = retries.clone();
         one_attempt.max_attempts = Some(1);
         let url = self.endpoint(endpoint);
-        let extra_headers = self
+        let origin = self.endpoint_origin();
+        let mut extra_headers = self
             .compatibility
             .as_ref()
             .map(|options| options.extra_headers().clone())
             .unwrap_or_default();
+        let affinity_format = self.session_affinity_format(&request, &caps);
+        super::apply_session_affinity_headers(&mut extra_headers, &request, &affinity_format);
+        let codex_session_key = super::codex_session::transport_session_key(&request);
+        let mut codex_auth_scope = String::new();
+        if codex_backend {
+            let (scope, _) = super::codex_session::resolve_codex_auth_scope(
+                auth.as_ref(),
+                self.api_key.as_deref(),
+                &signal,
+            )
+            .await;
+            if signal.is_cancelled() {
+                return Err(aborted_error());
+            }
+            let turn_state = self.codex_transport.prepare_turn_state(
+                &request.messages,
+                &scope,
+                codex_session_key.as_deref(),
+            );
+            self.codex_transport.apply_codex_request_headers(
+                &mut extra_headers,
+                &request,
+                &body,
+                &origin,
+                &scope,
+                responses_lite,
+                turn_state.as_deref(),
+            );
+            codex_auth_scope = scope;
+        }
         let max_attempts = retries.max_attempts.unwrap_or(3);
         let mut attempt = 0;
         let result = loop {
@@ -406,16 +445,32 @@ impl OpenAIProvider {
             )
             .await;
             let outcome = match response {
-                Ok(response) => match support {
-                    RemoteCompactionSupport::ResponsesV2 => {
-                        collect_v2_observed(response, &signal, idle_ms, observer.clone()).await
+                Ok(response) => {
+                    if codex_backend {
+                        self.codex_transport.capture_http_headers(
+                            &origin,
+                            &codex_auth_scope,
+                            codex_session_key.as_deref(),
+                            response.headers(),
+                        );
                     }
-                    RemoteCompactionSupport::ResponsesV1 => {
-                        collect_v1_observed(response, &signal, &original, idle_ms, observer.clone())
+                    match support {
+                        RemoteCompactionSupport::ResponsesV2 => {
+                            collect_v2_observed(response, &signal, idle_ms, observer.clone()).await
+                        }
+                        RemoteCompactionSupport::ResponsesV1 => {
+                            collect_v1_observed(
+                                response,
+                                &signal,
+                                &original,
+                                idle_ms,
+                                observer.clone(),
+                            )
                             .await
+                        }
+                        RemoteCompactionSupport::Unsupported => unreachable!(),
                     }
-                    RemoteCompactionSupport::Unsupported => unreachable!(),
-                },
+                }
                 Err(error) => Err(error),
             };
             match outcome {
@@ -483,6 +538,10 @@ impl OpenAIProvider {
             retained_input_metadata,
         };
         validate_checkpoint(&checkpoint)?;
+        if codex_backend {
+            self.codex_transport
+                .invalidate_session_anchor(codex_session_key.as_deref());
+        }
         Ok(RemoteCompactionResult {
             checkpoint,
             usage: result.usage,

@@ -415,6 +415,8 @@ pub struct SpawnSubAgentOptions {
     pub task_resume_raw: Option<Json>,
     /// Override how much parent context the child inherits.
     pub fork_context: Option<ForkContext>,
+    /// True when the caller explicitly supplied a non-null `fork_turns` argument.
+    pub fork_context_explicit: bool,
     /// Force structured output matching this schema.
     pub output_schema: Option<RuntimeObject>,
     /// Run this sub-agent in its own isolated git worktree. Mutually exclusive

@@ -249,6 +249,10 @@ fn merge_review_catalog_metadata(
     catalog.auto_compact_token_limit = declared
         .auto_compact_token_limit
         .or(catalog.auto_compact_token_limit);
+    catalog.tool_output_token_limit = declared
+        .tool_output_token_limit
+        .or(catalog.tool_output_token_limit);
+    catalog.responses_lite = declared.responses_lite.or(catalog.responses_lite);
     catalog.supports_reasoning_summary_parameter = declared
         .supports_reasoning_summary_parameter
         .or(catalog.supports_reasoning_summary_parameter);
@@ -1474,6 +1478,7 @@ async fn codex(
     {
         headers.insert("ChatGPT-Account-Id".into(), json!(account_id));
     }
+    headers.insert("originator".into(), json!("codex_cli_rs"));
     headers.insert("version".into(), json!(codex_client_version()));
 
     let mut auth = Map::new();
@@ -1645,6 +1650,16 @@ pub(crate) fn codex_capabilities(limits: super::codex_catalog::ModelLimits) -> V
     }
     if let Some(value) = limits.auto_compact_token_limit {
         capabilities["autoCompactTokenLimit"] = json!(value);
+    }
+    if let Some(value) = limits.tool_output_token_limit {
+        capabilities["toolOutputTokenLimit"] = json!(value);
+    }
+    if let Some(value) = limits.responses_lite {
+        capabilities["responsesLite"] = json!(value);
+        if value {
+            capabilities["additionalTools"] = json!(true);
+            capabilities["midConvoSystemMessages"] = json!(true);
+        }
     }
     if let Some(value) = limits.effective_context_window_percent {
         capabilities["effectiveContextWindowPercent"] = json!(value);

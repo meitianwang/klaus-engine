@@ -1287,6 +1287,12 @@ pub struct EngineConfig {
     /// Captured model automatic-compaction limit before user scope overrides.
     #[serde(skip)]
     pub model_auto_compact_token_limit: Option<u64>,
+    /// Captured model single-tool output token ceiling from catalog truncation policy.
+    #[serde(skip)]
+    pub model_tool_output_token_limit: Option<u64>,
+    /// True when `reasoning_summary` was explicitly specified by configuration or runtime update.
+    #[serde(skip)]
+    pub reasoning_summary_explicit: bool,
     /// Runtime provenance of an automatic-window override; never persisted.
     #[serde(skip)]
     pub auto_compact_window_source: Option<crate::context::compact::window::AutoWindowSource>,
@@ -1707,6 +1713,8 @@ impl Default for EngineConfig {
             model_context_window: None,
             model_effective_context_window_percent: None,
             model_auto_compact_token_limit: None,
+            model_tool_output_token_limit: None,
+            reasoning_summary_explicit: false,
             auto_compact_window_source: None,
             max_output_retry_tokens: None,
             permission_mode: ExternalPermissionMode::Default,

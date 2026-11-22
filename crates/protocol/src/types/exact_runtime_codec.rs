@@ -973,6 +973,8 @@ impl_runtime_struct!(ModelCapabilitiesInit, deny_unknown: true, {
     multi_agent_reasoning_effort => "multiAgentReasoningEffort": optional,
     effective_context_window_percent => "effectiveContextWindowPercent": optional,
     auto_compact_token_limit => "autoCompactTokenLimit": optional,
+    tool_output_token_limit => "toolOutputTokenLimit": optional,
+    responses_lite => "responsesLite": optional,
     used_fallback_model_metadata => "usedFallbackModelMetadata": default_false,
     model_specialty => "modelSpecialty": optional,
     supports_image_detail_original => "supportsImageDetailOriginal": default_false,

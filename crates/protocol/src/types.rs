@@ -1358,6 +1358,8 @@ pub struct ModelCapabilitiesInit {
     pub multi_agent_reasoning_effort: Option<RuntimeString>,
     pub effective_context_window_percent: Option<i64>,
     pub auto_compact_token_limit: Option<u64>,
+    pub tool_output_token_limit: Option<u64>,
+    pub responses_lite: Option<bool>,
     pub used_fallback_model_metadata: bool,
     pub model_specialty: Option<RuntimeString>,
     pub supports_image_detail_original: bool,

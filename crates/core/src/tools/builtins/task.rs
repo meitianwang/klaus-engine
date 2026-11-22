@@ -833,7 +833,9 @@ impl Tool for TaskTool {
         };
         let peer = js_truthy_string(js_property(&input, "peer")?);
         let name = js_truthy_string(js_property(&input, "name")?).cloned();
-        let fork_context = Some(task_fork_turns(input.get("fork_turns")).map_err(ToolError::new)?);
+        let raw_fork_turns = input.get("fork_turns");
+        let fork_context_explicit = raw_fork_turns.is_some_and(|value| !value.is_null());
+        let fork_context = Some(task_fork_turns(raw_fork_turns).map_err(ToolError::new)?);
         let background_slot = js_property(&input, "run_in_background")?;
         // Asked for detachment in so many words. Only the literal `true` counts:
         // `parse_input` rejects a non-boolean, so anything else is not a request
@@ -870,6 +872,7 @@ impl Tool for TaskTool {
                     persistent: if persistent { Some(true) } else { None },
                     isolation,
                     fork_context,
+                    fork_context_explicit,
                     ..Default::default()
                 };
                 let result = match spawn_bg(opts).await {
@@ -957,6 +960,7 @@ impl Tool for TaskTool {
             swarm: peer.map(|p| SwarmSpawn { peer: p.clone() }),
             isolation,
             fork_context,
+            fork_context_explicit,
             ..Default::default()
         };
         let run = match spawn(opts).await {

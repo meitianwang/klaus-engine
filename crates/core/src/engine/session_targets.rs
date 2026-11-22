@@ -239,6 +239,8 @@ impl InferenceBundle {
         config.model_effective_context_window_percent =
             Some(provider.effective_context_window_percent(&model));
         config.model_auto_compact_token_limit = provider.model_auto_compact_token_limit(&model);
+        config.model_tool_output_token_limit =
+            provider.model_metadata(&model).tool_output_token_limit;
         let explicit_output = if target.is_some() {
             None
         } else {

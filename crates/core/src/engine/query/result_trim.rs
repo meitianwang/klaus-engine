@@ -130,6 +130,21 @@ pub(crate) fn tool_result_spill_limit(tool: &dyn Tool, internal_name: &RuntimeSt
     tool_result_spill_limit_from_override(internal_name, tool.max_result_size_chars())
 }
 
+pub(crate) fn tool_result_spill_limit_with_model_cap(
+    tool: &dyn Tool,
+    internal_name: &RuntimeString,
+    model_tool_output_token_limit: Option<u64>,
+) -> f64 {
+    let base = tool_result_spill_limit(tool, internal_name);
+    if internal_name == "read" {
+        return base;
+    }
+    match model_tool_output_token_limit.filter(|limit| *limit > 0) {
+        Some(tokens) => base.min((tokens.saturating_mul(4)) as f64),
+        None => base,
+    }
+}
+
 /// Query's successful tool-result envelope consumption point.
 pub(super) fn render_successful_tool_result_content_with_output(
     content: Vec<OutputBlock>,
