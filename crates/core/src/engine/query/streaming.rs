@@ -818,7 +818,7 @@ async fn stream_and_dispatch_inner(
                     message: format!("stream total timeout: model response exceeded {total}ms")
                         .into(),
                     status: None,
-                    code: None,
+                    code: Some("stream_total_timeout".into()),
                     error_type: None,
                     media_origins: None,
                     media_repair_complete: crate::context::media_budget::request_media_repaired(),
@@ -843,11 +843,7 @@ async fn stream_and_dispatch_inner(
                 });
                 ModelStreamEvent::Error {
                     error: ProviderError {
-                        kind: if total_deadline_is_next {
-                            ProviderErrorKind::Timeout
-                        } else {
-                            ProviderErrorKind::Network
-                        },
+                        kind: ProviderErrorKind::Timeout,
                         message: if total_deadline_is_next {
                             format!("stream total timeout: model response exceeded {total}ms")
                                 .into()
@@ -855,7 +851,14 @@ async fn stream_and_dispatch_inner(
                             format!("stream idle timeout: no model event for {idle}ms").into()
                         },
                         status: None,
-                        code: None,
+                        code: Some(
+                            if total_deadline_is_next {
+                                "stream_total_timeout"
+                            } else {
+                                "stream_idle_timeout"
+                            }
+                            .into(),
+                        ),
                         error_type: None,
                         media_origins: None,
                         media_repair_complete: crate::context::media_budget::request_media_repaired(

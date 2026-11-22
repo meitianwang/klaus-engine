@@ -77,6 +77,7 @@ struct FrozenHintResults {
     model: Option<RuntimeString>,
     replacements: HashMap<RuntimeString, RuntimeString>,
     persisted: Option<(RuntimeString, Vec<(RuntimeString, RuntimeString)>)>,
+    unsupported_models: HashSet<RuntimeString>,
 }
 
 /// Session-owned frozen request replacements. Sharing this state across one
@@ -156,6 +157,24 @@ impl ContextHintState {
         if inner.model.as_ref() == Some(model) {
             inner.replacements.extend(projection.replacements.clone());
         }
+    }
+
+    /// Record that the endpoint rejected `CONTEXT_HINT_BETA` for `model`, so
+    /// subsequent requests in this session omit the beta header and body field.
+    pub fn mark_beta_unsupported(&self, model: &RuntimeString) {
+        self.inner
+            .lock()
+            .unwrap()
+            .unsupported_models
+            .insert(model.clone());
+    }
+
+    pub fn is_beta_unsupported(&self, model: &RuntimeString) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .unsupported_models
+            .contains(model)
     }
 
     pub fn records(&self) -> Vec<(RuntimeString, RuntimeString)> {
@@ -348,11 +367,20 @@ impl ContextHintController {
         if !self.beta_active() {
             return HintErrorAction::None;
         }
+        let lower = error
+            .message
+            .try_to_utf8()
+            .map(|text| text.to_ascii_lowercase())
+            .unwrap_or_default();
+        let names_context_hint_beta = (lower.contains("beta") || lower.contains("header"))
+            && lower.contains(CONTEXT_HINT_BETA);
         let action = match error.status {
-            Some(422 | 424) => HintErrorAction::ClearAndRetry,
-            Some(400)
-                if error.message.contains("Unexpected value")
-                    && error.message.contains("anthropic-beta") =>
+            Some(422 | 424) if !names_context_hint_beta => HintErrorAction::ClearAndRetry,
+            Some(400 | 422)
+                if names_context_hint_beta
+                    || (error.status == Some(400)
+                        && error.message.contains("Unexpected value")
+                        && error.message.contains("anthropic-beta")) =>
             {
                 HintErrorAction::StripAndRetry
             }

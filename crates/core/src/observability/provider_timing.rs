@@ -14,6 +14,48 @@ use tokio::time::Instant;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Default)]
+struct StreamLiveness {
+    inner: std::sync::Arc<StreamLivenessInner>,
+}
+
+#[derive(Default)]
+struct StreamLivenessInner {
+    active: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StreamLiveness {
+    fn touch(&self) {
+        self.inner
+            .active
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.notify.notify_one();
+    }
+
+    fn take_activity(&self) -> bool {
+        self.inner
+            .active
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    async fn notified(&self) {
+        self.inner.notify.notified().await;
+    }
+}
+
+tokio::task_local! {
+    static STREAM_LIVENESS: StreamLiveness;
+}
+
+/// Renew the caller's stream-idle deadline when wire-level protocol frames
+/// (such as SSE `ping` keepalives or encrypted thinking deltas) prove the
+/// upstream stream is still actively progressing without emitting a visible
+/// [`ModelStreamEvent`]. Never extends `total_deadline`.
+pub(crate) fn note_stream_liveness() {
+    let _ = STREAM_LIVENESS.try_with(StreamLiveness::touch);
+}
+
 pub(crate) enum StreamStep {
     Event(Option<ModelStreamEvent>),
     Timeout { total: bool },
@@ -156,15 +198,20 @@ impl RequestTiming {
         total_deadline: Instant,
         watch_cancellation: bool,
     ) -> StreamStep {
-        let idle_deadline = Instant::now() + Duration::from_millis(self.idle_ms);
-        let total_is_next = total_deadline <= idle_deadline;
-        let deadline = total_deadline.min(idle_deadline);
-        let next = stream.next();
+        let mut idle_deadline = Instant::now() + Duration::from_millis(self.idle_ms);
+        let liveness = StreamLiveness::default();
+        let next = STREAM_LIVENESS.scope(liveness.clone(), stream.next());
         tokio::pin!(next);
         loop {
-            if Instant::now() >= total_deadline {
+            let now = Instant::now();
+            if now >= total_deadline {
                 return StreamStep::Timeout { total: true };
             }
+            if liveness.take_activity() {
+                idle_deadline = now + Duration::from_millis(self.idle_ms);
+            }
+            let total_is_next = total_deadline <= idle_deadline;
+            let deadline = total_deadline.min(idle_deadline);
             tokio::select! {
                 biased;
                 _ = self.signal.cancelled(), if watch_cancellation => return StreamStep::Cancelled,
@@ -174,7 +221,17 @@ impl RequestTiming {
                     }
                     return StreamStep::Event(event);
                 }
-                _ = tokio::time::sleep_until(deadline) => return StreamStep::Timeout { total: total_is_next },
+                _ = liveness.notified() => {
+                    let _ = liveness.take_activity();
+                    idle_deadline = Instant::now() + Duration::from_millis(self.idle_ms);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if !total_is_next && liveness.take_activity() {
+                        idle_deadline = Instant::now() + Duration::from_millis(self.idle_ms);
+                        continue;
+                    }
+                    return StreamStep::Timeout { total: total_is_next };
+                }
                 _ = tokio::time::sleep_until(self.next_progress) => {
                     self.record("progress");
                     self.next_progress = Instant::now() + PROGRESS_INTERVAL;
@@ -927,5 +984,69 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["started", "failed"]);
         assert_eq!(records.last().unwrap()["errorKind"], "network");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_liveness_renews_idle_deadline_without_extending_total_deadline() {
+        let mut timing = RequestTiming::start(
+            "turn",
+            "synthetic-liveness-request",
+            &"synthetic-model".into(),
+            None,
+            None,
+            1,
+            100,
+            260,
+            AbortSignal::new(),
+        );
+        let start = Instant::now();
+        let mut alive_then_event: ModelStream = Box::pin(async_stream::stream! {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                note_stream_liveness();
+            }
+            yield ModelStreamEvent::TextDelta {
+                text: "arrived".into(),
+            };
+        });
+        match timing
+            .next_event(
+                &mut alive_then_event,
+                start + Duration::from_millis(500),
+                false,
+            )
+            .await
+        {
+            StreamStep::Event(Some(ModelStreamEvent::TextDelta { text })) => {
+                assert_eq!(text, "arrived");
+            }
+            other => panic!(
+                "expected TextDelta after liveness renewals, got non-event step: {}",
+                matches!(other, StreamStep::Timeout { .. })
+            ),
+        }
+
+        let total_start = Instant::now();
+        let mut endless_keepalives: ModelStream = Box::pin(async_stream::stream! {
+            loop {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                note_stream_liveness();
+            }
+            #[allow(unreachable_code)]
+            {
+                yield ModelStreamEvent::TextDelta { text: "".into() };
+            }
+        });
+        match timing
+            .next_event(
+                &mut endless_keepalives,
+                total_start + Duration::from_millis(260),
+                false,
+            )
+            .await
+        {
+            StreamStep::Timeout { total: true } => {}
+            _ => panic!("endless keepalives must still hit total_deadline"),
+        }
     }
 }

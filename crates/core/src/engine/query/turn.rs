@@ -3234,7 +3234,13 @@ async fn run_turn_stream_with_retry(
                 .is_some_and(|code| code == "antigravity_response_timeout")
             {
                 0
-            } else if error.kind == ProviderErrorKind::Timeout && error.status.is_none() {
+            } else if error.kind == ProviderErrorKind::Timeout
+                && error.status.is_none()
+                && error
+                    .code
+                    .as_ref()
+                    .is_none_or(|code| code != "stream_idle_timeout")
+            {
                 shared.config().max_retries.min(1)
             } else {
                 shared.config().max_retries

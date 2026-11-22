@@ -609,6 +609,11 @@ impl AnthropicProvider {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_set_first_party(&mut self, is_first_party: bool) {
+        self.is_first_party = is_first_party;
+    }
+
     /// The capability set for ONE request's model: the per-model override when
     /// the host declared one, else the session-level set.
     fn capabilities_for(&self, model: &RuntimeString) -> ModelCapabilities {
@@ -1403,7 +1408,14 @@ impl ModelProvider for AnthropicProvider {
             if let Some(t) = &wire_thinking {
                 request_params.insert("thinking", t.clone());
             }
-            let mut context_hints = ContextHintController::new(req.context_hints.as_ref(), is_first_party);
+            let hint_beta_supported = is_first_party
+                && !native_tool_support.disabled_for(&messages_url, &req.model, CONTEXT_HINT_BETA)
+                && !req
+                    .context_hints
+                    .as_ref()
+                    .is_some_and(|intent| intent.state.is_beta_unsupported(&req.model));
+            let mut context_hints =
+                ContextHintController::new(req.context_hints.as_ref(), hint_beta_supported);
             if let Some(hint) = context_hints.build_request(&req.messages) {
                 if hint.enabled {
                     request_params.insert("context_hint", vobj(vec![
@@ -1676,6 +1688,9 @@ impl ModelProvider for AnthropicProvider {
                 let mut got_error = false;
                 while let Some(block) = decoder.next_block() {
                     let Some(data) = parse_sse_data(&block) else {
+                        if is_sse_comment_block(&block) {
+                            crate::observability::provider_timing::note_stream_liveness();
+                        }
                         continue;
                     };
                     if data
@@ -1714,6 +1729,7 @@ impl ModelProvider for AnthropicProvider {
                         got_error = true;
                         break;
                     }
+                    crate::observability::provider_timing::note_stream_liveness();
                     let out =
                         handle_event(&data, &mut blocks, structured_tool_fallback, &mut structured_json, &mut thinking_summary);
                     saw_wire_stop |= data.get("type").and_then(Value::as_str).is_some_and(|tag| tag == "message_stop");
@@ -1936,10 +1952,24 @@ fn apply_hint_projection_to_body(body: &mut Value, projection: &ContextHintProje
     }
 }
 
+fn disable_context_hint_beta(ctx: &AttemptCtx, status: Option<u16>) {
+    ctx.native_tool_support
+        .disable_for(&ctx.url, &ctx.hint_model, CONTEXT_HINT_BETA);
+    if let Some(intent) = ctx.context_hints.lock_recover().request_intent().cloned() {
+        intent.state.mark_beta_unsupported(&ctx.hint_model);
+    }
+    crate::observability::prefix_attribution::record_downgrade_rebuild(
+        "beta-header:context-hint",
+        &diagnostic_string(&ctx.hint_model),
+        status,
+    );
+}
+
 async fn attempt_with_media_remediation(
     ctx: &AttemptCtx,
     signal: &AbortSignal,
 ) -> Result<AttemptOutcome, RawProviderError> {
+    let mut pending_hint_beta_disable: Option<Option<u16>> = None;
     loop {
         if signal.is_cancelled() {
             return Err(RawProviderError {
@@ -1973,6 +2003,16 @@ async fn attempt_with_media_remediation(
             }
         };
         let result = attempt_once(ctx, signal, &extra).await;
+        if let Some(prior_status) = pending_hint_beta_disable.take() {
+            let still_unexpected_beta = result.as_ref().err().is_some_and(|raw| {
+                raw.status == Some(400)
+                    && raw.message.contains("Unexpected value")
+                    && raw.message.contains("anthropic-beta")
+            });
+            if !still_unexpected_beta {
+                disable_context_hint_beta(ctx, prior_status);
+            }
+        }
         let classified = result.as_ref().err().map(classify_error);
         crate::observability::provider_diagnostics::record_named(
             crate::observability::provider_diagnostics::TIMING_LOG_FILE_NAME,
@@ -2044,6 +2084,7 @@ async fn attempt_with_media_remediation(
                         false
                     };
                     if downgrade_tool_protocol_body(ctx, refusal, raw.status) || beta_dropped {
+                        crate::observability::provider_timing::note_stream_liveness();
                         continue;
                     }
                 }
@@ -2052,6 +2093,7 @@ async fn attempt_with_media_remediation(
                 let adjusted = reduce_output_reservation(&mut ctx.body.lock_recover(), raw);
                 if let Some(output_tokens) = adjusted {
                     tracing::debug!(output_tokens, "Retrying with a smaller output reservation");
+                    crate::observability::provider_timing::note_stream_liveness();
                     continue;
                 }
             }
@@ -2078,6 +2120,7 @@ async fn attempt_with_media_remediation(
                             observer.store(true, std::sync::atomic::Ordering::Release);
                         }
                         tracing::warn!(%reason, "Retrying request after replacing rejected media");
+                        crate::observability::provider_timing::note_stream_liveness();
                         continue;
                     }
                 }
@@ -2097,6 +2140,17 @@ async fn attempt_with_media_remediation(
                 return Err(marked);
             }
             if hint_action != HintErrorAction::None && !signal.is_cancelled() {
+                if hint_action == HintErrorAction::StripAndRetry {
+                    if raw
+                        .message
+                        .to_ascii_lowercase()
+                        .contains(&CONTEXT_HINT_BETA.to_ascii_lowercase())
+                    {
+                        disable_context_hint_beta(ctx, raw.status);
+                    } else {
+                        pending_hint_beta_disable = Some(raw.status);
+                    }
+                }
                 let projection = if hint_action == HintErrorAction::ClearAndRetry {
                     let intent = ctx.context_hints.lock_recover().request_intent().cloned();
                     let directory = intent
@@ -2122,6 +2176,7 @@ async fn attempt_with_media_remediation(
                     hint_action,
                     HintErrorAction::ClearAndRetry | HintErrorAction::StripAndRetry
                 ) {
+                    crate::observability::provider_timing::note_stream_liveness();
                     continue;
                 }
             }
@@ -2350,12 +2405,23 @@ async fn attempt_once(
                 {
                     return Err(raw_from_sse(&data));
                 }
+                crate::observability::provider_timing::note_stream_liveness();
+                if data
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| tag == "ping")
+                {
+                    continue;
+                }
                 return Ok(Established {
                     body_stream,
                     decoder,
                     first_events: vec![data],
                     native_response_endpoint,
                 });
+            }
+            if is_sse_comment_block(&block) {
+                crate::observability::provider_timing::note_stream_liveness();
             }
             continue;
         }
@@ -2623,6 +2689,31 @@ fn parse_sse_data(block: &RuntimeString) -> Option<Value> {
         return None;
     }
     runtime_json::parse(&RuntimeString::from_utf16(data)).ok()
+}
+
+/// True when `block` consists solely of SSE comment lines (`: ...`), such as
+/// upstream keepalive heartbeats emitted while thinking is buffered server-side.
+fn is_sse_comment_block(block: &RuntimeString) -> bool {
+    let mut saw_comment = false;
+    for mut line in block.as_utf16().split(|unit| *unit == u16::from(b'\n')) {
+        if line.last() == Some(&u16::from(b'\r')) {
+            line = &line[..line.len() - 1];
+        }
+        while line
+            .first()
+            .is_some_and(|unit| *unit == u16::from(b' ') || *unit == u16::from(b'\t'))
+        {
+            line = &line[1..];
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if line.first() != Some(&u16::from(b':')) {
+            return false;
+        }
+        saw_comment = true;
+    }
+    saw_comment
 }
 
 // ---------------------------------------------------------------------------
