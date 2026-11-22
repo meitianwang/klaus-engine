@@ -3187,13 +3187,15 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
         }
         // The Codex catalog, endpoint state for the same reason: a model picker
         // reads it with no session bound, and the engine is the only fetcher of it.
-        "claude/transcribeAudio" | "codex/transcribeAudio" => {
+        "claude/transcribeAudio" | "codex/transcribeAudio" | "bailian/transcribeAudio" => {
             let params = match params.deserialize::<wire::SubscriptionTranscribeParams>() {
                 Ok(params) => params,
                 Err(error) => return send_invalid_params(&state, &id, &error).await,
             };
             let source = if method.starts_with("claude/") {
                 super::subscription_speech::Source::Claude
+            } else if method.starts_with("bailian/") {
+                super::subscription_speech::Source::Bailian
             } else {
                 super::subscription_speech::Source::Codex
             };
@@ -3242,13 +3244,17 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                     .await;
             });
         }
-        "claude/cancelTranscription" | "codex/cancelTranscription" => {
+        "claude/cancelTranscription"
+        | "codex/cancelTranscription"
+        | "bailian/cancelTranscription" => {
             let params = match params.deserialize::<wire::SubscriptionCancelTranscriptionParams>() {
                 Ok(params) => params,
                 Err(error) => return send_invalid_params(&state, &id, &error).await,
             };
             let source = if method.starts_with("claude/") {
                 "claude"
+            } else if method.starts_with("bailian/") {
+                "bailian"
             } else {
                 "codex"
             };

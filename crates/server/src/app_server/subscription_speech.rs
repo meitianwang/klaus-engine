@@ -17,6 +17,9 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 const MAX_AUDIO: usize = 25 * 1024 * 1024;
+const BAILIAN_MAX_AUDIO: usize = 7 * 1024 * 1024;
+const BAILIAN_ASR_MODEL: &str = "qwen-audio-3.0-asr-flash";
+const BAILIAN_ASR_PATH: &str = "/api/v1/services/aigc/multimodal-generation/generation";
 const MAX_TEXT: usize = 48_000;
 const MAX_RESPONSE: usize = 1024 * 1024;
 const BUDGET: Duration = Duration::from_secs(120);
@@ -25,12 +28,14 @@ const BUDGET: Duration = Duration::from_secs(120);
 pub(super) enum Source {
     Claude,
     Codex,
+    Bailian,
 }
 impl Source {
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Bailian => "bailian",
         }
     }
     fn error(self, category: &str) -> String {
@@ -123,6 +128,10 @@ fn mime(value: Option<&str>) -> Result<(&'static str, &'static str), String> {
         "audio/wav" | "audio/wave" | "audio/x-wav" => Ok(("audio/wav", "wav")),
         "audio/mp4" | "audio/x-m4a" => Ok(("audio/mp4", "mp4")),
         "audio/mpeg" | "audio/mp3" => Ok(("audio/mpeg", "mp3")),
+        "audio/opus" => Ok(("audio/opus", "opus")),
+        "audio/flac" => Ok(("audio/flac", "flac")),
+        "audio/aac" => Ok(("audio/aac", "aac")),
+        "audio/amr" => Ok(("audio/amr", "amr")),
         "audio/pcm" => Ok(("audio/pcm", "pcm")),
         _ => Err("provider_transcription_format_unsupported".into()),
     }
@@ -199,6 +208,7 @@ fn credential_identity(root: &Path, source: Source) -> Option<String> {
             root.join(".credentials.json"),
         ],
         Source::Codex => vec![model_sources::codex_store_path(root)],
+        Source::Bailian => vec![root.join("bailian-tokenplan.json")],
     };
     if paths
         .iter()
@@ -224,6 +234,10 @@ fn credential_identity(root: &Path, source: Source) -> Option<String> {
                 account["accountId"].as_str()?,
                 model_sources::account_credential_id("codex", &account)
             ))
+        }
+        Source::Bailian => {
+            let (key, region, _) = super::bailian::auth::media_credential_for_root(root)?;
+            Some(format!("{region}:{:x}", Sha256::digest(key.as_bytes())))
         }
     }
 }
@@ -369,8 +383,11 @@ pub(super) async fn transcribe(
     };
     let (kind, extension) = mime(params.mime_type.as_deref().or(Some(default_mime)))?;
     let language = language(params.language.as_deref())?;
-    if source == Source::Codex && kind == "audio/pcm" {
+    if matches!(source, Source::Codex | Source::Bailian) && kind == "audio/pcm" {
         return Err(source.error("format_unsupported"));
+    }
+    if source == Source::Bailian && audio.len() > BAILIAN_MAX_AUDIO {
+        return Err(source.error("audio_too_large"));
     }
     let audio = if source == Source::Claude {
         pcm_audio(&audio, kind)?
@@ -414,6 +431,39 @@ pub(super) async fn transcribe(
                         &token.access_token,
                         &token.account_id,
                         audio,
+                        kind,
+                        extension,
+                        language.as_deref(),
+                    ),
+                )
+                .await?;
+                Ok::<Response, String>(Response {
+                    value: wire::SubscriptionTranscriptResult { text },
+                    publication_check,
+                })
+            }
+            Source::Bailian => {
+                let expected = credential_identity(&root, source)
+                    .ok_or_else(|| source.error("authentication_required"))?;
+                let generation = format!("{:x}", Sha256::digest(expected.as_bytes()));
+                if params
+                    .expected_credential_generation
+                    .as_deref()
+                    .is_some_and(|value| value != generation)
+                {
+                    return Err(source.error("credential_changed"));
+                }
+                let (api_key, _, base_url) = super::bailian::auth::media_credential_for_root(&root)
+                    .ok_or_else(|| source.error("authentication_required"))?;
+                let publication_check = pin_identity(&root, source, expected);
+                let endpoint = format!("{base_url}{BAILIAN_ASR_PATH}");
+                let text = while_current(
+                    source,
+                    publication_check.clone(),
+                    bailian_request(
+                        &endpoint,
+                        &api_key,
+                        &audio,
                         kind,
                         extension,
                         language.as_deref(),
@@ -760,6 +810,115 @@ async fn codex_request(
         .filter(|text| text.len() <= MAX_TEXT)
         .ok_or_else(|| source.error("response_invalid"))?;
     Ok(text.to_owned())
+}
+
+fn bailian_transcript_text(value: &Value) -> Option<String> {
+    let output = value.get("output")?;
+    if let Some(text) = output.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = output
+        .get("sentence")
+        .and_then(|sentence| sentence.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_owned());
+    }
+    let parts = output
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)?;
+    let joined: String = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!joined.is_empty()).then_some(joined)
+}
+
+async fn bailian_request(
+    endpoint: &str,
+    api_key: &str,
+    audio: &[u8],
+    kind: &str,
+    extension: &str,
+    language: Option<&str>,
+) -> Result<String, String> {
+    let source = Source::Bailian;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(audio);
+    let data_uri = format!("data:{kind};base64,{encoded}");
+    let format = if extension == "mp4" { "m4a" } else { extension };
+    let mut parameters = serde_json::Map::new();
+    parameters.insert("format".into(), Value::String(format.into()));
+    if format == "wav" {
+        parameters.insert("sample_rate".into(), serde_json::json!(16_000));
+    }
+    if let Some(language) = language {
+        parameters.insert("language_hints".into(), serde_json::json!([language]));
+    }
+    let payload = serde_json::json!({
+        "model": BAILIAN_ASR_MODEL,
+        "input": {
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": { "data": data_uri }
+                }]
+            }]
+        },
+        "parameters": parameters,
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(BUDGET)
+        .user_agent(super::bailian::auth::user_agent())
+        .build()
+        .map_err(|_| source.error("transport_failed"))?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .header("content-type", "application/json")
+        .body(payload.to_string())
+        .send()
+        .await
+        .map_err(|_| source.error("transport_failed"))?;
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE as u64)
+    {
+        return Err(source.error("response_invalid"));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| source.error("transport_failed"))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err(source.error("response_invalid"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let code = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("code").and_then(Value::as_str).map(str::to_owned));
+        return Err(match code.as_deref() {
+            Some("InvalidApiKey") => source.error("authentication_required"),
+            Some("Throttling") => source.error("rate_limited"),
+            Some("Arrearage" | "AccessDenied.Unpurchased") => source.error("billing_required"),
+            _ => http_error(source, status.as_u16()),
+        });
+    }
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| source.error("response_invalid"))?;
+    let text = bailian_transcript_text(&value)
+        .filter(|text| text.len() <= MAX_TEXT)
+        .ok_or_else(|| source.error("response_invalid"))?;
+    Ok(text)
 }
 
 #[cfg(test)]

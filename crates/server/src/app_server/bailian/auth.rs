@@ -631,6 +631,22 @@ pub fn media_credential() -> Value {
     })
 }
 
+/// Read the stored plan key, region and media gateway root for a specific config root.
+pub(crate) fn media_credential_for_root(root: &std::path::Path) -> Option<(String, String, String)> {
+    let raw = std::fs::read_to_string(root.join("bailian-tokenplan.json")).ok()?;
+    let store: Value = serde_json::from_str(&raw).ok()?;
+    let key = string_field(&store, "apiKey")?;
+    let region = string_field(&store, "region")
+        .and_then(|value| Region::parse(&value))
+        .unwrap_or(Region::Cn);
+    let base = std::env::var("BAILIAN_MEDIA_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("https://{}", region.host()));
+    Some((key, region.as_str().to_string(), base))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -33,6 +33,10 @@ fn seed(root: &Path, source: Source) {
             model_sources::codex_store_path(root),
             json!({"defaultAccountId":"fixture-codex","accounts":{"fixture-codex":{"accountId":"fixture-codex","accessToken":"fixture-codex-access","accessTokenExpiresAt":expiry}}}),
         ),
+        Source::Bailian => (
+            root.join("bailian-tokenplan.json"),
+            json!({"apiKey":"sk-sp-fixture-bailian","region":"cn"}),
+        ),
     };
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
 }

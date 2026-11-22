@@ -536,6 +536,8 @@ facade_methods! {
     /// conversation on this source without a key reads as "not configured" instead
     /// of as a failed call.
     BailianMediaCredential => "bailian/mediaCredential" (wire::QoderParams) -> Value;
+    BailianTranscribeAudio => "bailian/transcribeAudio" (wire::SubscriptionTranscribeParams) -> wire::SubscriptionTranscriptResult;
+    BailianCancelTranscription => "bailian/cancelTranscription" (wire::SubscriptionCancelTranscriptionParams) -> wire::SubscriptionCancelTranscriptionResult;
 
     /// The Zhipu GLM Coding Plan subscription: a monthly credit-metered plan whose
     /// coding gateway serves the ordinary Anthropic wire, so like Bailian there is
