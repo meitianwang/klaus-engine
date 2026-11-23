@@ -3378,6 +3378,14 @@ fn project_responses_input(
                                 persisted_call_kind(tu, tools)
                             };
                             tool_use_kinds.insert(tu.id.clone(), kind);
+                            // Replayed calls carry the completion status the API
+                            // reports on them. History rebuilt without it stops
+                            // matching the provider's own copy of the response,
+                            // and the reasoning that follows the call is then
+                            // dropped as a prefix mismatch. Always completed: a
+                            // call only reaches history after an accepted
+                            // response terminal, so its item was fully generated
+                            // even when the tool's own execution was interrupted.
                             match kind {
                                 ProviderToolCallKind::Function => {
                                     let (wire_name, namespace) =
@@ -3386,6 +3394,7 @@ fn project_responses_input(
                                     item.insert("type", vs("function_call"));
                                     item.insert("call_id", vs(tu.id.clone()));
                                     item.insert("name", vs(wire_name));
+                                    item.insert("status", vs("completed"));
                                     if let Some(namespace) = namespace {
                                         item.insert("namespace", vs(namespace));
                                     }
@@ -3408,6 +3417,7 @@ fn project_responses_input(
                                     item.insert("type", vs("custom_tool_call"));
                                     item.insert("call_id", vs(tu.id.clone()));
                                     item.insert("name", vs(wire_name));
+                                    item.insert("status", vs("completed"));
                                     if let Some(namespace) = namespace {
                                         item.insert("namespace", vs(namespace));
                                     }
@@ -11696,7 +11706,7 @@ mod tests {
             v,
             json!([
                 { "type": "reasoning", "summary": [ { "type": "summary_text", "text": "reasoned" } ], "encrypted_content": "enc123" },
-                { "type": "function_call", "call_id": "call_9", "name": "grep", "arguments": "{\"q\":\"x\"}" }
+                { "type": "function_call", "call_id": "call_9", "name": "grep", "status": "completed", "arguments": "{\"q\":\"x\"}" }
             ])
         );
 
@@ -11832,10 +11842,10 @@ mod tests {
         assert_eq!(
             v,
             json!([
-                { "type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "input": "{\"source\":\"console.log(1)\"}" },
+                { "type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "status": "completed", "input": "{\"source\":\"console.log(1)\"}" },
                 { "type": "custom_tool_call_output", "call_id": "call_exec", "output": "done" },
                 { "role": "user", "content": [ { "type": "input_image", "image_url": "data:image/png;base64,QQ==", "detail": "auto" } ] },
-                { "type": "function_call", "call_id": "call_wait", "name": "wait", "arguments": "{\"seconds\":1}" },
+                { "type": "function_call", "call_id": "call_wait", "name": "wait", "status": "completed", "arguments": "{\"seconds\":1}" },
                 { "type": "function_call_output", "call_id": "call_wait", "output": "waited" }
             ])
         );
@@ -12316,7 +12326,7 @@ mod tests {
         assert_eq!(
             items,
             &[
-                json!({"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"}),
+                json!({"type":"custom_tool_call","call_id":"c1","name":"apply_patch","status":"completed","input":"*** Begin Patch"}),
                 json!({"type":"custom_tool_call_output","call_id":"c1","output":"done"}),
                 json!({"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"calendar"}}),
                 json!({
@@ -12330,6 +12340,68 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn replayed_calls_carry_completion_status_in_every_wire_mode() {
+        let mut specs = namespace_projection_specs();
+        specs.push(function_spec(
+            "apply_patch",
+            "Apply a patch.",
+            required_string_schema("source"),
+        ));
+        let profile = resolve_provider_behavior_profile(None, &RuntimeString::from("gpt-5"));
+        let history = [
+            assistant_function(
+                "f1",
+                "mcp__calendar__create_event",
+                json!({"title":"standup"}),
+            ),
+            function_result("f1", "created"),
+            assistant_custom("c1", "apply_patch", "*** Begin Patch"),
+            custom_result("c1", "done"),
+        ];
+        // Native declarations keep the custom kind and group names by namespace;
+        // the plain function-tool dialect folds every call into function_call.
+        for (function_tools, namespaces) in [(false, true), (true, false)] {
+            let (input, _) = project_responses_input(
+                &history,
+                &specs,
+                &profile,
+                None,
+                function_tools,
+                &[],
+                &[],
+                false,
+                namespaces,
+            )
+            .expect("history projection is representable");
+            let items = input.as_array().unwrap();
+            assert_eq!(items[0]["type"], json!("function_call"));
+            assert_eq!(items[0]["status"], json!("completed"));
+            assert_eq!(items[1]["type"], json!("function_call_output"));
+            if function_tools {
+                assert_eq!(items[2]["type"], json!("function_call"));
+                assert_eq!(items[2]["name"], json!("apply_patch"));
+                assert_eq!(items[3]["type"], json!("function_call_output"));
+            } else {
+                assert_eq!(items[0]["name"], json!("create_event"));
+                assert_eq!(items[0]["namespace"], json!("mcp__calendar"));
+                assert_eq!(items[2]["type"], json!("custom_tool_call"));
+                assert_eq!(items[3]["type"], json!("custom_tool_call_output"));
+            }
+            // The completion status is part of the call item, not of its result.
+            assert!(items[1].get("status").is_none());
+            assert!(items[3].get("status").is_none());
+            assert_eq!(items[2]["status"], json!("completed"));
+
+            // Downgrading namespaces to flat names must not drop the status.
+            let mut body = vobj([("tools", Value::Array(Vec::new())), ("input", input)]);
+            native_tool_loading::flatten_tool_namespaces(&mut body);
+            assert_eq!(body["input"][0]["status"], json!("completed"));
+            assert_eq!(body["input"][2]["status"], json!("completed"));
+            assert!(body["input"][0].get("namespace").is_none());
+        }
     }
 
     #[test]
@@ -12385,7 +12457,7 @@ mod tests {
         assert_eq!(
             to_responses_input(&messages, &tools),
             json!([
-                {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"raw"},
+                {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","status":"completed","input":"raw"},
                 {"type":"function_call_output","call_id":"c1","output":"explicit function result"}
             ])
         );

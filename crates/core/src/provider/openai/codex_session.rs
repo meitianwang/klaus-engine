@@ -289,15 +289,21 @@ impl CodexTransportState {
                 "true".to_string(),
             );
         }
-        // A Responses reply echoes the request's tool catalog back by default.
-        // The engine drives the API statelessly and never reads the echo, so
-        // ask the backend to omit it; on tool-heavy requests this trims a
-        // fixed per-response payload that scales with the declaration size.
+        // A Responses reply echoes the request's tool catalog back by default,
+        // and attributes upstream usage to every streamed item. The engine
+        // drives the API statelessly, never reads the echo, and accounts tokens
+        // from the response-level usage only, so ask the backend to omit both:
+        // the catalog trim is a fixed per-response payload that scales with the
+        // declaration size, and the attribution trim drops per-item bookkeeping
+        // the engine has no consumer for.
         if !headers
             .keys()
             .any(|key| key.eq_ignore_ascii_case("x-codex-exclude"))
         {
-            headers.insert("x-codex-exclude".to_string(), "tools".to_string());
+            headers.insert(
+                "x-codex-exclude".to_string(),
+                "tools,usage.attribution".to_string(),
+            );
         }
         if let Some(token) = turn_state.filter(|token| !token.is_empty()) {
             headers.insert("x-codex-turn-state".to_string(), token.to_string());
