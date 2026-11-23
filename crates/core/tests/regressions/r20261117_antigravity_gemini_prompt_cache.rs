@@ -621,11 +621,12 @@ async fn antigravity_gemini_keeps_deferred_tools_out_of_declarations_and_invokes
     assert_eq!(normal_calls[1].wire["tools"], normal_calls[2].wire["tools"]);
     assert_eq!(normal_calls[2].wire["tools"], normal_calls[3].wire["tools"]);
 
-    // Verify `tool_search` response on Gemini carries the matched `inputSchema`
-    // and `call_mcp_tool` guidance at the append-only tail of `contents`.
+    // Verify `tool_search` response on Gemini projects the matched schema and
+    // `call_mcp_tool` guidance into the string `output` field at the append-only
+    // tail of `contents`.
     let step1_contents = normal_calls[1].wire["contents"].to_string();
-    assert!(step1_contents.contains("\"mcp__demo__beta\""));
-    assert!(step1_contents.contains("\"inputSchema\""));
+    assert!(step1_contents.contains("mcp__demo__beta"));
+    assert!(step1_contents.contains("Input schema:"));
     assert!(step1_contents.contains("call_mcp_tool"));
     let step2_contents = normal_calls[2].wire["contents"].to_string();
     assert!(step2_contents.contains("ack:demo:beta:ping"));

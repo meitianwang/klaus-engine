@@ -1894,31 +1894,24 @@ fn to_contents_with_profile(
             Message::ToolResult(tr) => {
                 // Echo the call id (= tool_use_id) and recover the name — name
                 // alone mis-pairs parallel same-name calls and 400s on Gemini 3.
-                let response = if indirect_deferred_dispatch
-                    && tr.tool_kind
-                        == Some(crate::types::provider::ProviderToolCallKind::ToolSearch)
-                {
-                    let mut fields = RuntimeObject::new();
-                    fields.insert("output", vs(text_of_output_blocks(&tr.content)));
-                    fields.insert(
-                        "invocation",
-                        vs(
-                            "Invoke matched deferred tools via call_mcp_tool with {\"name\": \"<tool_name>\", \"arguments\": {...}}.",
-                        ),
-                    );
-                    if let Some(native) = tr
-                        .native_tool_output
-                        .as_ref()
-                        .and_then(RuntimeJson::as_object)
-                    {
-                        if let Some(matched_tools) = native.get("tools") {
-                            fields.insert("tools", matched_tools.clone());
-                        }
-                    }
-                    RuntimeJson::Object(fields)
+                // Project deferred `tool_search` definitions into the `output`
+                // text field instead of embedding raw `inputSchema` objects in
+                // `functionResponse.response`: Gemini treats nested `{"$ref": ...}`
+                // objects inside `functionResponse.response` as multimodal
+                // `FunctionResponsePart` display-name references and rejects JSON
+                // Schema `$ref` pointers with `400 INVALID_ARGUMENT`.
+                let output = if indirect_deferred_dispatch && !tr.is_error {
+                    tr.tool_kind
+                        .filter(|kind| {
+                            *kind == crate::types::provider::ProviderToolCallKind::ToolSearch
+                        })
+                        .and(tr.native_tool_output.as_ref())
+                        .and_then(crate::tools::builtins::tool_search::project_search_result_text)
                 } else {
-                    vobj([("output", vs(text_of_output_blocks(&tr.content)))])
-                };
+                    None
+                }
+                .unwrap_or_else(|| text_of_output_blocks(&tr.content));
+                let response = vobj([("output", vs(output))]);
                 let mut parts = vec![Part {
                     function_response: Some(FunctionResponse {
                         id: tr.tool_use_id.clone(),
