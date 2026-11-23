@@ -278,13 +278,22 @@ async fn native_capability_inventory_stays_separate_from_conversation_choices() 
         "defaultAgentModelId":"vision-chat", "tabModelIds":["tab-model"],
         "imageGenerationModelIds":["native-image"], "webSearchModelIds":["native-search"],
         "audioTranscriptionModelIds":["native-transcription"],
+        "agentModelSorts":[{"displayName":"Recommended","groups":[{"modelIds":[
+            "vision-chat",
+            "tab-model",
+            "native-image",
+            "native-search",
+            "native-transcription",
+            "private-model",
+            "internal-only-model"
+        ]}]}],
         "models": {
             "vision-chat":{"supportsImages":true,"supportedMimeTypes":{"image/png":true,"video/mp4":true}},
             "tab-model":{}, "native-image":{}, "native-search":{}, "native-transcription":{},
             "private-model":{"isInternal":true}, "internal-only-model":{"isInternalOnly":true}
         }
     });
-    std::fs::write(root.path().join("antigravity-models.json"),json!({"generation":generation,"fetchedAt":chrono::Utc::now().timestamp_millis(),"payload":payload}).to_string()).unwrap();
+    std::fs::write(root.path().join("antigravity-models.json"),json!({"generation":generation,"fetchedAt":chrono::Utc::now().timestamp_millis(),"clientIdentity":super::super::antigravity::cloud_test_identity(),"payload":payload}).to_string()).unwrap();
     let mut client = TestClient::start_full(
         make_create_session(&[]),
         None,

@@ -20,7 +20,8 @@ async fn named_goal_submission_automatically_reaches_blocked_with_a_running_shel
                     "bash",
                     json!({
                         "command": if cfg!(windows) { "ping -n 31 127.0.0.1 > NUL" } else { "exec sleep 30" },
-                        "runInBackground": true
+                        "runInBackground": true,
+                        "yieldMs": if cfg!(windows) { 10000 } else { 250 }
                     }),
                 )),
                 1 => {

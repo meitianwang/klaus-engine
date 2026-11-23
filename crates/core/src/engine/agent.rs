@@ -3115,6 +3115,7 @@ impl Agent {
             initial_queue,
             prepared,
         )?;
+        session.set_host_supplied_tools(host_supplied_tools);
         session.set_manual_mcp_servers(manual_mcp_servers);
         plugin_binding.session = Arc::downgrade(&session);
         plugin_sessions.retain(|binding| binding.session.strong_count() > 0);
@@ -5594,6 +5595,18 @@ mod tests {
                         && text.text.starts_with("<skill-catalog:")))
     }
 
+    fn is_deferred_tool_catalog_context(message: &Message) -> bool {
+        matches!(message, Message::User(user)
+            if user.is_meta == Some(true)
+                && matches!(user.content.as_slice(), [ContentBlock::Text(text)]
+                    if text.phase.as_ref().is_some_and(|phase| phase == "deferred-tool-catalog")
+                        || text.text.starts_with("<deferred-tool-catalog>")))
+    }
+
+    fn is_catalog_context(message: &Message) -> bool {
+        is_skill_catalog_context(message) || is_deferred_tool_catalog_context(message)
+    }
+
     fn text_message_content(message: &Message) -> &RuntimeString {
         let content = match message {
             Message::User(user) => &user.content,
@@ -5864,7 +5877,7 @@ mod tests {
         assert!(history.iter().any(is_skill_catalog_context));
         let conversation: Vec<_> = history
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(conversation.len(), 4);
         assert_eq!(
@@ -5878,7 +5891,7 @@ mod tests {
         let visible_history = side.visible_history();
         let visible_conversation: Vec<_> = visible_history
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(visible_conversation.as_slice(), &conversation[2..]);
         assert!(visible_history.iter().all(|message| {
@@ -5956,7 +5969,7 @@ mod tests {
         assert_eq!(side.history(), visible_history);
         let conversation: Vec<_> = visible_history
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(conversation.len(), 2);
         assert!(matches!(conversation[0], Message::User(user) if user.is_meta != Some(true)));
@@ -10834,7 +10847,7 @@ mod tests {
         let command_messages: Vec<_> = requests[0]
             .messages
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(command_messages.len(), 1);
         let Message::User(user) = command_messages[0] else {
@@ -11438,7 +11451,7 @@ mod tests {
         assert!(history.iter().any(is_skill_catalog_context));
         let conversation: Vec<_> = history
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(conversation.len(), 4);
         assert!(matches!(conversation[0], Message::User(user) if user.is_meta != Some(true)));
@@ -11458,7 +11471,11 @@ mod tests {
             .iter()
             .position(|message| message_uuid(message) == cut_uuid.as_str())
             .unwrap();
-        let expected_prefix = history[..cut_index].to_vec();
+        let expected_prefix: Vec<_> = history[..cut_index]
+            .iter()
+            .filter(|message| !is_deferred_tool_catalog_context(message))
+            .cloned()
+            .collect();
         session.dispose().await;
 
         let forked = agent
@@ -11479,7 +11496,7 @@ mod tests {
         assert!(branch_history.iter().any(is_skill_catalog_context));
         let branch_conversation: Vec<_> = branch_history
             .iter()
-            .filter(|message| !is_skill_catalog_context(message))
+            .filter(|message| !is_catalog_context(message))
             .collect();
         assert_eq!(branch_conversation.as_slice(), &conversation[..2]);
         forked.dispose().await;
@@ -11496,7 +11513,12 @@ mod tests {
             .await;
         assert!(missing.is_err());
         let source = store.resume("sess-fork-cut").await.unwrap();
-        assert_eq!(source.messages, history);
+        let expected_history: Vec<_> = history
+            .iter()
+            .filter(|message| !is_deferred_tool_catalog_context(message))
+            .cloned()
+            .collect();
+        assert_eq!(source.messages, expected_history);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1451,6 +1451,7 @@ impl Session {
             precompute: Arc::new(crate::engine::query::PrecomputeRegistry::default()),
             config: init.config.clone(),
             tools: init.tools.clone(),
+            host_supplied_tools: AtomicBool::new(false),
             host_refresh_tools: init.refresh_tools,
             workspace,
             workflow_journal_log: Mutex::new(init.prior_workflow_journal.unwrap_or_default()),
@@ -4482,6 +4483,11 @@ impl Session {
         }
     }
 
+    pub(crate) fn set_host_supplied_tools(&self, host_supplied_tools: bool) {
+        self.host_supplied_tools
+            .store(host_supplied_tools, Ordering::SeqCst);
+    }
+
     /// Refresh the engine's own delegation tool so its advertised agent roster
     /// and model catalog match the current registry. A host-supplied tool
     /// answering to `task` owns that name and keeps its own implementation.
@@ -4490,7 +4496,13 @@ impl Session {
         tools: &mut [Arc<dyn Tool>],
         config: &ResolvedConfig,
     ) {
-        Self::refresh_builtin_delegation_tool(tools, config, &self.current_agent_registry().list());
+        if !self.host_supplied_tools.load(Ordering::SeqCst) {
+            Self::refresh_builtin_delegation_tool(
+                tools,
+                config,
+                &self.current_agent_registry().list(),
+            );
+        }
     }
 
     pub(crate) fn prepare_planning_tool_inventory(&self, tools: &mut Vec<Arc<dyn Tool>>) {

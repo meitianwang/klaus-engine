@@ -230,7 +230,7 @@ fn project_with_mode(request: &mut ModelRequest, active: bool, include_all_non_c
         content: vec![ContentBlock::Text(TextBlock {
             text,
             citations: None,
-            harness_envelope: None,
+            harness_envelope: Some(crate::schemas::content::HarnessEnvelope::SystemReminder),
             message_id: None,
             phase: Some(PHASE.into()),
         })],

@@ -165,6 +165,10 @@ pub trait LiveRollout: Send + Sync + std::fmt::Debug {
     fn inspection_revision(&self) -> Option<u64> {
         None
     }
+    /// True when `shutdown` aborted via panic rather than completing its drain.
+    fn shutdown_panicked(&self) -> bool {
+        false
+    }
     async fn flush(&self) -> std::io::Result<()>;
     async fn shutdown(&self) -> std::io::Result<()>;
 }

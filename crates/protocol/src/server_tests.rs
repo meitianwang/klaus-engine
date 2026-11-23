@@ -3681,6 +3681,7 @@ fn shutdown_timeout_typing_never_depends_on_human_error_text() {
     failures.extend_core(SessionShutdownOutcome {
         errors: vec!["core adapter also mentioned timed out in prose".to_string()],
         timed_out: false,
+        undrained: false,
     });
     assert!(
         !failures.timed_out,
@@ -3694,6 +3695,7 @@ fn shutdown_timeout_typing_never_depends_on_human_error_text() {
     core_timeout.extend_core(SessionShutdownOutcome {
         errors: vec!["opaque structured core failure".to_string()],
         timed_out: true,
+        undrained: false,
     });
     assert!(
         core_timeout.timed_out,
@@ -8665,6 +8667,13 @@ async fn get_history_cost_subagents() {
                         if text.harness_envelope == Some(HarnessEnvelope::SystemReminder)
                             && text.text.starts_with("<skill-catalog:")))
         };
+        let is_deferred_tool_catalog = |message: &Message| {
+            matches!(message, Message::User(user)
+                if user.is_meta == Some(true)
+                    && matches!(user.content.as_slice(), [ContentBlock::Text(text)]
+                        if text.phase.as_ref().is_some_and(|phase| phase == "deferred-tool-catalog")
+                            || text.text.starts_with("<deferred-tool-catalog>")))
+        };
         assert_eq!(
             history
                 .iter()
@@ -8675,7 +8684,9 @@ async fn get_history_cost_subagents() {
         );
         let users = history
             .iter()
-            .filter(|message| !is_retained_skill_catalog(message))
+            .filter(|message| {
+                !is_retained_skill_catalog(message) && !is_deferred_tool_catalog(message)
+            })
             .filter_map(|message| match message {
                 Message::User(user) => Some(user),
                 _ => None,
@@ -8692,10 +8703,14 @@ async fn get_history_cost_subagents() {
             Message::Assistant(assistant)
                 if matches!(assistant.content.as_slice(), [ContentBlock::Text(text)]
                     if text.text == "hi there"))));
-        let reminders = history.iter().filter_map(|message| match message {
-            Message::User(user) if user.is_meta == Some(true) => Some(user),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let reminders = history
+            .iter()
+            .filter(|message| !is_deferred_tool_catalog(message))
+            .filter_map(|message| match message {
+                Message::User(user) if user.is_meta == Some(true) => Some(user),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert!(reminders.len() <= 1, "a fresh history cannot duplicate its initial catalog page");
         for reminder in reminders {
             use klaus_agent_core::extensions::skills::builtin_skills::builtin_skills;

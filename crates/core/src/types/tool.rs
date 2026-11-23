@@ -2527,15 +2527,26 @@ mod tests {
             },
             Case {
                 tool: crate::tools::builtins::read::create_read_tool(),
-                input: runtime(json!({ "path": "x", "offset": "x", "limit": "x", "pages": 1 })),
-                declaration: &["path", "offset", "limit", "pages"],
-                issues: &["offset", "limit", "pages"],
+                input: runtime(json!({
+                    "path": "x",
+                    "offset": "x",
+                    "limit": "x",
+                    "pages": 1,
+                    "allow_large": 1
+                })),
+                declaration: &["path", "offset", "limit", "pages", "allow_large"],
+                issues: &["offset", "limit", "pages", "allow_large"],
             },
             Case {
                 tool: crate::tools::builtins::task_control::create_task_stop_tool(),
-                input: runtime(json!({ "task_id": 1, "shell_id": 1 })),
-                declaration: &["task_id", "shell_id"],
-                issues: &["task_id", "shell_id"],
+                input: runtime(json!({
+                    "task_id": 1,
+                    "shell_id": 1,
+                    "shellId": 1,
+                    "signal": 1
+                })),
+                declaration: &["task_id", "shell_id", "shellId", "signal"],
+                issues: &["task_id", "shell_id", "shellId", "signal"],
             },
             Case {
                 tool: crate::tools::builtins::swarm_tools::create_team_create_tool(),

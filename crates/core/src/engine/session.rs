@@ -1296,6 +1296,7 @@ pub struct Session {
     // construction-time environment prompt that may need rebuilding.
     config: ResolvedConfig,
     tools: Vec<AnyTool>,
+    host_supplied_tools: AtomicBool,
     host_refresh_tools: Option<Arc<dyn Fn() -> Vec<AnyTool> + Send + Sync>>,
     /// The session's working-tree cluster (see [`SessionWorkspaceState`]).
     workspace: SessionWorkspaceState,

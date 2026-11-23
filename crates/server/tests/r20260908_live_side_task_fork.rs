@@ -410,6 +410,7 @@ pub(super) struct Fixture {
     pub(super) source: Arc<Session>,
     pub(super) store: Arc<dyn SessionStore>,
     pub(super) root: tempfile::TempDir,
+    ephemeral_side: bool,
     config_home_guard: FixtureConfigHome,
 }
 
@@ -445,6 +446,11 @@ impl Fixture {
         Self::with_credentials(ignore_snapshot, pause, None).await
     }
 
+    pub(super) async fn new_ephemeral() -> Self {
+        Self::with_bootstrap_transport_and_diagnostic(false, None, None, true, None, None, true)
+            .await
+    }
+
     pub(super) async fn with_credentials(
         ignore_snapshot: bool,
         pause: Option<(Arc<Notify>, Arc<Notify>)>,
@@ -471,13 +477,22 @@ impl Fixture {
             true,
             Some(diagnostic),
             None,
+            false,
         )
         .await
     }
 
     pub(super) async fn with_auto_compact_window(window: u64) -> Self {
-        Self::with_bootstrap_transport_and_diagnostic(false, None, None, true, None, Some(window))
-            .await
+        Self::with_bootstrap_transport_and_diagnostic(
+            false,
+            None,
+            None,
+            true,
+            None,
+            Some(window),
+            false,
+        )
+        .await
     }
 
     async fn with_bootstrap_transport(
@@ -493,6 +508,7 @@ impl Fixture {
             injected,
             None,
             None,
+            false,
         )
         .await
     }
@@ -504,6 +520,7 @@ impl Fixture {
         injected: bool,
         diagnostic: Option<Arc<FixtureDiagnostic>>,
         auto_compact_window: Option<u64>,
+        ephemeral_side: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let config_home_guard = FixtureConfigHome::enter(root.path());
@@ -590,12 +607,26 @@ impl Fixture {
             user_config_dir.clone(),
         )
         .create_session;
+        let ephemeral_production = crate::lifecycle::engine_sessions_in_test_root(
+            agent.clone(),
+            None,
+            user_config_dir.clone(),
+        )
+        .create_session;
+        let captured_for_create = captured.clone();
         let create: CreateSession = Arc::new(move |ctx| {
             let production = production.clone();
+            let ephemeral_production = ephemeral_production.clone();
+            let captured_for_create = captured_for_create.clone();
             let agent = agent.clone();
             let pause = pause.clone();
             let user_config_dir = user_config_dir.clone();
             Box::pin(async move {
+                if ephemeral_side && ctx.side_task.is_some() {
+                    let session = ephemeral_production(ctx).await?;
+                    *captured_for_create.lock().unwrap() = Some(session.clone());
+                    return Ok(session);
+                }
                 if ctx.fork_live.is_some() {
                     if let Some((entered, release)) = pause {
                         entered.notify_one();
@@ -639,22 +670,57 @@ impl Fixture {
             diagnostic,
         };
         client.initialize().await;
-        let start = request(
-            &mut client,
-            2,
-            "session/start",
-            json!({"init":{"threadId":"side","cwd":root.path()}}),
-        )
-        .await;
-        assert_eq!(start["result"]["sessionId"], "side", "{start}");
-        let side = request(
-            &mut client,
-            3,
-            "session/createSideTask",
-            json!({"sessionId":"side","threadId":"parent","newThreadId":"side"}),
-        )
-        .await;
-        assert!(side.get("error").is_none(), "{side}");
+        if ephemeral_side {
+            let parent_start = request(
+                &mut client,
+                2,
+                "session/start",
+                json!({"init":{"cwd":root.path()},"resume":"parent"}),
+            )
+            .await;
+            assert_eq!(
+                parent_start["result"]["sessionId"], "parent",
+                "{parent_start}"
+            );
+            let parent_history = request(
+                &mut client,
+                20,
+                "session/history",
+                json!({"sessionId":"parent"}),
+            )
+            .await;
+            assert!(parent_history.get("error").is_none(), "{parent_history}");
+            let side = request(
+                &mut client,
+                3,
+                "session/startSideTask",
+                json!({
+                    "parentThreadId": "parent",
+                    "sourceSessionId": "parent",
+                    "init": {"threadId": "side", "cwd": root.path()}
+                }),
+            )
+            .await;
+            assert!(side.get("error").is_none(), "{side}");
+            assert_eq!(side["result"]["initialized"]["ephemeral"], true, "{side}");
+        } else {
+            let start = request(
+                &mut client,
+                2,
+                "session/start",
+                json!({"init":{"threadId":"side","cwd":root.path()}}),
+            )
+            .await;
+            assert_eq!(start["result"]["sessionId"], "side", "{start}");
+            let side = request(
+                &mut client,
+                3,
+                "session/createSideTask",
+                json!({"sessionId":"side","threadId":"parent","newThreadId":"side"}),
+            )
+            .await;
+            assert!(side.get("error").is_none(), "{side}");
+        }
         let source = captured
             .lock()
             .unwrap()
@@ -669,6 +735,7 @@ impl Fixture {
             source,
             store,
             root,
+            ephemeral_side,
             config_home_guard,
         }
     }
@@ -693,17 +760,24 @@ impl Fixture {
             .await
             .expect("endpoint teardown completes")
             .unwrap();
-        let mut source_thread = self
-            .store
-            .read_thread("side")
-            .await
-            .expect("a persisted side task keeps its own thread");
-        assert_eq!(
-            source_thread.meta.role,
-            Some(klaus_agent_core::schemas::rollout::SessionRole::SideTask),
-            "the source thread keeps the side-task role"
-        );
-        let _ = &mut source_thread;
+        if self.ephemeral_side {
+            assert!(
+                self.store.read_thread("side").await.is_err(),
+                "ephemeral side task stays storeless"
+            );
+        } else {
+            let mut source_thread = self
+                .store
+                .read_thread("side")
+                .await
+                .expect("a persisted side task keeps its own thread");
+            assert_eq!(
+                source_thread.meta.role,
+                Some(klaus_agent_core::schemas::rollout::SessionRole::SideTask),
+                "the source thread keeps the side-task role"
+            );
+            let _ = &mut source_thread;
+        }
         drop(self.config_home_guard);
     }
 }

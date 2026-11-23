@@ -3957,6 +3957,21 @@ fn migrate_baseline_shared_prompt_prefix(request: &mut RuntimeJson) -> Result<()
     }
     let source = source.as_array().ok_or("source prefix must be an array")?;
     let target = target.as_array().ok_or("target prefix must be an array")?;
+    let effective_target = match request.get("model").and_then(RuntimeJson::as_str) {
+        Some(model) => {
+            let mut config = crate::schemas::config::default_config();
+            config.model = model.clone();
+            build_system_prompt(&SystemPromptInput {
+                config,
+                ..Default::default()
+            })
+            .into_iter()
+            .take_while(|part| part.cache_scope == Some(crate::types::provider::CacheScope::Global))
+            .map(|part| runtime_codec::encode_value(&part).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+        }
+        None => target.clone(),
+    };
     let system = request
         .get_mut("system")
         .and_then(RuntimeJson::as_array_mut)
@@ -3968,6 +3983,7 @@ fn migrate_baseline_shared_prompt_prefix(request: &mut RuntimeJson) -> Result<()
         source
             .iter()
             .chain(target)
+            .chain(&effective_target)
             .any(|known| part.get("name") == known.get("name"))
     }) {
         return Err("request repeats a stable prompt fragment".into());
@@ -3997,7 +4013,7 @@ fn migrate_baseline_shared_prompt_prefix(request: &mut RuntimeJson) -> Result<()
             .concat(&text.slice_utf16(end..));
         *part.get_mut("text").expect("validated text field") = RuntimeJson::String(migrated);
     }
-    let replacement = target.iter().cloned().chain(suffix);
+    let replacement = effective_target.into_iter().chain(suffix);
     system.splice(.., replacement);
     Ok(())
 }
@@ -7556,6 +7572,7 @@ fn canonicalize_fixed_ts_reference_trace(
     // adopt the canonical identities in their recorded runtime events and side
     // effects, which are compared against the normalized calls by identity.
     let mut adopted_unified_identities = false;
+    let mut wait_agent_facade_ms = std::collections::HashMap::<RuntimeString, u64>::new();
     for call in trace.normalized_internal_calls.iter_mut() {
         let renamed = call
             .get("internalName")
@@ -7570,18 +7587,81 @@ fn canonicalize_fixed_ts_reference_trace(
                 }
             });
         if let Some(new_name) = renamed {
-            call.as_object_mut()
-                .expect("normalized call is an object")
-                .insert("internalName", RuntimeJson::from(new_name));
+            let call_obj = call.as_object_mut().expect("normalized call is an object");
+            call_obj.insert("internalName", RuntimeJson::from(new_name));
+            if new_name == "TaskOutput"
+                && call_obj
+                    .get("visibleName")
+                    .and_then(RuntimeJson::as_str)
+                    .is_some_and(|name| name == "wait_agent")
+            {
+                let facade_wait_ms = match call_obj
+                    .get("visibleInput")
+                    .and_then(RuntimeJson::as_object)
+                    .and_then(|input| input.get("timeout_ms"))
+                {
+                    None => Some(30_000_u64),
+                    Some(value) if value.is_null() => None,
+                    Some(value) => value
+                        .as_f64()
+                        .filter(|n| n.is_finite())
+                        .map(|n| (n.clamp(0.0, 3_600_000.0)) as u64),
+                };
+                if let Some(wait_ms) = facade_wait_ms {
+                    if let Some(internal_input) = call_obj
+                        .get_mut("internalInput")
+                        .and_then(RuntimeJson::as_object_mut)
+                    {
+                        if !internal_input.contains_key("_facade_wait_ms") {
+                            internal_input.insert("_facade_wait_ms", RuntimeJson::from(wait_ms));
+                            if let Some(id) = call_obj.get("id").and_then(RuntimeJson::as_str) {
+                                wait_agent_facade_ms.insert(id.clone(), wait_ms);
+                            }
+                        }
+                    }
+                }
+            }
             adopted_unified_identities = true;
         }
     }
     if adopted_unified_identities {
         for effect in trace.side_effects.iter_mut() {
             adopt_unified_background_tool_identities(effect);
+            if let Some(effect_obj) = effect.as_object_mut() {
+                if let Some(wait_ms) = effect_obj
+                    .get("id")
+                    .and_then(RuntimeJson::as_str)
+                    .and_then(|id| wait_agent_facade_ms.get(id))
+                    .copied()
+                {
+                    if let Some(input) = effect_obj
+                        .get_mut("input")
+                        .and_then(RuntimeJson::as_object_mut)
+                    {
+                        if !input.contains_key("_facade_wait_ms") {
+                            input.insert("_facade_wait_ms", RuntimeJson::from(wait_ms));
+                        }
+                    }
+                }
+            }
         }
         for event in trace.engine_events.iter_mut() {
             adopt_unified_background_tool_identities(event);
+            if let Some(wait_ms) = event
+                .pointer("/item/id")
+                .and_then(RuntimeJson::as_str)
+                .and_then(|id| wait_agent_facade_ms.get(id))
+                .copied()
+            {
+                if let Some(arguments) = event
+                    .pointer_mut("/item/arguments")
+                    .and_then(RuntimeJson::as_object_mut)
+                {
+                    if !arguments.contains_key("_facade_wait_ms") {
+                        arguments.insert("_facade_wait_ms", RuntimeJson::from(wait_ms));
+                    }
+                }
+            }
         }
     }
     let canonical_normalized = normalized_calls(
@@ -19976,7 +20056,7 @@ mod tests {
         let migrated = subagent_model_schema_expectations(source, &trace.run).unwrap();
         let expected = migrated.get(&RuntimeString::from("spawn_agent")).unwrap();
         let quoted = RuntimeString::from(
-            r#""Required for every new child task. Select low for simple mechanical work, medium for standard implementation or investigation, and high for complex reasoning; alternatively supply a concrete model ID, qualified as source:modelId when selecting another source. Choose by task complexity without asking the user to choose a tier. This explicit selection takes precedence over role and configured child defaults. Do not omit it or use \"inherit\". Only an invalid or unavailable selection falls back to the captured parent model. Existing children keep their original model; use followup_task where available, or the message tool's explicit turn trigger.""#,
+            r#""Required for every new child task. Select low for simple mechanical work, medium for standard implementation or investigation, and high for complex reasoning. Choose by task complexity without asking the user to choose a tier. This explicit selection takes precedence over role and configured child defaults. Do not omit it or use \"inherit\". Concrete model IDs are disabled; use only low, medium, or high. An unavailable tier falls back to the captured parent model. Existing children keep their original model; use followup_task where available, or the message tool's explicit turn trigger.""#,
         );
         let name = RuntimeString::from("spawn_agent");
         let mut exact_patterns = source.request_tool_input_schema_includes[&name].clone();
@@ -21433,7 +21513,7 @@ mod tests {
                     .and_then(RuntimeJson::as_object_mut)
                     .unwrap();
                 assert!(!input.contains_key("model") && !input.contains_key("resume"));
-                input.insert("model", RuntimeJson::String(trace.run.model.clone()));
+                input.insert("model", RuntimeJson::from("low"));
             }
             let migrated = canonicalize_fixed_ts_reference_trace(trace, &manifest, 1).unwrap();
             assert!(runtime_sequence_semantic_eq(

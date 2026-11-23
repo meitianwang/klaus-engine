@@ -42,7 +42,7 @@ impl LiveRollout for FailedShutdownRollout {
     }
 
     async fn shutdown(&self) -> std::io::Result<()> {
-        Err(std::io::Error::other("fixture rollout shutdown failed"))
+        panic!("fixture rollout shutdown panicked")
     }
 }
 
@@ -105,10 +105,13 @@ async fn failed_closed_session() -> (TestClient, tempfile::TempDir) {
     )
     .await;
     assert_eq!(closed["error"]["code"], wire::ENGINE_ERROR, "{closed}");
-    assert!(closed["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("fixture rollout shutdown failed"));
+    assert!(
+        closed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session close did not drain"),
+        "{closed}"
+    );
     (client, root)
 }
 

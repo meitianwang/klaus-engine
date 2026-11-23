@@ -578,6 +578,7 @@ async fn actual_nested_requests_bill_one_root_goal_after_the_root_is_idle() {
     // The root is idle and both descendant lifetimes overlap. Only the root's
     // goal clock may accrue this real elapsed interval.
     tokio::time::sleep(Duration::from_millis(1100)).await;
+    fixture.session.flush_goal_progress().await.unwrap();
     let idle = fixture.session.thread_goal().await.unwrap().unwrap();
     assert!(
         idle.time_used_seconds >= 1,

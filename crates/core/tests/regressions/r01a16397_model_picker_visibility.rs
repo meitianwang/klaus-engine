@@ -25,7 +25,7 @@ async fn conversation_catalog_hides_internal_rows_without_losing_runtime_metadat
     std::fs::write(
         root.path().join("codex-model-catalog.json"),
         json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accountId": account,
             "clientVersion": model_sources::codex_client_version(),
             "models": vector["models"]

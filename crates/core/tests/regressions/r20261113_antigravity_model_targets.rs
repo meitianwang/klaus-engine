@@ -188,10 +188,14 @@ async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder
 
     let previous_api = std::env::var_os("KLAUS_ANTIGRAVITY_API_URL");
     let previous_direct = std::env::var_os("KLAUS_ANTIGRAVITY_ALLOW_DIRECT");
-    unsafe {
-        std::env::set_var("KLAUS_ANTIGRAVITY_API_URL", &origin);
-        std::env::set_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", "1");
-    }
+    klaus_agent_core::runtime_process::set_process_environment_var(
+        "KLAUS_ANTIGRAVITY_API_URL",
+        &origin,
+    );
+    klaus_agent_core::runtime_process::set_process_environment_var(
+        "KLAUS_ANTIGRAVITY_ALLOW_DIRECT",
+        "1",
+    );
 
     let main = LoopbackProvider::start().await;
     let store: Arc<dyn klaus_agent_core::credential_store::CredentialStore> =
@@ -286,14 +290,22 @@ async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder
         .await
         .unwrap();
     server_task.abort();
-    unsafe {
-        match previous_api {
-            Some(value) => std::env::set_var("KLAUS_ANTIGRAVITY_API_URL", value),
-            None => std::env::remove_var("KLAUS_ANTIGRAVITY_API_URL"),
-        }
-        match previous_direct {
-            Some(value) => std::env::set_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", value),
-            None => std::env::remove_var("KLAUS_ANTIGRAVITY_ALLOW_DIRECT"),
-        }
+    match previous_api {
+        Some(value) => klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_ANTIGRAVITY_API_URL",
+            value,
+        ),
+        None => klaus_agent_core::runtime_process::remove_process_environment_var(
+            "KLAUS_ANTIGRAVITY_API_URL",
+        ),
+    }
+    match previous_direct {
+        Some(value) => klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_ANTIGRAVITY_ALLOW_DIRECT",
+            value,
+        ),
+        None => klaus_agent_core::runtime_process::remove_process_environment_var(
+            "KLAUS_ANTIGRAVITY_ALLOW_DIRECT",
+        ),
     }
 }

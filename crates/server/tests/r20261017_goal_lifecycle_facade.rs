@@ -2532,6 +2532,9 @@ async fn actual_goal_turn_provenance_survives_product_events_and_provider_free_h
         .filter(|message| {
             message["type"] == "user"
                 && message["isMeta"] == true
+                && !message["content"].as_array().is_some_and(|content| {
+                    content.len() == 1 && content[0]["phase"] == "deferred-tool-catalog"
+                })
                 && started.iter().any(|turn| {
                     history["result"]["historyTurnIds"][message["uuid"].as_str().unwrap()]
                         == turn["detail"]["turnId"]
@@ -2577,7 +2580,7 @@ async fn actual_goal_turn_provenance_survives_product_events_and_provider_free_h
 #[tokio::test]
 async fn named_goal_inheritance_from_an_ephemeral_side_task_is_rejected() {
     let _serial = GOAL_CONFIG_LOCK.lock().await;
-    let fixture = super::r20260908_live_side_task_fork::Fixture::new(false, None).await;
+    let fixture = super::r20260908_live_side_task_fork::Fixture::new_ephemeral().await;
     let before = fixture.source.history();
     let mut fixture = fixture;
     fixture.client.send(json!({"id":50,"method":"session/forkLive","params":{

@@ -580,7 +580,27 @@ async fn remote_resumed_json_reads_preserve_saved_goal_queue_and_history_units()
             .finish()
             .await,
     );
-    assert_eq!(field(&observed_history, "history"), history);
+    let persisted_history = RuntimeJson::Array(
+        history
+            .as_array()
+            .expect("seed history array")
+            .iter()
+            .filter(|message| {
+                !message
+                    .get("content")
+                    .and_then(RuntimeJson::as_array)
+                    .is_some_and(|content| {
+                        content.len() == 1
+                            && content[0]
+                                .get("phase")
+                                .and_then(RuntimeJson::as_string)
+                                .is_some_and(|phase| phase == "deferred-tool-catalog")
+                    })
+            })
+            .cloned()
+            .collect(),
+    );
+    assert_eq!(field(&observed_history, "history"), &persisted_history);
     assert_eq!(
         fixture.calls(),
         1,

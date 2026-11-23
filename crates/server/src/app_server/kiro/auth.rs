@@ -395,7 +395,7 @@ mod tests {
                 ("KLAUS_KIRO_LOCAL_HOME", home.into_os_string()),
             ] {
                 env.push((key, std::env::var_os(key)));
-                std::env::set_var(key, value);
+                klaus_agent_core::runtime_process::set_process_environment_var(key, value);
             }
             let previous_root = super::super::config_root();
             let store = root.path().join("klaus");
@@ -419,9 +419,9 @@ mod tests {
             super::super::set_config_root(&self.previous_root);
             for (key, value) in self.env.drain(..) {
                 if let Some(value) = value {
-                    std::env::set_var(key, value);
+                    klaus_agent_core::runtime_process::set_process_environment_var(key, value);
                 } else {
-                    std::env::remove_var(key);
+                    klaus_agent_core::runtime_process::remove_process_environment_var(key);
                 }
             }
         }

@@ -302,7 +302,7 @@ fn summary_requests(provider: &LoopbackProvider) -> Vec<Value> {
                 block["type"] == "text"
                     && block["text"]
                         .as_str()
-                        .is_some_and(|text| text.starts_with(instruction))
+                        .is_some_and(|text| text.contains(instruction))
             })
         })
     };
@@ -964,8 +964,8 @@ async fn global_model_tiers_hot_update_keeps_inflight_low_request_on_old_provide
     let next = LoopbackProvider::start().await;
     let mut fixture = Fixture::new(false, None).await;
     let mut init = main.init("main-model");
-    init["modelTierTargets"] =
-        json!({"low":tier_target(&old,"custom","old","old-key",12000,500,1.0)});
+    init["featureTargets"] =
+        json!({"title":tier_target(&old,"custom","old","old-key",12000,500,1.0)});
     assert_eq!(
         reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
         1
@@ -976,7 +976,10 @@ async fn global_model_tiers_hot_update_keeps_inflight_low_request_on_old_provide
     tokio::time::timeout(REPLY_TIMEOUT, old.entered.notified())
         .await
         .unwrap();
-    let changed = reconfigure(&mut fixture,21,json!({"modelTierTargets":{"low":tier_target(&next,"custom","next","next-key",16000,400,2.0)}}),Some(1)).await;
+    let mut next_init = main.init("main-model");
+    next_init["featureTargets"] =
+        json!({"title":tier_target(&next,"custom","next","next-key",16000,400,2.0)});
+    let changed = reconfigure(&mut fixture, 21, next_init, Some(1)).await;
     assert_eq!(changed["result"]["revision"], 2, "{changed}");
     assert!(next.requests.lock().unwrap().is_empty());
     old.hold.store(false, Ordering::SeqCst);

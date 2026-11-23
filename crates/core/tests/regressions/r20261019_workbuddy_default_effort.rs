@@ -362,9 +362,12 @@ async fn workbuddy_model_defaults_reach_both_modes_without_changing_explicit_or_
                 1,
                 "one complete trusted mode instruction: {body}"
             );
-            assert_eq!(
-                instructions[0]["content"], expected,
-                "the full mode template survives"
+            assert!(
+                instructions[0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&expected)),
+                "the full mode template survives: {}",
+                instructions[0]["content"]
             );
             assert_eq!(
                     body.get("reasoning_effort").and_then(Value::as_str),

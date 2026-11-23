@@ -2266,7 +2266,9 @@ async fn resolve_approval_request(
         // -- an action that would otherwise prompt is granted instead of
         // failing. Hard denials are decided by the permission engine before
         // this function runs, so they still block.
-        if context.sandbox_mode == Some(crate::types::permission::SandboxMode::DangerFullAccess) {
+        if automatic_eligible
+            && context.sandbox_mode == Some(crate::types::permission::SandboxMode::DangerFullAccess)
+        {
             return Ok(ApprovalResponse::Allow {
                 updated_input: None,
                 updated_permissions: None,

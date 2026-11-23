@@ -317,6 +317,15 @@ fn is_retained_skill_catalog(message: &Message) -> bool {
                     && text.text.starts_with("<skill-catalog:")))
 }
 
+fn is_deferred_tool_catalog(message: &Message) -> bool {
+    matches!(message, Message::User(user)
+        if user.is_meta == Some(true) && user.content.len() == 1
+            && matches!(&user.content[0],
+                klaus_agent_core::schemas::content::ContentBlock::Text(text)
+                if text.phase.as_ref().is_some_and(|phase| phase == "deferred-tool-catalog")
+                    || text.text.starts_with("<deferred-tool-catalog>")))
+}
+
 fn assert_retained_skill_catalog(history: &[Message]) {
     assert_eq!(
         history
@@ -332,7 +341,9 @@ fn user_turns(history: &[Message]) -> usize {
     history
         .iter()
         .filter(|message| {
-            matches!(message, Message::User(_)) && !is_retained_skill_catalog(message)
+            matches!(message, Message::User(_))
+                && !is_retained_skill_catalog(message)
+                && !is_deferred_tool_catalog(message)
         })
         .count()
 }

@@ -871,9 +871,12 @@ mod tests {
         // itself opens a real loopback listener, which this test does not want,
         // so the probe override keeps the eligibility part offline-free: with
         // no reachable probe the state is simply unclassified and absent.
-        std::env::set_var("BAILIAN_PROBE_URL", "http://127.0.0.1:9/v1/messages");
+        klaus_agent_core::runtime_process::set_process_environment_var(
+            "BAILIAN_PROBE_URL",
+            "http://127.0.0.1:9/v1/messages",
+        );
         let answer = usage().await.expect("usage answers");
-        std::env::remove_var("BAILIAN_PROBE_URL");
+        klaus_agent_core::runtime_process::remove_process_environment_var("BAILIAN_PROBE_URL");
         assert_eq!(answer["signedIn"], json!(true));
         assert_eq!(answer["quotaAvailable"], json!(false));
         // The engine's renewal throttle (AUTO_RENEW_GAP) allows the attempt, so

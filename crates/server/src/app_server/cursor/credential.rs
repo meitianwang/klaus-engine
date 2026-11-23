@@ -379,6 +379,7 @@ pub(super) fn check_generation(generation: u64) -> Result<(), String> {
 
 pub(super) fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .no_gzip()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(2)
@@ -389,6 +390,7 @@ pub(super) fn client() -> Result<reqwest::Client, String> {
 
 pub(super) fn inference_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .no_gzip()
         .redirect(reqwest::redirect::Policy::none())
         .http2_prior_knowledge()
         .connect_timeout(Duration::from_secs(15))
@@ -490,14 +492,25 @@ async fn unary_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
     super::diagnostics::event("body_decode_begin", json!({"wireBytes":wire_bytes}));
     let decoded = tokio::task::spawn_blocking(move || {
         use std::io::Read;
-        let decoder = flate2::read::MultiGzDecoder::new(bytes.as_slice());
+        let mut remaining = bytes.as_slice();
+        if remaining.is_empty() {
+            return Err("cursor_response_read_failed");
+        }
         let mut decoded = Vec::new();
-        decoder
-            .take((MAX_BODY + 1) as u64)
-            .read_to_end(&mut decoded)
-            .map_err(|_| "cursor_response_read_failed")?;
-        if decoded.len() > MAX_BODY {
-            return Err("cursor_response_too_large");
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            let decoder = flate2::bufread::GzDecoder::new(&mut remaining);
+            let limit = (MAX_BODY + 1).saturating_sub(decoded.len()) as u64;
+            decoder
+                .take(limit)
+                .read_to_end(&mut decoded)
+                .map_err(|_| "cursor_response_read_failed")?;
+            if decoded.len() > MAX_BODY {
+                return Err("cursor_response_too_large");
+            }
+            if remaining.len() == before {
+                return Err("cursor_response_read_failed");
+            }
         }
         Ok(decoded)
     })

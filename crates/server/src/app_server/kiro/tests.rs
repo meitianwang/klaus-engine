@@ -299,8 +299,11 @@ async fn direct_login_uses_pkce_callback_path_and_renews_only_its_independent_gr
     super::set_config_root(root.path());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_url = format!("http://{}", listener.local_addr().unwrap());
-    std::env::set_var("KLAUS_TEST", "1");
-    std::env::set_var("KLAUS_KIRO_AUTH_URL", &auth_url);
+    klaus_agent_core::runtime_process::set_process_environment_var("KLAUS_TEST", "1");
+    klaus_agent_core::runtime_process::set_process_environment_var(
+        "KLAUS_KIRO_AUTH_URL",
+        &auth_url,
+    );
     let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(2);
     let server = tokio::spawn(async move {
         for index in 0..2 {
@@ -370,8 +373,8 @@ async fn direct_login_uses_pkce_callback_path_and_renews_only_its_independent_gr
     super::login::cancel(27, &flow_id).await;
     assert_eq!(auth::status()["loggedIn"], true);
     server.await.unwrap();
-    std::env::remove_var("KLAUS_KIRO_AUTH_URL");
-    std::env::remove_var("KLAUS_TEST");
+    klaus_agent_core::runtime_process::remove_process_environment_var("KLAUS_KIRO_AUTH_URL");
+    klaus_agent_core::runtime_process::remove_process_environment_var("KLAUS_TEST");
 }
 
 #[test]

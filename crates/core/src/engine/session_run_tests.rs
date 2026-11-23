@@ -6069,7 +6069,8 @@ async fn a_tool_call_cut_off_mid_arguments_is_dropped_not_executed() {
         .collect();
     assert_eq!(results.len(), 1, "the one call answered once: {results:?}");
     assert!(
-        results[0].contains("dropped") && results[0].contains("arrived incomplete"),
+        results[0].contains("exceeded the output token limit")
+            && results[0].contains("that call did not run"),
         "the model is told why the call did not run: {results:?}"
     );
 }
@@ -13450,7 +13451,10 @@ async fn symlinked_default_project_memory_root_never_authorizes_external_sensiti
         None,
         None,
         None,
-        Some(vec![fork_user("symlinked-default-memory-input")]),
+        Some(vec![fork_user_text(
+            "symlinked-default-memory-input",
+            "please remember this durable preference",
+        )]),
         None,
     );
 
@@ -13631,7 +13635,10 @@ async fn extraction_completes_when_a_missing_index_probe_fails_mid_turn() {
         Some(host),
         None,
         None,
-        Some(vec![fork_user("probe-miss-extraction-input")]),
+        Some(vec![fork_user_text(
+            "probe-miss-extraction-input",
+            "please remember this durable preference",
+        )]),
         None,
     );
 
@@ -13897,7 +13904,10 @@ async fn failed_direct_memory_write_does_not_skip_the_extraction_retry() {
         output: None,
         extra_user_blocks: None,
     });
-    let recent = fork_user("retry-after-failed-direct-write");
+    let recent = fork_user_text(
+        "retry-after-failed-direct-write",
+        "please remember this durable preference",
+    );
     let mut first = vec![ev::message_start(None)];
     first.extend(exact_tool_use_events(
         "extraction-retry-write",
@@ -13984,7 +13994,7 @@ async fn arbitrary_host_memory_path_does_not_receive_internal_sensitive_bypass()
         question_answer: None,
         uuid: "host-memory-input".into(),
         content: vec![ContentBlock::Text(TextBlock {
-            text: "remember this".into(),
+            text: "please remember this preference".into(),
             citations: None,
             harness_envelope: None,
             message_id: None,
@@ -14077,7 +14087,10 @@ async fn custom_host_memory_fork_cannot_escape_through_missing_symlink_descendan
         Some(host),
         None,
         None,
-        Some(vec![fork_user("symlink-escape-input")]),
+        Some(vec![fork_user_text(
+            "symlink-escape-input",
+            "please remember this durable preference",
+        )]),
         None,
     );
 
@@ -14140,7 +14153,7 @@ async fn tool_reported_memory_failure_is_terminal_evented_and_keeps_cursor() {
         question_answer: None,
         uuid: "memory-tool-failure-input".into(),
         content: vec![ContentBlock::Text(TextBlock {
-            text: "remember this".into(),
+            text: "please remember this preference".into(),
             citations: None,
             harness_envelope: None,
             message_id: None,
@@ -14269,7 +14282,10 @@ async fn partial_memory_writes_are_reported_when_a_later_required_write_fails() 
         Some(host),
         None,
         None,
-        Some(vec![fork_user("partial-memory-input")]),
+        Some(vec![fork_user_text(
+            "partial-memory-input",
+            "please remember this durable preference",
+        )]),
         None,
     );
 
@@ -14333,7 +14349,10 @@ async fn provider_eof_without_message_stop_fails_memory_run_and_keeps_cursor() {
         Some(host),
         None,
         None,
-        Some(vec![fork_user("provider-eof-memory-input")]),
+        Some(vec![fork_user_text(
+            "provider-eof-memory-input",
+            "please remember this durable preference",
+        )]),
         None,
     );
 
@@ -15720,7 +15739,7 @@ fn fork_snapshot_call_cases() -> Vec<(&'static str, bool, SpawnSubAgentOptions, 
             "model does not block recent",
             true,
             SpawnSubAgentOptions {
-                model: Some("child-model".into()),
+                model: Some("low".into()),
                 fork_context: Some(ForkContext::Recent(NonZeroUsize::new(1).unwrap())),
                 ..Default::default()
             },
@@ -17420,10 +17439,35 @@ async fn goal_mode_off_runs_exactly_the_one_turn_the_host_asked_for() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Title generation is background maintenance: it runs on the session's LOW
-/// tier when the tier map has one, not on the main model.
+/// Title generation rides its own feature target; when no title target is
+/// configured it follows the session's main model even if a low tier is set.
 #[tokio::test]
 async fn title_generation_runs_on_the_low_tier_model() {
+    use super::{FeatureTargets, InferenceTarget, InferenceTargetState};
+    struct TitleTargetProvider {
+        base: crate::testing::FakeProvider,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+    impl crate::types::provider::ModelProvider for TitleTargetProvider {
+        fn info(&self) -> &crate::types::provider::ProviderInfo {
+            self.base.info()
+        }
+        fn capabilities(
+            &self,
+            model: &RuntimeString,
+        ) -> crate::types::provider::ProviderCapabilities {
+            self.base.capabilities(model)
+        }
+        fn stream(&self, req: ModelRequest, _signal: AbortSignal) -> ModelStream {
+            self.requests.lock().unwrap().push(req);
+            Box::pin(futures::stream::iter(text_turn(
+                r#"{"title":"A targeted title"}"#,
+            )))
+        }
+        fn estimate_tokens(&self, req: &ModelRequest) -> Option<u64> {
+            self.base.estimate_tokens(req)
+        }
+    }
     let requests: Arc<Mutex<Vec<ModelRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let mut config = default_config();
     config.model = "main-model".into();
@@ -17455,11 +17499,34 @@ async fn title_generation_runs_on_the_low_tier_model() {
     );
 
     let result = session.generate_title(None, None, false).await.unwrap();
-
     assert_eq!(result.title, Some(RuntimeString::from("A test title")));
+
+    session
+        .install_feature_targets(FeatureTargets {
+            title: Some(InferenceTargetState::Ready(InferenceTarget {
+                source: "custom".into(),
+                model_id: "title-entry".into(),
+                model: "title-model".into(),
+                provider: Arc::new(TitleTargetProvider {
+                    base: fake_provider(),
+                    requests: requests.clone(),
+                }),
+                pricing: Vec::new(),
+                review_requirements: None,
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+    let targeted = session.generate_title(None, None, false).await.unwrap();
+    assert_eq!(
+        targeted.title,
+        Some(RuntimeString::from("A targeted title"))
+    );
+
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].model, "low-model");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model, "main-model");
+    assert_eq!(requests[1].model, "title-model");
 }
 
 /// The memory-maintenance fork (extraction / consolidation / dream) is pure
@@ -17496,7 +17563,7 @@ async fn memory_extraction_fork_follows_the_main_model_when_no_memory_target_is_
             question_answer: None,
             uuid: "tier-fork-input".into(),
             content: vec![ContentBlock::Text(TextBlock {
-                text: "remember something".into(),
+                text: "please remember this preference".into(),
                 citations: None,
                 harness_envelope: None,
                 message_id: None,
@@ -17598,7 +17665,7 @@ async fn memory_extraction_fork_runs_on_the_configured_memory_feature_target() {
             question_answer: None,
             uuid: "feature-target-fork-input".into(),
             content: vec![ContentBlock::Text(TextBlock {
-                text: "remember something".into(),
+                text: "please remember this preference".into(),
                 citations: None,
                 harness_envelope: None,
                 message_id: None,
@@ -17683,7 +17750,18 @@ async fn spawn_sub_agent_resolves_tier_selections() {
     );
     let spawn = foreground_spawn(&session);
 
-    for selection in ["low", "high", "concrete-id"] {
+    for selection in ["low", "high", "concrete-id:0"] {
+        if selection == "concrete-id:0" {
+            session
+                .set_subagent_model_settings(
+                    Some(true),
+                    Some(vec![crate::schemas::config::SubagentModelOption {
+                        value: "concrete-id:0".into(),
+                        label: "Concrete".into(),
+                    }]),
+                )
+                .unwrap();
+        }
         let run = spawn(SpawnSubAgentOptions {
             prompt: "tier probe".into(),
             model: Some(selection.into()),
@@ -17701,7 +17779,7 @@ async fn spawn_sub_agent_resolves_tier_selections() {
         .iter()
         .map(|req| req.model.try_to_utf8().unwrap())
         .collect();
-    assert_eq!(models, vec!["low-model", "main-model", "concrete-id"]);
+    assert_eq!(models, vec!["low-model", "main-model", "concrete-id:0"]);
 }
 
 #[tokio::test]
@@ -17731,8 +17809,20 @@ async fn background_spawn_sub_agent_resolves_tier_selections() {
         None,
     );
 
-    for (selection, expected_output) in [("low", "one"), ("high", "two"), ("concrete-id", "three")]
+    for (selection, expected_output) in
+        [("low", "one"), ("high", "two"), ("concrete-id:0", "three")]
     {
+        if selection == "concrete-id:0" {
+            session
+                .set_subagent_model_settings(
+                    Some(true),
+                    Some(vec![crate::schemas::config::SubagentModelOption {
+                        value: "concrete-id:0".into(),
+                        label: "Concrete".into(),
+                    }]),
+                )
+                .unwrap();
+        }
         let spawned = spawn(SpawnSubAgentOptions {
             prompt: "tier probe".into(),
             model: Some(selection.into()),
@@ -17759,7 +17849,7 @@ async fn background_spawn_sub_agent_resolves_tier_selections() {
         .iter()
         .map(|req| req.model.try_to_utf8().unwrap())
         .collect();
-    assert_eq!(models, vec!["low-model", "main-model", "concrete-id"]);
+    assert_eq!(models, vec!["low-model", "main-model", "concrete-id:0"]);
 }
 
 #[tokio::test]

@@ -1909,11 +1909,21 @@ mod tests {
                         && text.text.starts_with("<skill-catalog:")))
     }
 
+    fn is_deferred_tool_catalog(message: &Message) -> bool {
+        matches!(message, Message::User(user)
+            if user.is_meta == Some(true)
+                && matches!(user.content.as_slice(), [ContentBlock::Text(text)]
+                    if text.phase.as_ref().is_some_and(|phase| phase == "deferred-tool-catalog")
+                        || text.text.starts_with("<deferred-tool-catalog>")))
+    }
+
     fn user_turns(history: &[Message]) -> usize {
         history
             .iter()
             .filter(|message| {
-                matches!(message, Message::User(_)) && !is_retained_skill_catalog(message)
+                matches!(message, Message::User(_))
+                    && !is_retained_skill_catalog(message)
+                    && !is_deferred_tool_catalog(message)
             })
             .count()
     }
@@ -1929,7 +1939,9 @@ mod tests {
         );
         let users = history
             .iter()
-            .filter(|message| !is_retained_skill_catalog(message))
+            .filter(|message| {
+                !is_retained_skill_catalog(message) && !is_deferred_tool_catalog(message)
+            })
             .filter_map(|message| match message {
                 Message::User(user) => Some(user),
                 _ => None,
@@ -3308,9 +3320,13 @@ mod tests {
             .is_err());
         thread.dispose().await;
         let resumed = engine.resume_thread(&id).await.unwrap();
+        let persisted_before: Vec<_> = before
+            .into_iter()
+            .filter(|message| !is_deferred_tool_catalog(message))
+            .collect();
         assert_eq!(
             resumed.history(),
-            before,
+            persisted_before,
             "neither side input nor response was persisted"
         );
         resumed.dispose().await;

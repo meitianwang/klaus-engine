@@ -27,11 +27,11 @@ const EXACT_RUNTIME_LOCK_BYTES: &[u8] = include_bytes!(
 // and this audited admission boundary together.
 const PROVIDER_RUNTIME_LOCK_SIZE: usize = 12_275;
 const PROVIDER_RUNTIME_LOCK_SHA256: &str =
-    "f507a8c26487e3877d9d5e5898a592df75d979168474a1e69346f4e20d6759ac";
+    "a0171c0849210d69ab66d5fde6cfac31dfa94f869be4dbb4ea883521d542be35";
 const PROVIDER_RUNTIME_CANDIDATE_SHA256: &str =
-    "65997edc8a5d63348549d285a34c436c150dc218b21a568598ab5a24348782b7";
+    "074d04a0ac70c91c14594b2908674a273d3d7953cba48109cafbd4fc0f415cbe";
 const PROVIDER_RUNTIME_PUBLISHED_SHA256: &str =
-    "3586fd818dbc71d0ccd67924fe7fe8f299e4f5f595e133c9711d60c75e723438";
+    "ad75299d1206d6cf1f401f900029fa651dbd6d82e5ce9b63b1fb879f792d58ae";
 
 const WINLDD_KIND: &str = "winldd";
 const WINLDD_TARGET: &str = "win-x64";

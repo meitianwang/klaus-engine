@@ -1124,7 +1124,7 @@ fn presentation_failed_compatibility_batch_keeps_its_progress_and_original_paylo
     let mut db = TurnIndexDb::open(db_path.to_str().unwrap()).unwrap();
     db.window("t", &path, len, 1, None, 100, true, "full")
         .unwrap();
-    db.conn.execute_batch("DROP TABLE history_user_presentations; DROP TABLE history_presentation_backfill; PRAGMA user_version=4;").unwrap();
+    db.conn.execute_batch("DELETE FROM page_turns_v2 WHERE id LIKE '%-preamble'; DROP TABLE history_user_presentations; DROP TABLE history_presentation_backfill; PRAGMA user_version=4;").unwrap();
     db.conn
         .execute(
             "UPDATE history_item_chunks SET payload=x'7b' WHERE item_id='message:display-one'",

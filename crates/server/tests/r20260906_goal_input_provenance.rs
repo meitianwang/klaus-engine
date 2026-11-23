@@ -18,6 +18,19 @@ fn is_retained_skill_catalog(message: &Value) -> bool {
         })
 }
 
+fn is_deferred_tool_catalog(message: &Value) -> bool {
+    message["type"] == "user"
+        && message["isMeta"] == true
+        && message["content"].as_array().is_some_and(|content| {
+            content.len() == 1
+                && content[0]["type"] == "text"
+                && (content[0]["phase"] == "deferred-tool-catalog"
+                    || content[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("<deferred-tool-catalog>")))
+        })
+}
+
 #[tokio::test]
 async fn turn_start_preserves_meta_input_and_first_goal_display_metadata() {
     let agent = make_agent_for_tests(
@@ -93,7 +106,11 @@ async fn turn_start_preserves_meta_input_and_first_goal_display_metadata() {
     );
     let users: Vec<&Value> = messages
         .iter()
-        .filter(|message| message["type"] == "user" && !is_retained_skill_catalog(message))
+        .filter(|message| {
+            message["type"] == "user"
+                && !is_retained_skill_catalog(message)
+                && !is_deferred_tool_catalog(message)
+        })
         .collect();
     assert_eq!(users.len(), 3);
     assert_eq!(

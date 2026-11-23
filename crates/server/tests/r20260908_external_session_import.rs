@@ -24,6 +24,19 @@ fn is_retained_skill_catalog(message: &Value) -> bool {
         })
 }
 
+fn is_deferred_tool_catalog(message: &Value) -> bool {
+    message["type"] == "user"
+        && message["isMeta"] == true
+        && message["content"].as_array().is_some_and(|content| {
+            content.len() == 1
+                && content[0]["type"] == "text"
+                && (content[0]["phase"] == "deferred-tool-catalog"
+                    || content[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("<deferred-tool-catalog>")))
+        })
+}
+
 const METHOD: &str = "engine/importExternalSession";
 const THREAD: &str = "614cc8f1-8c61-5f4f-8ef8-8199ba8b267a";
 
@@ -95,7 +108,9 @@ fn visible_text(read: &Value) -> Vec<String> {
                 .unwrap()
                 .iter()
                 .filter(|item| {
-                    !(item["type"] == "klausMessage" && is_retained_skill_catalog(&item["message"]))
+                    !(item["type"] == "klausMessage"
+                        && (is_retained_skill_catalog(&item["message"])
+                            || is_deferred_tool_catalog(&item["message"])))
                 })
                 .map(|item| {
                     item["text"]

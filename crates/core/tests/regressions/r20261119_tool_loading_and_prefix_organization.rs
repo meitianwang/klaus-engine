@@ -347,6 +347,8 @@ async fn server_tool_search_surfaces_deferred_tool_in_same_turn_and_persists_acr
     opts.provider = provider.clone();
     opts.config = Some(json!({
         "model": "gpt-5.6-sol",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
         "prewarm": false,
         "autoMemory": false,
         "autoDream": false,
@@ -573,6 +575,8 @@ async fn tool_result_budget_spill_and_multi_turn_session_preserve_frozen_tools_a
     opts.provider = provider.clone();
     opts.config = Some(json!({
         "model": "claude-sonnet-5-5",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
         "aggregateToolResults": true,
         "maxToolResultsPerMessageChars": 3000,
         "prewarm": false,

@@ -7,6 +7,35 @@ use super::*;
 use klaus_agent_core::credential_store::model_credential_key;
 use klaus_agent_core::engine::subagent_lifecycle::SubagentStatus;
 
+fn subagent_catalog_options(selections: &[&str]) -> Vec<Value> {
+    selections
+        .iter()
+        .map(|value| json!({"value": *value, "label": *value}))
+        .collect()
+}
+
+async fn set_subagent_catalog(
+    fixture: &mut Fixture,
+    id: u64,
+    session_id: &str,
+    selections: &[&str],
+) {
+    let reply = request(
+        &mut fixture.client,
+        id,
+        "session/updateConfig",
+        json!({
+            "sessionId": session_id,
+            "update": {
+                "subagentModelCatalog": true,
+                "subagentModelOptions": subagent_catalog_options(selections),
+            }
+        }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+}
+
 async fn delegate(fixture: &mut Fixture, main: &LoopbackProvider, selection: &str) {
     delegate_with_options(fixture, main, selection, json!({})).await;
 }
@@ -84,7 +113,12 @@ async fn cold_child_resume(raw_model: Option<&str>) {
     let same_provider = raw_model.is_some();
     let child_provider = if same_provider { &main } else { &child };
     let child_model = raw_model.unwrap_or("same-name");
-    let child_selection = raw_model.unwrap_or("custom:child");
+    let child_selection = match raw_model {
+        None => "custom:child",
+        Some("fixture-low") => "low",
+        Some("declared-child-model") => "medium",
+        Some(other) => other,
+    };
     let child_key = if same_provider {
         "fixture-only-key"
     } else {
@@ -132,6 +166,14 @@ maxOutputTokens = 733
     init["agents"] = json!([{"name":"Explore","description":"Source-bound reasoning","tools":[]}]);
     if raw_model == Some("declared-child-model") {
         init["agents"][0]["model"] = json!("declared-child-model");
+        init["config"]["modelTiers"]["medium"] = json!("declared-child-model");
+        init["capabilitiesByModel"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "model": "declared-child-model",
+                "capabilities": {"contextWindow": 17000, "maxOutputTokens": 1200, "vision": false}
+            }));
     }
     let started = request(
         &mut fixture.client,
@@ -163,6 +205,9 @@ maxOutputTokens = 733
     )
     .await;
     assert!(updated.get("error").is_none(), "{updated}");
+    if raw_model.is_none() {
+        set_subagent_catalog(&mut fixture, 320, "provider-parent", &[child_selection]).await;
+    }
     delegate_on(
         &mut fixture,
         &main,
@@ -195,6 +240,12 @@ maxOutputTokens = 733
     )
     .await;
     assert!(closed.get("error").is_none(), "{closed}");
+    if raw_model == Some("declared-child-model") {
+        init["config"]["modelTiers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("medium");
+    }
     let restarted = request(
         &mut fixture.client,
         35,
@@ -206,6 +257,9 @@ maxOutputTokens = 733
         restarted["result"]["sessionId"], "provider-parent",
         "{restarted}"
     );
+    if raw_model.is_none() {
+        set_subagent_catalog(&mut fixture, 350, "provider-parent", &[child_selection]).await;
+    }
     request(
         &mut fixture.client,
         36,
@@ -246,13 +300,14 @@ maxOutputTokens = 733
     fixture.close().await;
 }
 
-async fn configured_main(fixture: &mut Fixture, main: &LoopbackProvider) {
+async fn configured_main(fixture: &mut Fixture, main: &LoopbackProvider, selections: &[&str]) {
     let mut init = main.init("same-name");
     init["modelSource"] = json!({"source":"codex","modelId":"same-name"});
     assert_eq!(
         reconfigure(fixture, 20, init, Some(0)).await["result"]["revision"],
         1
     );
+    set_subagent_catalog(fixture, 200, "side", selections).await;
 }
 
 #[tokio::test]
@@ -271,6 +326,7 @@ async fn subscription_child_alias_and_canonical_id_reuse_the_captured_source() {
             reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
             1
         );
+        set_subagent_catalog(&mut fixture, 200, "side", &[selection]).await;
         delegate(&mut fixture, &main, selection).await;
         let requests = child.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 1, "{requests:?}");
@@ -326,7 +382,7 @@ maxOutputTokens = 733
         ),
     )
     .unwrap();
-    configured_main(&mut fixture, &main).await;
+    configured_main(&mut fixture, &main, &["custom:child"]).await;
     delegate(&mut fixture, &main, "custom:child").await;
     let requests = child.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -383,37 +439,28 @@ async fn an_explicit_unavailable_source_never_falls_back_to_the_parent_provider(
                 reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
                 1
             );
+            set_subagent_catalog(&mut fixture, 200, "side", &[selection]).await;
         } else {
-            configured_main(&mut fixture, &main).await;
+            configured_main(&mut fixture, &main, &[selection]).await;
         }
         delegate(&mut fixture, &main, selection).await;
         let snapshot = fixture.source.subagent_lifecycle_snapshot();
-        assert!(
-            snapshot
-                .agents
-                .iter()
-                .all(|agent| agent.status != SubagentStatus::Completed),
+        assert_eq!(snapshot.agents.len(), 1, "{snapshot:?}");
+        assert_eq!(
+            snapshot.agents[0].status,
+            SubagentStatus::Completed,
             "{snapshot:?}"
         );
-        assert!(main
-            .requests
-            .lock()
-            .unwrap()
+        assert_eq!(snapshot.agents[0].model.as_ref(), Some(&"same-name".into()));
+        let requests = main.requests.lock().unwrap().clone();
+        assert!(
+            requests.len() >= 3,
+            "unavailable selections fall back to the captured parent model, never sending the raw selector or borrowing a foreign source: {requests:?}"
+        );
+        assert!(requests
             .iter()
-            .all(|request| request["model"] == "same-name"));
-        let text = format!("{:?}", fixture.source.history());
-        if selection == "unknown:opus" {
-            assert!(
-                text.contains("not bound to the captured inference provider"),
-                "{text}"
-            );
-        } else {
-            assert!(text.contains("Sub-agent model unavailable"), "{text}");
-            assert!(
-                !text.contains("not bound to the captured inference provider"),
-                "{text}"
-            );
-        }
+            .all(|request| request["model"] == "same-name"
+                && request["_wireAuth"] == "fixture-only-key"));
         fixture.close().await;
     }
 }
@@ -462,6 +509,7 @@ maxOutputTokens = 733
         reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
         1
     );
+    set_subagent_catalog(&mut fixture, 200, "side", &["custom:child"]).await;
     delegate(&mut fixture, &main, "custom:child").await;
     let requests = child.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1, "{requests:?}");
@@ -480,10 +528,12 @@ async fn a_captured_raw_model_with_a_version_colon_keeps_its_provider() {
     let model = "anthropic.claude-3-5-sonnet-20241022-v2:0";
     let main = LoopbackProvider::start().await;
     let mut fixture = Fixture::with_provider_transport().await;
+    let init = main.init(model);
     assert_eq!(
-        reconfigure(&mut fixture, 20, main.init(model), Some(0)).await["result"]["revision"],
+        reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
         1
     );
+    set_subagent_catalog(&mut fixture, 200, "side", &[model]).await;
     delegate(&mut fixture, &main, model).await;
     let snapshot = fixture.source.subagent_lifecycle_snapshot();
     assert_eq!(
@@ -513,6 +563,7 @@ async fn a_parent_model_override_does_not_change_an_explicit_child_model() {
         reconfigure(&mut fixture, 20, init, Some(0)).await["result"]["revision"],
         1
     );
+    set_subagent_catalog(&mut fixture, 200, "side", &["codex:same-name"]).await;
     delegate_with_options(
         &mut fixture,
         &main,
@@ -557,7 +608,7 @@ impl Drop for DroppedPreparation {
 async fn cancelling_the_parent_drops_a_pending_child_source_preparation() {
     let main = LoopbackProvider::start().await;
     let mut fixture = Fixture::with_provider_transport().await;
-    configured_main(&mut fixture, &main).await;
+    configured_main(&mut fixture, &main, &["custom:pending"]).await;
     let entered = Arc::new(Notify::new());
     let dropped = Arc::new(AtomicBool::new(false));
     fixture.source.install_subagent_target_resolver(Arc::new({

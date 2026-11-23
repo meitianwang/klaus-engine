@@ -505,13 +505,23 @@ mod tests {
                 });
             }
         });
-        std::env::set_var("KLAUS_TRAE_DEVICE_URL", &origin);
-        std::env::set_var("KLAUS_TRAE_ACCOUNT_URL", &origin);
+        klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_TRAE_DEVICE_URL",
+            &origin,
+        );
+        klaus_agent_core::runtime_process::set_process_environment_var(
+            "KLAUS_TRAE_ACCOUNT_URL",
+            &origin,
+        );
         struct Environment;
         impl Drop for Environment {
             fn drop(&mut self) {
-                std::env::remove_var("KLAUS_TRAE_DEVICE_URL");
-                std::env::remove_var("KLAUS_TRAE_ACCOUNT_URL");
+                klaus_agent_core::runtime_process::remove_process_environment_var(
+                    "KLAUS_TRAE_DEVICE_URL",
+                );
+                klaus_agent_core::runtime_process::remove_process_environment_var(
+                    "KLAUS_TRAE_ACCOUNT_URL",
+                );
             }
         }
         let _environment = Environment;

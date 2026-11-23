@@ -273,6 +273,7 @@ impl ProtocolShutdownFailures {
 
     fn extend_core(&mut self, outcome: SessionShutdownOutcome) {
         self.timed_out |= outcome.timed_out;
+        self.undrained |= outcome.undrained;
         self.errors.extend(outcome.errors);
     }
 

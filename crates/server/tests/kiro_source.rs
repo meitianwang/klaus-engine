@@ -149,7 +149,7 @@ impl Environment {
             ("KLAUS_KIRO_RUNTIME_URL", url),
         ] {
             vars.push((key, std::env::var_os(key)));
-            std::env::set_var(key, value);
+            klaus_agent_core::runtime_process::set_process_environment_var(key, value);
         }
         Self(vars)
     }
@@ -158,9 +158,9 @@ impl Drop for Environment {
     fn drop(&mut self) {
         for (key, value) in self.0.drain(..) {
             if let Some(value) = value {
-                std::env::set_var(key, value);
+                klaus_agent_core::runtime_process::set_process_environment_var(key, value);
             } else {
-                std::env::remove_var(key);
+                klaus_agent_core::runtime_process::remove_process_environment_var(key);
             }
         }
     }

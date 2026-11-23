@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::sync::{watch, Notify};
@@ -72,6 +72,7 @@ pub(crate) struct SessionRollout {
     state: Arc<Mutex<State>>,
     fence: OnceLock<WriteFence>,
     close_fence: OnceLock<WriteFence>,
+    shutdown_panicked: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionRollout {
@@ -97,6 +98,7 @@ impl SessionRollout {
             })),
             fence: OnceLock::new(),
             close_fence: OnceLock::new(),
+            shutdown_panicked: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -373,6 +375,9 @@ impl LiveRollout for SessionRollout {
         self.fence().await?;
         self.raw.flush().await
     }
+    fn shutdown_panicked(&self) -> bool {
+        self.shutdown_panicked.load(Ordering::SeqCst)
+    }
     async fn shutdown(&self) -> io::Result<()> {
         let (receive, owner) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -388,6 +393,7 @@ impl LiveRollout for SessionRollout {
                 let raw = self.raw.clone();
                 let fence = self.fence.get().cloned();
                 let close_fence = self.close_fence.get().cloned();
+                let shutdown_panicked = self.shutdown_panicked.clone();
                 let completion = PrefixCompletion {
                     send,
                     state: self.state.clone(),
@@ -417,7 +423,10 @@ impl LiveRollout for SessionRollout {
                     })
                     .catch_unwind()
                     .await
-                    .unwrap_or_else(|_| Err(io::Error::other("session rollout shutdown panicked")));
+                    .unwrap_or_else(|_| {
+                        shutdown_panicked.store(true, Ordering::SeqCst);
+                        Err(io::Error::other("session rollout shutdown panicked"))
+                    });
                     completion.complete(result);
                 };
                 (

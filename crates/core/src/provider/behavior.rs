@@ -3533,7 +3533,7 @@ mod tests {
                             },
                             "model": {
                                 "type": "string",
-                                "description": "Required for every new child task. Select low for simple mechanical work, medium for standard implementation or investigation, and high for complex reasoning; alternatively supply a concrete model ID, qualified as source:modelId when selecting another source. Choose by task complexity without asking the user to choose a tier. This explicit selection takes precedence over role and configured child defaults. Do not omit it or use \"inherit\". Only an invalid or unavailable selection falls back to the captured parent model. Existing children keep their original model; use followup_task where available, or the message tool's explicit turn trigger."
+                                "description": "old model description"
                             },
                             "fork_turns": {
                                 "type": "string",

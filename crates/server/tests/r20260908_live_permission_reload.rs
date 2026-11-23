@@ -371,7 +371,7 @@ async fn live_permission_reload_is_lazy_and_rejects_unknown_closed_or_host_suppl
 
 #[tokio::test]
 async fn live_permission_reload_keeps_ephemeral_side_task_prefix_binding_and_role() {
-    let mut fixture = super::r20260908_live_side_task_fork::Fixture::new(false, None).await;
+    let mut fixture = super::r20260908_live_side_task_fork::Fixture::new_ephemeral().await;
     let source = fixture.source.clone();
     let full = source.history();
     let visible = source.visible_history();

@@ -327,11 +327,12 @@ pub(crate) type ShutdownPhaseResult = Result<(), ShutdownPhaseFailure>;
 pub struct SessionShutdownOutcome {
     pub errors: Vec<String>,
     pub timed_out: bool,
+    pub undrained: bool,
 }
 
 impl SessionShutdownOutcome {
     pub fn ok(&self) -> bool {
-        self.errors.is_empty()
+        self.errors.is_empty() && !self.timed_out && !self.undrained
     }
 
     pub fn error_message(&self) -> Option<String> {
@@ -344,6 +345,11 @@ impl SessionShutdownOutcome {
     }
 
     pub(crate) fn push_error(&mut self, error: impl Into<String>) {
+        self.errors.push(error.into());
+    }
+
+    pub(crate) fn push_undrained(&mut self, error: impl Into<String>) {
+        self.undrained = true;
         self.errors.push(error.into());
     }
 

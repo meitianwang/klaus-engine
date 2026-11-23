@@ -632,6 +632,14 @@ const COVERAGE: &[(&str, Reach)] = &[
         "BailianMediaCredential",
         Reach::Withheld("the CLI has no media route; the desktop host runs the plan's speech API and is the only caller"),
     ),
+    (
+        "BailianTranscribeAudio",
+        Reach::Withheld("audio capture belongs to the desktop; the CLI submits text"),
+    ),
+    (
+        "BailianCancelTranscription",
+        Reach::Withheld("the CLI owns no subscription audio capture operation"),
+    ),
     // ---- The MiniMax M Plan subscription --------------------------------------
     // M Plan likewise has no login flow to reach: the plan takes a console
     // subscription key and offers no OAuth or device flow to third-party clients.

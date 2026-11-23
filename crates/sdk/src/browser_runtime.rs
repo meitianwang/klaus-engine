@@ -3594,7 +3594,8 @@ mod tests {
     }
 
     fn bundled_browser_asset_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/klaus-bundled/browser")
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/klaus-bundled/browser");
+        std::fs::canonicalize(&root).unwrap_or(root)
     }
 
     #[test]

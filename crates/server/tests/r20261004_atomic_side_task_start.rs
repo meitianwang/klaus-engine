@@ -34,6 +34,15 @@ fn is_retained_skill_catalog(message: &Message) -> bool {
                     && text.text.starts_with("<skill-catalog:")))
 }
 
+fn is_deferred_tool_catalog(message: &Message) -> bool {
+    matches!(message, Message::User(user)
+        if user.is_meta == Some(true) && user.content.len() == 1
+            && matches!(&user.content[0],
+                klaus_agent_core::schemas::content::ContentBlock::Text(text)
+                if text.phase.as_ref().is_some_and(|phase| phase == "deferred-tool-catalog")
+                    || text.text.starts_with("<deferred-tool-catalog>")))
+}
+
 fn assert_visible_side_turn(session: &Session, input: &str) {
     let history = session.visible_history();
     assert_eq!(
@@ -46,7 +55,7 @@ fn assert_visible_side_turn(session: &Session, input: &str) {
     );
     let conversation = history
         .iter()
-        .filter(|message| !is_retained_skill_catalog(message))
+        .filter(|message| !is_retained_skill_catalog(message) && !is_deferred_tool_catalog(message))
         .collect::<Vec<_>>();
     assert_eq!(
         conversation.len(),
@@ -476,7 +485,7 @@ async fn cold_and_unmaterialized_parents_use_persisted_context_without_parent_st
         assert!(!fixture.sessions.lock().unwrap().contains_key("parent"));
         run_turn(&mut fixture.client, 11, "side", "cold side request").await;
         assert_eq!(std::fs::read_to_string(&parent_path).unwrap(), before);
-        let rollouts: Vec<_> = std::fs::read_dir(parent_path.parent().unwrap())
+        let mut rollouts: Vec<_> = std::fs::read_dir(parent_path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -484,7 +493,15 @@ async fn cold_and_unmaterialized_parents_use_persisted_context_without_parent_st
                     .is_some_and(|extension| extension == "jsonl")
             })
             .collect();
-        assert_eq!(rollouts, vec![parent_path.clone()]);
+        rollouts.sort();
+        assert_eq!(rollouts.len(), 2, "{rollouts:?}");
+        assert!(rollouts.contains(&parent_path), "{rollouts:?}");
+        assert!(
+            rollouts
+                .iter()
+                .any(|path| path.to_string_lossy().ends_with("-side.jsonl")),
+            "{rollouts:?}"
+        );
         fixture.client.close().await;
     }
 }

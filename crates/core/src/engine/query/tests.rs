@@ -6974,18 +6974,21 @@ async fn default_parser_runs_once_and_does_not_reparse_hook_rewrite() {
     let initial = runtime_json!({
         "description": "delegate once",
         "prompt": "initial prompt",
+        "model": "low",
         "fork_turns":"9007199254740993",
         "extra": "strip-before-hook"
     });
     let hook_rewrite = runtime_json!({
         "description": "delegate once",
         "prompt": "hook prompt",
+        "model": "low",
         "fork_turns": "all",
         "run_in_background": "false"
     });
     let approval_rewrite = runtime_json!({
         "description": "delegate once",
         "prompt": "approval prompt",
+        "model": "low",
         "fork_turns": "all",
         "run_in_background": "false"
     });
@@ -7097,6 +7100,7 @@ async fn default_parser_runs_once_and_does_not_reparse_hook_rewrite() {
         Some(runtime_json!({
             "description": "delegate once",
             "prompt": "initial prompt",
+            "model": "low",
             "fork_turns":"9007199254740993"
         }))
     );
@@ -7121,11 +7125,13 @@ async fn trusted_task_agent_type_to_primitive_failure_uses_failure_hook_only() {
     let initial = runtime_json!({
         "description": "delegate",
         "prompt": "initial",
+        "model": "low",
         "agentType": "reviewer"
     });
     let rewritten = runtime_json!({
         "description": "delegate",
         "prompt": "trusted rewrite",
+        "model": "low",
         "agentType": { "toString": null }
     });
     let mut first = vec![ev::message_start(None)];
@@ -7472,6 +7478,7 @@ async fn invalid_openai_fork_turns_fails_before_hooks_and_permission() {
     let visible = runtime_json!({
         "task_name": "unsafe context",
         "message": "must fail before policy",
+        "model": "low",
         "fork_turns": "0"
     });
     let mut first = vec![ev::message_start(Some("gpt-5"))];
@@ -12693,9 +12700,14 @@ async fn request_view_budget_persists_an_over_budget_historical_result() {
         sent_text.len() < 10_000,
         "the replacement is a preview, not the body"
     );
+    assert_eq!(
+        records[0].1.try_to_utf8().unwrap(),
+        sent_text,
+        "the record keeps the exact preview the model saw"
+    );
     assert!(
-        records[0].1.starts_with(&body[..100]),
-        "the record keeps the exact body the model saw"
+        records[0].1.contains(&body[..100]),
+        "the persisted preview retains the leading prefix of the body"
     );
 }
 

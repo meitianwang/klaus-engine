@@ -208,6 +208,11 @@ impl Catalog {
                 for property in properties.values_mut().filter_map(Value::as_object_mut) {
                     property.remove("description");
                 }
+                if let Some(allow_large) = properties.remove("allow_large") {
+                    if allow_large != json!({"type":"boolean"}) {
+                        return Err("cursor_read_intent_schema_unsupported".into());
+                    }
+                }
             }
         }
         let expected = json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","exclusiveMinimum":0,"maximum":9007199254740991_i64},"limit":{"type":"integer","exclusiveMinimum":0,"maximum":9007199254740991_i64},"pages":{"type":"string"}},"required":["path"],"additionalProperties":false});

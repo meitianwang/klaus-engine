@@ -335,9 +335,12 @@ async fn workbuddy_full_modes_use_system_without_changing_another_chat_provider(
                     1,
                     "one complete trusted mode instruction: {body}"
                 );
-                assert_eq!(
-                    instructions[0]["content"], expected,
-                    "the full mode template survives"
+                assert!(
+                    instructions[0]["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&expected)),
+                    "the full mode template survives: {}",
+                    instructions[0]["content"]
                 );
                 assert_eq!(
                     instructions[0]["role"], expected_role,

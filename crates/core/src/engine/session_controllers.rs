@@ -3384,6 +3384,7 @@ impl Session {
                     .unwrap_or_else(|_| SessionShutdownOutcome {
                         errors: vec!["session shutdown task panicked".to_string()],
                         timed_out: false,
+                        undrained: true,
                     });
                 let _ = send.send(Some(result));
             });
@@ -3409,6 +3410,7 @@ impl Session {
                 return SessionShutdownOutcome {
                     errors: vec!["session shutdown task ended without a completion".to_string()],
                     timed_out: false,
+                    undrained: true,
                 };
             }
         }
@@ -3709,10 +3711,10 @@ impl Session {
             Ok((pause, flush)) => {
                 for (phase, result) in [("pause", pause), ("accounting flush", flush)] {
                     if let Err(error) = result {
-                        outcome.push_failure(ShutdownPhaseFailure::error(format!(
+                        outcome.push_undrained(format!(
                             "goal shutdown {phase} failed: {}",
                             runtime_error_message_to_public_host(&error)
-                        )));
+                        ));
                     }
                 }
             }
@@ -4274,10 +4276,17 @@ impl Session {
                     .await
                     {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => outcome.push_error(format!(
-                            "abandoned resumed Session rollout shutdown failed: {}",
-                            runtime_error_message_to_public_host(&error)
-                        )),
+                        Ok(Err(error)) => {
+                            let message = format!(
+                                "abandoned resumed Session rollout shutdown failed: {}",
+                                runtime_error_message_to_public_host(&error)
+                            );
+                            if r.shutdown_panicked() {
+                                outcome.push_undrained(message);
+                            } else {
+                                outcome.push_error(message);
+                            }
+                        }
                         Err(_) => outcome.push_timeout(
                             "abandoned resumed Session rollout shutdown timed out after producer fencing",
                         ),
@@ -4294,7 +4303,12 @@ impl Session {
                     match tokio::time::timeout_at(persistence_deadline, r.shutdown()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            outcome.push_error(format!("rollout shutdown failed: {error}"))
+                            let message = format!("rollout shutdown failed: {error}");
+                            if r.shutdown_panicked() {
+                                outcome.push_undrained(message);
+                            } else {
+                                outcome.push_error(message);
+                            }
                         }
                         Err(_) => outcome.push_timeout(
                             "rollout shutdown timed out during the persistence phase",
