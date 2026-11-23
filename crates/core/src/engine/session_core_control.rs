@@ -151,6 +151,8 @@ use tokio_util::sync::CancellationToken;
 
 // Rewind, checkpoints, steering, and turn-control surfaces.
 pub(crate) const PREDICTION_SOURCE_ROLLOUT_EVENT: &str = "prediction_source";
+/// Output ceiling for a lean composer suggestion request.
+const PREDICTION_MAX_OUTPUT_TOKENS: u64 = 512;
 
 impl Session {
     /// Current authoritative background-process state for this Session.
@@ -4655,6 +4657,29 @@ impl Session {
         } else {
             self.inject_proposed_plan_into_history(&mut messages, &model)
         };
+        // This source exposes no explicit cache retention: once the implicit prefix
+        // cache has expired, a suggestion would re-send the whole conversation
+        // at full price for a single short line, so a cold, long session skips
+        // the request entirely. Warm sessions still reuse the main prefix.
+        const ANTIGRAVITY_COLD_PREDICTION_MIN_HISTORY_TOKENS: u64 = 8_000;
+        if bundle.config.is_antigravity_source()
+            && self.effective_session_cache_ttl(&bundle.config).is_none()
+            && crate::context::tokens::estimate_messages_tokens(&messages)
+                >= ANTIGRAVITY_COLD_PREDICTION_MIN_HISTORY_TOKENS
+        {
+            let now_ms = (self.deps.now)();
+            let cache_warm = self.turn.last_response_at_ms().is_some_and(|last| {
+                now_ms.saturating_sub(last)
+                    <= crate::types::provider::ANTIGRAVITY_IMPLICIT_CACHE_COLD_AFTER_MS
+            });
+            if !cache_warm {
+                return Ok(ReadonlyQueryOutcome {
+                    final_text: r#"{"suggestion":null}"#.into(),
+                    usage: None,
+                    stop_reason: TerminalReason::Completed,
+                });
+            }
+        }
         let user_uuid = (self.deps.uuid)();
         messages.push(Message::User(UserMessage {
             question_answer: None,
@@ -4665,6 +4690,19 @@ impl Session {
 
         let mut config = bundle.config_for_model(&model);
         config.max_retries = 0;
+        // A suggestion is one short line. On Antigravity Gemini the generation
+        // settings are outside the implicit cache key, so the request can drop
+        // reasoning and cap output without losing the warm main prefix.
+        let lean_gemini_prediction =
+            bundle.config.is_antigravity_source() && bundle.provider.info().name == "gemini";
+        if lean_gemini_prediction {
+            config.max_output_tokens = Some(
+                config
+                    .max_output_tokens
+                    .unwrap_or(PREDICTION_MAX_OUTPUT_TOKENS)
+                    .min(PREDICTION_MAX_OUTPUT_TOKENS),
+            );
+        }
         let approvals_reviewer = step_policy.approvals_reviewer;
         let task_plan = crate::tasks::task_store::TaskPlanBinding::capture(&self.task_list_id());
         let tool_context_base: ToolContextFactory = {
@@ -4706,7 +4744,15 @@ impl Session {
             let cost = self.cost.clone();
             Box::new(move || cost.lock_recover().total_cost_usd())
         };
-        let prediction_effort = effort.clone().or_else(|| bundle.config.effort.clone());
+        let (prediction_effort, prediction_thinking, effort_override) = if lean_gemini_prediction {
+            (None, Some(ThinkingConfig::Disabled), None)
+        } else {
+            (
+                effort.clone().or_else(|| bundle.config.effort.clone()),
+                bundle.config.thinking.then_some(ThinkingConfig::Adaptive),
+                effort,
+            )
+        };
         // OpenAI-wire providers derive shard routing and retention from non-skipped
         // cache retention (`prompt_cache_key` / `prompt_cache_retention`); Anthropic
         // and Gemini providers keep their warm prefix while avoiding a cache-write
@@ -4784,11 +4830,7 @@ impl Session {
             edited_files_reminder: None,
             effort: prediction_effort,
             ultra_mode: bundle.config.ultra_mode,
-            thinking: if bundle.config.thinking {
-                Some(ThinkingConfig::Adaptive)
-            } else {
-                None
-            },
+            thinking: prediction_thinking,
             skip_cache_write,
             cache_ttl: self.effective_session_cache_ttl(&bundle.config),
             cache_domain: None,
@@ -4842,7 +4884,7 @@ impl Session {
                 slot: Arc::new(std::sync::Mutex::new(Some(capture))),
                 next: None,
                 model_override: None,
-                effort_override: effort,
+                effort_override,
                 ultra_override: None,
                 last_wire_request: None,
             },

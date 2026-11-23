@@ -284,7 +284,7 @@ pub fn default_builtins(config: &ResolvedConfig, opts: BuiltinsOptions) -> Vec<A
                     .map(|a| a.iter().map(to_task_agent).collect())
                     .unwrap_or_default(),
             },
-            config.is_claude_subscription_source(),
+            config.subagents_default_isolated_context(),
         ));
     }
     // The `skill` tool runs a skill as a forked sub-agent; only useful when skills

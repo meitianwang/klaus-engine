@@ -776,6 +776,11 @@ pub enum CacheTtl {
 /// and nothing is lost by re-declaring what the next request sends.
 pub const PROMPT_CACHE_COLD_AFTER_MS: i64 = 60 * 60 * 1_000;
 
+/// Idle gap past which an Antigravity session's opportunistic server-side
+/// implicit prompt cache has expired (~3–5 minutes typical TTL), allowing aged
+/// tool outputs and images to be reclaimed without sacrificing a warm prefix.
+pub const ANTIGRAVITY_IMPLICIT_CACHE_COLD_AFTER_MS: i64 = 10 * 60 * 1_000;
+
 impl RuntimeEncode for CacheTtl {
     fn encode_runtime(&self, out: &mut RuntimeEncoder) -> Result<(), RuntimeCodecError> {
         let tag = match self {

@@ -661,7 +661,7 @@ pub fn create_task_tool(opts: TaskToolOptions) -> Arc<dyn Tool> {
 
 /// Construct the `task` tool with source-specific defaults (isolated
 /// `fork_turns: "none"` default and `Explore` low-tier fallback when bound to
-/// a Claude subscription session).
+/// a quota-metered subscription session).
 pub fn create_task_tool_for_source(
     opts: TaskToolOptions,
     claude_subscription_defaults: bool,

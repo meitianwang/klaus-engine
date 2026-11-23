@@ -1854,10 +1854,26 @@ impl EngineConfig {
             == Some("subscription")
     }
 
+    /// Whether this configuration targets the Antigravity subscription model source.
+    pub fn is_antigravity_source(&self) -> bool {
+        self.model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
+            .is_some_and(|source| source.eq_ignore_ascii_case("antigravity"))
+    }
+
+    /// Whether newly spawned subagents start in an isolated context (`fork_turns: "none"`)
+    /// unless conversation inheritance is explicitly requested.
+    pub fn subagents_default_isolated_context(&self) -> bool {
+        self.is_claude_subscription_source() || self.is_antigravity_source()
+    }
+
     /// Whether per-message tool-result spill budgeting and cold-cache reclaim
-    /// are active: explicit opt-in or Claude subscription sessions.
+    /// are active: explicit opt-in or quota-metered subscription sessions.
     pub fn effective_aggregate_tool_results(&self) -> bool {
-        self.aggregate_tool_results || self.is_claude_subscription_source()
+        self.aggregate_tool_results
+            || self.is_claude_subscription_source()
+            || self.is_antigravity_source()
     }
 
     /// Resident capacity is resolved from the configuration of each load request.

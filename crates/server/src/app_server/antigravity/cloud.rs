@@ -885,6 +885,7 @@ async fn send_once(
         })
         .flatten();
     let mut wire_send = super::cache_diagnostics::WireSend::new(wire_request.clone());
+    let send_started_ms = chrono::Utc::now().timestamp_millis();
     let send_future = async {
         if method == "streamGenerateContent" {
             let timeout = header_timeout.unwrap_or(DEFAULT_STREAM_RESPONSE_HEADER_TIMEOUT);
@@ -904,7 +905,9 @@ async fn send_once(
         outcome = send_future => match outcome {
             Err(()) => {
                 wire_send.outcome("header_timeout", None);
-                super::egress::reset_pool(generation).await;
+                if should_reset_pool_on_header_timeout(generation, send_started_ms) {
+                    super::egress::reset_pool(generation).await;
+                }
                 return Err((api_error("antigravity_response_timeout"), Some(used_token)));
             }
             Ok(Ok(response)) => response,
@@ -927,6 +930,7 @@ async fn send_once(
         },
     };
     let response_status = Some(response.status().as_u16());
+    record_upstream_activity(generation);
     wire_send.outcome("response_started", response_status);
     if let Some(diagnostics) = wire_request {
         response.extensions_mut().insert(diagnostics);
@@ -1129,7 +1133,42 @@ struct SessionLease {
 #[derive(Default)]
 struct AccountPoolRouting {
     in_flight: std::collections::HashMap<String, usize>,
+    last_upstream_activity_ms: std::collections::HashMap<String, i64>,
     leases: std::collections::HashMap<String, SessionLease>,
+}
+
+fn record_upstream_activity(generation: Option<&str>) {
+    let Some(generation) = generation.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    state
+        .last_upstream_activity_ms
+        .insert(generation.to_string(), now_ms);
+}
+
+/// Only evict the relay's shared account transport when no sibling stream is
+/// active on the same account and no upstream bytes have arrived since this
+/// request started. Otherwise a single slow prefill would tear down healthy
+/// HTTP/2 connections and sticky cache routing for every other open session.
+fn should_reset_pool_on_header_timeout(generation: Option<&str>, send_started_ms: i64) -> bool {
+    let Some(generation) = generation.filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    if state.in_flight.get(generation).copied().unwrap_or(0) > 1 {
+        return false;
+    }
+    if state
+        .last_upstream_activity_ms
+        .get(generation)
+        .copied()
+        .is_some_and(|ts| ts >= send_started_ms)
+    {
+        return false;
+    }
+    true
 }
 
 fn pool_routing() -> &'static std::sync::Mutex<AccountPoolRouting> {
@@ -1157,6 +1196,7 @@ pub(super) fn switch_session_leases(generation: &str, epoch: u64) {
 pub(super) fn prune_session_leases(generation: &str) {
     let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
     state.in_flight.remove(generation);
+    state.last_upstream_activity_ms.remove(generation);
     state
         .leases
         .retain(|_, lease| lease.generation != generation);
@@ -2574,6 +2614,7 @@ impl GeminiClient for CloudClient {
                             break 'read;
                         }
                     };
+                    record_upstream_activity(Some(&generation));
                     total_bytes = total_bytes.saturating_add(chunk.len());
                     if total_bytes > MAX_BODY_BYTES {
                         wire_response.outcome("response_too_large");
@@ -3033,6 +3074,41 @@ mod tests {
         assert_eq!(lease.generation, "selected-account");
         assert_eq!(lease.manual_switch_epoch, epoch);
         assert_eq!(state.in_flight.get("selected-account"), Some(&1));
+    }
+
+    #[test]
+    fn header_timeout_resets_the_account_pool_only_for_a_silent_solitary_stream() {
+        let solitary = format!("timeout-solitary-{}", uuid::Uuid::new_v4());
+        let started_ms = chrono::Utc::now().timestamp_millis();
+        let _own = enter_active_generation(&solitary);
+        assert!(
+            should_reset_pool_on_header_timeout(Some(&solitary), started_ms),
+            "a lone stream with no upstream bytes may recover by resetting the pool"
+        );
+
+        let shared = format!("timeout-shared-{}", uuid::Uuid::new_v4());
+        let _first = enter_active_generation(&shared);
+        let _sibling = enter_active_generation(&shared);
+        assert!(
+            !should_reset_pool_on_header_timeout(Some(&shared), started_ms),
+            "a sibling stream on the same account must keep its connection"
+        );
+
+        let active = format!("timeout-active-{}", uuid::Uuid::new_v4());
+        let _single = enter_active_generation(&active);
+        record_upstream_activity(Some(&active));
+        assert!(
+            !should_reset_pool_on_header_timeout(Some(&active), started_ms),
+            "upstream bytes since the send started prove the transport is healthy"
+        );
+        assert!(
+            should_reset_pool_on_header_timeout(
+                Some(&active),
+                chrono::Utc::now().timestamp_millis() + 1
+            ),
+            "activity older than this send does not vouch for the transport"
+        );
+        prune_session_leases(&active);
     }
 
     #[test]

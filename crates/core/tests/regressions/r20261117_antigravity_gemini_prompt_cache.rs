@@ -21,13 +21,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use klaus_agent_core::engine::agent::{Agent, StartSessionOptions};
+use klaus_agent_core::engine::deps::NowFn;
 use klaus_agent_core::engine::session::{Input, RuntimePolicyUpdate, Session, TurnOptions};
 use klaus_agent_core::mcp::tool_wrapper::{wrap_mcp_tool, McpToolCall, WrapMcpToolOptions};
 use klaus_agent_core::mcp::types::{McpCallResult, McpToolDescriptor};
 use klaus_agent_core::planning::CollaborationMode;
 use klaus_agent_core::provider::gemini::{
     generate_content_request, GeminiAdapterPolicy, GeminiApiError, GeminiChunkStream, GeminiClient,
-    GeminiProvider, GeminiProviderOptions, GenerateContentParameters, GenerateContentResponse,
+    GeminiProvider, GeminiProviderOptions, GeminiThinkingDialect, GenerateContentParameters,
+    GenerateContentResponse,
 };
 use klaus_agent_core::runtime_process::RuntimeProcessContext;
 use klaus_agent_core::runtime_values::{runtime_codec, runtime_json, RuntimeString};
@@ -36,7 +38,7 @@ use klaus_agent_core::tools::builtins::task::{create_task_tool, TaskToolOptions}
 use klaus_agent_core::tools::builtins::tool_search::create_tool_search_tool;
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::permission::{ApprovalPolicy, SandboxMode};
-use klaus_agent_core::types::provider::{AuthHeaders, ModelCapabilities};
+use klaus_agent_core::types::provider::{AuthHeaders, ModelCapabilities, ThinkingCapability};
 use klaus_agent_core::types::tool::Tool;
 use serde_json::{json, Value};
 
@@ -45,7 +47,7 @@ use super::r7c876d49_spec_restores_latest_permission_policy::{agent_options, pro
 const GEMINI_MODEL: &str = "gemini-cache-stability-fixture";
 
 #[derive(Clone)]
-enum ScriptedReply {
+pub(super) enum ScriptedReply {
     Text(&'static str),
     TextWithPromptTokens(&'static str, u64),
     ToolCall {
@@ -62,25 +64,25 @@ enum ScriptedReply {
 }
 
 #[derive(Clone, Debug)]
-struct CapturedGeminiCall {
-    cache_key: Option<String>,
-    wire: Value,
+pub(super) struct CapturedGeminiCall {
+    pub(super) cache_key: Option<String>,
+    pub(super) wire: Value,
 }
 
-struct ScriptedGeminiClient {
+pub(super) struct ScriptedGeminiClient {
     calls: Mutex<Vec<CapturedGeminiCall>>,
     replies: Mutex<VecDeque<ScriptedReply>>,
 }
 
 impl ScriptedGeminiClient {
-    fn new(replies: Vec<ScriptedReply>) -> Arc<Self> {
+    pub(super) fn new(replies: Vec<ScriptedReply>) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             replies: Mutex::new(replies.into()),
         })
     }
 
-    fn taken(&self) -> Vec<CapturedGeminiCall> {
+    pub(super) fn taken(&self) -> Vec<CapturedGeminiCall> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -178,15 +180,52 @@ fn start_antigravity_gemini_session_with_cap(
     auto_compact_token_limit: Option<u64>,
     model_messages: Option<Value>,
 ) -> (tempfile::TempDir, Arc<Session>) {
+    start_antigravity_gemini_session_with_overrides(
+        client,
+        tools,
+        context_window,
+        auto_compact_token_limit,
+        model_messages,
+        GeminiFixtureOverrides::default(),
+    )
+}
+
+/// Optional knobs layered over the Antigravity Gemini fixture session.
+#[derive(Default)]
+pub(super) struct GeminiFixtureOverrides {
+    /// Merged over the fixture configuration object.
+    pub(super) config: Option<Value>,
+    /// Controllable clock for idle-window behavior.
+    pub(super) now: Option<NowFn>,
+    /// Declare a level-dialect thinking model for the fixture.
+    pub(super) thinking_level: bool,
+}
+
+/// Start an Antigravity Gemini session with optional fixture overrides.
+pub(super) fn start_antigravity_gemini_session_with_overrides(
+    client: Arc<ScriptedGeminiClient>,
+    tools: Vec<Arc<dyn Tool>>,
+    context_window: u64,
+    auto_compact_token_limit: Option<u64>,
+    model_messages: Option<Value>,
+    overrides: GeminiFixtureOverrides,
+) -> (tempfile::TempDir, Arc<Session>) {
+    let GeminiFixtureOverrides {
+        config: config_overrides,
+        now,
+        thinking_level,
+    } = overrides;
     let directory = tempfile::tempdir().unwrap();
     let provider = GeminiProvider::new(GeminiProviderOptions {
         default_model: Some(GEMINI_MODEL.into()),
         client: Some(client),
+        thinking_dialect: thinking_level.then_some(GeminiThinkingDialect::Level),
         capabilities: Some(ModelCapabilities {
             context_window: Some(context_window),
             max_output_tokens: Some(1_024),
             auto_compact_token_limit,
             tools: Some(true),
+            thinking: thinking_level.then(ThinkingCapability::default),
             model_messages: model_messages
                 .map(|value| runtime_json::parse(&RuntimeString::from(value.to_string())).unwrap()),
             ..Default::default()
@@ -202,7 +241,8 @@ fn start_antigravity_gemini_session_with_cap(
     let mut options =
         agent_options(RuntimeProcessContext::initialize(process_supervisor()).unwrap());
     options.provider = Arc::new(provider);
-    options.config = Some(json!({
+    options.deps.now = now;
+    let mut config = json!({
         "model": GEMINI_MODEL,
         "modelSource": {
             "source": "antigravity",
@@ -226,7 +266,16 @@ fn start_antigravity_gemini_session_with_cap(
         "totalTokensReminder": "off",
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access"
-    }));
+    });
+    if let (Some(base), Some(extra)) = (
+        config.as_object_mut(),
+        config_overrides.as_ref().and_then(Value::as_object),
+    ) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    options.config = Some(config);
     options.tools = Some(tools);
     options.include_default_agents = Some(true);
     let root = directory.path().to_string_lossy().into_owned();
@@ -322,7 +371,7 @@ fn demo_mcp_tool(server: &str, name: &str, description: &str) -> Arc<dyn Tool> {
 async fn subagents_and_readonly_queries_isolate_gemini_cache_keys_from_parent() {
     let file_target = "note.txt";
     let client = ScriptedGeminiClient::new(vec![
-        // Parent step 1 spawns a default (`fork_turns: "all"`) sub-agent.
+        // Parent step 1 spawns an explicit `fork_turns: "all"` sub-agent.
         ScriptedReply::ToolCall {
             id: "call-fork-sub",
             name: "task",
@@ -330,6 +379,7 @@ async fn subagents_and_readonly_queries_isolate_gemini_cache_keys_from_parent() 
                 "description": "fork child check",
                 "prompt": "Read note.txt and report back.",
                 "model": "low",
+                "fork_turns": "all",
                 "run_in_background": false
             }),
         },
@@ -398,7 +448,7 @@ async fn subagents_and_readonly_queries_isolate_gemini_cache_keys_from_parent() 
     assert_eq!(calls[3].cache_key.as_deref(), Some(parent_id.as_str()));
     assert_eq!(calls[5].cache_key.as_deref(), Some(parent_id.as_str()));
 
-    // Default fork sub-agent gets its own `:sub:` key (never the parent key) and
+    // Fork sub-agent gets its own `:sub:` key (never the parent key) and
     // keeps that same `:sub:` key across both of its steps.
     let fork_sub_key = calls[1].cache_key.as_deref().expect("fork sub cache_key");
     assert!(

@@ -4472,7 +4472,7 @@ impl Session {
                         .map(crate::tools::builtins::index::to_task_agent)
                         .collect(),
                 },
-                config.is_claude_subscription_source(),
+                config.subagents_default_isolated_context(),
             );
             if rebuilt.exposure() != exposure {
                 rebuilt = crate::tools::builtins::tool_search::ExposureOverrideTool::wrap(

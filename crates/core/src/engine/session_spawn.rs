@@ -287,10 +287,10 @@ impl Session {
             && creation_snapshot.is_none()
             && !opts.fork_context_explicit
             && !opts.feature_target_model
-            && capture.bundle.config.is_claude_subscription_source()
+            && capture.bundle.config.subagents_default_isolated_context()
         {
-            // Claude subscription subagents start in an isolated context unless
-            // the caller explicitly requested conversation inheritance.
+            // Subscription subagents start in an isolated context unless the
+            // caller explicitly requested conversation inheritance.
             fork_path = false;
         }
         let type_name = if let Some(snapshot) = creation_snapshot {
@@ -362,7 +362,7 @@ impl Session {
         let mut child_bundle = bundle.clone();
         if creation_snapshot.is_none() {
             let explore_low_tier = RuntimeString::from("low");
-            let force_claude_explore_low_tier = bundle.config.is_claude_subscription_source()
+            let force_explore_low_tier = bundle.config.subagents_default_isolated_context()
                 && !bundle.config.subagent_model_catalog
                 && !opts.feature_target_model
                 && !opts.orchestrator_target_model
@@ -374,7 +374,7 @@ impl Session {
                 .model
                 .as_ref()
                 .or(bundle.config.default_subagent_model.as_ref());
-            let selection = if force_claude_explore_low_tier && raw_selection.is_none() {
+            let selection = if force_explore_low_tier && raw_selection.is_none() {
                 Some(&explore_low_tier)
             } else {
                 raw_selection
@@ -416,7 +416,7 @@ impl Session {
                 } else {
                     Ok(())
                 };
-                let effective_selection = if force_claude_explore_low_tier {
+                let effective_selection = if force_explore_low_tier {
                     &explore_low_tier
                 } else {
                     selection
@@ -575,7 +575,7 @@ impl Session {
         let fork_path = run_opts.fork_conversation.is_some()
             && !(!opts.fork_context_explicit
                 && !opts.feature_target_model
-                && capture.bundle.config.is_claude_subscription_source());
+                && capture.bundle.config.subagents_default_isolated_context());
         if fork_path
             && (run_opts.parent_agent_id.is_some() || run_opts.initiating_turn_id.is_some())
             && opts.inherited_context.is_none()

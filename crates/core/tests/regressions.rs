@@ -13,6 +13,9 @@
 #[path = "regressions/r20261122_gemini_tool_search_ref_schema.rs"]
 mod r20261122_gemini_tool_search_ref_schema;
 
+#[path = "regressions/r20261123_antigravity_quota_burn_guards.rs"]
+mod r20261123_antigravity_quota_burn_guards;
+
 #[path = "regressions/r20261123_open_plan_periodic_reminder_and_hash_task_ids.rs"]
 mod r20261123_open_plan_periodic_reminder_and_hash_task_ids;
 

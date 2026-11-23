@@ -295,7 +295,9 @@ use crate::types::file_state::FileStateCache;
 use crate::types::json::runtime_schema_from_static;
 use crate::types::json::Json;
 use crate::types::permission::PermissionUpdate;
-use crate::types::provider::PROMPT_CACHE_COLD_AFTER_MS;
+use crate::types::provider::{
+    ANTIGRAVITY_IMPLICIT_CACHE_COLD_AFTER_MS, PROMPT_CACHE_COLD_AFTER_MS,
+};
 use crate::types::tool::RunBashOptions;
 use crate::types::tool::ToolContext;
 use async_stream::stream;
@@ -1839,10 +1841,19 @@ impl Session {
         // prompt cache has certainly expired, so the whole prefix re-sends
         // regardless and the budget pass may trade aged full-size results down
         // to their persisted previews at no extra cache cost.
+        let cold_cache_window_ms = if initial_bundle.config.is_antigravity_source()
+            && this
+                .effective_session_cache_ttl(&initial_bundle.config)
+                .is_none()
+        {
+            ANTIGRAVITY_IMPLICIT_CACHE_COLD_AFTER_MS
+        } else {
+            PROMPT_CACHE_COLD_AFTER_MS
+        };
         let cold_reclaim_due = this.config.reclaim_tool_results_when_cache_cold
             && this
                 .turn
-                .cold_cache_reclaim_due((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS);
+                .cold_cache_reclaim_due((this.deps.now)(), cold_cache_window_ms);
         if initial_bundle.config.effective_aggregate_tool_results() && cold_reclaim_due {
             this.tool_result_budget_state()
                 .lock_recover()
@@ -2018,7 +2029,7 @@ impl Session {
             // flip the declaration the main thread is caching against.
             thinking_context_cold: this
                 .turn
-                .latch_thinking_context_cold((this.deps.now)(), PROMPT_CACHE_COLD_AFTER_MS),
+                .latch_thinking_context_cold((this.deps.now)(), cold_cache_window_ms),
             context_edit_state: Some(this.context_edit_state.clone()),
             tool_freeze_state: Some(this.tool_freeze_state.clone()),
             live_model_override,

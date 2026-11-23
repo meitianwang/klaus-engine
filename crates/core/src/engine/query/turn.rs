@@ -2575,6 +2575,11 @@ async fn run_turn_tool_result_budget(
         crate::context::tool_result_budget::decide(messages, &guard, limit, &skip, &names, reclaim)
     };
     if decision.reapply.is_empty() && decision.to_persist.is_empty() {
+        // Nothing to rewrite, but every result the model is about to see now
+        // belongs to the cached prefix. Freeze it here too, otherwise a kept
+        // result stays "fresh" forever and the cold window never reclaims it.
+        let mut guard = state.lock_recover();
+        crate::context::tool_result_budget::settle(&mut guard, messages, &[]);
         return Ok(());
     }
     let mut replacements: HashMap<RuntimeString, RuntimeString> =
@@ -2622,12 +2627,13 @@ async fn run_turn_tool_result_budget(
             record(persisted.clone()).await?;
         }
     }
-    if !crate::context::tool_result_budget::apply(messages, &replacements) {
-        return Ok(());
-    }
+    let changed = crate::context::tool_result_budget::apply(messages, &replacements);
     {
         let mut guard = state.lock_recover();
         crate::context::tool_result_budget::settle(&mut guard, messages, &persisted);
+    }
+    if !changed {
+        return Ok(());
     }
     *prepared = shared.prepare(
         messages,
