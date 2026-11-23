@@ -517,3 +517,124 @@ async fn identical_malformed_prefixes_still_have_bounded_loop_protection() {
     assert!(run.events.iter().any(|event| matches!(event, EngineEvent::TurnFailed { error, .. } if error.message.contains("stuck in a loop"))));
     assert!(!run.directory.0.join("partial.txt").exists());
 }
+
+#[tokio::test]
+async fn parallel_unreadable_calls_have_bounded_loop_protection() {
+    let directory = Directory(
+        std::env::temp_dir().join(format!("klaus-parallel-malformed-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&directory.0).unwrap();
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let mut options = agent_options(process.clone());
+    options.provider = Arc::new(OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: Some("fixture-key".into()),
+        capabilities: Some(ModelCapabilities {
+            tools: Some(true),
+            max_output_tokens: Some(16_384),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }));
+    options.include_default_agents = Some(false);
+    options.tools = Some(vec![create_write_tool(), create_read_tool()]);
+    let requests = Arc::new(Mutex::new(Vec::<ModelRequest>::new()));
+    let captured = requests.clone();
+    options.deps.call_model = Some(Box::new(move |request, _| {
+        let mut reqs = captured.lock().unwrap();
+        let idx = reqs.len();
+        reqs.push(request);
+        let mut events = Vec::new();
+        let stop_reason = if idx < 12 {
+            for slot in ["a", "b"] {
+                let id = format!("call-{idx}-{slot}");
+                events.extend([
+                    ModelStreamEvent::ToolUseStart {
+                        id: id.clone().into(),
+                        name: "read".into(),
+                        thought_signature: None,
+                        tool_kind: None,
+                        input_format: None,
+                    },
+                    ModelStreamEvent::ToolUseInputDelta {
+                        id: id.clone().into(),
+                        partial_json: r#"{"path":"incomplete"#.into(),
+                    },
+                    ModelStreamEvent::ToolUseStop { id: id.into() },
+                ]);
+            }
+            ModelStopReason::ToolUse
+        } else {
+            events.push(ModelStreamEvent::TextDelta {
+                text: "Finished.".into(),
+            });
+            ModelStopReason::EndTurn
+        };
+        events.push(ModelStreamEvent::MessageStop {
+            stop_reason,
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tokens: None,
+            },
+        });
+        Box::pin(futures::stream::iter(events))
+    }));
+    let session = Agent::new(options).start_session(StartSessionOptions {
+        cwd: Some(directory.0.to_string_lossy().into_owned().into()),
+        user_config_dir: Some(directory.0.to_string_lossy().into_owned().into()),
+        config: Some(json!({
+            "model":"argument-fixture", "prewarm":false, "goal":false,
+            "thinking":false, "autoMemory":false, "autoDream":false,
+            "memoryRecall":false, "checkpointing":false,
+            "speculativeCompaction":false, "earlyMicrocompact":false,
+            "idleMicrocompact":false, "compactionSelfCheck":false,
+            "loopDetection":true, "maxOutputTokens":1000
+        })),
+        ..Default::default()
+    });
+    let events = session
+        .run_streamed(
+            Input::Text("Read two files in parallel.".into()),
+            TurnOptions::default(),
+        )
+        .events
+        .collect::<Vec<_>>()
+        .await;
+    session.shutdown_and_wait().await.unwrap();
+    process.shutdown().await.unwrap();
+    let count = requests.lock().unwrap().len();
+    assert_eq!(
+        count, 6,
+        "identical multi-call unreadable batches must be bounded after 6 responses"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TurnFailed { error, .. } if error.message.contains("stuck in a loop")
+    )));
+}
+
+#[tokio::test]
+async fn unreadable_call_at_output_ceiling_halts_after_budget_ladder_is_spent() {
+    let run = run((0..12)
+        .map(|_| Call {
+            tool: "read",
+            arguments: r#"{"path":"incomplete"#.into(),
+            stop: ModelStopReason::MaxTokens,
+            at_cap: true,
+        })
+        .collect())
+    .await;
+    assert_eq!(run.requests[1].max_output_tokens, 2000);
+    assert!(text(result(&run.requests[2], "call-1")).contains("reduce the output content by half"));
+    assert_eq!(
+        run.requests.len(),
+        8,
+        "2 budget-ladder retries plus 6 identical post-ladder responses must halt the loop"
+    );
+    assert!(run.events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TurnFailed { error, .. } if error.message.contains("stuck in a loop")
+    )));
+}

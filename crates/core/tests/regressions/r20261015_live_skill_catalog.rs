@@ -654,3 +654,180 @@ async fn meta_continuation_advances_catalog_pages_once_per_full_turn() {
     assert_eq!(provider.inner.requests.lock().unwrap().len(), 3);
     session.shutdown_and_wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn skill_catalog_refresh_preserves_host_dynamic_task_and_skill_overrides() {
+    use async_trait::async_trait;
+    use klaus_agent_core::provider::openai::{OpenAIProvider, OpenAIProviderOptions};
+    use klaus_agent_core::runtime_values::{runtime_json, RuntimeJson};
+    use klaus_agent_core::tools::build_tool::{
+        text_result, DEFAULT_IS_CONCURRENCY_SAFE, DEFAULT_IS_DESTRUCTIVE, DEFAULT_IS_ENABLED,
+        DEFAULT_IS_READ_ONLY,
+    };
+    use klaus_agent_core::types::errors::ToolError;
+    use klaus_agent_core::types::json::Json;
+    use klaus_agent_core::types::provider::ModelCapabilities;
+    use klaus_agent_core::types::tool::{
+        Tool, ToolContext, ToolExposure, ToolProgress, ToolResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct HostOverrideTool {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for HostOverrideTool {
+        fn name(&self) -> RuntimeString {
+            self.name.into()
+        }
+        fn description(&self) -> RuntimeString {
+            format!("Host override for {}.", self.name).into()
+        }
+        fn input_schema(&self) -> Json {
+            runtime_json::parse(&RuntimeString::from(
+                r#"{"type":"object","properties":{"payload":{"type":"string"}},"required":["payload"],"additionalProperties":false}"#,
+            ))
+            .expect("valid schema")
+        }
+        fn exposure(&self) -> ToolExposure {
+            ToolExposure::Direct
+        }
+        fn is_concurrency_safe(&self, _input: &Json) -> bool {
+            DEFAULT_IS_CONCURRENCY_SAFE
+        }
+        fn is_read_only(&self, _input: &Json) -> bool {
+            DEFAULT_IS_READ_ONLY
+        }
+        fn is_destructive(&self, _input: &Json) -> Option<bool> {
+            DEFAULT_IS_DESTRUCTIVE
+        }
+        fn is_enabled(&self) -> bool {
+            DEFAULT_IS_ENABLED
+        }
+        async fn call(
+            &self,
+            _input: Json,
+            _ctx: &ToolContext,
+            _on_progress: Option<ToolProgress>,
+        ) -> Result<ToolResult, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(text_result(
+                RuntimeJson::Null,
+                format!("HOST_OVERRIDE_{}", self.name),
+                false,
+            ))
+        }
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "klaus-live-skill-host-overrides-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let mut options = agent_options(process.clone());
+    options.tools = None;
+    options.provider = Arc::new(OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: Some("fixture-key".into()),
+        capabilities: Some(ModelCapabilities {
+            tools: Some(true),
+            max_output_tokens: Some(8_192),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }));
+    let task_calls = Arc::new(AtomicUsize::new(0));
+    let skill_calls = Arc::new(AtomicUsize::new(0));
+    let step = Arc::new(AtomicUsize::new(0));
+    options.deps.call_model = Some(Box::new(move |_request, _| {
+        let round = step.fetch_add(1, Ordering::SeqCst);
+        let mut events = Vec::new();
+        let stop_reason = if round == 0 || round == 2 {
+            for (suffix, tool_name) in [("t", "task"), ("s", "skill")] {
+                let id = format!("override-{round}-{suffix}");
+                events.extend([
+                    ModelStreamEvent::ToolUseStart {
+                        id: id.clone().into(),
+                        name: tool_name.into(),
+                        thought_signature: None,
+                        tool_kind: None,
+                        input_format: None,
+                    },
+                    ModelStreamEvent::ToolUseInputDelta {
+                        id: id.clone().into(),
+                        partial_json: r#"{"payload":"ok"}"#.into(),
+                    },
+                    ModelStreamEvent::ToolUseStop { id: id.into() },
+                ]);
+            }
+            ModelStopReason::ToolUse
+        } else {
+            events.push(ModelStreamEvent::TextDelta {
+                text: "Done.".into(),
+            });
+            ModelStopReason::EndTurn
+        };
+        events.push(ModelStreamEvent::MessageStop {
+            stop_reason,
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                total_tokens: Some(30),
+            },
+        });
+        Box::pin(futures::stream::iter(events))
+    }));
+    let agent = Agent::new(options);
+    let session = agent.start_session(StartSessionOptions {
+        cwd: Some(temp_dir.to_string_lossy().into_owned().into()),
+        user_config_dir: Some(temp_dir.to_string_lossy().into_owned().into()),
+        mcp_tools: Some(vec![
+            Arc::new(HostOverrideTool {
+                name: "task",
+                calls: task_calls.clone(),
+            }),
+            Arc::new(HostOverrideTool {
+                name: "skill",
+                calls: skill_calls.clone(),
+            }),
+        ]),
+        config: Some(json!({
+            "model":"live-skills-test",
+            "prewarm":false,
+            "goal":false,
+            "thinking":false,
+            "autoMemory":false,
+            "autoDream":false,
+            "memoryRecall":false,
+            "checkpointing":false,
+            "permissionMode":"bypassPermissions"
+        })),
+        ..Default::default()
+    });
+
+    run(&session, "first turn").await;
+    assert_eq!(task_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(skill_calls.load(Ordering::SeqCst), 1);
+
+    agent
+        .replace_session_skills(&session, vec![skill("REFRESHED_BODY")])
+        .unwrap();
+
+    run(&session, "second turn after skill refresh").await;
+    assert_eq!(
+        task_calls.load(Ordering::SeqCst),
+        2,
+        "skill catalog refresh must not replace a host-supplied dynamic task tool"
+    );
+    assert_eq!(
+        skill_calls.load(Ordering::SeqCst),
+        2,
+        "skill catalog refresh must not replace a host-supplied dynamic skill tool"
+    );
+    session.shutdown_and_wait().await.unwrap();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

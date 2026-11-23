@@ -79,6 +79,12 @@ pub(super) fn apply_policy(body: &mut Value, request: &ModelRequest, native: boo
                     ("type", vs("function_call")),
                     ("name", vs("tool_search")),
                     ("call_id", item["call_id"].clone()),
+                    (
+                        "status",
+                        item.get("status")
+                            .cloned()
+                            .unwrap_or_else(|| vs("completed")),
+                    ),
                     ("arguments", vs(runtime_json::stringify(&item["arguments"]))),
                 ]);
             } else if kind

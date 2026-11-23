@@ -4245,37 +4245,35 @@ impl Session {
         let mut tools = self.tools.clone();
         let subagent_config = self.inference_config();
         if !update.host_supplied_tools {
-            let had_task = tools.iter().any(|tool| tool.name() == "task");
-            tools.retain(|tool| tool.name() != "task" && tool.name() != "skill");
-            if had_task {
-                tools.push(crate::tools::builtins::task::create_task_tool_for_source(
-                    crate::tools::builtins::task::TaskToolOptions {
-                        model_catalog: subagent_config.subagent_model_catalog,
-                        model_options: subagent_config.subagent_model_options.clone(),
-                        agents: update
-                            .agents
-                            .iter()
-                            .map(crate::tools::builtins::index::to_task_agent)
-                            .collect(),
-                    },
-                    subagent_config.is_claude_subscription_source(),
-                ));
-            }
-            if let Some(skills) = &update.skills {
-                if !self
-                    .config
-                    .disabled_tools
-                    .contains(&RuntimeString::from("skill"))
-                {
-                    let skills = skills.clone();
-                    let gate = skill_gate.clone();
-                    tools.push(crate::extensions::skills::skill_tool::create_skill_tool(
-                        move || {
-                            let all = skills();
-                            gate.as_ref()
-                                .map_or_else(|| all.clone(), |gate| gate.filter(&all))
-                        },
-                    ));
+            Self::refresh_builtin_delegation_tool(&mut tools, &subagent_config, &update.agents);
+            let skill_name = RuntimeString::from("skill");
+            if !update.browser_tool_overrides.contains(&skill_name) {
+                let skill_exposure = tools
+                    .iter()
+                    .find(|tool| tool.name() == "skill")
+                    .map(|tool| tool.exposure());
+                tools.retain(|tool| tool.name() != "skill");
+                if let Some(skills) = &update.skills {
+                    if !self.config.disabled_tools.contains(&skill_name) {
+                        let skills = skills.clone();
+                        let gate = skill_gate.clone();
+                        let mut rebuilt_skill =
+                            crate::extensions::skills::skill_tool::create_skill_tool(move || {
+                                let all = skills();
+                                gate.as_ref()
+                                    .map_or_else(|| all.clone(), |gate| gate.filter(&all))
+                            });
+                        if let Some(exposure) = skill_exposure {
+                            if rebuilt_skill.exposure() != exposure {
+                                rebuilt_skill =
+                                    crate::tools::builtins::tool_search::ExposureOverrideTool::wrap(
+                                        rebuilt_skill,
+                                        exposure,
+                                    );
+                            }
+                        }
+                        tools.push(rebuilt_skill);
+                    }
                 }
             }
             let browser_tools = crate::tools::builtins::browser::create_browser_tools();
@@ -4454,13 +4452,10 @@ impl Session {
         tools
     }
 
-    /// Refresh the engine's own delegation tool so its advertised agent roster
-    /// and model catalog match the current registry. A host-supplied tool
-    /// answering to `task` owns that name and keeps its own implementation.
-    pub(crate) fn prepare_subagent_tool_inventory(
-        &self,
+    fn refresh_builtin_delegation_tool(
         tools: &mut [Arc<dyn Tool>],
         config: &ResolvedConfig,
+        agents: &[crate::engine::agent_definitions::AgentDefinition],
     ) {
         if let Some(tool) = tools
             .iter_mut()
@@ -4471,9 +4466,7 @@ impl Session {
                 crate::tools::builtins::task::TaskToolOptions {
                     model_catalog: config.subagent_model_catalog,
                     model_options: config.subagent_model_options.clone(),
-                    agents: self
-                        .current_agent_registry()
-                        .list()
+                    agents: agents
                         .iter()
                         .map(crate::tools::builtins::index::to_task_agent)
                         .collect(),
@@ -4487,6 +4480,17 @@ impl Session {
             }
             *tool = rebuilt;
         }
+    }
+
+    /// Refresh the engine's own delegation tool so its advertised agent roster
+    /// and model catalog match the current registry. A host-supplied tool
+    /// answering to `task` owns that name and keeps its own implementation.
+    pub(crate) fn prepare_subagent_tool_inventory(
+        &self,
+        tools: &mut [Arc<dyn Tool>],
+        config: &ResolvedConfig,
+    ) {
+        Self::refresh_builtin_delegation_tool(tools, config, &self.current_agent_registry().list());
     }
 
     pub(crate) fn prepare_planning_tool_inventory(&self, tools: &mut Vec<Arc<dyn Tool>>) {

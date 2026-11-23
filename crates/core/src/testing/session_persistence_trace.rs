@@ -1849,7 +1849,7 @@ mod provider_behavior_tests {
                 "replayAfterToolRemoval": [
                     {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","status":"completed","input":"*** Begin Patch"},
                     {"type":"custom_tool_call_output","call_id":"c1","output":"done"},
-                    {"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"calendar"}},
+                    {"type":"tool_search_call","call_id":"s1","status":"completed","execution":"client","arguments":{"query":"calendar"}},
                     {"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client","tools":[
                         {"type":"function","name":"read","description":"Read","strict":false,"defer_loading":true,"parameters":{"type":"object"}},
                         {"type":"namespace","name":"calendar","description":"Tools in the calendar namespace.","tools":[
@@ -1861,7 +1861,7 @@ mod provider_behavior_tests {
                     {"role":"user","content":"# Earlier Conversation Summary\n\nThe conversation before this point was compacted. You also have access to the current state of the files and tools used so far. Build on the work already done and avoid duplicating it.\n\nprovider state"},
                     {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","status":"completed","input":"*** Begin Patch"},
                     {"type":"custom_tool_call_output","call_id":"c1","output":"done"},
-                    {"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"calendar"}},
+                    {"type":"tool_search_call","call_id":"s1","status":"completed","execution":"client","arguments":{"query":"calendar"}},
                     {"type":"tool_search_output","call_id":"s1","status":"completed","execution":"client","tools":[
                         {"type":"function","name":"read","description":"Read","strict":false,"defer_loading":true,"parameters":{"type":"object"}},
                         {"type":"namespace","name":"calendar","description":"Tools in the calendar namespace.","tools":[

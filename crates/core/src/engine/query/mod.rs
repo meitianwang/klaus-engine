@@ -958,12 +958,14 @@ struct TruncationRecovery {
     /// dropped call's error result; the loop reads it to decide whether the
     /// budget ladder still applies.
     tool_over_limit_retries: u32,
-    /// Digest of the raw arguments of the last response whose ONLY call was
-    /// dropped for unreadable arguments, with no output ceiling involved.
+    /// Digest of the ordered `(internal_name, raw_input)` pairs from the last
+    /// response whose calls were all dropped without an active output-ceiling
+    /// budget retry.
     identical_malformed_signature: u64,
-    /// Consecutive responses repeating that exact digest. A readable call, a
-    /// mixed batch, visible text progress or a different prefix breaks the
-    /// streak; the output-ceiling ladder keeps its own budget above.
+    /// Consecutive responses repeating that exact digest. Any executable or
+    /// salvaged call, an active output-ceiling budget retry, or a changed raw
+    /// argument prefix breaks the streak; accompanying commentary text does
+    /// not, because the tool call itself still never ran.
     identical_malformed_repeats: u32,
 }
 

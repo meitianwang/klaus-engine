@@ -3427,12 +3427,14 @@ fn project_responses_input(
                                 ProviderToolCallKind::ToolSearch => out.push(vobj([
                                     ("type", vs("tool_search_call")),
                                     ("call_id", vs(tu.id.clone())),
+                                    ("status", vs("completed")),
                                     ("execution", vs("client")),
                                     ("arguments", tu.input.clone()),
                                 ])),
                                 ProviderToolCallKind::ServerToolSearch => out.push(vobj([
                                     ("type", vs("tool_search_call")),
                                     ("call_id", vs(tu.id.clone())),
+                                    ("status", vs("completed")),
                                     ("execution", vs("server")),
                                     ("arguments", tu.input.clone()),
                                 ])),
@@ -12328,7 +12330,7 @@ mod tests {
             &[
                 json!({"type":"custom_tool_call","call_id":"c1","name":"apply_patch","status":"completed","input":"*** Begin Patch"}),
                 json!({"type":"custom_tool_call_output","call_id":"c1","output":"done"}),
-                json!({"type":"tool_search_call","call_id":"s1","execution":"client","arguments":{"query":"calendar"}}),
+                json!({"type":"tool_search_call","call_id":"s1","status":"completed","execution":"client","arguments":{"query":"calendar"}}),
                 json!({
                     "type":"tool_search_output","call_id":"s1","status":"completed","execution":"client",
                     "tools":[
@@ -12360,6 +12362,20 @@ mod tests {
             function_result("f1", "created"),
             assistant_custom("c1", "apply_patch", "*** Begin Patch"),
             custom_result("c1", "done"),
+            assistant_tool_search("s1", json!({"query":"calendar"})),
+            tool_search_result("s1", native_search_output_fixture()),
+            assistant_provider_call(
+                "srv1",
+                "tool_search",
+                json!({"query":"calendar"}),
+                ProviderToolCallKind::ServerToolSearch,
+            ),
+            provider_result(
+                "srv1",
+                "server search complete",
+                ProviderToolCallKind::ServerToolSearch,
+                Some(json!({"status":"completed","execution":"server","tools":[]})),
+            ),
         ];
         // Native declarations keep the custom kind and group names by namespace;
         // the plain function-tool dialect folds every call into function_call.
@@ -12384,23 +12400,42 @@ mod tests {
                 assert_eq!(items[2]["type"], json!("function_call"));
                 assert_eq!(items[2]["name"], json!("apply_patch"));
                 assert_eq!(items[3]["type"], json!("function_call_output"));
+                assert_eq!(items[4]["type"], json!("function_call"));
+                assert_eq!(items[4]["status"], json!("completed"));
+                assert_eq!(items[6]["type"], json!("function_call"));
+                assert_eq!(items[6]["status"], json!("completed"));
             } else {
                 assert_eq!(items[0]["name"], json!("create_event"));
                 assert_eq!(items[0]["namespace"], json!("mcp__calendar"));
                 assert_eq!(items[2]["type"], json!("custom_tool_call"));
                 assert_eq!(items[3]["type"], json!("custom_tool_call_output"));
+                assert_eq!(items[4]["type"], json!("tool_search_call"));
+                assert_eq!(items[4]["execution"], json!("client"));
+                assert_eq!(items[4]["status"], json!("completed"));
+                assert_eq!(items[6]["type"], json!("tool_search_call"));
+                assert_eq!(items[6]["execution"], json!("server"));
+                assert_eq!(items[6]["status"], json!("completed"));
             }
             // The completion status is part of the call item, not of its result.
             assert!(items[1].get("status").is_none());
             assert!(items[3].get("status").is_none());
             assert_eq!(items[2]["status"], json!("completed"));
 
-            // Downgrading namespaces to flat names must not drop the status.
+            // Downgrading namespaces or native tool_search_call items must not drop status.
             let mut body = vobj([("tools", Value::Array(Vec::new())), ("input", input)]);
             native_tool_loading::flatten_tool_namespaces(&mut body);
             assert_eq!(body["input"][0]["status"], json!("completed"));
             assert_eq!(body["input"][2]["status"], json!("completed"));
+            assert_eq!(body["input"][4]["status"], json!("completed"));
+            assert_eq!(body["input"][6]["status"], json!("completed"));
             assert!(body["input"][0].get("namespace").is_none());
+
+            let mut downgrade_request = base_req();
+            downgrade_request.messages = history.to_vec();
+            downgrade_request.tools = specs.clone();
+            native_tool_loading::apply_policy(&mut body, &downgrade_request, false);
+            assert_eq!(body["input"][4]["status"], json!("completed"));
+            assert_eq!(body["input"][6]["status"], json!("completed"));
         }
     }
 
@@ -14197,6 +14232,7 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], json!("tool_search_call"));
         assert_eq!(input[0]["call_id"], json!("srv1"));
+        assert_eq!(input[0]["status"], json!("completed"));
         assert_eq!(input[0]["execution"], json!("server"));
         assert_eq!(input[0]["arguments"], json!({"query":"calendar"}));
         assert_eq!(input[1]["type"], json!("tool_search_output"));
