@@ -154,7 +154,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -383,7 +382,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -526,8 +524,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-ephemeral-refusal-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -712,8 +709,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-ephemeral-refusal-chat"
+        "tool_choice": "auto"
       }
     }
   ]

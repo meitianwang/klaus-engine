@@ -1647,7 +1647,11 @@ async fn call_model_and_effort_validation_precede_unknown_role_rejection() {
             model: Some("custom:missing-role-admission-model".into()),
             ..base.clone()
         },
-        "Source-qualified sub-agent models require an endpoint source resolver.",
+        // With the model directory off, a source-qualified concrete id is
+        // refused by the tier gate before any endpoint resolver is consulted.
+        // It is still a call-inference error, so the ordering against the role
+        // layer is what this case pins.
+        "Concrete subagent models are disabled. Select low, medium, or high.",
     )
     .await;
     assert_role_boundary_rejection(

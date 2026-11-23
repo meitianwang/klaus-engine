@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "baselineRevision": "437d9d5fe669360becf7c1e08d4464af2c174ab0",
   "decisionCommit": "10519175a0467629541698f2ac7d7959a6614098",
-  "sourceContractSha256": "90709e509c066ffd3f36cd677836883b29216cecd22ae108f7fec9564b227279",
+  "sourceContractSha256": "d36d3d4318a8de5d9b8ae401c19f5ca1d5ba2212135c945aedba8acbdbcf97a1",
   "replacementFixture": {
     "path": "crates/core/src/tools/code_mode/fixtures/exec_wait_trace.json",
     "sha256": "6c2b491ff043273854484343cec52dc249d1ff1c859c6e0b7661a7d29d5df7c7"

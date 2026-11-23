@@ -122,7 +122,11 @@ impl ModelProvider for MessagingProvider {
                 let mut input = json!({"model": "low", "description":"named-investigation", "prompt":"original-child-direction", "fork_turns":"none", "run_in_background":true});
                 if let Some(role) = self.role {
                     input["subagent_type"] = json!(role);
-                    input["model"] = json!("inherit");
+                    // A named role still spells an explicit tier: `inherit` is
+                    // only accepted on the Claude subscription defaults path.
+                    // The resume assertion below compares the two child models,
+                    // so a fixed tier keeps that identity check intact.
+                    input["model"] = json!("low");
                 }
                 Box::pin(futures::stream::iter(tool_events(
                     "spawn-child",

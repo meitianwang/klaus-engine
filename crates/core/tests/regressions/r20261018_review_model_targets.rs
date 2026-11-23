@@ -40,6 +40,9 @@ fn provider(parent: ModelCapabilities) -> Arc<dyn ModelProvider> {
 #[test]
 fn preferred_override_and_parent_fallback_keep_exact_model_and_effort_choices() {
     let parent = metadata(&["medium", "high"], "medium");
+    // The provider materializes the deferred-tool capability it actually drives,
+    // so the fallback is compared against what the provider reports.
+    let reported_parent = provider(parent.clone()).model_metadata(&"parent".into());
     let live = Arc::new(Mutex::new(vec![(
         RuntimeString::from("gpt-5.6-luna"),
         metadata(&["low", "medium"], "medium"),
@@ -71,7 +74,7 @@ fn preferred_override_and_parent_fallback_keep_exact_model_and_effort_choices() 
     );
     assert_eq!(fallback.model, "parent");
     assert_eq!(fallback.effort, Some(EffortValue::Level(EffortLevel::High)));
-    assert_eq!(fallback.metadata, parent);
+    assert_eq!(fallback.metadata, reported_parent);
     let mut overridden = metadata(&["low", "high"], "high");
     overridden.auto_review_model_override = Some("explicit-review".into());
     let selected = resolve_approval_review_target(provider(overridden), &"parent".into(), None);
@@ -958,8 +961,19 @@ async fn declared_native_routes_control_attribution_independently_from_auth_rout
         assert_eq!(header.contains("x-codex-guardian: reviewer"), native);
         assert_eq!(body.get("max_output_tokens").is_none(), native);
         for tool in body["tools"].as_array().unwrap() {
-            // Every Responses target speaks OpenAI's tool_search enum now.
-            assert_eq!(tool["execution"], json!("client"));
+            if native {
+                // A native target declares the client-executed enum on every
+                // entry, including the search tool's own kind.
+                assert_eq!(tool["execution"], json!("client"), "{tool}");
+                if tool["name"] == json!("tool_search") {
+                    assert_eq!(tool["type"], json!("tool_search"));
+                }
+            } else {
+                // A downgraded target declares plain functions, so the same
+                // capability is spelled without an execution field at all.
+                assert_eq!(tool["type"], json!("function"), "{tool}");
+                assert!(tool.get("execution").is_none(), "{tool}");
+            }
         }
         let input = body["input"]
             .as_array()

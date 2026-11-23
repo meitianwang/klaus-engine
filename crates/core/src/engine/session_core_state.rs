@@ -4454,12 +4454,18 @@ impl Session {
         tools
     }
 
+    /// Refresh the engine's own delegation tool so its advertised agent roster
+    /// and model catalog match the current registry. A host-supplied tool
+    /// answering to `task` owns that name and keeps its own implementation.
     pub(crate) fn prepare_subagent_tool_inventory(
         &self,
         tools: &mut [Arc<dyn Tool>],
         config: &ResolvedConfig,
     ) {
-        if let Some(tool) = tools.iter_mut().find(|tool| tool.name() == "task") {
+        if let Some(tool) = tools
+            .iter_mut()
+            .find(|tool| tool.name() == "task" && tool.refreshable_delegation_tool())
+        {
             let exposure = tool.exposure();
             let mut rebuilt = crate::tools::builtins::task::create_task_tool_for_source(
                 crate::tools::builtins::task::TaskToolOptions {

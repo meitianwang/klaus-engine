@@ -629,7 +629,7 @@ async fn advisor_is_not_advertised_to_children_without_parent_snapshot_access() 
     let mut spawn = tool_events(
         "child-probe",
         "task",
-        r#"{"model":"test-model","description":"Inspect inherited tools","prompt":"Child tools check","run_in_background":false}"#,
+        r#"{"model":"low","description":"Inspect inherited tools","prompt":"Child tools check","run_in_background":false}"#,
     );
     spawn.push(ModelStreamEvent::MessageStop {
         stop_reason: ModelStopReason::ToolUse,

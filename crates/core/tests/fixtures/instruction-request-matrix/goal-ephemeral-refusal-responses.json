@@ -154,7 +154,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-responses",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -383,7 +382,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-ephemeral-refusal-responses",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -395,8 +393,18 @@
         "stream": true,
         "store": false,
         "max_output_tokens": 8192,
-        "instructions": "Instruction matrix base instructions.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content.",
         "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "id": "msg_<item-id>",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Instruction matrix base instructions.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content."
+              }
+            ]
+          },
           {
             "role": "user",
             "content": "Perform the explicitly requested task."
@@ -528,8 +536,18 @@
         "stream": true,
         "store": false,
         "max_output_tokens": 8192,
-        "instructions": "Instruction matrix base instructions.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content.",
         "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "id": "msg_<item-id>",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Instruction matrix base instructions.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content."
+              }
+            ]
+          },
           {
             "role": "user",
             "content": "Perform the explicitly requested task."
@@ -538,18 +556,21 @@
             "type": "function_call",
             "call_id": "matrix-tool-call",
             "name": "get_goal",
+            "status": "completed",
             "arguments": "{}"
           },
           {
             "type": "function_call",
             "call_id": "matrix-goal-create",
             "name": "create_goal",
+            "status": "completed",
             "arguments": "{\"objective\":\"Explicit temporary-session objective\"}"
           },
           {
             "type": "function_call",
             "call_id": "matrix-goal-update",
             "name": "update_goal",
+            "status": "completed",
             "arguments": "{\"status\":\"complete\"}"
           },
           {

@@ -1704,6 +1704,44 @@ async fn stream_and_dispatch_inner(
                     }))
         });
 
+    // Bound the recovery of an UNREADABLE call that repeats byte-for-byte. The
+    // call never runs, so identical prefixes carry no new information and the
+    // model is not progressing. Only a response whose single call was dropped
+    // for unreadable arguments counts, and only with no output ceiling involved
+    // — that case owns the separate budget ladder below. Any readable call, a
+    // mixed batch or a different prefix breaks the streak.
+    {
+        let repeating = !output_limit_reached
+            && calls.is_empty()
+            && dropped.len() == 1
+            && partial
+                .get(&dropped[0].visible.id)
+                .is_some_and(|p| !p.arguments_are_parseable());
+        let mut recovery = shared.truncation.lock_recover();
+        if repeating {
+            let call = &dropped[0];
+            let raw = partial
+                .get(&call.visible.id)
+                .map(|p| p.raw_input.clone())
+                .unwrap_or_default();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&call.internal_name, &mut hasher);
+            std::hash::Hash::hash(&raw, &mut hasher);
+            let signature = std::hash::Hasher::finish(&hasher);
+            if recovery.identical_malformed_signature == signature
+                && recovery.identical_malformed_repeats > 0
+            {
+                recovery.identical_malformed_repeats += 1;
+            } else {
+                recovery.identical_malformed_signature = signature;
+                recovery.identical_malformed_repeats = 1;
+            }
+        } else {
+            recovery.identical_malformed_signature = 0;
+            recovery.identical_malformed_repeats = 0;
+        }
+    }
+
     // Salvage a `write` the output ceiling cut off, and only once truncation is
     // confirmed. Two gates, both load-bearing:
     //

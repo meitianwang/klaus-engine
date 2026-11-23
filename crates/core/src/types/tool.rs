@@ -1885,6 +1885,12 @@ pub trait Tool: Send + Sync {
     fn task_scope_host_capability(&self) -> bool {
         false
     }
+    /// The engine's own delegation tool, whose agent roster and model catalog
+    /// are rebuilt as they change. A host-supplied implementation answering to
+    /// the same name owns that name and is never replaced by a rebuild.
+    fn refreshable_delegation_tool(&self) -> bool {
+        false
+    }
 
     fn is_enabled(&self) -> bool;
     fn is_concurrency_safe(&self, input: &Json) -> bool;

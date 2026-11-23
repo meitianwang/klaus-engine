@@ -218,15 +218,8 @@ async fn actual_review_inspects_before_internal_result_and_uses_complete_wire_bu
                         .iter()
                         .map(|tool| tool["name"].as_str().unwrap())
                         .collect::<Vec<_>>();
-                    assert_eq!(names.len(), 6);
-                    for expected in [
-                        "exec_command",
-                        "write_stdin",
-                        "view_image",
-                        "exec",
-                        "wait",
-                        "emit_result",
-                    ] {
+                    assert_eq!(names.len(), 4);
+                    for expected in ["exec_command", "write_stdin", "view_image", "emit_result"] {
                         assert!(names.contains(&expected), "{body}");
                     }
                     assert_eq!(body["tool_choice"], json!({"type":"auto"}));

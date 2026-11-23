@@ -176,7 +176,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-recovered-compacted-resumed-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -356,7 +355,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-recovered-compacted-resumed-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -507,8 +505,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-recovered-compacted-resumed-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -657,8 +654,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-recovered-compacted-resumed-chat"
+        "tool_choice": "auto"
       }
     }
   ]

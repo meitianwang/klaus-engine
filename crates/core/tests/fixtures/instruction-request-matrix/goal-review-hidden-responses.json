@@ -63,6 +63,10 @@
               "pages": {
                 "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
                 "type": "string"
+              },
+              "allow_large": {
+                "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+                "type": "boolean"
               }
             },
             "required": [
@@ -248,7 +252,7 @@
                 "maximum": 9007199254740991
               },
               "runInBackground": {
-                "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+                "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
                 "type": "boolean"
               },
               "sandboxPermissions": {
@@ -299,7 +303,6 @@
       },
       "skipCacheWrite": true,
       "cacheKey": "goal-review-hidden-responses",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -311,8 +314,18 @@
         "stream": true,
         "store": false,
         "max_output_tokens": 8192,
-        "instructions": "# Review guidelines\n\nYou are acting as a reviewer for a proposed code change made by another engineer.\n\nBelow are the default guidelines for determining whether the original author would appreciate an issue being flagged. More specific guidelines may appear elsewhere (in a developer message, a user message, or a file) and override these general instructions.\n\nAn issue qualifies as a bug worth flagging when:\n\n1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.\n2. It is discrete and actionable (not a general issue with the codebase or a combination of multiple issues).\n3. Fixing it does not demand a level of rigor absent from the rest of the codebase.\n4. It was introduced by the change under review (pre-existing bugs should not be flagged).\n5. The author would likely fix the issue if made aware of it.\n6. It does not rely on unstated assumptions about the codebase or the author's intent.\n7. Any claimed impact on other parts of the codebase identifies the code that is provably affected, not speculation.\n8. It is clearly not just an intentional change by the original author.\n\nFor every flagged issue, write an accompanying comment:\n\n1. Be clear about why the issue is a bug.\n2. Communicate severity accurately; do not overstate it.\n3. Keep the body to at most one paragraph.\n4. Do not include code chunks longer than 3 lines; wrap any code in inline code tags or a code block.\n5. State the scenarios, environments, or inputs required for the bug to arise.\n6. Keep the tone matter-of-fact, not accusatory and not flattering.\n7. Write so the original author can immediately grasp the idea without close reading.\n\nHOW MANY FINDINGS TO RETURN:\n\nOutput every finding the original author would fix if they knew about it. If no finding meets that bar, prefer outputting no findings. Do not stop at the first qualifying finding.\n\nGUIDELINES:\n\n- Ignore trivial style unless it obscures meaning or violates documented standards.\n- Use one comment per distinct issue.\n- Keep each finding's line range as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).\n\nTag each finding title with a priority level, e.g. \"[P1] Un-padding slices along wrong tensor dimensions\". [P0] - drop everything to fix; blocking release or major usage. [P1] - urgent, next cycle. [P2] - normal, fix eventually. [P3] - low, nice to have. Also set the numeric \"priority\" field to 0-3 accordingly; omit it or use null when a priority cannot be determined.\n\nAt the end, output an \"overall correctness\" verdict of whether the patch should be considered \"correct\": correct implies existing code and tests will not break and the patch is free of bugs and other blocking issues. Ignore non-blocking issues such as style, formatting, typos, and documentation.\n\nOUTPUT FORMAT:\n\n## Output schema - MUST MATCH *exactly*\n\n```json\n{\n  \"findings\": [\n    {\n      \"title\": \"<= 80 chars, imperative>\",\n      \"body\": \"<valid Markdown explaining *why* this is a problem; cite files/lines/functions>\",\n      \"confidence_score\": <float 0.0-1.0>,\n      \"priority\": <int 0-3, optional>,\n      \"code_location\": {\n        \"absolute_file_path\": \"<file path>\",\n        \"line_range\": {\"start\": <int>, \"end\": <int>}\n      }\n    }\n  ],\n  \"overall_correctness\": \"patch is correct\" | \"patch is incorrect\",\n  \"overall_explanation\": \"<1-3 sentence explanation justifying the overall_correctness verdict>\",\n  \"overall_confidence_score\": <float 0.0-1.0>\n}\n```\n\n* **Do not** wrap the JSON in markdown fences or extra prose.\n* The code_location field is required and must include absolute_file_path and line_range, and should overlap with the diff.\n* Do not generate a PR fix.\n\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: <workspace>\n - Is a git repository: false\n - Platform: <host-fact>\n - Shell: <host-fact>\n - OS Version: <host-fact>\n - Your own extensions are configured at the paths below. A path that does not exist yet simply means nothing is configured at that scope; it is not a fault to investigate, and another agent tool's config directory is not yours to read from.\n  - Skills: <workspace>/.klaus/skills (project), <workspace>/skills (user)\n  - MCP servers: <workspace>/.klaus/mcp.json (project), <workspace>/mcp.json (user)\n - You are powered by the model instruction-matrix.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content.",
         "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "id": "msg_<item-id>",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "# Review guidelines\n\nYou are acting as a reviewer for a proposed code change made by another engineer.\n\nBelow are the default guidelines for determining whether the original author would appreciate an issue being flagged. More specific guidelines may appear elsewhere (in a developer message, a user message, or a file) and override these general instructions.\n\nAn issue qualifies as a bug worth flagging when:\n\n1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.\n2. It is discrete and actionable (not a general issue with the codebase or a combination of multiple issues).\n3. Fixing it does not demand a level of rigor absent from the rest of the codebase.\n4. It was introduced by the change under review (pre-existing bugs should not be flagged).\n5. The author would likely fix the issue if made aware of it.\n6. It does not rely on unstated assumptions about the codebase or the author's intent.\n7. Any claimed impact on other parts of the codebase identifies the code that is provably affected, not speculation.\n8. It is clearly not just an intentional change by the original author.\n\nFor every flagged issue, write an accompanying comment:\n\n1. Be clear about why the issue is a bug.\n2. Communicate severity accurately; do not overstate it.\n3. Keep the body to at most one paragraph.\n4. Do not include code chunks longer than 3 lines; wrap any code in inline code tags or a code block.\n5. State the scenarios, environments, or inputs required for the bug to arise.\n6. Keep the tone matter-of-fact, not accusatory and not flattering.\n7. Write so the original author can immediately grasp the idea without close reading.\n\nHOW MANY FINDINGS TO RETURN:\n\nOutput every finding the original author would fix if they knew about it. If no finding meets that bar, prefer outputting no findings. Do not stop at the first qualifying finding.\n\nGUIDELINES:\n\n- Ignore trivial style unless it obscures meaning or violates documented standards.\n- Use one comment per distinct issue.\n- Keep each finding's line range as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).\n\nTag each finding title with a priority level, e.g. \"[P1] Un-padding slices along wrong tensor dimensions\". [P0] - drop everything to fix; blocking release or major usage. [P1] - urgent, next cycle. [P2] - normal, fix eventually. [P3] - low, nice to have. Also set the numeric \"priority\" field to 0-3 accordingly; omit it or use null when a priority cannot be determined.\n\nAt the end, output an \"overall correctness\" verdict of whether the patch should be considered \"correct\": correct implies existing code and tests will not break and the patch is free of bugs and other blocking issues. Ignore non-blocking issues such as style, formatting, typos, and documentation.\n\nOUTPUT FORMAT:\n\n## Output schema - MUST MATCH *exactly*\n\n```json\n{\n  \"findings\": [\n    {\n      \"title\": \"<= 80 chars, imperative>\",\n      \"body\": \"<valid Markdown explaining *why* this is a problem; cite files/lines/functions>\",\n      \"confidence_score\": <float 0.0-1.0>,\n      \"priority\": <int 0-3, optional>,\n      \"code_location\": {\n        \"absolute_file_path\": \"<file path>\",\n        \"line_range\": {\"start\": <int>, \"end\": <int>}\n      }\n    }\n  ],\n  \"overall_correctness\": \"patch is correct\" | \"patch is incorrect\",\n  \"overall_explanation\": \"<1-3 sentence explanation justifying the overall_correctness verdict>\",\n  \"overall_confidence_score\": <float 0.0-1.0>\n}\n```\n\n* **Do not** wrap the JSON in markdown fences or extra prose.\n* The code_location field is required and must include absolute_file_path and line_range, and should overlap with the diff.\n* Do not generate a PR fix.\n\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: <workspace>\n - Is a git repository: false\n - Platform: <host-fact>\n - Shell: <host-fact>\n - OS Version: <host-fact>\n - Your own extensions are configured at the paths below. A path that does not exist yet simply means nothing is configured at that scope; it is not a fault to investigate, and another agent tool's config directory is not yours to read from.\n  - Skills: <workspace>/.klaus/skills (project), <workspace>/skills (user)\n  - MCP servers: <workspace>/.klaus/mcp.json (project), <workspace>/mcp.json (user)\n - You are powered by the model instruction-matrix.\n\n# Provider Behavior\n\n- Use provider-visible tool descriptions and schemas as the tool contract. Put every argument in the named field the schema declares; use freeform input only when a tool description explicitly asks for it.\n- When independent tool calls or sub-agent tasks can run in parallel, issue them together in one assistant response.\n- Encrypted reasoning items may be replayed by the harness to preserve Responses reasoning continuity; do not expose, transform, or describe their opaque content."
+              }
+            ]
+          },
           {
             "role": "user",
             "content": "Review the explicitly provided change for actionable defects."
@@ -349,6 +362,10 @@
                 "pages": {
                   "description": "PDF only: bounded page range to render as images, e.g. \"5\" or \"1-10\". Use 1-based page numbers and request at most 20 pages. Open-ended ranges are not supported. Omit pages to read a small PDF natively when the current model supports it.",
                   "type": "string"
+                },
+                "allow_large": {
+                  "description": "Text only: read the whole file (or whole requested range) in one call even when it exceeds the token read limit, when it still fits in your context. Use only if you genuinely need all of it.",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -544,7 +561,7 @@
                   "maximum": 9007199254740991
                 },
                 "runInBackground": {
-                  "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Observe that shellId with bash_output and stop it with kill_shell.",
+                  "description": "Run a resumable command, returning its output and exit code if it finishes within the initial observation window, or a shellId if it remains running. Its result reaches you by itself when it finishes; re-read it with TaskOutput, wait with Yield, and stop it with TaskStop.",
                   "type": "boolean"
                 },
                 "sandboxPermissions": {
@@ -589,8 +606,7 @@
             "strict": false
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-review-hidden-responses"
+        "tool_choice": "auto"
       }
     }
   ]

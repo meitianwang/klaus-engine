@@ -18,7 +18,7 @@ fn spawn_agent_schema_inherits_parent_environment() {
     assert!(!properties.contains_key("isolation"));
 
     let input = runtime_json::parse(&RuntimeString::from(
-        r#"{"model":"test-model","description":"inspect","prompt":"inspect the project","cwd":"","isolation":"worktree"}"#,
+        r#"{"model":"low","description":"inspect","prompt":"inspect the project","cwd":"","isolation":"worktree"}"#,
     ))
     .expect("valid task input");
     let parsed = tool

@@ -103,7 +103,6 @@
         "type": "adaptive"
       },
       "cacheKey": "child-default-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -198,8 +197,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "child-default-chat"
+        "tool_choice": "auto"
       }
     }
   ]

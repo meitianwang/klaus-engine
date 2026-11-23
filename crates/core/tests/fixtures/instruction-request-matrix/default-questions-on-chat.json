@@ -235,7 +235,6 @@
         "type": "adaptive"
       },
       "cacheKey": "default-questions-on-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -462,8 +461,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "default-questions-on-chat"
+        "tool_choice": "auto"
       }
     }
   ]

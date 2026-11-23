@@ -187,14 +187,33 @@ fn role_model_defaults_and_explicit_arguments_survive_provider_adapters() {
 
 #[test]
 fn shared_behavior_policy_does_not_treat_question_answers_as_runtime_permission() {
+    let boundary = contract()["shared_question_boundary"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The boundary is stated in the base packages that carry it, and never
+    // phrased as a permission grant. The question tools themselves state it on
+    // every profile, which the sibling test above pins.
+    for model in ["gpt-6.1-sol", "gpt-6.2-sol", "gemini-4"] {
+        let parts = build_system_prompt(&SystemPromptInput {
+            config: ResolvedConfig {
+                model: model.into(),
+                ..ResolvedConfig::default()
+            },
+            ..Default::default()
+        });
+        let base = parts.iter().find(|part| part.name == "base").unwrap();
+        assert!(base.text.contains(&boundary), "{model}: {base:?}");
+        assert!(!base
+            .text
+            .contains("when progress requires the user's decision or approval"));
+    }
+    // A package without the sentence still never grants permission through it.
     let parts = build_system_prompt(&SystemPromptInput {
         config: ResolvedConfig::default(),
         ..Default::default()
     });
     let base = parts.iter().find(|part| part.name == "base").unwrap();
-    assert!(base
-        .text
-        .contains(contract()["shared_question_boundary"].as_str().unwrap()));
     assert!(!base
         .text
         .contains("when progress requires the user's decision or approval"));

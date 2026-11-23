@@ -176,7 +176,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-ordinary-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -395,7 +394,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-ordinary-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -580,7 +578,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-long-paused-ordinary-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -731,8 +728,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-long-paused-ordinary-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -893,8 +889,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-long-paused-ordinary-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -998,8 +993,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-long-paused-ordinary-chat"
+        "tool_choice": "auto"
       }
     }
   ]

@@ -176,7 +176,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-paused-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -327,8 +326,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-paused-chat"
+        "tool_choice": "auto"
       }
     }
   ]

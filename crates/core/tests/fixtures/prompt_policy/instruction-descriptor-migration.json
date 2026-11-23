@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "sourceContractSha256": "90709e509c066ffd3f36cd677836883b29216cecd22ae108f7fec9564b227279",
+  "sourceContractSha256": "d36d3d4318a8de5d9b8ae401c19f5ca1d5ba2212135c945aedba8acbdbcf97a1",
   "rules": [
     {
       "style": "anthropic",

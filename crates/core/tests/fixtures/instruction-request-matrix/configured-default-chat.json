@@ -235,7 +235,6 @@
         "type": "adaptive"
       },
       "cacheKey": "configured-default-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -462,8 +461,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "configured-default-chat"
+        "tool_choice": "auto"
       }
     }
   ]

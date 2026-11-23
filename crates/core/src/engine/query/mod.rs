@@ -958,7 +958,19 @@ struct TruncationRecovery {
     /// dropped call's error result; the loop reads it to decide whether the
     /// budget ladder still applies.
     tool_over_limit_retries: u32,
+    /// Digest of the raw arguments of the last response whose ONLY call was
+    /// dropped for unreadable arguments, with no output ceiling involved.
+    identical_malformed_signature: u64,
+    /// Consecutive responses repeating that exact digest. A readable call, a
+    /// mixed batch, visible text progress or a different prefix breaks the
+    /// streak; the output-ceiling ladder keeps its own budget above.
+    identical_malformed_repeats: u32,
 }
+
+/// A model that keeps re-sending the SAME unreadable arguments is not making
+/// progress: the call never runs, so nothing is learned between attempts. Five
+/// retries after the first failure are granted before the turn is failed.
+const MAX_IDENTICAL_MALFORMED_RESPONSES: u32 = 6;
 
 /// The result of one `stream_and_dispatch`.
 enum Outcome {

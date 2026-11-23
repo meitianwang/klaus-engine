@@ -190,7 +190,6 @@
         "type": "adaptive"
       },
       "cacheKey": "plan-recovered-compacted-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -394,7 +393,6 @@
         "type": "adaptive"
       },
       "cacheKey": "plan-recovered-compacted-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -573,8 +571,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "plan-recovered-compacted-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -755,8 +752,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "plan-recovered-compacted-chat"
+        "tool_choice": "auto"
       }
     }
   ]

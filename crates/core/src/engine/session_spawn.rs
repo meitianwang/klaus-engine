@@ -2929,6 +2929,14 @@ impl Session {
                     parts
                 })
             })
+        } else if let Some(parts) = inherited_system {
+            // Nothing to layer on top, but an inherited prompt is still the
+            // child's prompt: a full-history fork keeps the parent's role even
+            // when no role, reminder, memory or teammate section is added.
+            Arc::new(move || {
+                let parts = parts.clone();
+                Box::pin(async move { parts })
+            })
         } else {
             self.system_prompt_provider.read_recover().clone()
         }

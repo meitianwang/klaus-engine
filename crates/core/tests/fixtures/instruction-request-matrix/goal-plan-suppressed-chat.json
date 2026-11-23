@@ -212,7 +212,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-plan-suppressed-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -399,8 +398,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-plan-suppressed-chat"
+        "tool_choice": "auto"
       }
     }
   ]

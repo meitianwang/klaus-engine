@@ -675,6 +675,10 @@ impl Tool for TaskTool {
         "task"
     }
 
+    fn refreshable_delegation_tool(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> RuntimeString {
         self.description.clone()
     }

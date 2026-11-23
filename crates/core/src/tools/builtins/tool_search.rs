@@ -1511,6 +1511,10 @@ impl Tool for ExposureOverrideTool {
         self.inner.persistence_identity()
     }
 
+    fn refreshable_delegation_tool(&self) -> bool {
+        self.inner.refreshable_delegation_tool()
+    }
+
     fn name(&self) -> RuntimeString {
         self.inner.name()
     }

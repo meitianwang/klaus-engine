@@ -1501,7 +1501,7 @@ const EXEC_WAIT_FIXTURE_PATH: &str =
 const EXEC_WAIT_FIXTURE_SHA256: &str =
     "6c2b491ff043273854484343cec52dc249d1ff1c859c6e0b7661a7d29d5df7c7";
 const SOURCE_CONTRACT_SHA256: &str =
-    "90709e509c066ffd3f36cd677836883b29216cecd22ae108f7fec9564b227279";
+    "d36d3d4318a8de5d9b8ae401c19f5ca1d5ba2212135c945aedba8acbdbcf97a1";
 const TEAM_CREATE_LEGACY_SOURCE_RAW_SHA256: &str =
     "025acd106c31f77fc14525b955c5c7cabcf411397c96d3bacd52cc8ac646fe73";
 const TEAM_CREATE_CC_TARGET_RAW_SHA256: &str =
@@ -1523,7 +1523,7 @@ const TEAM_CREATE_LEGACY_SOURCE_CATALOG_SHA256: [&str; 12] = [
 const FIXED_BASELINE_TREE: &str = "df2949dcf5281ba0d4b83531dbffd2e16f430848";
 const LIVE_MODEL_TOKEN: &str = "$MODEL";
 const LIVE_PRELUDE_BOUNDARIES_SHA256: &str =
-    "694d4e49f30c9c03c0cdc24c5daf28f51718d5578231493a92fdb97e3b25b5d4";
+    "13eab5cec0fdac8808fcde857fb720a3df351bad08c11a393f00584b3919a31b";
 const LIVE_PRELUDE_BOUNDARIES_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/provider_behavior/v1/live-prelude-boundaries.json");
 const CODE_MODE_SOURCE_TASK_SHA256: &str =
@@ -5841,7 +5841,7 @@ fn optional_question_catalog_spec(
 }
 
 const INSTRUCTION_DESCRIPTOR_MIGRATION_SHA256: &str =
-    "3677292a7553afee585a75a45734418deb33ed57519758b5b9a1d8395d5a91fb";
+    "54dc57b61180544887561c5fc622e8fc63dcadee72c3857084e91950f83f89b4";
 
 static INSTRUCTION_DESCRIPTOR_RULES: LazyLock<Result<RuntimeJson, String>> = LazyLock::new(|| {
     let fixture = runtime_json::parse(&RuntimeString::from(include_str!(
@@ -6011,7 +6011,7 @@ fn pinned_instruction_request_projection() -> Result<RuntimeJson, String> {
     )))
     .map_err(|error| format!("invalid instruction projection fixture: {error}"))?;
     if exact_runtime_json_sha256(&fixture)
-        != "e15dc71482cf7cab8c026346d573dafa3be3fcc9dfc59e71e8bd1a0db7255f9a"
+        != "d1d56a31227728676d43838dd1cde040d3aa862bab3ff06d274300a24dc50818"
         || !runtime_json_field_eq(&fixture, "sourceContractSha256", SOURCE_CONTRACT_SHA256)
     {
         return Err("instruction projection fixture drifted".into());
@@ -23124,9 +23124,9 @@ mod tests {
     fn fixed_default_planning_contracts_pin_complete_parts_and_profile_rendering() {
         for (fixture, digest) in [
             (include_str!("../../tests/fixtures/instruction-request-matrix/default-questions-off-chat.json"),
-             "bc9435763b4779739d9675dc0b8f1abfe91ad8432b7122e4f3f5343afe948afd"),
+             "64d21dc90f9ac6ffdcb5ce33b86c763a5904bf4c6ce73a2400e87f1cb435a5a8"),
             (include_str!("../../tests/fixtures/instruction-request-matrix/default-questions-off-responses.json"),
-             "e75a35e65c509a1177627451838824124cf9af141293aa3148a836eaf1e940a2"),
+             "745d0bd0ce03bfb702ae720f595f32ce1ac090cb6235214c3cdcd22cf51f2bb6"),
         ] {
             assert_eq!(sha256_hex(fixture.as_bytes()), digest);
             let fixture = runtime_json::parse(&RuntimeString::from(fixture)).unwrap();

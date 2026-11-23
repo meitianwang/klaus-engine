@@ -190,7 +190,6 @@
         "type": "adaptive"
       },
       "cacheKey": "plan-questions-default-off-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -369,8 +368,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "plan-questions-default-off-chat"
+        "tool_choice": "auto"
       }
     }
   ]

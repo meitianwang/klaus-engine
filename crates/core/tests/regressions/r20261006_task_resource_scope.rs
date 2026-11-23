@@ -107,13 +107,16 @@ async fn task_resource_scope_hard_denies_unscoped_native_side_effect_tools() {
         },
     );
     let engine = StaticPermissionEngine::new(&config);
+    // Every name here is a production builtin the scope allow-list refuses.
+    // The interactive-shell pair is `exec_command` / `write_stdin`; `sleep` is
+    // the unscoped wait primitive.
     for name in [
         "REPL",
         "workflow",
         "save_memory",
         "task",
-        "exec",
-        "wait",
+        "write_stdin",
+        "sleep",
         "exec_command",
         "web_search",
         "web_fetch",

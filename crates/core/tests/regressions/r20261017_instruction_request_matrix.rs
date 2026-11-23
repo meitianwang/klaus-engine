@@ -35,8 +35,8 @@ use klaus_agent_core::store::session_store::{CompactionRecord, SessionStore};
 use klaus_agent_core::types::abort::AbortSignal;
 use klaus_agent_core::types::events::EngineEvent;
 use klaus_agent_core::types::provider::{
-    ModelCapabilities, ModelProvider, ModelRequest, ModelStream, ProviderCapabilities,
-    ProviderInfo, SystemPromptPart,
+    stable_system_text, ModelCapabilities, ModelProvider, ModelRequest, ModelStream,
+    ProviderCapabilities, ProviderInfo, SystemPromptPart,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -581,9 +581,30 @@ fn expected_runtime_guidance(request: &ModelRequest) -> Option<String> {
         .unwrap(),
     )
 }
+/// Instruction text of a developer/system message item: a plain string, or the
+/// concatenated `input_text` parts of the identified message form.
+fn message_text(item: &Value) -> String {
+    match &item["content"] {
+        Value::String(text) => text.clone(),
+        parts => parts
+            .as_array()
+            .expect("message content is text or a part array")
+            .iter()
+            .map(|part| {
+                assert_eq!(part["type"], "input_text", "{part}");
+                part["text"].as_str().unwrap().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
 fn expected_developer_context(case: Case, api: Api, request: &ModelRequest) -> Vec<String> {
     let mut expected = if matches!(api, Api::Responses) {
-        expected_runtime_guidance(request).into_iter().collect()
+        // The stable prefix rides the developer lane as its own identified
+        // message item, ahead of the runtime guidance and the mode text.
+        let mut parts = vec![stable_system_text(&request.system).try_to_utf8().unwrap()];
+        parts.extend(expected_runtime_guidance(request));
+        parts
     } else {
         Vec::new()
     };
@@ -751,14 +772,16 @@ fn verify_boundaries(case: Case, api: Api, model: &[ModelRequest], wire: &[Value
         if let Some(instructions) = body["instructions"].as_str() {
             assert_objectives_remain_data(instructions);
         }
+        // Tool-declaration batches also ride the developer role, but they carry
+        // no instruction text; only content-bearing messages belong to this lane.
         let developers = messages
             .iter()
-            .filter(|item| item["role"] == "developer")
+            .filter(|item| item["role"] == "developer" && item.get("content").is_some())
             .collect::<Vec<_>>();
         assert_eq!(
             developers
                 .iter()
-                .map(|item| item["content"].as_str().unwrap().to_owned())
+                .map(|item| message_text(item))
                 .collect::<Vec<_>>(),
             expected_developer_context(case, api, request),
             "the native developer lane contains only the complete ordered runtime and mode instructions"
@@ -785,10 +808,18 @@ fn verify_boundaries(case: Case, api: Api, model: &[ModelRequest], wire: &[Value
                         "Chat carries the full stable review context and full volatile permissions in order"
                     );
                 }
-                Api::Responses => assert_eq!(body["instructions"], expected),
+                Api::Responses => {
+                    // The stable review context rides the identified developer
+                    // message item instead of a top-level instructions field.
+                    assert!(body.get("instructions").is_none(), "{body}");
+                    assert_eq!(message_text(developers.first().unwrap()), expected);
+                }
             }
         } else {
-            assert_eq!(developers.last().unwrap()["content"], expected_mode(case));
+            assert_eq!(
+                message_text(developers.last().unwrap()),
+                expected_mode(case)
+            );
             assert_eq!(
                 messages.last().unwrap()["role"],
                 "developer",
@@ -828,6 +859,11 @@ fn canonicalize(value: &mut Value, root: &Path, url: &str) {
             *text = ENVIRONMENT
                 .replace_all(text, "${1}<host-fact>")
                 .into_owned();
+            // The identified developer message item carries a freshly minted id
+            // per run; the identity is generated, the instruction body is not.
+            static MESSAGE_ITEM_ID: LazyLock<regex::Regex> =
+                LazyLock::new(|| regex::Regex::new(r"^msg_[0-9a-f-]{36}$").unwrap());
+            *text = MESSAGE_ITEM_ID.replace(text, "msg_<item-id>").into_owned();
             static PLAN_CONTEXT: LazyLock<regex::Regex> =
                 LazyLock::new(|| regex::Regex::new(r"^planning-context-[0-9a-f-]{36}-").unwrap());
             *text = PLAN_CONTEXT

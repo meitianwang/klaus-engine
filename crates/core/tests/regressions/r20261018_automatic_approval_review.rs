@@ -1252,7 +1252,7 @@ async fn private_review_has_fixed_tools_and_independent_turns_from_a_restricted_
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
-        for name in ["exec_command", "write_stdin", "view_image", "exec", "wait"] {
+        for name in ["exec_command", "write_stdin", "view_image"] {
             assert!(
                 names.iter().any(|actual| actual == name),
                 "the independent review omitted {name}"

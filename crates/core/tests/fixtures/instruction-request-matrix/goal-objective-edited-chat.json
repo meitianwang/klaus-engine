@@ -176,7 +176,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-objective-edited-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -385,7 +384,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-objective-edited-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -536,8 +534,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-objective-edited-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -694,8 +691,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-objective-edited-chat"
+        "tool_choice": "auto"
       }
     }
   ]

@@ -66,7 +66,6 @@ fn pick_config(config: crate::schemas::config::EngineConfig) -> Value {
         "memory": value["memory"].clone(),
         "workflow": value["workflow"].clone(),
         "swarm": value["swarm"].clone(),
-        "codeMode": value["codeMode"].clone(),
         "agentMemory": value["agentMemory"].clone(),
         "memoryRecall": value["memoryRecall"].clone(),
         "agentMemorySnapshot": value["agentMemorySnapshot"].clone(),

@@ -600,7 +600,7 @@ impl ModelProvider for Provider {
                         call(
                             "spawn-grand",
                             "task",
-                            json!({"model": "owner-model", "description":"Grandchild owner check","prompt":GRAND,"subagent_type":"owner-worker","fork_turns":self.grand_fork,"run_in_background":true}),
+                            json!({"model": "low", "description":"Grandchild owner check","prompt":GRAND,"subagent_type":"owner-worker","fork_turns":self.grand_fork,"run_in_background":true}),
                         )
                     }
                 }
@@ -633,7 +633,7 @@ impl ModelProvider for Provider {
                 0 => call(
                     "spawn-child",
                     "task",
-                    json!({"model": "owner-model", "description":"Child owner check","prompt":CHILD,"subagent_type":"owner-worker","fork_turns":"all","run_in_background":true}),
+                    json!({"model": "low", "description":"Child owner check","prompt":CHILD,"subagent_type":"owner-worker","fork_turns":"all","run_in_background":true}),
                 ),
                 1 => {
                     let result = result(&request, "spawn-child");
@@ -755,6 +755,11 @@ async fn native_child_connections_keep_question_owners_and_admitted_catalogs() {
         options.provider = provider.clone();
         options.config.as_mut().unwrap()["approval_policy"] = json!("on-request");
         options.config.as_mut().unwrap()["prewarm"] = json!(false);
+        // This fixture counts every model request and every connection close, so
+        // the background memory-extraction fork must not add a session of its own.
+        options.config.as_mut().unwrap()["agentMemory"] = json!(false);
+        options.config.as_mut().unwrap()["autoMemory"] = json!(false);
+        options.config.as_mut().unwrap()["memoryRecall"] = json!(false);
         options.config.as_mut().unwrap()["allow"] = json!(["task", "task_stop"]);
         options.tools = Some(vec![
             create_task_tool(TaskToolOptions::default()),

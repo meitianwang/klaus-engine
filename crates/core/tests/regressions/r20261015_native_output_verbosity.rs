@@ -196,7 +196,17 @@ async fn responses_preserve_per_model_output_detail_and_structured_format() {
             json!(["result"])
         );
         assert_eq!(body["max_output_tokens"], json!(321));
-        assert_eq!(body["reasoning"]["effort"], json!("high"));
+        if model == "gpt-6.1-sol" {
+            // A mid-conversation effort model keeps its top-level effort pinned
+            // and carries the requested level on a trailing configuration item.
+            assert_eq!(body["reasoning"]["effort"], json!("medium"));
+            let items = body["input"].as_array().unwrap();
+            let trailing = items.last().unwrap();
+            assert_eq!(trailing["type"], json!("configuration_update"), "{body}");
+            assert_eq!(trailing["reasoning"]["effort"], json!("high"), "{body}");
+        } else {
+            assert_eq!(body["reasoning"]["effort"], json!("high"));
+        }
     }
 }
 

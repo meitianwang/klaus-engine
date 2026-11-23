@@ -131,7 +131,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-progress-disabled-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -284,7 +283,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-progress-disabled-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -387,8 +385,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-progress-disabled-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -493,8 +490,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-progress-disabled-chat"
+        "tool_choice": "auto"
       }
     }
   ]

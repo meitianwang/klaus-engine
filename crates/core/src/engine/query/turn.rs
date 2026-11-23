@@ -4562,6 +4562,33 @@ async fn run_turn_loop_guard(
     loop_detector: &mut Option<LoopDetector>,
     pending_loop_reminder: &mut Option<RuntimeString>,
 ) -> bool {
+    // An unreadable call repeated byte-for-byte never runs, so the streak is
+    // pure waste rather than a retried action. It is bounded on its own terms,
+    // independently of the streamed-text detector.
+    let identical_malformed = shared.truncation.lock_recover().identical_malformed_repeats
+        >= super::MAX_IDENTICAL_MALFORMED_RESPONSES;
+    if identical_malformed {
+        for r in tool_results {
+            if let Some(cb) = &shared.params.on_message {
+                if cb(Message::ToolResult(r.clone())).await.is_err() {
+                    return false;
+                }
+            }
+        }
+        shared.q.push(EngineEvent::TurnFailed { inference: None,
+            error: EngineError {
+                code: EngineErrorCode::LoopDetected,
+                message: RuntimeString::from(
+                    "Halted: the model appears stuck in a loop (the same tool call arrived with unreadable arguments every time, so it never ran). Re-approach the task or break it into smaller steps.",
+                ),
+                cause: None,
+                request_id: None,
+                provider_kind: None,
+                retry_after_ms: None,
+            },
+        });
+        return false;
+    }
     if let Some(ld) = loop_detector.as_mut() {
         let loop_res = ld.result();
         if loop_res.count > 1 {

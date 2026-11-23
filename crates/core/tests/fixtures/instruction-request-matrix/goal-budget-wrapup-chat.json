@@ -176,7 +176,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-budget-wrapup-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     },
     {
@@ -374,7 +373,6 @@
         "type": "adaptive"
       },
       "cacheKey": "goal-budget-wrapup-chat",
-      "contextManagement": {},
       "thinkingContext": "keepAll"
     }
   ],
@@ -525,8 +523,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-budget-wrapup-chat"
+        "tool_choice": "auto"
       }
     },
     {
@@ -679,8 +676,7 @@
             }
           }
         ],
-        "tool_choice": "auto",
-        "prompt_cache_key": "goal-budget-wrapup-chat"
+        "tool_choice": "auto"
       }
     }
   ]
