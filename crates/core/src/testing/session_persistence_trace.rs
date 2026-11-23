@@ -1828,6 +1828,10 @@ mod provider_behavior_tests {
             "internalEngineEventName": internal_engine_event_name,
         });
 
+        // The model-visible declaration list carries the indirect dispatcher
+        // alongside the direct tools: with a deferred tool in the pool the
+        // static gate adds `call_mcp_tool` at its name-sorted position, so
+        // discovery never shifts the leading declaration prefix.
         assert_eq!(
             trace,
             exact_json!({
@@ -1890,7 +1894,7 @@ mod provider_behavior_tests {
                 },
                 "directModelOnlyVisibility": {
                     "exposure": "direct_model_only",
-                    "requestTools": ["bridge", "read", "tool_search", "update_plan"],
+                    "requestTools": ["bridge", "call_mcp_tool", "read", "tool_search", "update_plan"],
                     "model": true,
                     "deferredHidden": true,
                     "codeMode": false,
