@@ -156,6 +156,8 @@ pub(crate) struct SubagentCreationSnapshot {
 /// The sender's effective query configuration, captured before message handoff.
 #[derive(Clone)]
 pub(crate) struct SubagentResumeContext {
+    pub(crate) orchestration_guard:
+        Option<Arc<crate::tools::builtins::orchestrate::OrchestratedExecutionGuard>>,
     pub(crate) mcp: crate::engine::session::SubagentMcpCapture,
     pub(crate) bundle: Arc<InferenceBundle>,
     pub(crate) permission: PermissionContext,
@@ -172,6 +174,8 @@ struct OrdinaryBindings {
 }
 
 struct OrdinaryWorker {
+    orchestration_guard:
+        Option<Arc<crate::tools::builtins::orchestrate::OrchestratedExecutionGuard>>,
     committed: bool,
     loaded: Option<Arc<tokio::sync::RwLock<()>>>,
     locally_evicted: bool,
@@ -1138,6 +1142,12 @@ impl Session {
                 return Some(Err(error));
             }
 
+            if let Ok(ctx) = &resume_context {
+                if ctx.orchestration_guard.is_some() {
+                    worker.orchestration_guard = ctx.orchestration_guard.clone();
+                }
+            }
+
             let launch = request.trigger_turn && !worker.running;
             if launch {
                 // Message-driven continuation is detached even for an originally foreground child.
@@ -1923,6 +1933,7 @@ impl Session {
             state.workers.insert(
                 id.clone(),
                 OrdinaryWorker {
+                    orchestration_guard: None,
                     committed: true,
                     loaded: None,
                     locally_evicted: false,
@@ -2062,6 +2073,7 @@ impl Session {
                     RuntimeString::from("The sender's runtime configuration is unavailable.")
                 })?;
             return Ok(SubagentResumeContext {
+                orchestration_guard: None,
                 mcp: snapshot.mcp_runtime.capture(&snapshot.tools),
                 bundle: snapshot.bundle.clone(),
                 permission: snapshot.permission.clone(),
@@ -2072,6 +2084,7 @@ impl Session {
         }
         let runtime_policy = self.runtime_policy_snapshot();
         Ok(SubagentResumeContext {
+            orchestration_guard: None,
             mcp: self.current_subagent_mcp_capture(),
             bundle: self.inference_snapshot(),
             permission: self.permission_context_for_policy(&runtime_policy),
@@ -2499,12 +2512,14 @@ impl Session {
             let sender = parent_agent_id
                 .as_ref()
                 .map(|id| RuntimeString::from(id.clone()));
-            Some(self.capture_subagent_resume_context(
+            let mut ctx = self.capture_subagent_resume_context(
                 sender.as_ref(),
                 parent_capture.as_ref(),
                 &permission,
                 runtime_capabilities.as_ref(),
-            )?)
+            )?;
+            ctx.orchestration_guard = opts.orchestration_guard.clone();
+            Some(ctx)
         } else {
             None
         };
@@ -2671,6 +2686,7 @@ impl Session {
             state.workers.insert(
                 id.clone(),
                 OrdinaryWorker {
+                    orchestration_guard: None,
                     committed: false,
                     loaded: Some(Arc::new(tokio::sync::RwLock::new(()))),
                     locally_evicted: false,
@@ -2810,13 +2826,14 @@ impl Session {
                     .as_ref()
                     .and_then(|(_, _, run)| run.collaboration_mode)
                     .unwrap_or_else(|| self.planning.mode());
-                let (abort, initiating_turn_id, parent_agent_id) = {
-                    let state = runtime.state.lock_recover();
-                    let worker = state.workers.get(&id).expect("published worker");
+                let (abort, initiating_turn_id, parent_agent_id, resumed_orchestration_guard) = {
+                    let mut state = runtime.state.lock_recover();
+                    let worker = state.workers.get_mut(&id).expect("published worker");
                     (
                         worker.abort.clone(),
                         worker.bindings.spawn_turn_id.clone(),
                         worker.bindings.parent_agent_id.clone(),
+                        worker.orchestration_guard.take(),
                     )
                 };
                 // Each run owns its partial output. Earlier completed answers
@@ -2862,6 +2879,7 @@ impl Session {
                                             ultra_mode: Some(snapshot.ultra_mode),
                                             output_schema: snapshot.output_schema.clone(),
                                             cwd: Some(snapshot.cwd.clone()),
+                                            orchestration_guard: resumed_orchestration_guard,
                                             ..Default::default()
                                         },
                                         snapshot.permission.clone(),

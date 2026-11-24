@@ -3571,3 +3571,75 @@ mod permission_origin_tests;
 
 #[path = "session_subagent_plan_boundary_tests.rs"]
 mod plan_boundary;
+
+#[tokio::test]
+async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_prefix() {
+    let mut turns = Vec::new();
+    for index in 0..31 {
+        let mut events = vec![ev::message_start(None)];
+        events.extend(exact_tool_use_events(
+            &format!("stage-probe-{index}"),
+            "message_gate",
+            &exact_json!({}),
+        ));
+        events.push(ev::stop(
+            Some(ModelStopReason::ToolUse),
+            Some(make_usage(None, None)),
+        ));
+        turns.push(events);
+        if index == 29 || index == 30 {
+            turns.push(text_turn("stage done"));
+        }
+    }
+    let probe = gate();
+    probe.release.add_permits(31);
+    let fixture = IsolatedHardeningFixture::new(turns, vec![probe.clone()]);
+    let session = &fixture.session;
+    let mut ctx = crate::tools::builtins::test_ctx::make_ctx("/tmp");
+    ctx.permission = session.permission_context();
+    ctx.background_tasks = Some(session.background_task_registry());
+    ctx.spawn_sub_agent = Some(session.make_spawn_sub_agent(
+        0,
+        CancellationToken::new(),
+        ctx.permission.clone(),
+        Arc::new(Vec::new),
+        false,
+        None,
+        None,
+    ));
+    let first = session
+        .run_orchestration_stage_for_test(&ctx, None)
+        .await
+        .unwrap();
+    let first = first.serializable.output;
+    assert_eq!(
+        first.get("stopReason"),
+        Some(&RuntimeJson::from("stage_checkpoint_reached")),
+        "{first:?}"
+    );
+    assert_eq!(first.get("stepsUsed"), Some(&RuntimeJson::from(30_i64)));
+    let id = first.get("agentId").and_then(RuntimeJson::as_str).unwrap();
+    let resume_index = fixture.requests.lock().unwrap().len();
+    let resumed = session
+        .run_orchestration_stage_for_test(&ctx, Some(id.clone()))
+        .await
+        .unwrap();
+    let resumed = resumed.serializable.output;
+    assert_eq!(resumed.get("agentId"), first.get("agentId"));
+    assert_eq!(
+        resumed.get("stopReason"),
+        Some(&RuntimeJson::from("completed")),
+        "{resumed:?}"
+    );
+    assert_eq!(resumed.get("stepsUsed"), Some(&RuntimeJson::from(1_i64)));
+    assert_eq!(probe.permissions.lock().unwrap().len(), 31);
+    let requests = fixture.requests.lock().unwrap();
+    let system_role = crate::engine::session::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE;
+    assert!(requests[0].system.iter().any(|part| part
+        .text
+        .try_to_utf8()
+        .unwrap()
+        .contains(system_role)));
+    assert_eq!(requests[0].system, requests[resume_index].system);
+    assert_eq!(requests[0].tools, requests[resume_index].tools);
+}

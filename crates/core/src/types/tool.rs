@@ -369,6 +369,8 @@ pub struct InheritedSubagentContext {
 
 #[derive(Clone, Default)]
 pub struct SpawnSubAgentOptions {
+    pub orchestration_guard:
+        Option<Arc<crate::tools::builtins::orchestrate::OrchestratedExecutionGuard>>,
     pub prompt: RuntimeString,
     /// Stable message-routing name, separate from the role and task description.
     pub name: Option<RuntimeString>,
@@ -1769,6 +1771,9 @@ pub trait Tool: Send + Sync {
     /// Keep engine-owned restriction wrappers around a replacement native executor.
     fn rebind_native_mcp(&self, replacement: Arc<dyn Tool>) -> Arc<dyn Tool> {
         replacement
+    }
+    fn unwrap_orchestration_guard(&self) -> Option<Arc<dyn Tool>> {
+        None
     }
     /// Source objects stay in memory; persistence records only capability evidence.
     fn browser_dependency_persistence(&self) -> Option<BrowserDependencyPersistence> {

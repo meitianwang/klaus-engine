@@ -1730,10 +1730,19 @@ impl Session {
                 &mut child_tools, child_collaboration_mode, false, false,
             );
 
+            if let Some(guard) = &opts.orchestration_guard {
+                child_tools = crate::tools::builtins::orchestrate::rebind_orchestrated_executor_tools(
+                    child_tools, guard.clone(),
+                );
+            }
+
             // Role prompt + optional critical reminder + memory + teammate addendum.
             let role_instructions = def
                 .as_ref()
-                .and_then(|d| d.prompt.clone().or_else(|| d.system_prompt.clone()));
+                .and_then(|d| d.prompt.clone().or_else(|| d.system_prompt.clone()))
+                .or_else(|| opts.orchestration_guard.is_some().then(|| {
+                    RuntimeString::from(super::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE)
+                }));
             let critical_reminder = def.as_ref().and_then(|d| d.critical_system_reminder.clone());
             let memory_text = memory_bundle.as_ref().map(|m| m.text.clone());
             let child_cwd = run_opts.cwd_override.clone().unwrap_or_else(|| this.cwd_now());
@@ -3220,6 +3229,7 @@ impl Session {
             ctx.background_tasks = Some(this.background_task_registry_in_context(
                 Some(parent_agent_for_children.clone().into()),
                 Some(super::SubagentResumeContext {
+                    orchestration_guard: None,
                     mcp: child_mcp_capture.clone(),
                     bundle: child_capture.bundle.clone(),
                     permission: ctx.permission.clone(),

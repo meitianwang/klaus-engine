@@ -59,7 +59,7 @@ const EXECUTOR_VERIFICATION_OR_EDIT_TOOLS: &[&str] = &[
     "notebook_edit",
 ];
 
-const PLANNER_EDIT_GATE_REFUSAL: &str = "Orchestration mode is active: keep the main model focused on read-only investigation, planning, and verification, and dispatch workspace file edits through orchestrate_execution.";
+const PLANNER_EDIT_GATE_REFUSAL: &str = "Orchestration mode is active: dispatch workspace edits through orchestrate_execution using a concise intent-level plan. Pass resume with the returned agentId for short follow-up stages.";
 
 #[derive(Debug, Clone)]
 pub struct OrchestrateExecutionRequest {
@@ -95,12 +95,12 @@ pub fn create_orchestrate_execution_tool(execute: OrchestrateExecuteFn) -> Arc<d
                 "plan": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Self-contained implementation specification for the execution model: relevant context (including any visual details transcribed into text), ordered file changes, verification commands with expected outputs, and explicit conditions that require stopping and reporting back."
+                    "description": "Concise stage objective, target files or symbols, behavioral constraints, visual details in plain text, verification commands, and true stop conditions. Do not paste full rewrites or verbatim multi-hunk patches."
                 },
                 "resume": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Optional execution agentId returned by an earlier orchestrate_execution stage in this conversation to continue from its existing execution context."
+                    "description": "Optional agentId returned by an earlier stage in this conversation. Reuse it to continue discovery, implementation, or verification with the same worker context."
                 }
             },
             "required": ["description", "plan"],
@@ -120,7 +120,7 @@ impl Tool for OrchestrateExecutionTool {
     }
 
     fn static_description(&self) -> &str {
-        "Dispatch a self-contained implementation and verification plan to the configured orchestration execution model. Runs in an isolated execution context sharing this workspace, enforces automatic stop guardrails on repeated verification failures or stage step limits, and returns a structured status report for the main model to review."
+        "Dispatch a concise discovery, implementation, or verification stage to the configured worker in this workspace. Returns a structured stage report; pass resume with its agentId for short follow-up stages using the same context."
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
@@ -458,6 +458,13 @@ pub fn wrap_orchestrated_executor_tools(
     tools: Vec<Arc<dyn Tool>>,
     guard: Arc<OrchestratedExecutionGuard>,
 ) -> Vec<Arc<dyn Tool>> {
+    rebind_orchestrated_executor_tools(tools, guard)
+}
+
+pub fn rebind_orchestrated_executor_tools(
+    tools: Vec<Arc<dyn Tool>>,
+    guard: Arc<OrchestratedExecutionGuard>,
+) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
         .filter(|tool| {
@@ -466,9 +473,9 @@ pub fn wrap_orchestrated_executor_tools(
                 .iter()
                 .any(|excluded| name == *excluded)
         })
-        .map(|inner| {
+        .map(|tool| {
             Arc::new(OrchestratedExecutorGuardTool {
-                inner,
+                inner: tool.unwrap_orchestration_guard().unwrap_or(tool),
                 guard: guard.clone(),
             }) as Arc<dyn Tool>
         })
@@ -516,6 +523,9 @@ impl Tool for OrchestratedExecutorGuardTool {
             inner: self.inner.rebind_native_mcp(replacement),
             guard: self.guard.clone(),
         })
+    }
+    fn unwrap_orchestration_guard(&self) -> Option<Arc<dyn Tool>> {
+        Some(self.inner.clone())
     }
     fn browser_dependency_persistence(&self) -> Option<BrowserDependencyPersistence> {
         self.inner.browser_dependency_persistence()
@@ -768,6 +778,42 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&err.message.to_node_utf8()).contains("orchestrate_execution")
         );
+    }
+
+    #[tokio::test]
+    async fn rebinding_resets_both_stage_locks_without_changing_tool_specs() {
+        for (step_limit, fails, expected) in [
+            (2, false, ExecutionStopReason::StageCheckpointReached),
+            (30, true, ExecutionStopReason::VerificationFailedTwice),
+        ] {
+            let old = OrchestratedExecutionGuard::with_limits(Arc::new(|| false), step_limit, 2);
+            let tools = wrap_orchestrated_executor_tools(
+                vec![DummyTool::erased("bash", fails)],
+                old.clone(),
+            );
+            let ctx = make_ctx("/tmp");
+            let input = RuntimeJson::Object(Default::default());
+            for _ in 0..2 {
+                tools[0].call(input.clone(), &ctx, None).await.unwrap();
+            }
+            assert_eq!(old.stop_reason(), expected);
+            assert!(tools[0].parse_input(&input).is_err());
+            let specs = |tools: &[Arc<dyn Tool>]| {
+                crate::runtime_values::runtime_codec::encode_text(
+                    &crate::tools::pool::to_tool_specs(tools),
+                )
+                .unwrap()
+            };
+            let previous_specs = specs(&tools);
+            let next = OrchestratedExecutionGuard::new(Arc::new(|| false));
+            let tools = rebind_orchestrated_executor_tools(tools, next.clone());
+            assert_eq!(specs(&tools), previous_specs);
+            let parsed = tools[0].parse_input(&input).unwrap();
+            tools[0].call(parsed, &ctx, None).await.unwrap();
+            assert_eq!(next.steps_used(), 1);
+            assert_eq!(next.stop_reason(), ExecutionStopReason::Completed);
+            assert_eq!(old.steps_used(), 2);
+        }
     }
 
     #[tokio::test]

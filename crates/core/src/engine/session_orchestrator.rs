@@ -22,16 +22,19 @@ use crate::types::tool::{
     ToolContext, ToolResult,
 };
 
+pub(crate) const EXECUTOR_SYSTEM_ROLE: &str = "You are the main conversation's serial workspace executor. Work directly in the current working directory while the main model's editing tools are gated. Generic rules requiring isolated worktrees for concurrent sub-agents do not apply to this serial role unless the user or stage plan requests a worktree. Handle routine mechanical differences (line numbers, imports, formatting, lint, minor types, verification script paths, and test counts) directly and report actual results. Stop and report when verification or edits fail twice in a row, the codebase contradicts a core behavioral or architectural premise, an unresolved design choice or out-of-scope module change is required, or an explicit plan stop condition is met.";
+
 const EXECUTOR_ROLE_HEADER: &str = "\
 You are the execution model carrying out an implementation plan prepared by the main planning model.\n\
 \n\
 Execution rules:\n\
 - Carry out the plan below in order and run the specified verification commands.\n\
-- Handle minor mechanical adjustments (such as an import path or formatting fix) directly.\n\
+- Execute serially in the current workspace unless the user or plan requests a worktree.\n\
+- Handle routine mechanical differences directly and report actual results.\n\
 - Stop immediately and return a concise status report instead of improvising when:\n\
-  1. a verification step fails twice in a row;\n\
-  2. the codebase contradicts an assumption in the plan;\n\
-  3. completing the work requires a design choice or file outside the plan's scope; or\n\
+  1. verification or edits fail twice in a row;\n\
+  2. the codebase contradicts a core behavioral or architectural premise in the plan;\n\
+  3. completing the work requires an unresolved design choice or a module change outside the plan's scope; or\n\
   4. any stop condition listed in the plan is triggered.\n\
 - Your final message must concisely report: files changed, verification commands run and their outcomes, and any remaining steps or blockers.\n\
 \n\
@@ -247,6 +250,24 @@ impl Session {
             .any(|msg| msg.agent_id.is_none() && msg.origin.is_none() && msg.is_meta != Some(true))
     }
 
+    #[cfg(test)]
+    pub(super) async fn run_orchestration_stage_for_test(
+        self: &Arc<Self>,
+        parent_ctx: &ToolContext,
+        resume: Option<RuntimeString>,
+    ) -> Result<ToolResult, RuntimeString> {
+        self.spawn_and_drain_orchestration_stage(
+            parent_ctx.spawn_sub_agent.as_ref().unwrap(),
+            parent_ctx,
+            &"Run stage probe".into(),
+            &"Run the stage probe.".into(),
+            "low".into(),
+            resume,
+        )
+        .await
+        .map(Self::format_stage_result)
+    }
+
     async fn spawn_and_drain_orchestration_stage(
         self: &Arc<Self>,
         spawn: &SpawnForegroundSubAgent,
@@ -268,6 +289,7 @@ impl Session {
             prompt,
             name: Some(description.clone()),
             tools: Some(wrapped_tools),
+            orchestration_guard: Some(guard.clone()),
             model: Some(model_selection),
             orchestrator_target_model: true,
             resume,
@@ -405,8 +427,8 @@ impl Session {
 
         let status_header = match stage.stop_reason {
             ExecutionStopReason::Completed => format!(
-                "Execution stage completed (agentId: {}, stepsUsed: {}). Review the report and workspace changes below before concluding or dispatching follow-up work.",
-                stage.agent_id_str, stage.steps_used
+                "Execution stage completed (agentId: {}, stepsUsed: {}). Use the stage report and targeted spot-checks to verify progress. For follow-up work, pass resume=\"{}\".",
+                stage.agent_id_str, stage.steps_used, stage.agent_id_str
             ),
             ExecutionStopReason::VerificationFailedTwice => format!(
                 "Execution stage paused after two consecutive verification/edit failures (agentId: {}, stepsUsed: {}). Inspect the failure details below, revise the plan, and pass resume=\"{}\" to continue or adjust course.",
@@ -417,8 +439,8 @@ impl Session {
                 stage.agent_id_str, stage.steps_used, stage.agent_id_str
             ),
             ExecutionStopReason::InterruptedByUserMessage => format!(
-                "Execution stage paused because a new user message arrived (agentId: {}, stepsUsed: {}). Address the user's message and resume or revise the plan as needed.",
-                stage.agent_id_str, stage.steps_used
+                "Execution stage paused because a new user message arrived (agentId: {}, stepsUsed: {}). Address the user's message and pass resume=\"{}\" if continuing with an updated plan.",
+                stage.agent_id_str, stage.steps_used, stage.agent_id_str
             ),
         };
 

@@ -1478,6 +1478,7 @@ impl Session {
                 ctx.background_tasks = Some(this.background_task_registry_in_context(
                     None,
                     Some(super::SubagentResumeContext {
+                        orchestration_guard: None,
                         mcp: this.current_subagent_mcp_capture(),
                         bundle: bundle.clone(),
                         permission: ctx.permission.clone(),

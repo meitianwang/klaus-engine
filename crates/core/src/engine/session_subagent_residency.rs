@@ -106,6 +106,7 @@ impl Session {
         runtime.state.lock_recover().workers.insert(
             id.clone(),
             OrdinaryWorker {
+                orchestration_guard: None,
                 committed: false,
                 loaded: Some(Arc::new(tokio::sync::RwLock::new(()))),
                 locally_evicted: false,
