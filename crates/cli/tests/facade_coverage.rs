@@ -42,23 +42,23 @@ enum Reach {
 /// marker is what a caller writes. `MethodSpec::marker` exists for exactly this.
 const COVERAGE: &[(&str, Reach)] = &[
     ("EngineReadThreadFileChanges", Reach::Withheld("The CLI does not present saved file-change cards")),
-    ("KiroStatus", Reach::Withheld("The CLI has no account-management command")),
-    ("KiroLoginStart", Reach::Withheld("Browser authorization uses the named account facade")),
-    ("KiroLoginPoll", Reach::Withheld("Browser authorization uses the named account facade")),
-    ("KiroLoginCancel", Reach::Withheld("Browser authorization uses the named account facade")),
+    ("KiroStatus", Reach::Withheld("`klaus auth status` reads the same record in process")),
+    ("KiroLoginStart", Reach::Withheld("`klaus login kiro` drives `kiro::login::start` in process")),
+    ("KiroLoginPoll", Reach::Withheld("`klaus login kiro` drives `kiro::login::poll` in process")),
+    ("KiroLoginCancel", Reach::Withheld("`klaus login kiro` bounds its own foreground flow in process")),
     ("KiroAdoptCredential", Reach::Withheld("The desktop imports the signed-in local account")),
-    ("KiroLogout", Reach::Withheld("The CLI has no account-management command")),
+    ("KiroLogout", Reach::Withheld("`klaus logout kiro` drives `kiro::auth::logout` in process")),
     ("KiroModels", Reach::Withheld("The CLI accepts concrete source-qualified model IDs")),
     ("KiroUsage", Reach::Withheld("The CLI has no account quota gauge")),
     ("KiroCapabilities", Reach::Withheld("The CLI does not display source capability settings")),
     ("KiroSearch", Reach::Withheld("The search tool calls the selected subscription backend")),
     ("KiroCancelOperation", Reach::Withheld("The CLI does not start standalone source operations")),
-    ("TraeStatus", Reach::Withheld("The CLI has no account-management command")),
-    ("TraeLoginStart", Reach::Withheld("Browser authorization uses the named account facade")),
-    ("TraeLoginPoll", Reach::Withheld("Browser authorization uses the named account facade")),
-    ("TraeLoginCancel", Reach::Withheld("Browser authorization uses the named account facade")),
+    ("TraeStatus", Reach::Withheld("`klaus auth status` reads the same record in process")),
+    ("TraeLoginStart", Reach::Withheld("`klaus login trae` drives `trae::login::start` in process")),
+    ("TraeLoginPoll", Reach::Withheld("`klaus login trae` drives `trae::login::poll` in process")),
+    ("TraeLoginCancel", Reach::Withheld("`klaus login trae` bounds its own foreground flow in process")),
     ("TraeAdoptCredential", Reach::Withheld("The desktop imports the signed-in local account")),
-    ("TraeLogout", Reach::Withheld("The CLI has no account-management command")),
+    ("TraeLogout", Reach::Withheld("`klaus logout trae` drives `trae::auth::logout` in process")),
     ("TraeModels", Reach::Withheld("The CLI accepts concrete source-qualified model IDs")),
     ("TraeUsage", Reach::Withheld("The CLI has no account quota gauge")),
     ("TraeCapabilities", Reach::Withheld("The CLI does not display source capability settings")),
@@ -67,13 +67,13 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("TraeGenerateVideo", Reach::Withheld("Video generation uses the named host method")),
     ("TraeTranscribeAudio", Reach::Withheld("The CLI does not record standalone dictation audio")),
     ("TraeCancelOperation", Reach::Withheld("The CLI does not start standalone source operations")),
-    ("AntigravityStatus", Reach::Withheld("The CLI has no account-management command")),
-    ("AntigravityLoginStart", Reach::Withheld("Browser authorization is managed through the named account facade")),
-    ("AntigravityLoginPoll", Reach::Withheld("Browser authorization is managed through the named account facade")),
-    ("AntigravityLoginCancel", Reach::Withheld("Browser authorization is managed through the named account facade")),
+    ("AntigravityStatus", Reach::Withheld("`klaus auth status` reads the same record in process")),
+    ("AntigravityLoginStart", Reach::Withheld("`klaus login antigravity` drives `antigravity::login::start` in process")),
+    ("AntigravityLoginPoll", Reach::Withheld("`klaus login antigravity` drives `antigravity::login::poll` in process")),
+    ("AntigravityLoginCancel", Reach::Withheld("`klaus login antigravity` bounds its own foreground flow in process")),
     ("AntigravityAdoptCredential", Reach::Withheld("The desktop imports the signed-in account")),
-    ("AntigravitySwitchAccount", Reach::Withheld("The CLI has no account-management command")),
-    ("AntigravityLogout", Reach::Withheld("The CLI has no account-management command")),
+    ("AntigravitySwitchAccount", Reach::Withheld("Multi-account ordering is managed by the desktop settings card")),
+    ("AntigravityLogout", Reach::Withheld("`klaus logout antigravity` drives `antigravity::auth::logout` in process")),
     ("AntigravityModels", Reach::Withheld("The CLI accepts concrete source-qualified model ids")),
     ("AntigravityUsage", Reach::Withheld("The CLI draws no account quota gauge")),
     ("AntigravityCapabilities", Reach::Withheld("The CLI does not display native media settings")),
@@ -83,12 +83,12 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("AntigravityCancelOperation", Reach::Withheld("The CLI does not start standalone source operations")),
     ("QoderTranscribeAudio", Reach::Withheld("The CLI does not record standalone dictation audio")),
     ("QoderCancelTranscription", Reach::Withheld("The CLI does not start standalone dictation operations")),
-    ("CursorStatus", Reach::Withheld("The CLI has no Cursor account-management command")),
-    ("CursorLoginStart", Reach::Withheld("The CLI has no account browser-login command")),
-    ("CursorLoginPoll", Reach::Withheld("The CLI does not poll account login flows")),
-    ("CursorLoginCancel", Reach::Withheld("The CLI does not own account browser-login flows")),
+    ("CursorStatus", Reach::Withheld("`klaus auth status` reads the same record in process")),
+    ("CursorLoginStart", Reach::Withheld("`klaus login cursor` drives `cursor::auth::login_start` in process")),
+    ("CursorLoginPoll", Reach::Withheld("`klaus login cursor` drives `cursor::auth::login_poll` in process")),
+    ("CursorLoginCancel", Reach::Withheld("`klaus login cursor` bounds its own foreground flow in process")),
     ("CursorAdoptCredential", Reach::Withheld("The CLI does not decrypt or import application credentials")),
-    ("CursorLogout", Reach::Withheld("The CLI has no Cursor account-management command")),
+    ("CursorLogout", Reach::Withheld("`klaus logout cursor` drives `cursor::credential::logout` in process")),
     ("CursorModels", Reach::Withheld("The CLI accepts concrete model selections and does not list account catalogs")),
     ("CursorUsage", Reach::Withheld("The CLI draws no account quota gauge")),
     ("CursorGenerateImage", Reach::Withheld("The CLI has no standalone image-generation command")),
@@ -109,7 +109,7 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("EngineCompleteText", Reach::Withheld("Interactive hosts use bounded standalone text inference for dictation refinement and correction learning.")),
     ("EngineCancelTextCompletion", Reach::Withheld("Interactive hosts own cancellation of their standalone text inference.")),
     ("EngineMigrateRollouts", Reach::Called),
-    ("EngineCompressRollouts", Reach::Withheld("Cold compression is an endpoint background worker; hosts may kick the same worker through the named maintenance facade without changing its cold threshold.")),
+    ("EngineCompressRollouts", Reach::Called),
     ("SessionStart", Reach::Called),
     ("SessionPrepare", Reach::Withheld("The desktop prepares a retained endpoint before turn admission; the CLI binds resume or fork through its lifecycle commands before its first session operation.")),
     ("TurnStart", Reach::Called),
@@ -291,10 +291,7 @@ const COVERAGE: &[(&str, Reach)] = &[
     ("SessionClearGoal", Reach::Called),
     ("SessionSetGoal", Reach::Called),
     ("SessionSubagentTranscript", Reach::Called),
-    (
-        "SessionSendSubagentMessage",
-        Reach::Withheld("the desktop child-conversation composer owns explicit user messages and user-cancelled task recovery"),
-    ),
+    ("SessionSendSubagentMessage", Reach::Called),
     ("SessionMcpAuthorizationStatus", Reach::Called),
     ("SessionAgentMemorySnapshotDecision", Reach::Called),
     // ---- MCP ---------------------------------------------------------------
@@ -439,19 +436,19 @@ const COVERAGE: &[(&str, Reach)] = &[
     // ---- The QwenWork subscription -----------------------------------------
     (
         "QwenWorkStatus",
-        Reach::Withheld("the CLI has no QwenWork account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "QwenWorkLoginStart",
-        Reach::Withheld("the CLI has no QwenWork device-login command"),
+        Reach::Withheld("`klaus login qwenwork` drives `qwenwork::auth::start` in process"),
     ),
     (
         "QwenWorkLoginPoll",
-        Reach::Withheld("the CLI has no QwenWork device-login command"),
+        Reach::Withheld("`klaus login qwenwork` drives `qwenwork::auth::poll` in process"),
     ),
     (
         "QwenWorkLogout",
-        Reach::Withheld("the CLI has no QwenWork account-management surface"),
+        Reach::Withheld("`klaus logout qwenwork` drives `qwenwork::auth::logout` in process"),
     ),
     (
         "QwenWorkImportLocal",
@@ -516,19 +513,19 @@ const COVERAGE: &[(&str, Reach)] = &[
     // ---- The WorkBuddy subscription ----------------------------------------
     (
         "WorkBuddyStatus",
-        Reach::Withheld("the CLI has no WorkBuddy account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "WorkBuddyLoginStart",
-        Reach::Withheld("the CLI has no WorkBuddy device-login command"),
+        Reach::Withheld("`klaus login workbuddy` drives `workbuddy::auth::start` in process"),
     ),
     (
         "WorkBuddyLoginPoll",
-        Reach::Withheld("the CLI has no WorkBuddy device-login command"),
+        Reach::Withheld("`klaus login workbuddy` drives `workbuddy::auth::poll` in process"),
     ),
     (
         "WorkBuddyLogout",
-        Reach::Withheld("the CLI has no WorkBuddy account-management surface"),
+        Reach::Withheld("`klaus logout workbuddy` drives `workbuddy::auth::logout` in process"),
     ),
     (
         "WorkBuddyImportLocal",
@@ -555,28 +552,25 @@ const COVERAGE: &[(&str, Reach)] = &[
         Reach::Withheld("`klaus` draws no quota gauge, so it has nothing to fill"),
     ),
     // ---- The Kimi membership ------------------------------------------------
-    // `klaus login` covers Claude, Codex and Qoder only. Kimi's two credentials
-    // are both driven from the desktop settings pane: a console API key is pasted
-    // there, and the device flow has the host open the browser and poll.
     (
         "KimiStatus",
-        Reach::Withheld("the CLI has no Kimi account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "KimiSetApiKey",
-        Reach::Withheld("the CLI has no Kimi credential command; a key is set from the desktop settings pane"),
+        Reach::Withheld("`klaus login kimi --api-key` drives `kimi::auth::set_api_key` in process"),
     ),
     (
         "KimiLoginStart",
-        Reach::Withheld("the CLI has no Kimi device-login command"),
+        Reach::Withheld("`klaus login kimi` drives `kimi::auth::start` in process"),
     ),
     (
         "KimiLoginPoll",
-        Reach::Withheld("the CLI has no Kimi device-login command"),
+        Reach::Withheld("`klaus login kimi` drives `kimi::auth::poll` in process"),
     ),
     (
         "KimiLogout",
-        Reach::Withheld("the CLI has no Kimi account-management surface"),
+        Reach::Withheld("`klaus logout kimi` drives `kimi::auth::logout` in process"),
     ),
     (
         "KimiImportLocal",
@@ -598,15 +592,15 @@ const COVERAGE: &[(&str, Reach)] = &[
     // three console methods stay withheld like the rest of this surface.
     (
         "BailianStatus",
-        Reach::Withheld("the CLI has no Bailian account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "BailianSetApiKey",
-        Reach::Withheld("the CLI has no Bailian credential command; a key is set from the desktop settings pane"),
+        Reach::Withheld("`klaus login bailian` drives `bailian::auth::set_api_key` in process"),
     ),
     (
         "BailianLogout",
-        Reach::Withheld("the CLI has no Bailian account-management surface"),
+        Reach::Withheld("`klaus logout bailian` drives `bailian::auth::logout` in process"),
     ),
     (
         "BailianModels",
@@ -645,15 +639,15 @@ const COVERAGE: &[(&str, Reach)] = &[
     // subscription key and offers no OAuth or device flow to third-party clients.
     (
         "MinimaxStatus",
-        Reach::Withheld("the CLI has no MiniMax account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "MinimaxSetApiKey",
-        Reach::Withheld("the CLI has no MiniMax credential command; a key is set from the desktop settings pane"),
+        Reach::Withheld("`klaus login minimax` drives `minimax::auth::set_api_key` in process"),
     ),
     (
         "MinimaxLogout",
-        Reach::Withheld("the CLI has no MiniMax account-management surface"),
+        Reach::Withheld("`klaus logout minimax` drives `minimax::auth::logout` in process"),
     ),
     (
         "MinimaxModels",
@@ -672,15 +666,15 @@ const COVERAGE: &[(&str, Reach)] = &[
     // device-flow entry here either.
     (
         "ZhipuStatus",
-        Reach::Withheld("the CLI has no Zhipu account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "ZhipuSetApiKey",
-        Reach::Withheld("the CLI has no Zhipu credential command; a key is set from the desktop settings pane"),
+        Reach::Withheld("`klaus login zhipu` drives `zhipu::auth::set_api_key` in process"),
     ),
     (
         "ZhipuLogout",
-        Reach::Withheld("the CLI has no Zhipu account-management surface"),
+        Reach::Withheld("`klaus logout zhipu` drives `zhipu::auth::logout` in process"),
     ),
     (
         "ZhipuModels",
@@ -695,15 +689,15 @@ const COVERAGE: &[(&str, Reach)] = &[
     // so there is no device-flow entry here either.
     (
         "ArkStatus",
-        Reach::Withheld("the CLI has no Ark account-management surface"),
+        Reach::Withheld("`klaus auth status` reads the same record in process"),
     ),
     (
         "ArkSetApiKey",
-        Reach::Withheld("the CLI has no Ark credential command; a key is set from the desktop settings pane"),
+        Reach::Withheld("`klaus login ark` drives `ark::auth::set_api_key` in process"),
     ),
     (
         "ArkLogout",
-        Reach::Withheld("the CLI has no Ark account-management surface"),
+        Reach::Withheld("`klaus logout ark` drives `ark::auth::logout` in process"),
     ),
     (
         "ArkModels",

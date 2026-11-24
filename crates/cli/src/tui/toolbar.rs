@@ -34,6 +34,10 @@ pub struct Badges {
     pub plan: bool,
     /// Unattended: the session keeps going without a person watching.
     pub unattended: bool,
+    /// Orchestration mode: main model plans and verifies, executor model edits.
+    pub orchestrate: bool,
+    /// Parallel mode: decomposes independent sub-tasks across child agents.
+    pub parallel: bool,
 }
 
 /// The working tree's state, when the session is inside one.
@@ -151,8 +155,14 @@ fn facts_line(painter: &Painter, status: &Status, columns: usize) -> String {
     if status.badges.plan {
         badges.push((palette.badge_plan, "plan".to_string()));
     }
+    if status.badges.orchestrate {
+        badges.push((palette.badge_orchestrate, "orchestrate".to_string()));
+    }
+    if status.badges.parallel {
+        badges.push((palette.badge_parallel, "parallel".to_string()));
+    }
     if status.badges.unattended {
-        badges.push((palette.badge_afk, "afk".to_string()));
+        badges.push((palette.badge_afk, "goal".to_string()));
     }
 
     let cwd = paint::truncate_left(&paint::shorten_home(&status.cwd), limit::TOOLBAR_CWD);
@@ -364,6 +374,8 @@ mod tests {
             auto_approve: true,
             plan: true,
             unattended: true,
+            orchestrate: true,
+            parallel: true,
         };
         for columns in [12, 20, 40, 80] {
             let line = render(&plain(), &with_badges, columns)[1].clone();

@@ -115,6 +115,8 @@ pub struct Palette {
     pub badge_yolo: Style,
     pub badge_afk: Style,
     pub badge_plan: Style,
+    pub badge_orchestrate: Style,
+    pub badge_parallel: Style,
     /// The dashed rule and title of the plan-mode input area.
     pub plan_rule: Style,
 
@@ -192,6 +194,8 @@ impl Palette {
             badge_yolo: fg(rgb(0xff, 0xff, 0x00)).effects(Effects::BOLD),
             badge_afk: fg(rgb(0xff, 0x88, 0x00)).effects(Effects::BOLD),
             badge_plan: fg(rgb(0x00, 0xaa, 0xff)).effects(Effects::BOLD),
+            badge_orchestrate: fg(rgb(0xa9, 0x8b, 0xff)).effects(Effects::BOLD),
+            badge_parallel: fg(rgb(0xf0, 0x7a, 0xb8)).effects(Effects::BOLD),
             plan_rule: fg(rgb(0x60, 0xa5, 0xfa)),
 
             menu_marker: fg(rgb(0x4a, 0x55, 0x68)),
@@ -249,6 +253,8 @@ impl Palette {
             badge_yolo: fg(rgb(0xb4, 0x53, 0x09)).effects(Effects::BOLD),
             badge_afk: fg(rgb(0xc2, 0x41, 0x0c)).effects(Effects::BOLD),
             badge_plan: fg(rgb(0x25, 0x63, 0xeb)).effects(Effects::BOLD),
+            badge_orchestrate: fg(rgb(0x7c, 0x3a, 0xed)).effects(Effects::BOLD),
+            badge_parallel: fg(rgb(0xdb, 0x27, 0x77)).effects(Effects::BOLD),
             plan_rule: fg(rgb(0x25, 0x63, 0xeb)),
 
             menu_marker: fg(rgb(0x9c, 0xa3, 0xaf)),

@@ -220,3 +220,106 @@ fn canonical_policy_flags_are_independent_cli_inputs() {
     ));
     assert!(parsed.globals.permission_mode.is_none());
 }
+
+#[test]
+fn login_and_logout_accept_all_fourteen_shipped_sources_and_reject_retired_ones() {
+    for source in [
+        "claude",
+        "subscription",
+        "codex",
+        "qoder",
+        "antigravity",
+        "cursor",
+        "kiro",
+        "trae",
+        "qwenwork",
+        "workbuddy",
+        "kimi",
+        "bailian",
+        "minimax",
+        "zhipu",
+        "ark",
+    ] {
+        assert!(
+            Cli::try_parse_from(["klaus", "login", source]).is_ok(),
+            "login must accept {source}"
+        );
+        assert!(
+            Cli::try_parse_from(["klaus", "logout", source]).is_ok(),
+            "logout must accept {source}"
+        );
+    }
+    for retired in ["qoderwork", "local", "gemini-cli"] {
+        assert!(
+            Cli::try_parse_from(["klaus", "login", retired]).is_err(),
+            "login must reject retired source {retired}"
+        );
+    }
+}
+
+#[test]
+fn session_work_modes_and_reasoning_effort_parse_as_distinct_axes() {
+    let parsed = Cli::try_parse_from([
+        "klaus",
+        "--effort",
+        "xhigh",
+        "--collaboration-mode",
+        "plan",
+        "--parallel",
+        "--orchestrator-model",
+        "codex:gpt-5.6-sol",
+        "--worktree",
+        "exec",
+        "Design the change",
+    ])
+    .unwrap();
+    assert_eq!(
+        parsed.globals.effort,
+        Some(klaus_agent_cli::cli::EffortArg::Xhigh)
+    );
+    assert_eq!(
+        parsed.globals.collaboration_mode,
+        Some(klaus_agent_cli::cli::CollaborationModeArg::Plan)
+    );
+    assert!(parsed.globals.parallel);
+    assert_eq!(
+        parsed.globals.orchestrator_model.as_deref(),
+        Some("codex:gpt-5.6-sol")
+    );
+    assert!(parsed.globals.worktree);
+
+    let alias = Cli::try_parse_from(["klaus", "--ultra", "exec", "Run"]).unwrap();
+    assert!(alias.globals.parallel);
+
+    // `ultra` is a parallel-mode alias, not a native reasoning depth.
+    assert!(Cli::try_parse_from(["klaus", "--effort", "ultra", "exec", "Run"]).is_err());
+}
+
+#[test]
+fn rollout_compression_subagent_send_and_fork_boundaries_parse() {
+    assert!(Cli::try_parse_from(["klaus", "engine", "compress-rollouts"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "klaus",
+        "subagent",
+        "send",
+        "--agent-id",
+        "agent-1",
+        "--summary",
+        "Check tests",
+        "Run the unit suite"
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "klaus",
+        "session",
+        "fork",
+        "thread-1",
+        "--after-message",
+        "msg-2",
+        "--before-turn",
+        "turn-4",
+        "--last-turn",
+        "turn-3"
+    ])
+    .is_ok());
+}

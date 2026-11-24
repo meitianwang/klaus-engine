@@ -28,16 +28,19 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use klaus_agent_core::provider::oauth::{generate_pkce, HttpFetch, HttpRequest, ReqwestFetch};
 use klaus_agent_core::runtime_process::RuntimeProcessContext;
 use klaus_agent_server::app_server::model_sources::{self, SignIn};
-use klaus_agent_server::app_server::qoder;
+use klaus_agent_server::app_server::{
+    antigravity, ark, bailian, cursor, kimi, kiro, minimax, qoder, qwenwork, trae, workbuddy, zhipu,
+};
 use serde_json::{json, Value};
 
-use crate::cli::AuthSource;
+use crate::cli::{AuthSource, PlanRegionArg};
 use crate::error::{CliError, CliResult};
 use crate::output::Printer;
 
@@ -50,17 +53,132 @@ const CLAUDE_CALLBACK_PORT: u16 = 54545;
 /// terminal back. Long enough for a password manager and a second factor.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Sign in to a subscription.
+/// Sign in to a subscription or coding plan.
 pub async fn login(
     source: AuthSource,
+    api_key: Option<&str>,
+    region: Option<PlanRegionArg>,
     printer: &Printer,
     process_context: &RuntimeProcessContext,
 ) -> CliResult<()> {
+    if api_key.is_some()
+        && !matches!(
+            source,
+            AuthSource::Kimi
+                | AuthSource::Bailian
+                | AuthSource::Minimax
+                | AuthSource::Zhipu
+                | AuthSource::Ark
+        )
+    {
+        return Err(CliError::usage(format!(
+            "`--api-key` is only supported for kimi, bailian, minimax, zhipu and ark (not {})",
+            source_slug(source)
+        )));
+    }
+    if region.is_some()
+        && !matches!(
+            source,
+            AuthSource::WorkBuddy
+                | AuthSource::Bailian
+                | AuthSource::Minimax
+                | AuthSource::Zhipu
+                | AuthSource::Ark
+        )
+    {
+        return Err(CliError::usage(format!(
+            "`--region` is only supported for workbuddy, bailian, minimax, zhipu and ark (not {})",
+            source_slug(source)
+        )));
+    }
+
     let root = credential_root();
     match source {
         AuthSource::Claude => claude_login(&root, printer, process_context).await,
         AuthSource::Codex => codex_login(&root, printer, process_context).await,
         AuthSource::Qoder => qoder_login(&root, printer, process_context).await,
+        AuthSource::Antigravity => antigravity_login(&root, printer, process_context).await,
+        AuthSource::Cursor => cursor_login(&root, printer, process_context).await,
+        AuthSource::Kiro => kiro_login(&root, printer, process_context).await,
+        AuthSource::Trae => trae_login(&root, printer, process_context).await,
+        AuthSource::QwenWork => qwenwork_login(&root, printer, process_context).await,
+        AuthSource::WorkBuddy => workbuddy_login(&root, region, printer, process_context).await,
+        AuthSource::Kimi => kimi_login(&root, api_key, printer, process_context).await,
+        AuthSource::Bailian => {
+            plan_key_login(
+                "Bailian",
+                "bailian",
+                api_key,
+                region,
+                printer,
+                |key, reg| async move {
+                    bailian::set_config_root(&root);
+                    bailian::auth::set_api_key(&key, reg.as_deref()).await
+                },
+            )
+            .await
+        }
+        AuthSource::Minimax => {
+            plan_key_login(
+                "MiniMax",
+                "minimax",
+                api_key,
+                region,
+                printer,
+                |key, reg| async move {
+                    minimax::set_config_root(&root);
+                    minimax::auth::set_api_key(&key, reg.as_deref()).await
+                },
+            )
+            .await
+        }
+        AuthSource::Zhipu => {
+            plan_key_login(
+                "Zhipu",
+                "zhipu",
+                api_key,
+                region,
+                printer,
+                |key, reg| async move {
+                    zhipu::set_config_root(&root);
+                    zhipu::auth::set_api_key(&key, reg.as_deref()).await
+                },
+            )
+            .await
+        }
+        AuthSource::Ark => {
+            plan_key_login(
+                "Ark",
+                "ark",
+                api_key,
+                region,
+                printer,
+                |key, reg| async move {
+                    ark::set_config_root(&root);
+                    ark::auth::set_api_key(&key, reg.as_deref()).await
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn source_slug(source: AuthSource) -> &'static str {
+    match source {
+        AuthSource::Claude => "claude",
+        AuthSource::Codex => "codex",
+        AuthSource::Qoder => "qoder",
+        AuthSource::Antigravity => "antigravity",
+        AuthSource::Cursor => "cursor",
+        AuthSource::Kiro => "kiro",
+        AuthSource::Trae => "trae",
+        AuthSource::QwenWork => "qwenwork",
+        AuthSource::WorkBuddy => "workbuddy",
+        AuthSource::Kimi => "kimi",
+        AuthSource::Bailian => "bailian",
+        AuthSource::Minimax => "minimax",
+        AuthSource::Zhipu => "zhipu",
+        AuthSource::Ark => "ark",
     }
 }
 
@@ -79,23 +197,57 @@ pub async fn status(printer: &Printer) -> CliResult<()> {
 }
 
 async fn status_in(root: &std::path::Path, printer: &Printer) -> CliResult<()> {
+    let module_rows = collect_module_statuses(root);
+    if printer.is_json() {
+        let mut sources = serde_json::Map::new();
+        for (source, state) in model_sources::sign_in_status(root) {
+            let entry = match state {
+                SignIn::Active { account } => json!({
+                    "status": "signed_in",
+                    "loggedIn": true,
+                    "account": account,
+                }),
+                SignIn::Expired => json!({
+                    "status": "expired",
+                    "loggedIn": false,
+                }),
+                SignIn::Absent => json!({
+                    "status": "signed_out",
+                    "loggedIn": false,
+                }),
+                SignIn::Unreadable { reason } => json!({
+                    "status": "unreadable",
+                    "loggedIn": false,
+                    "error": reason,
+                }),
+            };
+            sources.insert(source.to_string(), entry);
+        }
+        for (slug, raw) in &module_rows {
+            sources.insert((*slug).to_string(), raw.clone());
+        }
+        return printer.declared(&json!({ "sources": sources }), |_| String::new());
+    }
+
     for (source, state) in model_sources::sign_in_status(root) {
         let line = match state {
             SignIn::Active {
                 account: Some(account),
             } => {
-                format!("{source:<8} signed in  {account}")
+                format!("{source:<12} signed in  {account}")
             }
-            SignIn::Active { account: None } => format!("{source:<8} signed in"),
+            SignIn::Active { account: None } => format!("{source:<12} signed in"),
             SignIn::Expired => {
-                format!("{source:<8} expired    run `klaus login {source}`")
+                format!("{source:<12} expired    run `klaus login {source}`")
             }
-            SignIn::Absent => format!("{source:<8} signed out run `klaus login {source}`"),
-            SignIn::Unreadable { reason } => format!("{source:<8} unreadable {reason}"),
+            SignIn::Absent => format!("{source:<12} signed out run `klaus login {source}`"),
+            SignIn::Unreadable { reason } => format!("{source:<12} unreadable {reason}"),
         };
         printer.note(&line);
     }
-    printer.note(&qoder_status_line(root));
+    for (slug, raw) in &module_rows {
+        printer.note(&format_module_status_line(slug, raw));
+    }
     // Which of them is actually in effect. The rows above say what this machine
     // COULD run on; without this, a reader with two subscriptions signed in and a
     // BYO key configured still cannot tell what a plain `klaus` will use.
@@ -103,6 +255,63 @@ async fn status_in(root: &std::path::Path, printer: &Printer) -> CliResult<()> {
         printer.note(&line);
     }
     Ok(())
+}
+
+fn collect_module_statuses(root: &std::path::Path) -> Vec<(&'static str, Value)> {
+    qoder::set_config_root(root);
+    antigravity::set_config_root(root);
+    cursor::set_config_root(root);
+    kiro::set_config_root(root);
+    trae::set_config_root(root);
+    qwenwork::set_config_root(root);
+    workbuddy::set_config_root(root);
+    kimi::set_config_root(root);
+    bailian::set_config_root(root);
+    minimax::set_config_root(root);
+    zhipu::set_config_root(root);
+    ark::set_config_root(root);
+    vec![
+        ("qoder", qoder::auth_status()),
+        ("antigravity", antigravity::auth::status()),
+        ("cursor", cursor::status()),
+        ("kiro", kiro::auth::status()),
+        ("trae", trae::auth::status()),
+        ("qwenwork", qwenwork::auth::status()),
+        ("workbuddy", workbuddy::auth::status()),
+        ("kimi", kimi::auth::status()),
+        ("bailian", bailian::auth::status()),
+        ("minimax", minimax::auth::status()),
+        ("zhipu", zhipu::auth::status()),
+        ("ark", ark::auth::status()),
+    ]
+}
+
+fn format_module_status_line(slug: &str, status: &Value) -> String {
+    let needs_login = status.get("needsLogin") == Some(&json!(true))
+        || status.get("loginExpired") == Some(&json!(true));
+    if status.get("loggedIn") != Some(&json!(true)) {
+        if needs_login {
+            return format!("{slug:<12} expired    run `klaus login {slug}`");
+        }
+        return format!("{slug:<12} signed out run `klaus login {slug}`");
+    }
+    if needs_login {
+        return format!("{slug:<12} expired    run `klaus login {slug}`");
+    }
+    let account = status
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let region = status
+        .get("region")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    match (account, region) {
+        (Some(account), Some(region)) => format!("{slug:<12} signed in  {account} ({region})"),
+        (Some(account), None) => format!("{slug:<12} signed in  {account}"),
+        (None, Some(region)) => format!("{slug:<12} signed in  ({region})"),
+        (None, None) => format!("{slug:<12} signed in"),
+    }
 }
 
 /// What answers when the command line names no model, and what `--model` can
@@ -156,32 +365,96 @@ async fn effective_lines() -> Vec<String> {
         ),
     });
     lines.push(
-        "           a subscription answers only when `--model subscription:… / codex:… / qoder:… / qwenwork:…` names one"
+        "           a model source answers when `--model <source>:<id>` names it (for example subscription:opus, codex:auto, antigravity:auto, cursor:auto)"
             .to_string(),
     );
     lines
 }
 
-/// Sign out of a subscription.
-pub fn logout(source: AuthSource, printer: &Printer) -> CliResult<()> {
+/// Sign out of a subscription or coding plan.
+pub async fn logout(source: AuthSource, printer: &Printer) -> CliResult<()> {
     let root = credential_root();
-    let (label, removed) = match source {
-        AuthSource::Claude => (
-            "claude",
-            model_sources::delete_claude_login(&root).map_err(CliError::engine)?,
-        ),
-        AuthSource::Codex => (
-            "codex",
-            model_sources::delete_codex_login(&root).map_err(CliError::engine)?,
-        ),
-        // Qoder keeps its own record and its own reader, so signing out goes
-        // through the module that owns it rather than through a second path that
-        // would have to know the file name.
+    let label = source_slug(source);
+    let removed = match source {
+        AuthSource::Claude => {
+            model_sources::delete_claude_login(&root).map_err(CliError::engine)?
+        }
+        AuthSource::Codex => model_sources::delete_codex_login(&root).map_err(CliError::engine)?,
         AuthSource::Qoder => {
             qoder::set_config_root(&root);
             let signed_in = qoder::signed_in();
-            qoder::logout().map_err(|error| CliError::engine(render_qoder(&error)))?;
-            ("qoder", signed_in)
+            qoder::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Antigravity => {
+            antigravity::set_config_root(&root);
+            let signed_in = antigravity::auth::status().get("loggedIn") == Some(&json!(true));
+            antigravity::auth::logout()
+                .await
+                .map_err(CliError::engine)?;
+            signed_in
+        }
+        AuthSource::Cursor => {
+            cursor::set_config_root(&root);
+            let signed_in = cursor::status().get("loggedIn") == Some(&json!(true));
+            cursor::logout(None).map_err(CliError::engine)?;
+            signed_in
+        }
+        AuthSource::Kiro => {
+            kiro::set_config_root(&root);
+            let signed_in = kiro::auth::status().get("loggedIn") == Some(&json!(true));
+            kiro::auth::logout().await.map_err(CliError::engine)?;
+            signed_in
+        }
+        AuthSource::Trae => {
+            trae::set_config_root(&root);
+            let signed_in = trae::auth::status().get("loggedIn") == Some(&json!(true));
+            trae::auth::logout().await.map_err(CliError::engine)?;
+            signed_in
+        }
+        AuthSource::QwenWork => {
+            qwenwork::set_config_root(&root);
+            let signed_in = qwenwork::auth::status().get("loggedIn") == Some(&json!(true));
+            qwenwork::auth::logout()
+                .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::WorkBuddy => {
+            workbuddy::set_config_root(&root);
+            let signed_in = workbuddy::auth::status().get("loggedIn") == Some(&json!(true));
+            workbuddy::auth::logout()
+                .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Kimi => {
+            kimi::set_config_root(&root);
+            let signed_in = kimi::auth::status().get("loggedIn") == Some(&json!(true));
+            kimi::auth::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Bailian => {
+            bailian::set_config_root(&root);
+            let signed_in = bailian::auth::status().get("loggedIn") == Some(&json!(true));
+            bailian::auth::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Minimax => {
+            minimax::set_config_root(&root);
+            let signed_in = minimax::auth::status().get("loggedIn") == Some(&json!(true));
+            minimax::auth::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Zhipu => {
+            zhipu::set_config_root(&root);
+            let signed_in = zhipu::auth::status().get("loggedIn") == Some(&json!(true));
+            zhipu::auth::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
+        }
+        AuthSource::Ark => {
+            ark::set_config_root(&root);
+            let signed_in = ark::auth::status().get("loggedIn") == Some(&json!(true));
+            ark::auth::logout().map_err(|error| CliError::engine(render_auth_error(&error)))?;
+            signed_in
         }
     };
     if removed {
@@ -366,22 +639,268 @@ async fn qoder_login(
     qoder::set_config_root(root);
     let start = qoder::start()
         .await
-        .map_err(|error| CliError::engine(render_qoder(&error)))?;
+        .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+    run_polled_login(
+        "Qoder",
+        "qoder",
+        "qoder:auto",
+        start,
+        printer,
+        process_context,
+        |flow| async move {
+            qoder::poll(&json!({ "flowId": flow }))
+                .await
+                .unwrap_or_else(|error| error)
+        },
+    )
+    .await
+}
+
+async fn antigravity_login(
+    root: &std::path::Path,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    antigravity::set_config_root(root);
+    let owner = 1usize;
+    let closed = Arc::new(AtomicBool::new(false));
+    let start = antigravity::login::start(owner, closed).await;
+    run_polled_login(
+        "Antigravity",
+        "antigravity",
+        "antigravity:auto",
+        start,
+        printer,
+        process_context,
+        move |flow| async move { antigravity::login::poll(owner, &flow).await },
+    )
+    .await
+}
+
+async fn cursor_login(
+    root: &std::path::Path,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    cursor::set_config_root(root);
+    let start = cursor::login_start(None);
+    run_polled_login(
+        "Cursor",
+        "cursor",
+        "cursor:auto",
+        start,
+        printer,
+        process_context,
+        |flow| async move { cursor::login_poll(&flow).await },
+    )
+    .await
+}
+
+async fn kiro_login(
+    root: &std::path::Path,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    kiro::set_config_root(root);
+    let owner = 1usize;
+    let closed = Arc::new(AtomicBool::new(false));
+    let start = kiro::login::start(owner, closed).await;
+    run_polled_login(
+        "Kiro",
+        "kiro",
+        "kiro:auto",
+        start,
+        printer,
+        process_context,
+        move |flow| async move { kiro::login::poll(owner, &flow).await },
+    )
+    .await
+}
+
+async fn trae_login(
+    root: &std::path::Path,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    trae::set_config_root(root);
+    let owner = 1usize;
+    let closed = Arc::new(AtomicBool::new(false));
+    let start = trae::login::start(owner, closed, &[], None).await;
+    run_polled_login(
+        "Trae",
+        "trae",
+        "trae:auto",
+        start,
+        printer,
+        process_context,
+        move |flow| async move { trae::login::poll(owner, &flow).await },
+    )
+    .await
+}
+
+async fn qwenwork_login(
+    root: &std::path::Path,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    qwenwork::set_config_root(root);
+    let start = qwenwork::auth::start()
+        .await
+        .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+    run_polled_login(
+        "QwenWork",
+        "qwenwork",
+        "qwenwork:auto",
+        start,
+        printer,
+        process_context,
+        |flow| async move {
+            qwenwork::auth::poll(&json!({ "flowId": flow }))
+                .await
+                .unwrap_or_else(|error| error)
+        },
+    )
+    .await
+}
+
+async fn workbuddy_login(
+    root: &std::path::Path,
+    region: Option<PlanRegionArg>,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    workbuddy::set_config_root(root);
+    let start = workbuddy::auth::start(region.map(PlanRegionArg::into_workbuddy))
+        .await
+        .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+    run_polled_login(
+        "WorkBuddy",
+        "workbuddy",
+        "workbuddy:auto",
+        start,
+        printer,
+        process_context,
+        |flow| async move {
+            workbuddy::auth::poll(&json!({ "flowId": flow }))
+                .await
+                .unwrap_or_else(|error| error)
+        },
+    )
+    .await
+}
+
+async fn kimi_login(
+    root: &std::path::Path,
+    api_key: Option<&str>,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+) -> CliResult<()> {
+    kimi::set_config_root(root);
+    if let Some(key) = api_key {
+        let reply = kimi::auth::set_api_key(key, None)
+            .await
+            .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+        if reply.get("ok") == Some(&json!(false)) {
+            return Err(CliError::engine(render_auth_error(&reply)));
+        }
+        printer.note("klaus: stored Kimi API key — run `klaus --model kimi:auto` to use it");
+        return Ok(());
+    }
+    let start = kimi::auth::start()
+        .await
+        .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+    run_polled_login(
+        "Kimi",
+        "kimi",
+        "kimi:auto",
+        start,
+        printer,
+        process_context,
+        |flow| async move {
+            kimi::auth::poll(&json!({ "flowId": flow }))
+                .await
+                .unwrap_or_else(|error| error)
+        },
+    )
+    .await
+}
+
+async fn plan_key_login<F, Fut>(
+    display_name: &str,
+    slug: &str,
+    api_key: Option<&str>,
+    region: Option<PlanRegionArg>,
+    printer: &Printer,
+    save: F,
+) -> CliResult<()>
+where
+    F: FnOnce(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, Value>>,
+{
+    let key = match api_key {
+        Some(key) => key.trim().to_string(),
+        None => super::engine::secret_from_stdin(printer)?,
+    };
+    if key.is_empty() {
+        return Err(CliError::usage(format!(
+            "empty {display_name} API key; pass `--api-key <KEY>` or provide it on stdin"
+        )));
+    }
+    let region_str = region.map(|r| r.as_str().to_string());
+    let reply = save(key, region_str)
+        .await
+        .map_err(|error| CliError::engine(render_auth_error(&error)))?;
+    if reply.get("ok") == Some(&json!(false)) {
+        return Err(CliError::engine(render_auth_error(&reply)));
+    }
+    printer.note(&format!(
+        "klaus: signed in to {display_name} — run `klaus --model {slug}:auto` to use it"
+    ));
+    Ok(())
+}
+
+/// Shared driver for browser-callback and device-code login flows owned by the
+/// engine's account modules.
+async fn run_polled_login<P, Fut>(
+    display_name: &str,
+    slug: &str,
+    example_model: &str,
+    start: Value,
+    printer: &Printer,
+    process_context: &RuntimeProcessContext,
+    mut poll_once: P,
+) -> CliResult<()>
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Value>,
+{
+    if start.get("ok") == Some(&json!(false)) {
+        return Err(CliError::engine(render_auth_error(&start)));
+    }
     let flow = start
         .get("flowId")
         .and_then(Value::as_str)
-        .ok_or_else(|| CliError::engine("the Qoder login returned no flow id".to_string()))?
+        .ok_or_else(|| CliError::engine(format!("the {display_name} login returned no flow id")))?
         .to_string();
     let auth_url = start
         .get("authUrl")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            CliError::engine("the Qoder login returned no authorization URL".to_string())
+            CliError::engine(format!(
+                "the {display_name} login returned no authorization URL"
+            ))
         })?
         .to_string();
-    // Printed BEFORE the browser is tried, so a headless box still has a
-    // completable login.
-    printer.note("klaus: authorize this device at");
+    if let Some(code) = start
+        .get("userCode")
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty())
+    {
+        printer.note(&format!(
+            "klaus: your {display_name} sign-in code is {code}"
+        ));
+    }
+    printer.note(&format!("klaus: authorize {display_name} in your browser:"));
     printer.note(&format!("       {auth_url}"));
     open_in_browser(process_context, &auth_url).await;
 
@@ -394,52 +913,35 @@ async fn qoder_login(
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     loop {
         if Instant::now() > deadline {
-            return Err(CliError::engine(
-                "the Qoder login timed out — run `klaus login qoder` again".to_string(),
-            ));
+            return Err(CliError::engine(format!(
+                "the {display_name} login timed out — run `klaus login {slug}` again"
+            )));
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let polled = qoder::poll(&json!({ "flowId": flow }))
-            .await
-            .map_err(|error| CliError::engine(render_qoder(&error)))?;
-        if polled.get("ok") == Some(&json!(true)) {
-            break;
-        }
-        // `pending` is the only "keep waiting" answer; an expired flow or a
-        // rejection stops here rather than spinning until the deadline.
+        let polled = poll_once(flow.clone()).await;
+        // Check `pending` BEFORE `ok`: loopback-backed flows (`kiro`) report
+        // `{"ok": true, "pending": true}` while waiting for the browser redirect.
         if polled.get("pending") == Some(&json!(true)) {
             continue;
         }
-        return Err(CliError::engine(render_qoder(&polled)));
+        if polled.get("ok") == Some(&json!(true)) {
+            break;
+        }
+        return Err(CliError::engine(render_auth_error(&polled)));
     }
-    printer.note("klaus: signed in to Qoder — run `klaus --model qoder:auto` to use it");
+    printer.note(&format!(
+        "klaus: signed in to {display_name} — run `klaus --model {example_model}` to use it"
+    ));
     Ok(())
 }
 
-/// The `qoder-auth:*` answers carry their failure as an `error` field on a plain
-/// object (the shape a settings page renders), so that is what a message here is.
-fn render_qoder(value: &Value) -> String {
+/// Auth module replies carry failures as an `error` field on a JSON object.
+fn render_auth_error(value: &Value) -> String {
     value
         .get("error")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| value.to_string())
-}
-
-/// One `auth status` row for Qoder. Its record is read by the module that owns
-/// it, so this reports what a session would actually find.
-fn qoder_status_line(root: &std::path::Path) -> String {
-    qoder::set_config_root(root);
-    let status = qoder::auth_status();
-    if status.get("loggedIn") != Some(&json!(true)) {
-        return format!("{:<8} signed out run `klaus login qoder`", "qoder");
-    }
-    // Qoder refreshes its own token from the record, so an expiry in the past is
-    // still recoverable without a new login; it is reported, not judged.
-    match status.get("account").and_then(Value::as_str) {
-        Some(account) => format!("{:<8} signed in  {account}", "qoder"),
-        None => format!("{:<8} signed in", "qoder"),
-    }
 }
 
 // ------------------------------------------------------------------- codex

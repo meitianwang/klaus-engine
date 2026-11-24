@@ -88,6 +88,9 @@ pub async fn run(
             thread_id,
             new_thread_id,
             before_message,
+            after_message,
+            before_turn,
+            last_turn,
             inherit_goal,
         } => {
             let event = session
@@ -99,9 +102,9 @@ pub async fn run(
                         thread_id: thread_id.clone(),
                         new_thread_id: new_thread_id.clone(),
                         before_message_uuid: before_message.clone(),
-                        after_message_uuid: None,
-                        last_turn_id: None,
-                        before_turn_id: None,
+                        after_message_uuid: after_message.clone(),
+                        last_turn_id: last_turn.clone(),
+                        before_turn_id: before_turn.clone(),
                         submission_id: None,
                     },
                     |event| event.session.is_some(),

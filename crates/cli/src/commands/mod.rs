@@ -62,15 +62,30 @@ pub async fn dispatch(mut cli: Cli, process_context: RuntimeProcessContext) -> C
         _ => {}
     }
 
+    // Terminal commands write directly to a person's stderr; host-only structured
+    // `[CursorDiagnostic]` spans stay enabled on `klaus app-server` and stdio.
+    klaus_agent_server::app_server::cursor::set_diagnostics_stderr(false);
+
     // Signing in touches credential records and nothing else. Starting an engine
     // for it would be worse than wasteful: a machine with no model configured yet
     // is exactly the machine someone runs `klaus login` on, and a session that
     // cannot resolve a provider would fail before the login could fix that.
     match &cli.command {
-        Some(Command::Login { source }) => {
-            return auth::login(*source, &printer, &process_context).await
+        Some(Command::Login {
+            source,
+            api_key,
+            region,
+        }) => {
+            return auth::login(
+                *source,
+                api_key.as_deref(),
+                *region,
+                &printer,
+                &process_context,
+            )
+            .await
         }
-        Some(Command::Logout { source }) => return auth::logout(*source, &printer),
+        Some(Command::Logout { source }) => return auth::logout(*source, &printer).await,
         Some(Command::Auth { command }) => {
             return match command {
                 crate::cli::AuthCommand::Status => auth::status(&printer).await,

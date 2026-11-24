@@ -28,8 +28,8 @@ use klaus_agent_protocol::{AgentMemorySnapshotUnavailableReason, BackgroundAgent
 use klaus_agent_server::app_server::methods::{
     SessionAgentMemorySnapshotDecision, SessionAgentMemorySnapshotDecisions, SessionDreamNow,
     SessionMemoryMaintenance, SessionResolveAgentMemorySnapshotDecision,
-    SessionSettleAgentMemorySnapshotUnavailable, SessionSubagentLifecycle,
-    SessionSubagentTranscript, SessionSubagents,
+    SessionSendSubagentMessage, SessionSettleAgentMemorySnapshotUnavailable,
+    SessionSubagentLifecycle, SessionSubagentTranscript, SessionSubagents,
 };
 use klaus_agent_server::app_server::wire;
 use klaus_agent_server::Method;
@@ -250,6 +250,45 @@ pub async fn subagent(
                 |event| match &event.subagent_transcript {
                     Some(transcript) => subagent_transcript(transcript),
                     None => missing("subagentTranscript"),
+                },
+            )
+            .await
+        }
+
+        SubagentCommand::Send {
+            agent_id,
+            summary,
+            message,
+        } => {
+            show::<SessionSendSubagentMessage>(
+                engine,
+                printer,
+                wire::SessionSendSubagentMessageParams {
+                    session_id: engine.session_id().to_string(),
+                    agent_id: agent_id.clone(),
+                    message: RuntimeString::from(message.as_str()),
+                    summary: summary.as_deref().map(RuntimeString::from),
+                    user_initiated: true,
+                    submission_id: None,
+                },
+                |event| match &event.subagent_message {
+                    Some(reply) => {
+                        let agent = reply
+                            .get("agentId")
+                            .and_then(|value| value.as_string())
+                            .map(text::text)
+                            .unwrap_or_else(|| agent_id.clone());
+                        let resumed = reply
+                            .get("resumed")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
+                        if resumed {
+                            format!("sent to {agent} (resumed)")
+                        } else {
+                            format!("sent to {agent}")
+                        }
+                    }
+                    None => missing("subagentMessage"),
                 },
             )
             .await

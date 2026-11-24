@@ -7,7 +7,7 @@ description = "Terminal client for the Klaus agent engine"
 # it is unversioned (see the note in the workspace manifest), so bumping this is
 # a CLI release decision and nothing else in the tree has to move. Bump it in the
 # same commit that ships a CLI release; never reuse a number for different bytes.
-version = "0.1.5"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

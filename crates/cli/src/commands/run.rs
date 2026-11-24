@@ -9,19 +9,23 @@ use clap::ValueEnum as _;
 
 use klaus_agent_core::engine::session::SideQuestionResult;
 use klaus_agent_core::runtime_values::RuntimeString;
-use klaus_agent_core::types::permission::ExternalPermissionMode;
+use klaus_agent_core::schemas::config::WebSearchAccess;
+use klaus_agent_core::types::permission::{
+    ApprovalPolicy as CoreApprovalPolicy, ExternalPermissionMode,
+};
+use klaus_agent_core::types::provider::{OutputVerbosity, ReasoningSummary};
 use klaus_agent_protocol::types::Input;
 use klaus_agent_protocol::{
     ProtocolSessionConfigUpdate, ProtocolSessionConfigUpdateResult, RunOpOptions,
 };
 use klaus_agent_server::app_server::methods::{
-    ConfigRead, SessionSetCollaborationMode, SessionSetModel, SessionSetRuntimePolicy,
-    SessionSideQuestion, SessionUpdateConfig,
+    ConfigRead, SessionContextSnapshot, SessionSetCollaborationMode, SessionSetModel,
+    SessionSetRuntimePolicy, SessionSideQuestion, SessionSubagents, SessionUpdateConfig,
 };
 use klaus_agent_server::app_server::wire;
 use serde_json::Value;
 
-use crate::cli::{ExecArgs, Globals, PermissionModeArg};
+use crate::cli::{CollaborationModeArg, EffortArg, ExecArgs, Globals, PermissionModeArg};
 use crate::error::{CliError, CliResult};
 use crate::model::ModelRef;
 use crate::output::Printer;
@@ -43,10 +47,14 @@ enum Slash {
 const HELP: &str = "\
 commands\n  \
 /help                          this list\n  \
-/model <id>                    switch model, from the next turn on\n  \
+/model <id|source:model>       switch model or source, from the next turn on\n  \
 /permissions sandbox=<policy> approval=<policy>  update session permissions\n  \
 /collaboration <plan|default>  update planning independently\n  \
-/config model=<id>             update the selected model\n  \
+/plan [on|off]                 toggle or set plan mode\n  \
+/parallel [on|off]             toggle or set parallel sub-agent decomposition\n  \
+/goal [on|off]                 toggle or set autonomous goal mode\n  \
+/orchestrate [on|off|src:id]   toggle orchestration or set executor model\n  \
+/config key=value ...          update model, parallel, goal, verbosity, summary, web-search\n  \
 /exit, /quit                   leave\n\
 keys\n  \
 ctrl-c                         interrupt the running turn (twice: stop waiting)\n  \
@@ -59,10 +67,14 @@ fn slash_commands() -> Vec<tui::menu::Candidate> {
     use tui::menu::Candidate;
     vec![
         Candidate::new("help", "this list"),
-        Candidate::new("model", "switch model, from the next turn on"),
+        Candidate::new("model", "switch model or source, from the next turn on"),
         Candidate::new("permissions", "update the session runtime policy"),
         Candidate::new("collaboration", "update planning independently"),
-        Candidate::new("config", "update the selected model"),
+        Candidate::new("plan", "toggle or set plan mode"),
+        Candidate::new("parallel", "toggle or set parallel mode"),
+        Candidate::new("goal", "toggle or set autonomous goal mode"),
+        Candidate::new("orchestrate", "toggle orchestration or set executor model"),
+        Candidate::new("config", "update mutable session config fields"),
         Candidate::new("exit", "leave"),
         Candidate::new("quit", "leave"),
     ]
@@ -139,11 +151,12 @@ pub async fn repl(
     let mut shell = tui::shell::is_available().then(|| tui::shell::Shell::new(slash_commands()));
 
     let mut prompt = first;
+    let mut active_globals = globals.clone();
     // The toolbar's facts, resolved once and then kept in step by the slash
     // commands that change them: re-reading per prompt would put a round trip in
     // front of every keystroke, and leaving it at the invocation's flags is what
     // made `/model` change the session without changing what the toolbar claimed.
-    let mut status = shell_status(session, globals).await;
+    let mut status = shell_status(session, &active_globals).await;
     // Ctrl-C at the prompt does not leave on the first press: there is no turn to
     // interrupt there, and quitting on a keystroke that means "stop that" in
     // every other context would be a trap. Two in a row is unambiguous.
@@ -152,6 +165,9 @@ pub async fn repl(
         let text_input = match prompt.take() {
             Some(text_input) => text_input,
             None => {
+                if shell.is_some() {
+                    refresh_live_toolbar(session, &mut status).await;
+                }
                 match read_prompt(shell.as_mut(), printer, console, session, &status).await? {
                     Typed::Line(line) => {
                         leaving = false;
@@ -186,7 +202,7 @@ pub async fn repl(
             ]))?;
         }
         if let Some(command) = text_input.strip_prefix('/') {
-            match slash(session, globals, printer, command, &mut status).await? {
+            match slash(session, &mut active_globals, printer, command, &mut status).await? {
                 Slash::Prompt => continue,
                 Slash::Leave => return Ok(()),
             }
@@ -260,12 +276,32 @@ async fn shell_status(session: &CliSession, globals: &Globals) -> tui::toolbar::
             if let Some(thinking) = resolved.get("thinking").and_then(Value::as_bool) {
                 status.thinking = thinking;
             }
+            if let Some(effort) = resolved.get("effort").and_then(Value::as_str) {
+                status.thinking = effort != "none";
+            }
+            if resolved.get("approval_policy").and_then(Value::as_str) == Some("never") {
+                status.badges.auto_approve = true;
+            }
+            if resolved
+                .get("ultra_mode")
+                .or_else(|| resolved.get("ultraMode"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                status.badges.parallel = true;
+            }
+            if resolved.get("goal").and_then(Value::as_bool) == Some(true) {
+                status.badges.unattended = true;
+            }
         }
     }
     // The flags win over the resolved view: they are this session's init, and the
     // engine applied them on top of the same config.
     if let Some(model) = &globals.model {
         status.model = model.clone();
+    }
+    if let Some(effort) = globals.effort {
+        status.thinking = !matches!(effort, EffortArg::None);
     }
     if let Ok(Some(config)) = session::session_config(globals) {
         if let Some(mode) = config
@@ -275,9 +311,104 @@ async fn shell_status(session: &CliSession, globals: &Globals) -> tui::toolbar::
         {
             status.mode = text::text(mode);
         }
+        if let Some(policy) = config
+            .get("approval_policy")
+            .or_else(|| config.get("approvalPolicy"))
+            .and_then(|value| value.as_string())
+        {
+            status.badges.auto_approve = text::text(policy) == "never";
+        }
+        if config
+            .get("ultra_mode")
+            .or_else(|| config.get("ultraMode"))
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            status.badges.parallel = true;
+        }
+        if config.get("goal").and_then(|value| value.as_bool()) == Some(true) {
+            status.badges.unattended = true;
+        }
     }
-    status.badges.plan = matches!(globals.permission_mode, Some(PermissionModeArg::Plan));
+    status.badges.plan = match globals.collaboration_mode {
+        Some(CollaborationModeArg::Plan) => true,
+        Some(CollaborationModeArg::Default) => false,
+        None => matches!(globals.permission_mode, Some(PermissionModeArg::Plan)),
+    };
+    status.badges.orchestrate = globals.orchestrate || globals.orchestrator_model.is_some();
+    if globals.parallel {
+        status.badges.parallel = true;
+    }
+    if globals.goal_mode {
+        status.badges.unattended = true;
+    }
     status
+}
+
+/// Refresh dynamic session telemetry (git tree, context occupancy, live
+/// background sub-agents) right before drawing the interactive toolbar.
+async fn refresh_live_toolbar(session: &CliSession, status: &mut tui::toolbar::Status) {
+    status.git = read_git_status(&session.cwd);
+    if let Ok(event) = session
+        .engine
+        .query::<SessionContextSnapshot>(session.engine.scope())
+        .await
+    {
+        if let Some(snapshot) = &event.context {
+            if snapshot.context_window > 0 {
+                let used = snapshot.total_tokens as u64;
+                let total = snapshot.context_window as u64;
+                status.context = Some((used as f64 / total as f64, used, total));
+            }
+        }
+    }
+    if let Ok(event) = session
+        .engine
+        .query::<SessionSubagents>(session.engine.scope())
+        .await
+    {
+        status.tasks = event
+            .subagents
+            .as_ref()
+            .filter(|items| !items.is_empty())
+            .map(|items| ("agents".to_string(), items.len()));
+    }
+}
+
+fn read_git_status(cwd: &str) -> Option<tui::toolbar::Git> {
+    let output = std::process::Command::new("git")
+        .args(["-C", cwd, "status", "--porcelain=v2", "--branch"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_git_porcelain_v2(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_git_porcelain_v2(stdout: &str) -> Option<tui::toolbar::Git> {
+    let mut git = tui::toolbar::Git::default();
+    for line in stdout.lines() {
+        if let Some(head) = line.strip_prefix("# branch.head ") {
+            let head = head.trim();
+            git.branch = if head == "(detached)" {
+                "HEAD".to_string()
+            } else {
+                head.to_string()
+            };
+        } else if let Some(ab) = line.strip_prefix("# branch.ab ") {
+            for token in ab.split_whitespace() {
+                if let Some(ahead) = token.strip_prefix('+') {
+                    git.ahead = ahead.parse().unwrap_or(0);
+                } else if let Some(behind) = token.strip_prefix('-') {
+                    git.behind = behind.parse().unwrap_or(0);
+                }
+            }
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            git.dirty = true;
+        }
+    }
+    (!git.branch.is_empty()).then_some(git)
 }
 
 /// Apply local session commands. Model changes retain their ordered next-turn
@@ -286,7 +417,7 @@ async fn shell_status(session: &CliSession, globals: &Globals) -> tui::toolbar::
 /// translated to those canonical requests at this input boundary.
 async fn slash(
     session: &mut CliSession,
-    globals: &Globals,
+    globals: &mut Globals,
     printer: &Printer,
     command: &str,
     status: &mut tui::toolbar::Status,
@@ -300,23 +431,14 @@ async fn slash(
         "help" | "?" => printer.note(HELP),
         "model" if rest.is_empty() => printer.note("klaus: /model needs a model id"),
         "model" => match ModelRef::parse(rest) {
-            // A selection decides which provider answers, and the endpoint settles
-            // that while starting a session — so this replaces the session rather
-            // than sending the selection string as a model NAME, which would leave
-            // the session on its current provider and ask it for a model called
-            // `custom:…`. The thread comes along, so the conversation continues.
             ModelRef::Selection(selection) => {
                 let selection = selection.to_string();
-                // A refused selection does NOT end the REPL. The replacement is
-                // started before the old session is released, so a selection that
-                // names nothing or is not signed in leaves the session in hand
-                // working — and the loop's whole contract is that a refusal keeps
-                // the history the user still wants.
                 match session
                     .reopen_with_selection(globals, &selection, printer)
                     .await
                 {
                     Ok(()) => {
+                        globals.model = Some(selection.clone());
                         status.model = selection.clone();
                         printer.note(&format!(
                             "klaus: {selection} — reopened this thread on it, from the next turn"
@@ -337,6 +459,7 @@ async fn slash(
                         submission_id: None,
                     })
                     .await?;
+                globals.model = Some(model.to_string());
                 status.model = model.to_string();
                 printer.note(&format!(
                     "klaus: model {model} — applies from the next turn"
@@ -377,6 +500,9 @@ async fn slash(
             if let Some(mode) = policy.sandbox_mode {
                 status.mode = mode;
             }
+            if let Some(approval) = policy.approval_policy {
+                status.badges.auto_approve = matches!(approval, CoreApprovalPolicy::Never);
+            }
             printer.note("klaus: runtime policy updated");
         }
         "collaboration" => {
@@ -385,18 +511,85 @@ async fn slash(
                 "default" => wire::CollaborationMode::Default,
                 _ => return Err(CliError::usage("/collaboration wants plan or default")),
             };
-            let planning = matches!(mode, wire::CollaborationMode::Plan);
-            session
-                .engine
-                .call::<SessionSetCollaborationMode>(wire::SessionCollaborationModeParams {
-                    session_id: Some(session.engine.session_id().to_string()),
-                    thread_id: None,
-                    mode,
-                    expected_revision: None,
-                })
-                .await?;
-            status.badges.plan = planning;
+            apply_collaboration_mode(session, globals, status, mode).await?;
             printer.note("klaus: collaboration mode updated");
+        }
+        "plan" => {
+            let next_plan = parse_toggle_arg(rest, status.badges.plan, "/plan")?;
+            let mode = if next_plan {
+                wire::CollaborationMode::Plan
+            } else {
+                wire::CollaborationMode::Default
+            };
+            apply_collaboration_mode(session, globals, status, mode).await?;
+            printer.note(if next_plan {
+                "klaus: plan mode on"
+            } else {
+                "klaus: plan mode off"
+            });
+        }
+        "parallel" | "ultra" => {
+            let enabled = parse_toggle_arg(rest, status.badges.parallel, "/parallel")?;
+            let update = ProtocolSessionConfigUpdate {
+                ultra_mode: Some(enabled),
+                ..Default::default()
+            };
+            submit_session_config_update(session, printer, &update, status).await?;
+            globals.parallel = enabled;
+        }
+        "goal" => {
+            let enabled = parse_toggle_arg(rest, status.badges.unattended, "/goal")?;
+            let update = ProtocolSessionConfigUpdate {
+                goal: Some(enabled),
+                ..Default::default()
+            };
+            submit_session_config_update(session, printer, &update, status).await?;
+            globals.goal_mode = enabled;
+        }
+        "orchestrate" => {
+            let mut next = globals.clone();
+            let note = match rest {
+                "" => {
+                    let enabled = !status.badges.orchestrate;
+                    next.orchestrate = enabled;
+                    if !enabled {
+                        next.orchestrator_model = None;
+                    }
+                    if enabled {
+                        "klaus: orchestration mode on — reopened this thread".to_string()
+                    } else {
+                        "klaus: orchestration mode off — reopened this thread".to_string()
+                    }
+                }
+                "on" | "true" => {
+                    next.orchestrate = true;
+                    "klaus: orchestration mode on — reopened this thread".to_string()
+                }
+                "off" | "false" => {
+                    next.orchestrate = false;
+                    next.orchestrator_model = None;
+                    "klaus: orchestration mode off — reopened this thread".to_string()
+                }
+                target => {
+                    session::parse_orchestrator_target(target)?;
+                    next.orchestrate = true;
+                    next.orchestrator_model = Some(target.to_string());
+                    format!(
+                        "klaus: orchestration mode on (executor {target}) — reopened this thread"
+                    )
+                }
+            };
+            match session.reopen_with_globals(&next, printer).await {
+                Ok(()) => {
+                    status.badges.orchestrate =
+                        next.orchestrate || next.orchestrator_model.is_some();
+                    *globals = next;
+                    printer.note(&note);
+                }
+                Err(error) => printer.note(&format!(
+                    "klaus: orchestration change was not applied ({error})"
+                )),
+            }
         }
         "mode" => match permission_mode(rest) {
             Some(mode) => {
@@ -412,6 +605,42 @@ async fn slash(
         )),
     }
     Ok(Slash::Prompt)
+}
+
+async fn apply_collaboration_mode(
+    session: &CliSession,
+    globals: &mut Globals,
+    status: &mut tui::toolbar::Status,
+    mode: wire::CollaborationMode,
+) -> CliResult<()> {
+    let planning = matches!(mode, wire::CollaborationMode::Plan);
+    session
+        .engine
+        .call::<SessionSetCollaborationMode>(wire::SessionCollaborationModeParams {
+            session_id: Some(session.engine.session_id().to_string()),
+            thread_id: None,
+            mode,
+            expected_revision: None,
+        })
+        .await?;
+    globals.collaboration_mode = Some(if planning {
+        CollaborationModeArg::Plan
+    } else {
+        CollaborationModeArg::Default
+    });
+    status.badges.plan = planning;
+    Ok(())
+}
+
+fn parse_toggle_arg(rest: &str, current: bool, cmd: &str) -> CliResult<bool> {
+    match rest {
+        "" => Ok(!current),
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        _ => Err(CliError::usage(format!(
+            "{cmd} takes on, off, or no argument to toggle"
+        ))),
+    }
 }
 
 /// Build an explicit policy update without changing fields the user omitted.
@@ -479,7 +708,7 @@ fn set_mode(status: &mut tui::toolbar::Status, mode: ExternalPermissionMode) {
 /// about to be released.
 async fn config(
     session: &mut CliSession,
-    globals: &Globals,
+    globals: &mut Globals,
     printer: &Printer,
     rest: &str,
     status: &mut tui::toolbar::Status,
@@ -495,6 +724,50 @@ async fn config(
                     update.model = Some(RuntimeString::from(model));
                 }
             },
+            Some(("parallel" | "ultra", value)) => match parse_bool_field(value) {
+                Some(enabled) => update.ultra_mode = Some(enabled),
+                None => {
+                    printer.note("klaus: parallel= wants true or false");
+                    return Ok(());
+                }
+            },
+            Some(("goal", value)) => match parse_bool_field(value) {
+                Some(enabled) => update.goal = Some(enabled),
+                None => {
+                    printer.note("klaus: goal= wants true or false");
+                    return Ok(());
+                }
+            },
+            Some(("verbosity", value)) => match value {
+                "low" => update.model_verbosity = Some(Some(OutputVerbosity::Low)),
+                "medium" => update.model_verbosity = Some(Some(OutputVerbosity::Medium)),
+                "high" => update.model_verbosity = Some(Some(OutputVerbosity::High)),
+                "unset" | "default" => update.model_verbosity = Some(None),
+                _ => {
+                    printer.note("klaus: verbosity= wants low, medium, high, or unset");
+                    return Ok(());
+                }
+            },
+            Some(("summary", value)) => match value {
+                "auto" => update.reasoning_summary = Some(ReasoningSummary::Auto),
+                "concise" => update.reasoning_summary = Some(ReasoningSummary::Concise),
+                "detailed" => update.reasoning_summary = Some(ReasoningSummary::Detailed),
+                "none" => update.reasoning_summary = Some(ReasoningSummary::None),
+                _ => {
+                    printer.note("klaus: summary= wants auto, concise, detailed, or none");
+                    return Ok(());
+                }
+            },
+            Some(("web-search" | "web_search", value)) => match value {
+                "disabled" => update.web_search_access = Some(WebSearchAccess::Disabled),
+                "cached" => update.web_search_access = Some(WebSearchAccess::Cached),
+                "indexed" => update.web_search_access = Some(WebSearchAccess::Indexed),
+                "live" => update.web_search_access = Some(WebSearchAccess::Live),
+                _ => {
+                    printer.note("klaus: web-search= wants disabled, cached, indexed, or live");
+                    return Ok(());
+                }
+            },
             Some(("mode", value)) => match permission_mode(value) {
                 Some(mode) => legacy_policy = Some(mode),
                 None => {
@@ -503,21 +776,20 @@ async fn config(
                 }
             },
             _ => {
-                printer.note("klaus: /config takes model=<id>; use /permissions to update policy");
+                printer.note(
+                    "klaus: /config takes model=<id> parallel=<bool> goal=<bool> verbosity=<low|medium|high|unset> summary=<auto|concise|detailed|none> web-search=<disabled|cached|indexed|live>",
+                );
                 return Ok(());
             }
         }
     }
-    if update.model.is_none() && legacy_policy.is_none() && reopen.is_none() {
-        printer.note("klaus: /config takes model=<id>; use /permissions to update policy");
+    let has_update = has_config_update(&update);
+    if !has_update && legacy_policy.is_none() && reopen.is_none() {
+        printer.note(
+            "klaus: /config takes model=<id> parallel=<bool> goal=<bool> verbosity=<low|medium|high|unset> summary=<auto|concise|detailed|none> web-search=<disabled|cached|indexed|live>",
+        );
         return Ok(());
     }
-    // The provider first, because it is the one that replaces the session; the
-    // update below then lands on the session that will actually run the turn.
-    //
-    // A refused selection stops here without applying the rest: this command
-    // exists to change both together, so half of it is not what was asked for.
-    // The session in hand is untouched either way.
     if let Some(selection) = &reopen {
         if let Err(error) = session
             .reopen_with_selection(globals, selection, printer)
@@ -529,11 +801,12 @@ async fn config(
             ));
             return Ok(());
         }
+        globals.model = Some(selection.clone());
         status.model = selection.clone();
         printer.note(&format!(
             "klaus: {selection} — reopened this thread on it, from the next turn"
         ));
-        if legacy_policy.is_none() {
+        if legacy_policy.is_none() && !has_update {
             return Ok(());
         }
     }
@@ -541,16 +814,52 @@ async fn config(
         apply_legacy_policy(session, mode).await?;
         set_mode(status, mode);
     }
-    if update.model.is_none() {
+    if !has_update {
         return Ok(());
     }
+    submit_session_config_update(session, printer, &update, status).await?;
+    if let Some(model) = &update.model {
+        globals.model = Some(text::text(model));
+    }
+    if let Some(parallel) = update.ultra_mode {
+        globals.parallel = parallel;
+    }
+    if let Some(goal) = update.goal {
+        globals.goal_mode = goal;
+    }
+    Ok(())
+}
+
+fn has_config_update(update: &ProtocolSessionConfigUpdate) -> bool {
+    update.model.is_some()
+        || update.ultra_mode.is_some()
+        || update.goal.is_some()
+        || update.model_verbosity.is_some()
+        || update.reasoning_summary.is_some()
+        || update.web_search_access.is_some()
+}
+
+fn parse_bool_field(value: &str) -> Option<bool> {
+    match value {
+        "true" | "on" | "1" => Some(true),
+        "false" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+async fn submit_session_config_update(
+    session: &CliSession,
+    printer: &Printer,
+    update: &ProtocolSessionConfigUpdate,
+    status: &mut tui::toolbar::Status,
+) -> CliResult<()> {
     settle::<SessionUpdateConfig>(
         &session.engine,
         printer,
         wire::SessionConfigUpdateParams {
             session_id: session.engine.session_id().to_string(),
             update: klaus_agent_server::app_server::runtime_wire::RawJson::from_serialize(
-                &text::to_json(&update)?,
+                &text::to_json(update)?,
             )
             .map_err(|error| CliError::Codec(error.to_string()))?,
             submission_id: None,
@@ -562,11 +871,14 @@ async fn config(
         },
     )
     .await?;
-    // Settled without error, so the fields this update named are the session's
-    // now. The engine echoes back exactly these two, so recording what was sent
-    // and what it confirmed are the same thing.
     if let Some(model) = &update.model {
         status.model = text::text(model);
+    }
+    if let Some(parallel) = update.ultra_mode {
+        status.badges.parallel = parallel;
+    }
+    if let Some(goal) = update.goal {
+        status.badges.unattended = goal;
     }
     Ok(())
 }
@@ -576,9 +888,29 @@ async fn config(
 /// than as unset.
 fn session_config(result: &ProtocolSessionConfigUpdateResult) -> String {
     let mut parts = Vec::new();
-    match &result.model {
-        Some(model) => parts.push(format!("model {}", text::text(model))),
-        None => parts.push("model unchanged".to_string()),
+    if let Some(model) = &result.model {
+        parts.push(format!("model {}", text::text(model)));
+    }
+    if let Some(parallel) = result.ultra_mode {
+        parts.push(format!("parallel {}", if parallel { "on" } else { "off" }));
+    }
+    if let Some(goal) = result.goal {
+        parts.push(format!("goal {}", if goal { "on" } else { "off" }));
+    }
+    if let Some(verbosity) = &result.model_verbosity {
+        match verbosity {
+            Some(level) => parts.push(format!("verbosity {}", level.as_str())),
+            None => parts.push("verbosity default".to_string()),
+        }
+    }
+    if let Some(summary) = &result.reasoning_summary {
+        parts.push(format!("summary {}", summary.as_str()));
+    }
+    if let Some(web_search) = &result.web_search_access {
+        parts.push(format!("web-search {}", web_search.as_str()));
+    }
+    if parts.is_empty() {
+        parts.push("config unchanged".to_string());
     }
     parts.join(", ")
 }
@@ -742,7 +1074,14 @@ mod tests {
     #[test]
     fn completion_advertises_canonical_permission_and_planning_commands() {
         let commands = slash_commands();
-        for (prefix, accepted) in [("/perm", "/permissions "), ("/coll", "/collaboration ")] {
+        for (prefix, accepted) in [
+            ("/perm", "/permissions "),
+            ("/coll", "/collaboration "),
+            ("/plan", "/plan "),
+            ("/para", "/parallel "),
+            ("/goal", "/goal "),
+            ("/orch", "/orchestrate "),
+        ] {
             let menu = tui::menu::Menu::for_input(prefix, &commands)
                 .expect("the public command is offered by completion");
             assert_eq!(menu.accept(), accepted);
@@ -753,6 +1092,21 @@ mod tests {
         }
         assert!(commands.iter().all(|candidate| candidate.name != "mode"));
         assert!(!HELP.contains("/mode "));
+    }
+
+    #[test]
+    fn git_porcelain_v2_parses_branch_ahead_behind_and_dirty_state() {
+        let raw = "\
+# branch.oid 7089fa511\n\
+# branch.head main\n\
+# branch.upstream origin/main\n\
+# branch.ab +2 -1\n\
+1 .M N... 100644 100644 100644 111 222 src/lib.rs\n";
+        let git = parse_git_porcelain_v2(raw).expect("valid git status");
+        assert_eq!(git.branch, "main");
+        assert_eq!(git.ahead, 2);
+        assert_eq!(git.behind, 1);
+        assert!(git.dirty);
     }
 
     #[test]

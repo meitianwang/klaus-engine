@@ -2,8 +2,17 @@
 
 use serde_json::{json, Value};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+static STDERR_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Suppress `[CursorDiagnostic]` stderr lines when an interactive terminal CLI
+/// owns stderr directly rather than a host log collector.
+pub fn set_diagnostics_stderr(enabled: bool) {
+    STDERR_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 tokio::task_local! { static CONTEXT: Context; }
 #[cfg(test)]
@@ -56,7 +65,9 @@ impl Context {
             "fields":fields});
         #[cfg(test)]
         let _ = CAPTURE.try_with(|events| events.lock().unwrap().push(event.clone()));
-        eprintln!("[CursorDiagnostic] {event}");
+        if STDERR_ENABLED.load(Ordering::Relaxed) {
+            eprintln!("[CursorDiagnostic] {event}");
+        }
         *self.phase.lock().unwrap_or_else(|p| p.into_inner()) = phase;
     }
 }

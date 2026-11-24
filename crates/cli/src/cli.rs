@@ -16,9 +16,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use klaus_agent_core::engine::rewind::RewindScope;
 use klaus_agent_core::hooks::setup::SetupTrigger;
 use klaus_agent_core::memory::agent_memory::AgentMemoryMergeChoice;
+use klaus_agent_core::schemas::effort::EffortLevel;
 use klaus_agent_core::schemas::rollout::SessionRole;
 use klaus_agent_core::types::permission::ExternalPermissionMode;
 use klaus_agent_protocol::{AgentMemorySnapshotUnavailableReason, QueuePriority, SteerPriority};
+use klaus_agent_server::app_server::wire::WorkBuddyRegion;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +62,37 @@ pub struct Globals {
     /// Model id for the session.
     #[arg(short = 'm', long, value_name = "MODEL", global = true)]
     pub model: Option<String>,
+
+    /// Native reasoning effort for the session.
+    #[arg(long, value_enum, global = true)]
+    pub effort: Option<EffortArg>,
+
+    /// Collaboration mode (`default` or `plan`).
+    #[arg(long = "collaboration-mode", value_enum, global = true)]
+    pub collaboration_mode: Option<CollaborationModeArg>,
+
+    /// Enable parallel mode: proactive decomposition of independent sub-tasks across
+    /// child agents (`--ultra` is accepted as an alias).
+    #[arg(long = "parallel", visible_alias = "ultra", global = true)]
+    pub parallel: bool,
+
+    /// Enable orchestration mode: the main model plans and verifies while an
+    /// executor model performs implementation steps.
+    #[arg(long = "orchestrate", global = true)]
+    pub orchestrate: bool,
+
+    /// Explicit executor model (`source:model`) for orchestration mode. Implies
+    /// `--orchestrate`.
+    #[arg(
+        long = "orchestrator-model",
+        value_name = "SOURCE:MODEL",
+        global = true
+    )]
+    pub orchestrator_model: Option<String>,
+
+    /// Run the session inside an isolated git worktree managed by the engine.
+    #[arg(long = "worktree", global = true)]
+    pub worktree: bool,
 
     /// Provider backend: anthropic (default), openai, gemini. Selecting the
     /// backend is the endpoint's decision, so a served engine owns its own.
@@ -308,27 +341,36 @@ pub enum Command {
         command: EngineCommand,
     },
 
-    /// Sign in to a subscription, so `--model subscription:…` / `codex:…` /
-    /// `qoder:…` works.
+    /// Sign in to a subscription or coding plan (`claude`, `codex`, `qoder`,
+    /// `antigravity`, `cursor`, `kiro`, `trae`, `qwenwork`, `workbuddy`, `kimi`,
+    /// `bailian`, `minimax`, `zhipu`, `ark`).
     ///
     /// The credential lands where every client on this machine reads it, so one
     /// sign-in serves the CLI and the desktop app rather than each keeping its
     /// own. A BYO API key is the other way to give a session a model, and it is
     /// set with `klaus engine credential set`.
     Login {
-        /// Which subscription. Defaults to Claude.
+        /// Which model source to sign in to. Defaults to Claude.
         #[arg(value_enum, default_value_t = AuthSource::Claude)]
         source: AuthSource,
+        /// API key for plan sources (`bailian`, `minimax`, `zhipu`, `ark`, or
+        /// `kimi`). Omit to read from stdin when signing in to an API-key plan.
+        #[arg(long = "api-key", value_name = "KEY")]
+        api_key: Option<String>,
+        /// Service region (`cn` or `intl`) for multi-region sources (`workbuddy`,
+        /// `bailian`, `minimax`, `zhipu`, `ark`).
+        #[arg(long, value_enum)]
+        region: Option<PlanRegionArg>,
     },
 
-    /// Forget a stored subscription sign-in.
+    /// Forget a stored subscription or coding-plan sign-in.
     Logout {
-        /// Which subscription. Defaults to Claude.
+        /// Which model source to sign out of. Defaults to Claude.
         #[arg(value_enum, default_value_t = AuthSource::Claude)]
         source: AuthSource,
     },
 
-    /// Which subscriptions this machine is signed in to.
+    /// Which model sources this machine is signed in to.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -474,6 +516,9 @@ mod rollout_maintenance_tests {
 
 #[derive(Subcommand, Debug)]
 pub enum EngineCommand {
+    /// Compress inactive rollout transcripts into cold archives.
+    CompressRollouts,
+
     /// Preview stored-history migration; only --apply changes files.
     MigrateRollouts {
         #[arg(long)]
@@ -667,6 +712,15 @@ pub enum SessionCommand {
         /// Inherit only history strictly before this message.
         #[arg(long = "before-message", value_name = "UUID")]
         before_message: Option<String>,
+        /// Inherit history through and including this message.
+        #[arg(long = "after-message", value_name = "UUID")]
+        after_message: Option<String>,
+        /// Inherit only completed turns strictly before this turn id.
+        #[arg(long = "before-turn", value_name = "TURN_ID")]
+        before_turn: Option<String>,
+        /// Inherit completed turns through and including this turn id.
+        #[arg(long = "last-turn", value_name = "TURN_ID")]
+        last_turn: Option<String>,
         /// Copy the source goal and defer automatic work until an explicit turn.
         #[arg(long = "inherit-goal")]
         inherit_goal: bool,
@@ -1074,10 +1128,24 @@ pub enum SubagentCommand {
     Lifecycle,
     /// One sub-agent's transcript.
     Transcript {
+        /// Parent thread id that spawned the sub-agent.
         #[arg(long = "thread-id", value_name = "THREAD_ID")]
         thread_id: String,
+        /// Sub-agent id to inspect.
         #[arg(long = "agent-id", value_name = "AGENT_ID")]
         agent_id: String,
+    },
+    /// Send a follow-up message to a running or completed sub-agent.
+    Send {
+        /// Target sub-agent id.
+        #[arg(long = "agent-id", value_name = "AGENT_ID")]
+        agent_id: String,
+        /// Short summary shown in activity logs.
+        #[arg(long, value_name = "TEXT")]
+        summary: Option<String>,
+        /// Message text delivered to the sub-agent.
+        #[arg(value_name = "MESSAGE")]
+        message: String,
     },
 }
 
@@ -1090,15 +1158,14 @@ pub enum SubagentCommand {
 // kebab-case by reflex. Accepting both is cheaper than making either one wrong.
 // ---------------------------------------------------------------------------
 
-/// Which subscription a sign-in command acts on.
+/// Which model source a sign-in command acts on.
 ///
-/// Named after the account a person has, not after the wire it ends up on: a user
-/// signs in to Claude or to ChatGPT, and which provider kind that becomes is the
-/// endpoint's business.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+/// Named after the account or coding plan a person signs in to, matching the
+/// `--model <source>:<id>` selection prefixes supported by the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum AuthSource {
     /// A Claude subscription (Pro/Max), used by `--model subscription:…`.
-    #[value(name = "claude")]
+    #[value(name = "claude", alias = "subscription")]
     Claude,
     /// A ChatGPT subscription through Codex, used by `--model codex:…`.
     #[value(name = "codex")]
@@ -1106,11 +1173,133 @@ pub enum AuthSource {
     /// A Qoder subscription, used by `--model qoder:…`.
     #[value(name = "qoder")]
     Qoder,
+    /// An Antigravity account, used by `--model antigravity:…`.
+    #[value(name = "antigravity")]
+    Antigravity,
+    /// A Cursor subscription, used by `--model cursor:…`.
+    #[value(name = "cursor")]
+    Cursor,
+    /// A Kiro account, used by `--model kiro:…`.
+    #[value(name = "kiro")]
+    Kiro,
+    /// A Trae account, used by `--model trae:…`.
+    #[value(name = "trae")]
+    Trae,
+    /// A QwenWork account, used by `--model qwenwork:…`.
+    #[value(name = "qwenwork", alias = "qwen-work")]
+    QwenWork,
+    /// A WorkBuddy account, used by `--model workbuddy:…`.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
+    /// A Kimi Coding account or API key, used by `--model kimi:…`.
+    #[value(name = "kimi")]
+    Kimi,
+    /// An Alibaba Bailian Coding Plan key, used by `--model bailian:…`.
+    #[value(name = "bailian")]
+    Bailian,
+    /// A MiniMax Coding Plan key, used by `--model minimax:…`.
+    #[value(name = "minimax")]
+    Minimax,
+    /// A Zhipu GLM Coding Plan key, used by `--model zhipu:…`.
+    #[value(name = "zhipu")]
+    Zhipu,
+    /// A Volcengine Ark Coding Plan key, used by `--model ark:…`.
+    #[value(name = "ark")]
+    Ark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PlanRegionArg {
+    /// Mainland China endpoint.
+    #[value(name = "cn")]
+    Cn,
+    /// International endpoint.
+    #[value(name = "intl")]
+    Intl,
+}
+
+impl PlanRegionArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cn => "cn",
+            Self::Intl => "intl",
+        }
+    }
+
+    pub fn into_workbuddy(self) -> WorkBuddyRegion {
+        match self {
+            Self::Cn => WorkBuddyRegion::Cn,
+            Self::Intl => WorkBuddyRegion::Intl,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EffortArg {
+    #[value(name = "none")]
+    None,
+    #[value(name = "minimal")]
+    Minimal,
+    #[value(name = "low")]
+    Low,
+    #[value(name = "medium")]
+    Medium,
+    #[value(name = "high")]
+    High,
+    #[value(name = "xhigh")]
+    Xhigh,
+    #[value(name = "max")]
+    Max,
+}
+
+impl EffortArg {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl From<EffortArg> for EffortLevel {
+    fn from(value: EffortArg) -> Self {
+        match value {
+            EffortArg::None => Self::None,
+            EffortArg::Minimal => Self::Minimal,
+            EffortArg::Low => Self::Low,
+            EffortArg::Medium => Self::Medium,
+            EffortArg::High => Self::High,
+            EffortArg::Xhigh => Self::Xhigh,
+            EffortArg::Max => Self::Max,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CollaborationModeArg {
+    #[value(name = "default")]
+    Default,
+    #[value(name = "plan")]
+    Plan,
+}
+
+impl CollaborationModeArg {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
-    /// Report each subscription as signed in, signed out or expired.
+    /// Report each model source as signed in, signed out or expired.
     Status,
 }
 
@@ -1135,6 +1324,7 @@ impl From<SandboxModeArg> for klaus_agent_core::types::permission::SandboxMode {
 pub enum ApprovalPolicyArg {
     #[value(name = "untrusted")]
     UnlessTrusted,
+    #[value(alias = "on-failure")]
     OnRequest,
     Never,
 }
@@ -1152,7 +1342,13 @@ impl From<ApprovalPolicyArg> for klaus_agent_core::types::permission::ApprovalPo
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ApprovalsReviewerArg {
     User,
-    #[value(name = "auto_review")]
+    #[value(
+        name = "auto_review",
+        alias = "auto-review",
+        alias = "automatic",
+        alias = "guardian-subagent",
+        alias = "guardian_subagent"
+    )]
     Automatic,
 }
 

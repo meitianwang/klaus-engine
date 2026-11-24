@@ -36,6 +36,7 @@ pub(crate) use capability_step::tests::fixture as native_step_fixture;
 pub use catalog::{fetch_models, model_capabilities, read_models, resolved_model};
 pub use credential::{adopt_credential, logout, status, usage};
 pub(super) use diagnostics::rpc as diagnostic_request;
+pub use diagnostics::set_diagnostics_stderr;
 
 #[derive(Default)]
 struct State {

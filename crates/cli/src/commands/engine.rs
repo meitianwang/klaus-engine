@@ -22,8 +22,9 @@
 
 use klaus_agent_server::app_server::methods::{
     ConfigBatchWrite, ConfigRead, ConfigValueWrite, EngineAddPermissionRules, EngineBuiltinSkills,
-    EngineMigrateRollouts, EnginePermissionRules, EngineRemovePermissionRule, HooksRead,
-    HooksWrite, ModelCredentialDelete, ModelCredentialRead, ModelCredentialWrite,
+    EngineCompressRollouts, EngineMigrateRollouts, EnginePermissionRules,
+    EngineRemovePermissionRule, HooksRead, HooksWrite, ModelCredentialDelete, ModelCredentialRead,
+    ModelCredentialWrite,
 };
 use klaus_agent_server::app_server::wire;
 use serde_json::Value;
@@ -50,6 +51,12 @@ pub async fn run(
         EngineCommand::Hooks { command } => hooks(engine, printer, command).await,
         EngineCommand::Credential { command } => credential(engine, printer, command).await,
         EngineCommand::Skills => skills(engine, printer).await,
+        EngineCommand::CompressRollouts => {
+            let result = engine
+                .call::<EngineCompressRollouts>(wire::EngineCompressRolloutsParams {})
+                .await?;
+            printer.declared(&result, |_| "rollout compression triggered".to_string())
+        }
         EngineCommand::MigrateRollouts {
             apply,
             expected_revisions,
@@ -313,7 +320,7 @@ async fn config_edits(raw: &str) -> CliResult<Vec<wire::ConfigEditParam>> {
 }
 
 /// One line from the terminal, without echoing a prompt into stdout.
-fn secret_from_stdin(printer: &Printer) -> CliResult<String> {
+pub(super) fn secret_from_stdin(printer: &Printer) -> CliResult<String> {
     printer.prompt("api key: ")?;
     let mut line = String::new();
     std::io::stdin()

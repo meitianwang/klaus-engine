@@ -181,10 +181,21 @@ impl CliSession {
     ) -> CliResult<()> {
         let mut globals = globals.clone();
         globals.model = Some(selection.to_string());
-        // Everything else about the init is rebuilt from the same globals the
-        // session was opened with, so only the selection differs.
+        self.reopen_with_globals(&globals, printer).await
+    }
+
+    /// Replace the live session using updated session-init globals, carrying the
+    /// bound thread over onto the replacement.
+    pub async fn reopen_with_globals(
+        &mut self,
+        globals: &Globals,
+        printer: &Printer,
+    ) -> CliResult<()> {
+        // Everything about the init is rebuilt from `globals` on the existing
+        // facade connection so start-time settings (selection, orchestration) can
+        // change mid-REPL without losing the conversation.
         let facade = self.engine.facade();
-        let session_id = start_session(&facade, &globals, &self.cwd, printer).await?;
+        let session_id = start_session(&facade, globals, &self.cwd, printer).await?;
         // The thread to carry over. An explicit bind (`--resume`, the `session`
         // commands) recorded one; otherwise it is the session id being replaced,
         // because a session the endpoint minted an id for IS the thread filed under
@@ -381,9 +392,16 @@ async fn start_session(
         cwd: Some(RuntimeString::from(cwd)),
         config: session_config(globals)?,
         collaboration_mode: globals
-            .permission_mode
-            .filter(|mode| matches!(mode, crate::cli::PermissionModeArg::Plan))
-            .map(|_| "plan".into()),
+            .collaboration_mode
+            .map(|mode| RuntimeString::from(mode.as_wire()))
+            .or_else(|| {
+                globals
+                    .permission_mode
+                    .filter(|mode| matches!(mode, crate::cli::PermissionModeArg::Plan))
+                    .map(|_| RuntimeString::from("plan"))
+            }),
+        orchestration_mode: (globals.orchestrate || globals.orchestrator_model.is_some())
+            .then_some(true),
         advisor_target: None,
         ..Default::default()
     };
@@ -405,14 +423,22 @@ async fn start_session(
     // while the bind methods report the thread they landed on — which is what
     // the CLI prints and what `session` commands rebind against.
     let mut init = text::to_json(&init)?;
-    // `modelSelection` belongs to the app-server facade, not to the protocol:
-    // the facade resolves it into `provider` + `auth` against `[modelProviders]`
-    // and the credential store, then strips it before the init reaches the
-    // protocol server. `ProtocolSessionInit` therefore has no field for it, and
-    // it is added to the encoded object instead.
+    // `modelSelection` and `orchestratorTarget` belong to the app-server facade,
+    // not to the raw protocol: the facade resolves them against `[modelProviders]`
+    // and the credential store before forwarding the init to the protocol server.
     if let Some(selection) = model_selection(globals) {
         if let Some(object) = init.as_object_mut() {
             object.insert("modelSelection", text::string(selection));
+        }
+    }
+    if let Some(spec) = globals.orchestrator_model.as_deref() {
+        let (source, model_id) = parse_orchestrator_target(spec)?;
+        if let Some(object) = init.as_object_mut() {
+            let mut target = RuntimeObject::new();
+            target.insert("type", text::string("source"));
+            target.insert("source", text::string(source));
+            target.insert("modelId", text::string(model_id));
+            object.insert("orchestratorTarget", RuntimeJson::Object(target));
         }
     }
     let started = facade
@@ -512,6 +538,25 @@ pub async fn build_endpoint(
     .map_err(|error| CliError::engine(format!("failed to start engine: {error}")))
 }
 
+/// Parse `<source>:<model>` for `--orchestrator-model` and `/orchestrate`.
+pub(crate) fn parse_orchestrator_target(spec: &str) -> CliResult<(&str, &str)> {
+    let trimmed = spec.trim();
+    let Some((source, model_id)) = trimmed.split_once(':') else {
+        return Err(CliError::usage(format!(
+            "orchestrator model must be <source>:<model> (for example codex:gpt-5.6-sol), not {trimmed:?}"
+        )));
+    };
+    let source = source.trim();
+    let model_id = model_id.trim();
+    if model_id.is_empty() || !klaus_agent_core::engine::session::is_supported_model_source(source)
+    {
+        return Err(CliError::usage(format!(
+            "unsupported orchestrator target {trimmed:?}; expected a known <source>:<model>"
+        )));
+    }
+    Ok((source, model_id))
+}
+
 /// The selection `--model` names, when it names one at all.
 ///
 /// A selection and a config `model` are mutually exclusive: the first decides
@@ -562,6 +607,24 @@ pub(crate) fn session_config(globals: &Globals) -> CliResult<Option<RuntimeJson>
         if object.get(&key).is_none() {
             object.insert(key, RuntimeJson::Bool(true));
         }
+    }
+    if let Some(effort) = globals.effort {
+        let key = RuntimeString::from("effort");
+        if object.get(&key).is_none() {
+            object.insert(
+                key,
+                klaus_agent_core::runtime_values::runtime_codec::encode_value(
+                    &klaus_agent_core::schemas::effort::EffortLevel::from(effort),
+                )
+                .map_err(|error| CliError::Codec(error.to_string()))?,
+            );
+        }
+    }
+    if globals.parallel && !object.contains_key("ultra_mode") && !object.contains_key("ultraMode") {
+        object.insert("ultra_mode", RuntimeJson::Bool(true));
+    }
+    if globals.worktree && !object.contains_key("worktree") {
+        object.insert("worktree", RuntimeJson::Bool(true));
     }
     if let Some(mode) = globals.sandbox_mode {
         object.insert(
@@ -783,5 +846,47 @@ mod tests {
             Some("from-config"),
             "a selection never lands in config.model, and never displaces it"
         );
+    }
+
+    #[test]
+    fn effort_parallel_and_worktree_flags_populate_session_config() {
+        let config = session_config(&Globals {
+            effort: Some(crate::cli::EffortArg::High),
+            parallel: true,
+            worktree: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config
+                .get("effort")
+                .and_then(RuntimeJson::as_string)
+                .map(text::text),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            config.get("ultra_mode").and_then(RuntimeJson::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            config.get("worktree").and_then(RuntimeJson::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn orchestrator_target_validates_supported_model_sources() {
+        assert_eq!(
+            parse_orchestrator_target("codex:gpt-5.6-sol").unwrap(),
+            ("codex", "gpt-5.6-sol")
+        );
+        assert_eq!(
+            parse_orchestrator_target("antigravity:gemini-4-carbon-high").unwrap(),
+            ("antigravity", "gemini-4-carbon-high")
+        );
+        assert!(parse_orchestrator_target("bare-model").is_err());
+        assert!(parse_orchestrator_target("unknown:model").is_err());
+        assert!(parse_orchestrator_target("qoderwork:auto").is_err());
     }
 }
