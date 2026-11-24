@@ -27,9 +27,27 @@ use crate::store::jsonl_store::rollout_metadata;
 
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 const CACHE_FILE_NAME: &str = ".profile-activity-cache.json";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const READ_CONCURRENCY: usize = 16;
 const SAVE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(60);
+const KNOWN_SOURCES: &[&str] = &[
+    "subscription",
+    "custom",
+    "codex",
+    "cursor",
+    "qoder",
+    "qwenwork",
+    "workbuddy",
+    "antigravity",
+    "trae",
+    "kiro",
+    "kimi",
+    "bailian",
+    "minimax",
+    "zhipu",
+    "ark",
+    "deepseek",
+];
 
 /// Per-store cache document and its disk write throttle. Reconciliation is
 /// serialized on the owning store's lock, so concurrent profile reads against
@@ -48,6 +66,22 @@ pub struct ProfileActivityDay {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileActivityModel {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub requests: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<ProfileActivityDay>,
+}
+
 /// Read-only lifetime activity measurements.
 ///
 /// `incomplete` means a transcript could not be read or decoded, so some
@@ -59,6 +93,8 @@ pub struct ProfileActivityDay {
 #[serde(rename_all = "camelCase")]
 pub struct ProfileActivity {
     pub days: Vec<ProfileActivityDay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ProfileActivityModel>,
     pub total_tokens: u64,
     pub peak_daily_tokens: u64,
     pub longest_task_ms: u64,
@@ -76,7 +112,18 @@ pub struct ProfileActivity {
 struct CachedRecord {
     request_id: String,
     assistant_id: String,
+    model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source: String,
     tokens: u64,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
     started_at_ms: Option<i64>,
 }
 
@@ -142,8 +189,20 @@ struct RecordTiming {
 }
 
 #[derive(Default)]
+struct ModelFold {
+    tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    requests: u64,
+    days: BTreeMap<NaiveDate, u64>,
+}
+
+#[derive(Default)]
 struct ActivityFold {
     days: BTreeMap<NaiveDate, u64>,
+    models: BTreeMap<(String, String), ModelFold>,
     assistants: HashSet<String>,
     requests: HashSet<String>,
     result: ProfileActivity,
@@ -177,9 +236,37 @@ impl ActivityFold {
                 .started_at_ms
                 .and_then(utc_date)
                 .filter(|date| *date <= today);
+            let model_entry = self
+                .models
+                .entry((record.source.clone(), record.model.clone()))
+                .or_default();
+            model_entry.tokens = safe_add(model_entry.tokens, tokens, &mut self.result.incomplete);
+            model_entry.input_tokens = safe_add(
+                model_entry.input_tokens,
+                record.input_tokens,
+                &mut self.result.incomplete,
+            );
+            model_entry.output_tokens = safe_add(
+                model_entry.output_tokens,
+                record.output_tokens,
+                &mut self.result.incomplete,
+            );
+            model_entry.cache_read_tokens = safe_add(
+                model_entry.cache_read_tokens,
+                record.cache_read_tokens,
+                &mut self.result.incomplete,
+            );
+            model_entry.cache_write_tokens = safe_add(
+                model_entry.cache_write_tokens,
+                record.cache_write_tokens,
+                &mut self.result.incomplete,
+            );
+            model_entry.requests = safe_add(model_entry.requests, 1, &mut self.result.incomplete);
             if let Some(date) = date {
                 let value = self.days.entry(date).or_default();
                 *value = safe_add(*value, tokens, &mut self.result.incomplete);
+                let model_day = model_entry.days.entry(date).or_default();
+                *model_day = safe_add(*model_day, tokens, &mut self.result.incomplete);
             } else {
                 // Older records can prove usage without proving their calendar
                 // day. Preserve the total, leave those tokens undated and mark
@@ -210,6 +297,36 @@ impl ActivityFold {
         if previous.is_some_and(|last| last == today || Some(last) == today.pred_opt()) {
             self.result.current_streak_days = streak;
         }
+        let mut models: Vec<ProfileActivityModel> = self
+            .models
+            .into_iter()
+            .map(|((source, model), entry)| ProfileActivityModel {
+                model,
+                source,
+                tokens: entry.tokens,
+                input_tokens: entry.input_tokens,
+                output_tokens: entry.output_tokens,
+                cache_read_tokens: entry.cache_read_tokens,
+                cache_write_tokens: entry.cache_write_tokens,
+                requests: entry.requests,
+                days: entry
+                    .days
+                    .into_iter()
+                    .map(|(date, tokens)| ProfileActivityDay {
+                        date: date.format("%Y-%m-%d").to_string(),
+                        tokens,
+                    })
+                    .collect(),
+            })
+            .collect();
+        models.sort_by(|left, right| {
+            right
+                .tokens
+                .cmp(&left.tokens)
+                .then_with(|| left.model.cmp(&right.model))
+                .then_with(|| left.source.cmp(&right.source))
+        });
+        self.result.models = models;
         self.result
     }
 }
@@ -277,13 +394,75 @@ fn lifecycle_payload_incomplete(items: &[RolloutItem]) -> bool {
     })
 }
 
+fn scalar_lossy(value: &RuntimeString) -> String {
+    value
+        .try_to_utf8()
+        .unwrap_or_else(|_| String::from_utf16_lossy(value.as_utf16()))
+}
+
+fn split_known_source(value: &str) -> (Option<&str>, &str) {
+    if let Some((prefix, rest)) = value.split_once(':') {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty()
+            && KNOWN_SOURCES
+                .iter()
+                .any(|known| prefix.eq_ignore_ascii_case(known))
+        {
+            return (Some(prefix), trimmed);
+        }
+    }
+    (None, value)
+}
+
+fn resolve_model_and_source(record: &crate::schemas::rollout::UsageLedgerItem) -> (String, String) {
+    let raw = scalar_lossy(&record.model);
+    let raw_trimmed = raw.trim();
+    let (raw_source, raw_bare) = split_known_source(raw_trimmed);
+    let inf_source = record
+        .inference
+        .as_ref()
+        .and_then(|inf| inf.source.as_ref())
+        .map(scalar_lossy)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let inf_model = record
+        .inference
+        .as_ref()
+        .map(|inf| scalar_lossy(&inf.model))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (inf_model_source, inf_bare) = match inf_model.as_deref() {
+        Some(value) => {
+            let (src, bare) = split_known_source(value);
+            (src, Some(bare))
+        }
+        None => (None, None),
+    };
+    let source = inf_source
+        .or_else(|| raw_source.map(str::to_ascii_lowercase))
+        .or_else(|| inf_model_source.map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let model = inf_bare
+        .filter(|value| !value.is_empty())
+        .unwrap_or(raw_bare);
+    let model = if model.is_empty() {
+        "unknown".to_string()
+    } else {
+        model.to_string()
+    };
+    (source, model)
+}
+
 fn cached_record(
     record: crate::schemas::rollout::UsageLedgerItem,
     clock: &RecordTiming,
 ) -> CachedRecord {
+    let (source, model) = resolve_model_and_source(&record);
     CachedRecord {
         request_id: id_key(&record.request_id),
         assistant_id: id_key(&record.assistant_message_id),
+        model,
+        source,
         tokens: record.usage.total_tokens.unwrap_or_else(|| {
             record
                 .usage
@@ -292,6 +471,10 @@ fn cached_record(
                 .saturating_add(record.usage.cache_read_input_tokens)
                 .saturating_add(record.usage.cache_creation_input_tokens)
         }),
+        input_tokens: record.usage.input_tokens,
+        output_tokens: record.usage.output_tokens,
+        cache_read_tokens: record.usage.cache_read_input_tokens,
+        cache_write_tokens: record.usage.cache_creation_input_tokens,
         started_at_ms: clock.started_at_ms,
     }
 }
@@ -1179,6 +1362,92 @@ mod tests {
         assert_eq!(
             store.profile_activity(millis("2026-10-18")).await.unwrap(),
             first
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_activity_aggregates_per_model_and_source_usage_with_inference_resolution() {
+        let root = TestDirectory::new();
+        let file = root.path().join("1-models.jsonl");
+        let mut items = vec![
+            header("models", None),
+            json!({"kind":"usage_ledger","requestId":"undated-opus","assistantMessageId":"undated-opus",
+                "model":"subscription:opus",
+                "inference":{"revision":1,"model":"claude-opus-5-5","source":"subscription","selection":"subscription:opus"},
+                "usage":{"inputTokens":20,"outputTokens":5,"cacheReadInputTokens":100,"cacheCreationInputTokens":15,"totalTokens":140},
+                "costUsd":0}),
+        ];
+        items.extend(turn("t1", "2026-10-17", 600));
+        items.push(json!({"kind":"usage_ledger","requestId":"dated-opus","assistantMessageId":"dated-opus",
+            "model":"subscription:opus",
+            "inference":{"revision":1,"model":"claude-opus-5-5","source":"subscription","selection":"subscription:opus"},
+            "usage":{"inputTokens":10,"outputTokens":4,"cacheReadInputTokens":50,"cacheCreationInputTokens":6,"totalTokens":70},
+            "costUsd":0}));
+        items.push(json!({"kind":"usage_ledger","requestId":"custom-qwen","assistantMessageId":"custom-qwen",
+            "model":"custom:f51ffcb9-fca4-4b5f-a978-943fa0c5a72f",
+            "inference":{"revision":0,"model":"qwen3.8-max","source":"custom","selection":"custom:f51ffcb9-fca4-4b5f-a978-943fa0c5a72f"},
+            "usage":{"inputTokens":30,"outputTokens":10,"cacheReadInputTokens":60,"cacheCreationInputTokens":0,"totalTokens":100},
+            "costUsd":0}));
+        items.extend(turn("t2", "2026-10-18", 400));
+        items.push(json!({"kind":"usage_ledger","requestId":"codex-gpt","assistantMessageId":"codex-gpt",
+            "model":"codex:gpt-6.1-sol",
+            "usage":{"inputTokens":40,"outputTokens":8,"cacheReadInputTokens":12,"cacheCreationInputTokens":0,"totalTokens":60},
+            "costUsd":0}));
+        write(&file, &items);
+
+        let result = store(root.path())
+            .profile_activity(millis("2026-10-18"))
+            .await
+            .unwrap();
+        assert_eq!(result.total_tokens, 370);
+        assert!(result.partial);
+        assert!(!result.incomplete);
+        assert_eq!(
+            result.models,
+            vec![
+                ProfileActivityModel {
+                    model: "claude-opus-5-5".into(),
+                    source: "subscription".into(),
+                    tokens: 210,
+                    input_tokens: 30,
+                    output_tokens: 9,
+                    cache_read_tokens: 150,
+                    cache_write_tokens: 21,
+                    requests: 2,
+                    days: vec![ProfileActivityDay {
+                        date: "2026-10-17".into(),
+                        tokens: 70,
+                    }],
+                },
+                ProfileActivityModel {
+                    model: "qwen3.8-max".into(),
+                    source: "custom".into(),
+                    tokens: 100,
+                    input_tokens: 30,
+                    output_tokens: 10,
+                    cache_read_tokens: 60,
+                    cache_write_tokens: 0,
+                    requests: 1,
+                    days: vec![ProfileActivityDay {
+                        date: "2026-10-17".into(),
+                        tokens: 100,
+                    }],
+                },
+                ProfileActivityModel {
+                    model: "gpt-6.1-sol".into(),
+                    source: "codex".into(),
+                    tokens: 60,
+                    input_tokens: 40,
+                    output_tokens: 8,
+                    cache_read_tokens: 12,
+                    cache_write_tokens: 0,
+                    requests: 1,
+                    days: vec![ProfileActivityDay {
+                        date: "2026-10-18".into(),
+                        tokens: 60,
+                    }],
+                },
+            ]
         );
     }
 

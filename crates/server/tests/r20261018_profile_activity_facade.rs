@@ -51,7 +51,11 @@ async fn profile_activity_facade_reads_archived_usage_without_session_activation
     assert_eq!(
         response["result"],
         json!({
-            "days":[{"date":"2024-01-01","tokens":22}],"totalTokens":22,"peakDailyTokens":22,
+            "days":[{"date":"2024-01-01","tokens":22}],
+            "models":[{"model":"fixture","tokens":22,"inputTokens":10,"outputTokens":3,
+                "cacheReadTokens":4,"cacheWriteTokens":5,"requests":1,
+                "days":[{"date":"2024-01-01","tokens":22}]}],
+            "totalTokens":22,"peakDailyTokens":22,
             "longestTaskMs":500,"longestStreakDays":1,"currentStreakDays":0
         })
     );

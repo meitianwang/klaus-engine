@@ -808,8 +808,26 @@ pub struct ProfileActivityDay {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileActivityModel {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub requests: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<ProfileActivityDay>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EngineProfileActivityResult {
     pub days: Vec<ProfileActivityDay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ProfileActivityModel>,
     pub total_tokens: u64,
     pub peak_daily_tokens: u64,
     pub longest_task_ms: u64,

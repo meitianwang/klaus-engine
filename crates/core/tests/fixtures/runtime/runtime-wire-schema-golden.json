@@ -11091,11 +11091,72 @@
         "flatten": false
       },
       {
+        "rustName": "model",
+        "rustType": "String",
+        "wireSerialize": "model",
+        "wireDeserialize": "model",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "source",
+        "rustType": "String",
+        "wireSerialize": "source",
+        "wireDeserialize": "source",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "skipSerializeIf": "String::is_empty",
+        "flatten": false
+      },
+      {
         "rustName": "tokens",
         "rustType": "u64",
         "wireSerialize": "tokens",
         "wireDeserialize": "tokens",
         "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "input_tokens",
+        "rustType": "u64",
+        "wireSerialize": "inputTokens",
+        "wireDeserialize": "inputTokens",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "output_tokens",
+        "rustType": "u64",
+        "wireSerialize": "outputTokens",
+        "wireDeserialize": "outputTokens",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "cache_read_tokens",
+        "rustType": "u64",
+        "wireSerialize": "cacheReadTokens",
+        "wireDeserialize": "cacheReadTokens",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "cache_write_tokens",
+        "rustType": "u64",
+        "wireSerialize": "cacheWriteTokens",
+        "wireDeserialize": "cacheWriteTokens",
+        "default": true,
         "skipSerialize": false,
         "skipDeserialize": false,
         "flatten": false
@@ -11355,6 +11416,17 @@
         "flatten": false
       },
       {
+        "rustName": "models",
+        "rustType": "Vec < ProfileActivityModel >",
+        "wireSerialize": "models",
+        "wireDeserialize": "models",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "skipSerializeIf": "Vec::is_empty",
+        "flatten": false
+      },
+      {
         "rustName": "total_tokens",
         "rustType": "u64",
         "wireSerialize": "totalTokens",
@@ -11458,6 +11530,112 @@
         "default": false,
         "skipSerialize": false,
         "skipDeserialize": false,
+        "flatten": false
+      }
+    ]
+  },
+  "crates/core/src/store/profile_activity.rs::ProfileActivityModel": {
+    "kind": "struct",
+    "shape": "named",
+    "canEncode": true,
+    "canDecode": true,
+    "renameAllSerialize": "camelCase",
+    "renameAllDeserialize": "camelCase",
+    "denyUnknownFields": false,
+    "transparent": false,
+    "containerDefault": false,
+    "taggingKind": "external",
+    "fields": [
+      {
+        "rustName": "model",
+        "rustType": "String",
+        "wireSerialize": "model",
+        "wireDeserialize": "model",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "source",
+        "rustType": "String",
+        "wireSerialize": "source",
+        "wireDeserialize": "source",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "skipSerializeIf": "String::is_empty",
+        "flatten": false
+      },
+      {
+        "rustName": "tokens",
+        "rustType": "u64",
+        "wireSerialize": "tokens",
+        "wireDeserialize": "tokens",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "input_tokens",
+        "rustType": "u64",
+        "wireSerialize": "inputTokens",
+        "wireDeserialize": "inputTokens",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "output_tokens",
+        "rustType": "u64",
+        "wireSerialize": "outputTokens",
+        "wireDeserialize": "outputTokens",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "cache_read_tokens",
+        "rustType": "u64",
+        "wireSerialize": "cacheReadTokens",
+        "wireDeserialize": "cacheReadTokens",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "cache_write_tokens",
+        "rustType": "u64",
+        "wireSerialize": "cacheWriteTokens",
+        "wireDeserialize": "cacheWriteTokens",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "requests",
+        "rustType": "u64",
+        "wireSerialize": "requests",
+        "wireDeserialize": "requests",
+        "default": false,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "flatten": false
+      },
+      {
+        "rustName": "days",
+        "rustType": "Vec < ProfileActivityDay >",
+        "wireSerialize": "days",
+        "wireDeserialize": "days",
+        "default": true,
+        "skipSerialize": false,
+        "skipDeserialize": false,
+        "skipSerializeIf": "Vec::is_empty",
         "flatten": false
       }
     ]
