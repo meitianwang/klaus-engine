@@ -13,6 +13,9 @@
 #[path = "regressions/r20261124_prediction_preserves_system_prompt_append.rs"]
 mod r20261124_prediction_preserves_system_prompt_append;
 
+#[path = "regressions/r20261124_subagent_prompt_cache_non_codex.rs"]
+mod r20261124_subagent_prompt_cache_non_codex;
+
 #[path = "regressions/r20261122_gemini_tool_search_ref_schema.rs"]
 mod r20261122_gemini_tool_search_ref_schema;
 

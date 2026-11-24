@@ -242,10 +242,15 @@ async fn parallel_subagent_replay_keeps_child_starts_bound_to_real_requests() {
                 parent_key,
                 "full forks retain the parent cache key"
             );
-            assert_eq!(
-                requests[0].get("skipCacheWrite"),
+            // OpenAI-wire forks omit skip_cache_write so prompt_cache_key routing
+            // and multi-step cache writes remain intact; Anthropic/generic forks
+            // keep skipCacheWrite=true to avoid caching the ephemeral fork tail.
+            let expected_skip_cache_write = if trace.run.profile == EvalProfile::Openai {
+                None
+            } else {
                 Some(&RuntimeJson::Bool(true))
-            );
+            };
+            assert_eq!(requests[0].get("skipCacheWrite"), expected_skip_cache_write);
             assert!(
                 requests[0]["tools"].as_array().unwrap().iter().any(|tool| {
                     ["Task", "spawn_agent", "task"]

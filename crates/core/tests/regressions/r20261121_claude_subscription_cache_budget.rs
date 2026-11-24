@@ -895,7 +895,7 @@ async fn claude_subscription_subagents_default_to_isolated_context_and_route_bui
 }
 
 #[tokio::test]
-async fn non_claude_sources_preserve_fork_turns_all_default_and_caller_selected_explore_tier() {
+async fn non_claude_sources_preserve_5m_ttl_and_caller_selected_explore_tier() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1008,7 +1008,9 @@ async fn non_claude_sources_preserve_fork_turns_all_default_and_caller_selected_
     server.abort();
 
     let bodies = captured.lock().unwrap();
-    // 1. Non-subscription session keeps standard 5m cache TTL (no ttl="1h") and `all (default)` task schema.
+    // 1. Non-subscription session keeps standard 5m cache TTL (no ttl="1h") and
+    //    defaults to isolated subagents (`none (default)`), since only Codex
+    //    shares byte-identical prefix caches across default forks.
     assert!(
         !bodies[0]["system"].to_string().contains("\"1h\""),
         "non-subscription session must not force 1h cache TTL"
@@ -1027,11 +1029,11 @@ async fn non_claude_sources_preserve_fork_turns_all_default_and_caller_selected_
         task_tool["input_schema"]["properties"]["fork_turns"]["description"]
             .as_str()
             .unwrap()
-            .contains("all (default)"),
-        "non-subscription task schema must preserve all (default)"
+            .contains("none (default)"),
+        "configured non-Codex task schema must advertise none (default)"
     );
 
-    // 2. Non-subscription same-model general-purpose with omitted fork_turns STILL inherits parent history!
+    // 2. Non-Codex general-purpose with omitted fork_turns starts isolated.
     let gp_child = bodies
         .iter()
         .find(|b| {
@@ -1042,10 +1044,10 @@ async fn non_claude_sources_preserve_fork_turns_all_default_and_caller_selected_
         })
         .expect("non-claude general-purpose child");
     assert!(
-        gp_child["messages"]
+        !gp_child["messages"]
             .to_string()
             .contains("PARENT_NON_CLAUDE_SENTINEL_7722"),
-        "non-subscription general-purpose subagent must preserve default ForkContext::All inheritance"
+        "configured non-Codex subagent with omitted fork_turns must start isolated"
     );
 
     // 3. Non-subscription Explore with model="high" STILL uses caller's "high" model (claude-opus-4-6), NOT low!

@@ -1854,6 +1854,14 @@ impl EngineConfig {
             == Some("subscription")
     }
 
+    /// Whether this configuration targets the Codex subscription model source.
+    pub fn is_codex_subscription_source(&self) -> bool {
+        self.model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
+            .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+    }
+
     /// Whether this configuration targets the Antigravity subscription model source.
     pub fn is_antigravity_source(&self) -> bool {
         self.model_source
@@ -1864,7 +1872,21 @@ impl EngineConfig {
 
     /// Whether newly spawned subagents start in an isolated context (`fork_turns: "none"`)
     /// unless conversation inheritance is explicitly requested.
+    ///
+    /// Configured non-Codex sources default to an isolated context so child turns do not
+    /// replay the full parent conversation without a byte-identical prefix cache hit.
+    /// Sessions without a declared `model_source` keep the unset default and still apply
+    /// prefix-divergence auto-downgrade in `session_spawn`.
     pub fn subagents_default_isolated_context(&self) -> bool {
+        self.model_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
+            .is_some_and(|source| !source.eq_ignore_ascii_case("codex"))
+    }
+
+    /// Whether built-in `Explore` subagents should be pinned to the `low` model tier
+    /// when model-directory mode is off (quota-metered subscription sources).
+    pub fn force_explore_low_tier(&self) -> bool {
         self.is_claude_subscription_source() || self.is_antigravity_source()
     }
 

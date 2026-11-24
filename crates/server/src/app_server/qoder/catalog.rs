@@ -930,6 +930,7 @@ async fn auto_capabilities() -> Value {
         "vision": !models.is_empty() && models.iter().all(entry_is_vision),
         "contextWindow": super::bridge::QODER_DEFAULT_CONTEXT_TOKENS,
         "reasoningDialect": "qoder",
+        "promptCacheKeyMode": "enabled",
     });
     if let Some(effort) = native_effort_capability(&auto_model_info(&models)) {
         caps["effort"] = effort;
@@ -986,6 +987,7 @@ fn capabilities_for_entry(entry: Option<&Value>) -> Value {
         "vision": entry.is_some_and(entry_is_vision),
         "contextWindow": super::bridge::resolve_qoder_context_length(entry),
         "reasoningDialect":"qoder",
+        "promptCacheKeyMode": "enabled",
         "fastMode": entry.and_then(super::catalog::fast_mode_switch).is_some(),
     });
     if let Some(effort) = entry.and_then(native_effort_capability) {
@@ -1186,6 +1188,7 @@ mod tests {
         assert_eq!(ultimate["vision"], json!(true));
         assert_eq!(ultimate["contextWindow"], json!(320_000));
         assert_eq!(ultimate["reasoningDialect"], json!("qoder"));
+        assert_eq!(ultimate["promptCacheKeyMode"], json!("enabled"));
 
         let text_only = model_capabilities("text-only").await;
         assert_eq!(text_only["vision"], json!(false));
@@ -1198,6 +1201,7 @@ mod tests {
 
         let mixed_auto = model_capabilities("auto").await;
         assert_eq!(mixed_auto["reasoningDialect"], json!("qoder"));
+        assert_eq!(mixed_auto["promptCacheKeyMode"], json!("enabled"));
         assert_eq!(
             mixed_auto["vision"],
             json!(false),

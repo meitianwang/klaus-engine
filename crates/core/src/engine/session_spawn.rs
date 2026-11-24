@@ -362,7 +362,7 @@ impl Session {
         let mut child_bundle = bundle.clone();
         if creation_snapshot.is_none() {
             let explore_low_tier = RuntimeString::from("low");
-            let force_explore_low_tier = bundle.config.subagents_default_isolated_context()
+            let force_explore_low_tier = bundle.config.force_explore_low_tier()
                 && !bundle.config.subagent_model_catalog
                 && !opts.feature_target_model
                 && !opts.orchestrator_target_model
@@ -529,12 +529,6 @@ impl Session {
             && creation_snapshot.is_none()
             && !opts.fork_context_explicit
             && !opts.feature_target_model
-            && bundle
-                .config
-                .model_source
-                .as_ref()
-                .and_then(|source| source.source.as_deref())
-                == Some("codex")
             && diverges_from_parent_prefix
         {
             // Specialized role prompts, narrowed tool inventories, and cross-model
@@ -1608,9 +1602,18 @@ impl Session {
             let _mcp_query_lease = mcp_runtime.begin_query(child_abort.clone());
             let mcp_clients = mcp_runtime.clients.clone();
 
-            // Resolve the child's tool set.
+            // Resolve the child's tool set. Nested children remain bounded by
+            // their parent agent's actual tool pool even when isolated from its
+            // conversation history.
             let (registered_tools, skill_catalog) = this.capture_tool_generation();
-            let mut base_tools = inherited_context.map(|context| context.tools.clone()).unwrap_or(registered_tools);
+            let mut base_tools = inherited_context
+                .or_else(|| {
+                    opts.inherited_context
+                        .as_ref()
+                        .filter(|_| run_opts.parent_agent_id.is_some())
+                })
+                .map(|context| context.tools.clone())
+                .unwrap_or(registered_tools);
             base_tools.retain(|tool| tool.native_mcp_binding().is_none());
             base_tools.extend(mcp_runtime.inherited_tools());
             let mut child_tools: Vec<AnyTool> = if fork_path && def.is_none() && opts.tools.is_none() {
@@ -2611,10 +2614,8 @@ impl Session {
                 } else {
                     None
                 },
-                skip_cache_write: if fork_path
-                    || resuming_fork
-                    || (opts.skip_cache_write == Some(true)
-                        && bundle.provider.info().name != "openai")
+                skip_cache_write: if bundle.provider.info().name != "openai"
+                    && (fork_path || resuming_fork || opts.skip_cache_write == Some(true))
                 {
                     Some(true)
                 } else {
@@ -2829,16 +2830,12 @@ impl Session {
                 .as_ref()
                 .map(|d| d.name.clone())
                 .unwrap_or_else(|| RuntimeString::from("agent"));
-            // On linear-prefix Responses backends, appending child role sections to
-            // the stable instructions item rewrites `input[1]` and invalidates the
-            // inherited conversation prefix. Marking them non-cacheable on a fork
-            // emits them as trailing `developer` guidance after the cached history.
-            let fork_trailing_role = inherited_system.is_some()
-                && inference_config
-                    .model_source
-                    .as_ref()
-                    .and_then(|source| source.source.as_deref())
-                    == Some("codex");
+            // Appending child role sections to the stable system prefix rewrites
+            // the leading prompt bytes and invalidates the inherited conversation
+            // cache. Marking them non-cacheable on a fork moves them to trailing
+            // guidance (OpenAI developer messages and prefix-cached runtime-reminder
+            // snapshots) and keeps explicit Anthropic breakpoints off the child role.
+            let fork_trailing_role = inherited_system.is_some();
             let role_cacheable = Some(!fork_trailing_role);
             let base_provider: SystemPromptThunk = match inherited_system {
                 Some(parts) => Arc::new(move || {
