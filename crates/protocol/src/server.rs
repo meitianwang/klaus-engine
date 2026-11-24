@@ -8671,24 +8671,15 @@ impl ServerInner {
             .await;
             return;
         }
-        if self.current_session_for_thread(&thread_id).is_some() {
-            if let Err(error) = self
-                .handle_update_thread_host_metadata(submission_id.clone(), thread_id, host_metadata)
-                .await
-            {
-                self.report_op_error(&submission_id, error).await;
-            }
-            return;
+        // Host metadata lives in `thread-metadata.sqlite3` and never mutates
+        // turn state, so execute directly even while `ensure_session` is still
+        // restoring a large rollout or a turn is queued on the serial chain.
+        if let Err(error) = self
+            .handle_update_thread_host_metadata(submission_id.clone(), thread_id, host_metadata)
+            .await
+        {
+            self.report_op_error(&submission_id, error).await;
         }
-        let inner = self.clone();
-        let sid = submission_id.clone();
-        self.enqueue(submission_id, move || -> ChainFuture {
-            Box::pin(async move {
-                inner
-                    .handle_update_thread_host_metadata(sid, thread_id, host_metadata)
-                    .await
-            })
-        });
     }
 
     /// Append a run/rewind/set op to the serial chain.

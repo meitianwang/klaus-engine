@@ -869,13 +869,16 @@ impl JsonlSessionStore {
     /// rather than rejected: this waits for the lock with a bounded
     /// backoff; only a contender that outlives the whole window is refused,
     /// and that refusal now surfaces instead of vanishing.
-    async fn require_sub_agent_dir(&self, thread_id: &str) -> io::Result<String> {
+    async fn acquire_lifecycle_with_backoff(
+        &self,
+        thread_id: &str,
+    ) -> io::Result<(LifecycleOperationGuard<'_>, LifecycleFileLock)> {
         let deadline = tokio::time::Instant::now() + SUBAGENT_DIR_LOCK_WAIT;
         let mut delay = SUBAGENT_DIR_LOCK_RETRY_START;
-        let (_operation, _file_lock) = loop {
+        loop {
             if let Some(operation) = self.begin_lifecycle(thread_id) {
                 match self.try_lifecycle_file_lock(thread_id).await {
-                    Ok(Some(file_lock)) => break (operation, file_lock),
+                    Ok(Some(file_lock)) => return Ok((operation, file_lock)),
                     Ok(None) => {}
                     Err(error) => return Err(error),
                 }
@@ -891,7 +894,11 @@ impl JsonlSessionStore {
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(SUBAGENT_DIR_LOCK_RETRY_MAX);
-        };
+        }
+    }
+
+    async fn require_sub_agent_dir(&self, thread_id: &str) -> io::Result<String> {
+        let (_operation, _file_lock) = self.acquire_lifecycle_with_backoff(thread_id).await?;
         self.recover_unarchive_if_needed_locked(thread_id).await?;
         let file = self
             .locate(thread_id)
@@ -1726,13 +1733,13 @@ impl SessionStore for JsonlSessionStore {
     }
 
     async fn resume_for_write(&self, thread_id: &str) -> io::Result<ResumedLiveRollout> {
-        let _operation = self.begin_lifecycle(thread_id).ok_or_else(|| {
+        let operation = self.begin_lifecycle(thread_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("session {thread_id} has a concurrent lifecycle operation"),
             )
         })?;
-        let _file_lock = self
+        let file_lock = self
             .try_lifecycle_file_lock(thread_id)
             .await?
             .ok_or_else(|| {
@@ -1750,10 +1757,16 @@ impl SessionStore for JsonlSessionStore {
         // The writer lease is the read linearization point. Once acquired, no
         // other continuation can append between this authoritative load and the
         // returned live writer. Temporary ownership guarantees every `?` and
-        // cancellation path below removes the sidecar.
+        // cancellation path below removes the sidecar. Release the namespace
+        // lifecycle guard before scanning history so metadata-only sidecar
+        // updates (`update_host_metadata`) do not fail while a large rollout
+        // loads; `.jsonl.lock` continues to exclude writers, archivers,
+        // deleters, renamers, and cold compression.
         let lock_path = compression::writer_lock_path(&file);
         let writer_lock =
             TemporarySessionLock::new(acquire_session_lock(&lock_path, &file).await?, lock_path);
+        drop(file_lock);
+        drop(operation);
         resume_for_write_test_pause(&file).await;
         let items = load_items(&file).await?;
         let mut resume = resume_result_from_items(thread_id, items)?;
@@ -1784,13 +1797,13 @@ impl SessionStore for JsonlSessionStore {
         &self,
         thread_id: &str,
     ) -> io::Result<crate::store::session_store::ResumedRuntimeRollout> {
-        let _operation = self.begin_lifecycle(thread_id).ok_or_else(|| {
+        let operation = self.begin_lifecycle(thread_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("session {thread_id} has a concurrent lifecycle operation"),
             )
         })?;
-        let _file_lock = self
+        let file_lock = self
             .try_lifecycle_file_lock(thread_id)
             .await?
             .ok_or_else(|| {
@@ -1808,10 +1821,16 @@ impl SessionStore for JsonlSessionStore {
         // The writer lease is the read linearization point. Once acquired, no
         // other continuation can append between this authoritative load and the
         // returned live writer. Temporary ownership guarantees every `?` and
-        // cancellation path below removes the sidecar.
+        // cancellation path below removes the sidecar. Release the namespace
+        // lifecycle guard before scanning history so metadata-only sidecar
+        // updates (`update_host_metadata`) do not fail while a large rollout
+        // loads; `.jsonl.lock` continues to exclude writers, archivers,
+        // deleters, renamers, and cold compression.
         let lock_path = compression::writer_lock_path(&file);
         let writer_lock =
             TemporarySessionLock::new(acquire_session_lock(&lock_path, &file).await?, lock_path);
+        drop(file_lock);
+        drop(operation);
         resume_for_write_test_pause(&file).await;
         let cancellation = crate::store::runtime_resume::ReadCancellation::new();
         let cancelled = cancellation.0.clone();
@@ -2919,31 +2938,17 @@ impl SessionStore for JsonlSessionStore {
         thread_id: &str,
         host_metadata: Option<RuntimeJson>,
     ) -> io::Result<()> {
-        let _operation = self.begin_lifecycle(thread_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("session {thread_id} has a concurrent lifecycle operation"),
-            )
-        })?;
-        let _file_lock = self
-            .try_lifecycle_file_lock(thread_id)
-            .await?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("session {thread_id} has a concurrent lifecycle operation"),
-                )
-            })?;
+        // Host metadata lives exclusively in `thread-metadata.sqlite3` and
+        // never mutates `.jsonl` bytes or `Session` turn state. Waiting briefly
+        // on the per-thread lifecycle lock serializes against `delete`/`rename`
+        // without colliding with `.jsonl.lock` held by an active writer or an
+        // in-progress multi-hundred-MB rollout restore.
+        let (_operation, _file_lock) = self.acquire_lifecycle_with_backoff(thread_id).await?;
         self.recover_unarchive_if_needed_locked(thread_id).await?;
         let file = self
             .locate(thread_id)
             .await?
             .ok_or_else(|| io::Error::other(format!("session {thread_id} not found")))?;
-        let writer_lock_path = compression::writer_lock_path(&file);
-        let writer_lock = TemporarySessionLock::new(
-            acquire_session_lock(&writer_lock_path, &file).await?,
-            writer_lock_path,
-        );
         let previous_updated_at = file_modified_at(Path::new(&file)).await.unwrap_or_default();
         let meta = update_metadata(
             &file,
@@ -2959,7 +2964,7 @@ impl SessionStore for JsonlSessionStore {
             updated_at: previous_updated_at,
             archived,
         });
-        writer_lock.release().await
+        Ok(())
     }
 
     /// Open (create-or-append) the per-agent sidechain rollout for a sub-agent —
@@ -8033,6 +8038,65 @@ mod tests {
 
         // An unknown thread is an error, not a silent no-op.
         assert!(store.update_host_metadata("missing", None).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn update_host_metadata_succeeds_during_runtime_resume_and_transient_lifecycle_lock() {
+        let dir = temp_dir();
+        let seed_store = store_at(&dir);
+        let seed = seed_store.create(meta()).await.unwrap();
+        seed.append_message(msg("t1", "first")).await;
+        seed.shutdown().await.unwrap();
+
+        let file = dir.join("1700000000-sess-1.jsonl");
+        let file_text = file.to_string_lossy().into_owned();
+        let (entered, release) = pause_resume_for_write_at(&file_text);
+        let store = Arc::new(store_at(&dir));
+        let pending = {
+            let store = store.clone();
+            tokio::spawn(async move { store.resume_runtime_for_write("sess-1").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), entered.notified())
+            .await
+            .expect("runtime resume acquired its temporary writer lease");
+        assert!(lock_path(&dir).exists());
+
+        let pinned = exact_json(r#"{"sidebarPinnedAt":1700000000123}"#);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.update_host_metadata("sess-1", Some(pinned.clone())),
+        )
+        .await
+        .expect("host metadata update must not block on runtime resume")
+        .unwrap();
+
+        release.notify_waiters();
+        let resumed = pending.await.unwrap().unwrap();
+        clear_resume_for_write_pause(&file_text);
+        assert_eq!(resumed.resume.meta.host_metadata, Some(pinned.clone()));
+        assert_eq!(
+            store.list(ListOptions::default()).await.unwrap().items[0].host_metadata,
+            Some(pinned)
+        );
+
+        let competing_store = store_at(&dir);
+        let held = competing_store
+            .try_lifecycle_file_lock("sess-1")
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            drop(held);
+        });
+        store.update_host_metadata("sess-1", None).await.unwrap();
+        assert_eq!(
+            store.list(ListOptions::default()).await.unwrap().items[0].host_metadata,
+            None
+        );
+
+        resumed.rollout.shutdown().await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

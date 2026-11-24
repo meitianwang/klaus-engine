@@ -179,3 +179,126 @@ async fn pin_and_unpin_settle_during_a_turn_and_persist_without_reactivation() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pin_settles_while_session_prepare_and_queued_turn_wait_on_restore() {
+    let dir = std::env::temp_dir().join(format!("klaus-pin-prepare-{}", uuid::Uuid::new_v4()));
+    let store: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+        dir: Some(dir.to_string_lossy().into_owned()),
+        archive_dir: None,
+    }));
+    let live = store
+        .create(SessionMeta {
+            id: "thread-pin".into(),
+            created_at: 1_700_000_000,
+            cwd: "/tmp".into(),
+            model: "m".into(),
+            title: None,
+            originator: None,
+            cli_version: None,
+            source: None,
+            role: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            host_metadata: None,
+        })
+        .await
+        .unwrap();
+    live.shutdown().await.unwrap();
+
+    let restore_entered = Arc::new(Notify::new());
+    let restore_entered_create = restore_entered.clone();
+    let release_restore = Arc::new(Notify::new());
+    let release_restore_create = release_restore.clone();
+    let agent = make_agent_with_call_model(Box::new(move |_, _| {
+        Box::pin(futures::stream::once(async move {
+            ev::stop(Some(ModelStopReason::EndTurn), None)
+        }))
+    }));
+    let lifecycle = crate::lifecycle::protocol_lifecycle(agent.clone(), Some(store.clone()));
+    let resume_store = store.clone();
+    let create: CreateSession = Arc::new(move |ctx: SessionContext| {
+        let agent = agent.clone();
+        let store = resume_store.clone();
+        let entered = restore_entered_create.clone();
+        let release = release_restore_create.clone();
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            agent
+                .resume_session(
+                    store,
+                    &ctx.resume.expect("resume thread"),
+                    StartSessionOptions {
+                        approval_handler: Some(ctx.approval_handler),
+                        elicit_handler: Some(ctx.elicit_handler),
+                        mcp_elicitation_presenter: Some(ctx.mcp_elicitation_presenter),
+                        permission_mode: Some(ExternalPermissionMode::BypassPermissions),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| Box::new(error) as BoxError)
+        })
+    });
+
+    let mut client = TestClient::start_full(
+        create,
+        Some(lifecycle),
+        Some(dir.join("permission-rules.json")),
+        Some(dir.join("config.json")),
+    );
+    client
+        .send(json!({
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": { "productEvents": true, "optOutNotificationMethods": ["session/event"] } }
+        }))
+        .await;
+    assert!(client.response_for(1).await.0.get("result").is_some());
+    client.send(json!({ "method": "initialized" })).await;
+    client
+        .send(json!({ "id": 2, "method": "session/start", "params": { "init": {}, "resume": "thread-pin" } }))
+        .await;
+    let (reply, _) = client.response_for(2).await;
+    let session_id = reply["result"]["sessionId"].clone();
+    assert!(session_id.is_string(), "{reply}");
+
+    // Start `session/prepare` AND queue `turn/start` while restoration is still blocked.
+    client
+        .send(
+            json!({ "id": 3, "method": "session/prepare", "params": { "sessionId": session_id } }),
+        )
+        .await;
+    tokio::time::timeout(REPLY_TIMEOUT, restore_entered.notified())
+        .await
+        .expect("session/prepare entered restore");
+    client
+        .send(json!({
+            "id": 4,
+            "method": "turn/start",
+            "params": { "sessionId": session_id, "input": [{ "type": "text", "text": "queued behind restore" }] }
+        }))
+        .await;
+    let (turn_ack, _) = client.response_for(4).await;
+    assert!(turn_ack.get("error").is_none(), "{turn_ack}");
+
+    let expected = json!({ "sidebarPinnedAt": 1700000000456_i64 });
+    update_metadata(&mut client, 5, session_id.clone(), expected).await;
+    assert_eq!(
+        store.list(ListOptions::default()).await.unwrap().items[0].host_metadata,
+        Some(
+            klaus_agent_core::runtime_values::runtime_json::parse(
+                &r#"{"sidebarPinnedAt":1700000000456}"#.into()
+            )
+            .unwrap()
+        )
+    );
+
+    release_restore.notify_waiters();
+    let (prepare_reply, _) = client.response_for(3).await;
+    assert!(prepare_reply.get("error").is_none(), "{prepare_reply}");
+    client.close().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
