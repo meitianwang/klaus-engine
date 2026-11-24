@@ -4616,10 +4616,12 @@ impl Session {
             let this = self.clone();
             let bundle = bundle.clone();
             let turn_model = model.clone();
+            let append = self.turn.last_system_prompt_append();
             Arc::new(move || {
                 let this = this.clone();
                 let bundle = bundle.clone();
                 let turn_model = turn_model.clone();
+                let append = append.clone();
                 Box::pin(async move {
                     this.assemble_turn_system_prompt_parts(
                         &bundle,
@@ -4628,7 +4630,7 @@ impl Session {
                         subagents_exposed,
                         advisor_exposed,
                         orchestration_exposed,
-                        None,
+                        append.as_ref(),
                         false,
                     )
                     .await

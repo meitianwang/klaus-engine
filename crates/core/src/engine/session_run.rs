@@ -1517,6 +1517,7 @@ impl Session {
             let initial = initial_bundle.clone();
             let model_override = opts.model.clone();
             let append = opts.system_prompt_append.clone();
+            this.turn.set_last_system_prompt_append(append.clone());
             Arc::new(move || {
                 let this = this.clone();
                 let bundle = Session::bundle_from_slot(&slot, &initial);

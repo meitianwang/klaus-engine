@@ -1064,3 +1064,95 @@ async fn prediction_never_executes_tools_and_always_uses_main_session_model() {
     }
     session.shutdown_and_wait().await.unwrap();
 }
+
+#[tokio::test]
+async fn prediction_reuses_latest_turn_system_prompt_append_and_clears_when_absent() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut config = default_config();
+    config.memory.enabled = false;
+    config.model = "main-model".into();
+    let session = mk_session_with_deps(
+        recording_deps(
+            requests.clone(),
+            vec![
+                text_turn("first reply"),
+                text_turn(r#"{"suggestion":"Continue with tests"}"#),
+                text_turn("second reply"),
+                text_turn(r#"{"suggestion":"Ship it"}"#),
+            ],
+        ),
+        config,
+        vec![create_read_tool()],
+    );
+
+    let host_append = RuntimeString::from("### Host directive\nKeep subagent titles concise.");
+    session
+        .run(
+            Input::Text("first prompt".into()),
+            TurnOptions {
+                system_prompt_append: Some(host_append.clone()),
+                ..TurnOptions::default()
+            },
+        )
+        .await;
+    let first_source = session
+        .prediction_context()
+        .await
+        .unwrap()
+        .turn_id
+        .expect("first turn id")
+        .try_to_utf8()
+        .unwrap();
+    let first_prediction = session
+        .predict_message_with_signal(
+            "dynamic prompt".into(),
+            first_source,
+            None,
+            AbortSignal::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_prediction, Some("Continue with tests".into()));
+
+    session
+        .run(Input::Text("second prompt".into()), TurnOptions::default())
+        .await;
+    let second_source = session
+        .prediction_context()
+        .await
+        .unwrap()
+        .turn_id
+        .expect("second turn id")
+        .try_to_utf8()
+        .unwrap();
+    let second_prediction = session
+        .predict_message_with_signal(
+            "dynamic prompt".into(),
+            second_source,
+            None,
+            AbortSignal::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_prediction, Some("Ship it".into()));
+
+    {
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(recorded[1].system, recorded[0].system);
+        assert!(
+            recorded[1]
+                .system
+                .iter()
+                .any(|part| part.name == "append" && part.text == host_append),
+            "prediction must carry the preceding turn's append part"
+        );
+        assert_eq!(recorded[3].system, recorded[2].system);
+        assert!(
+            !recorded[3].system.iter().any(|part| part.name == "append"),
+            "prediction must drop the append part once a newer turn omits it"
+        );
+    }
+
+    session.shutdown_and_wait().await.unwrap();
+}

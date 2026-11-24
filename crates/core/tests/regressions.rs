@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261124_prediction_preserves_system_prompt_append.rs"]
+mod r20261124_prediction_preserves_system_prompt_append;
+
 #[path = "regressions/r20261122_gemini_tool_search_ref_schema.rs"]
 mod r20261122_gemini_tool_search_ref_schema;
 

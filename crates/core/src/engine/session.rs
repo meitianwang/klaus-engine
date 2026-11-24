@@ -754,6 +754,10 @@ pub(crate) struct SessionTurnState {
     /// predictions on that exact failed turn until the user switches model,
     /// provider, or credential account, or completes a new turn.
     pub(crate) last_capacity_failed_turn: Mutex<Option<CapacityFailedTurn>>,
+    /// Per-turn `system_prompt_append` from the most recent foreground turn.
+    /// Speculative composer predictions reuse it so their system prompt stays
+    /// byte-identical to the main turn's cached prefix.
+    last_system_prompt_append: Mutex<Option<RuntimeString>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

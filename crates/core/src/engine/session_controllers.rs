@@ -354,6 +354,17 @@ impl SessionTurnState {
         self.last_response_at_ms.store(at_ms, Ordering::SeqCst);
     }
 
+    /// Return the `system_prompt_append` used by the latest foreground turn.
+    pub(crate) fn last_system_prompt_append(&self) -> Option<RuntimeString> {
+        self.last_system_prompt_append.lock_recover().clone()
+    }
+
+    /// Record the `system_prompt_append` used by the latest foreground turn so
+    /// follow-up predictions assemble the exact same system prompt prefix.
+    pub(crate) fn set_last_system_prompt_append(&self, append: Option<RuntimeString>) {
+        *self.last_system_prompt_append.lock_recover() = append;
+    }
+
     /// Whether the session has already been declared cache-cold for prior-turn
     /// thinking blocks. Read-only: forked and read-only queries consult the main
     /// thread's decision but never advance it, so a side call cannot flip the main
@@ -4429,6 +4440,7 @@ mod thinking_context_cold_tests {
             padded_high_water_tokens: AtomicU64::new(0),
             user_interrupted_turn: Mutex::new(None),
             last_capacity_failed_turn: Mutex::new(None),
+            last_system_prompt_append: Mutex::new(None),
         }
     }
 
