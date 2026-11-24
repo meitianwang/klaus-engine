@@ -1337,3 +1337,96 @@ async fn codex_gpt6_websocket_incremental_continuation_survives_default_and_swit
         &json!({"type": "configuration_update", "reasoning": {"effort": "low"}})
     );
 }
+
+#[tokio::test]
+async fn codex_websocket_midstream_abrupt_disconnect_evicts_socket_and_reconnects_cleanly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handshake_headers_log = Arc::new(Mutex::new(Vec::new()));
+    let ws_frames_log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let handshakes = handshake_headers_log.clone();
+    let frames = ws_frames_log.clone();
+    let server = tokio::spawn(async move {
+        for attempts in [
+            &[
+                ("resp_t1", "msg_t1", "Turn 1 ok.", true),
+                ("resp_t2_broken", "msg_broken", "half-baked ", false),
+            ][..],
+            &[(
+                "resp_t2_recovered",
+                "msg_recovered",
+                "Recovered turn 2.",
+                true,
+            )][..],
+        ] {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let (_, headers, _) = read_http_request(&mut tcp).await;
+            let accept = derive_accept_key(headers["sec-websocket-key"].as_bytes());
+            handshakes.lock().unwrap().push(headers);
+            tcp.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+            let mut ws = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+            for &(response_id, item_id, text, complete) in attempts {
+                let frame = ws.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(request["type"], "response.create");
+                frames.lock().unwrap().push(request);
+                for event in [
+                    json!({"type": "response.created", "response": {"id": response_id}}),
+                    json!({"type": "response.output_item.added", "item": {"id": item_id, "type": "message", "role": "assistant"}}),
+                    json!({"type": "response.output_text.delta", "item_id": item_id, "delta": text}),
+                ] {
+                    ws.send(WsMessage::Text(event.to_string())).await.unwrap();
+                }
+                if !complete {
+                    ws.flush().await.expect("flush partial");
+                    break;
+                }
+                for event in [
+                    json!({"type": "response.output_item.done", "item": {"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
+                    json!({"type": "response.completed", "response": {"id": response_id, "status": "completed", "usage": {"input_tokens": 700, "output_tokens": 10, "total_tokens": 710}}}),
+                ] {
+                    ws.send(WsMessage::Text(event.to_string())).await.unwrap();
+                }
+            }
+            drop(ws);
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let base_url = format!("http://{addr}/backend-api/codex");
+    let process = RuntimeProcessContext::initialize(process_supervisor()).unwrap();
+    let mut opts = agent_options(process);
+    opts.provider = build_codex_provider(&base_url, Some(true));
+    opts.config = Some(codex_config_json());
+    let agent = Agent::new(opts);
+    let session = agent
+        .try_start_session_async(StartSessionOptions {
+            cwd: Some(RuntimePath::from(dir.path().to_string_lossy().as_ref())),
+            user_config_dir: Some(RuntimePath::from(cfg_dir.path().to_string_lossy().as_ref())),
+            permission_mode: Some(ExternalPermissionMode::Default),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for (question, expected) in [
+        ("First question", "Turn 1 ok."),
+        ("Second question", "Recovered turn 2."),
+    ] {
+        let out = session
+            .run(Input::Text(question.into()), TurnOptions::default())
+            .await;
+        assert!(out.error.is_none(), "turn failed: {:?}", out.error);
+        assert_eq!(out.final_text.try_to_utf8().unwrap(), expected);
+    }
+    server.await.unwrap();
+    assert_eq!(handshake_headers_log.lock().unwrap().len(), 2);
+    let frames = ws_frames_log.lock().unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[1]["previous_response_id"], "resp_t1");
+    assert!(frames[2].get("previous_response_id").is_none());
+    let history = frames[2]["input"].to_string();
+    assert!(history.contains("First question"));
+    assert!(history.contains("Turn 1 ok."));
+    assert!(!history.contains("half-baked "));
+}

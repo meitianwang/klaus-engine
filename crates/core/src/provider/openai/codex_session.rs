@@ -951,7 +951,7 @@ async fn open_codex_websocket(
             .map_err(|err| {
                 (
                     classify_error(&RawProviderError {
-                        message: err.to_string(),
+                        message: super::error_with_source_chain(&err),
                         ..Default::default()
                     }),
                     false,
@@ -1007,7 +1007,7 @@ async fn open_codex_websocket(
         let upgraded = response.upgrade().await.map_err(|err| {
             (
                 classify_error(&RawProviderError {
-                    message: err.to_string(),
+                    message: super::error_with_source_chain(&err),
                     ..Default::default()
                 }),
                 false,
@@ -1235,10 +1235,7 @@ pub(super) async fn drive_codex_websocket_turn(
                         }
                         break 'frames;
                     }
-                    let error = classify_error(&RawProviderError {
-                        message: err.to_string(),
-                        ..Default::default()
-                    });
+                    let error = classify_ws_stream_error(&err);
                     let _ = tx.send(ModelStreamEvent::Error {
                         error: if review_stream {
                             error.mark_stream_interrupted()
@@ -1401,5 +1398,66 @@ pub(super) async fn drive_codex_websocket_turn(
         }
         transport_state.put_ws_session(session_key, active);
         return WsStreamOutcome::Completed;
+    }
+}
+
+fn classify_ws_stream_error(err: &tokio_tungstenite::tungstenite::Error) -> ProviderError {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    let mut error = classify_error(&RawProviderError {
+        message: super::error_with_source_chain(err),
+        ..Default::default()
+    });
+    if error.kind == ProviderErrorKind::Unknown
+        && matches!(
+            err,
+            WsError::ConnectionClosed
+                | WsError::AlreadyClosed
+                | WsError::Io(_)
+                | WsError::Tls(_)
+                | WsError::Protocol(_)
+        )
+    {
+        error.kind = ProviderErrorKind::Network;
+    }
+    error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::retry::is_retryable;
+    use tokio_tungstenite::tungstenite::error::{CapacityError, ProtocolError};
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    #[test]
+    fn ws_stream_io_and_protocol_disconnects_classify_as_retryable_network_errors() {
+        let rustls_eof = WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        ));
+        for transport_err in [
+            rustls_eof,
+            WsError::Io(std::io::Error::other("socket peer reset")),
+            WsError::Io(std::io::Error::other("连接被对端强制关闭")),
+            WsError::ConnectionClosed,
+            WsError::AlreadyClosed,
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        ] {
+            let classified = classify_ws_stream_error(&transport_err);
+            assert_eq!(
+                classified.kind,
+                ProviderErrorKind::Network,
+                "transport_err={transport_err:?}"
+            );
+            assert!(is_retryable(&classified));
+        }
+        let non_transport = WsError::Capacity(CapacityError::MessageTooLong {
+            size: 100,
+            max_size: 50,
+        });
+        let classified = classify_ws_stream_error(&non_transport);
+        assert_eq!(classified.kind, ProviderErrorKind::Unknown);
+        assert!(!is_retryable(&classified));
     }
 }

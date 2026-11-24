@@ -5880,7 +5880,7 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, Stri
 /// "error sending request for url (...)" while the actual root cause
 /// (TLS handshake failure, DNS, connect refused, ...) lives further down
 /// the source chain and would otherwise be swallowed.
-fn error_with_source_chain(err: &dyn std::error::Error) -> String {
+pub(super) fn error_with_source_chain(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {
@@ -5889,6 +5889,21 @@ fn error_with_source_chain(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+fn classify_http_stream_error(err: &reqwest::Error) -> ProviderError {
+    let mut error = classify_error(&RawProviderError {
+        message: error_with_source_chain(err),
+        ..Default::default()
+    });
+    if error.kind == ProviderErrorKind::Unknown {
+        error.kind = if err.is_timeout() {
+            ProviderErrorKind::Timeout
+        } else {
+            ProviderErrorKind::Network
+        };
+    }
+    error
 }
 
 /// Count the actual model input and structured output/tool framing.
@@ -6981,7 +6996,7 @@ impl OpenAIProvider {
                         if signal.is_cancelled() { return; }
                         yield ModelStreamEvent::Error {
                             error: {
-                                let error = classify_error(&RawProviderError { message: e.to_string(), ..Default::default() });
+                                let error = classify_http_stream_error(&e);
                                 if review_stream { error.mark_stream_interrupted() } else { error }
                             },
                         };
@@ -7361,7 +7376,7 @@ impl OpenAIProvider {
                         if signal.is_cancelled() { return; }
                         yield ModelStreamEvent::Error {
                             error: {
-                                let error = classify_error(&RawProviderError { message: e.to_string(), ..Default::default() });
+                                let error = classify_http_stream_error(&e);
                                 if review_stream { error.mark_stream_interrupted() } else { error }
                             },
                         };

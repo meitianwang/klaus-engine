@@ -287,8 +287,9 @@ static NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Bare socket/DNS error codes are matched with word boundaries so a code
     // inside a longer identifier keeps its own classification; transports and
     // gateways that report only the code or OS transport phrase ("read ECONNRESET",
-    // "write EPIPE", "broken pipe", "Connection closed.") must stay retryable.
-    Regex::new(r"(?i)network|fetch failed|\b(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN)\b|socket hang up|error sending request|error decoding response body|connection reset|connection refused|connection aborted|connection closed|other side closed|broken pipe|connection timeout|connect timeout|dns|tls handshake").unwrap()
+    // "write EPIPE", "broken pipe", "Connection closed.", rustls missing
+    // close_notify / unexpected EOF) must stay retryable.
+    Regex::new(r"(?i)network|fetch failed|\b(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN)\b|socket hang up|error sending request|error decoding response body|connection reset|connection refused|connection aborted|connection closed|peer closed connection|closed connection|other side closed|close_notify|unexpected[- ]eof|unexpected end of file|early eof|broken pipe|connection timeout|connect timeout|dns|tls handshake").unwrap()
 });
 
 /// A rate-limit delay hint like "Please try again in 11.054s" / "try again in
@@ -722,6 +723,14 @@ mod tests {
                 ProviderErrorKind::Network,
             ),
             ("error decoding response body", ProviderErrorKind::Network),
+            (
+                "IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+                ProviderErrorKind::Network,
+            ),
+            ("Trying to work with closed connection", ProviderErrorKind::Network),
+            ("IO error: unexpected end of file", ProviderErrorKind::Network),
+            ("IO error: early eof", ProviderErrorKind::Network),
+            ("unexpected eof while reading chunk", ProviderErrorKind::Network),
             ("something entirely unexpected", ProviderErrorKind::Unknown),
         ];
         for (msg, kind) in cases {
@@ -730,6 +739,12 @@ mod tests {
                 ..raw()
             });
             assert_eq!(e.kind, kind, "msg={msg}");
+            if kind == ProviderErrorKind::Network {
+                assert!(
+                    crate::provider::retry::is_retryable(&e),
+                    "network msg must be retryable: {msg}"
+                );
+            }
         }
     }
 
