@@ -1468,7 +1468,7 @@ fn map_chat_stop_reason(sr: &RuntimeString) -> ModelStopReason {
         ModelStopReason::ToolUse
     } else if sr == "length" {
         ModelStopReason::MaxTokens
-    } else if sr == "content_filter" {
+    } else if sr == "content_filter" || sr == "sensitive" {
         ModelStopReason::Refusal
     } else {
         ModelStopReason::EndTurn
@@ -4658,37 +4658,175 @@ fn chat_chunk_shape(chunk: &Value, state: &mut ChatState) -> ChatChunkShape {
 }
 
 fn chat_stream_error(chunk: &Value) -> Option<ProviderError> {
-    let error = chunk.get("error").filter(|error| !error.is_null())?;
-    let message = error
-        .get("message")
+    if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .or_else(|| chunk.get("error_msg").and_then(Value::as_str))
+            .map(diagnostic_string)
+            .unwrap_or_else(|| "OpenAI Chat stream failed".to_string());
+        let status = chunk
+            .get("error_code")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
+        let request_id = error
+            .get("request_id")
+            .and_then(Value::as_str)
+            .or_else(|| chunk.get("request_id").and_then(Value::as_str))
+            .map(diagnostic_string);
+        return Some(classify_error(&RawProviderError {
+            status,
+            message,
+            code: error
+                .get("code")
+                .and_then(Value::as_str)
+                .map(diagnostic_string),
+            body_type: error
+                .get("type")
+                .and_then(Value::as_str)
+                .map(diagnostic_string),
+            error_request_id: request_id,
+            ..Default::default()
+        }));
+    }
+    chat_choice_stream_error(chunk)
+}
+
+fn chat_choice_stream_error(chunk: &Value) -> Option<ProviderError> {
+    let choice = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())?;
+    let choice_error = choice.get("error").filter(|error| !error.is_null());
+    let finish_reason = choice
+        .get("finish_reason")
         .and_then(Value::as_str)
-        .or_else(|| error.as_str())
+        .map(diagnostic_string)
+        .filter(|reason| !reason.is_empty() && reason != "null");
+    let finish_lower = finish_reason.as_deref().map(str::to_ascii_lowercase);
+    let is_error_finish = matches!(finish_lower.as_deref(), Some("error" | "network_error"));
+    if choice_error.is_none() && !is_error_finish {
+        return None;
+    }
+
+    let native_reason = choice
+        .get("native_finish_reason")
+        .and_then(Value::as_str)
+        .map(diagnostic_string)
+        .filter(|reason| !reason.is_empty());
+    let message = choice_error
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
         .or_else(|| chunk.get("error_msg").and_then(Value::as_str))
         .map(diagnostic_string)
-        .unwrap_or_else(|| "OpenAI Chat stream failed".to_string());
-    let status = chunk
-        .get("error_code")
+        .unwrap_or_else(|| match (&finish_reason, &native_reason) {
+            (Some(reason), Some(native)) => {
+                format!("OpenAI Chat stream terminated with finish_reason={reason} ({native})")
+            }
+            (Some(reason), None) => {
+                format!("OpenAI Chat stream terminated with finish_reason={reason}")
+            }
+            (None, Some(native)) => {
+                format!("OpenAI Chat stream terminated with native_finish_reason={native}")
+            }
+            (None, None) => "OpenAI Chat stream failed".to_string(),
+        });
+    let status = choice_error
+        .and_then(|error| error.get("code"))
         .and_then(Value::as_u64)
-        .and_then(|status| u16::try_from(status).ok());
-    let request_id = error
-        .get("request_id")
+        .or_else(|| chunk.get("error_code").and_then(Value::as_u64))
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (400..=599).contains(code));
+    let code = choice_error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .map(diagnostic_string)
+        .or_else(|| native_reason.clone());
+    let body_type = choice_error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .map(diagnostic_string);
+    let request_id = choice_error
+        .and_then(|error| error.get("request_id"))
         .and_then(Value::as_str)
         .or_else(|| chunk.get("request_id").and_then(Value::as_str))
+        .or_else(|| chunk.get("id").and_then(Value::as_str))
         .map(diagnostic_string);
-    Some(classify_error(&RawProviderError {
+
+    let mut classified = classify_error(&RawProviderError {
         status,
         message,
-        code: error
-            .get("code")
-            .and_then(Value::as_str)
-            .map(diagnostic_string),
-        body_type: error
-            .get("type")
-            .and_then(Value::as_str)
-            .map(diagnostic_string),
+        code,
+        body_type,
         error_request_id: request_id,
         ..Default::default()
-    }))
+    });
+
+    if finish_lower.as_deref() == Some("network_error") {
+        if classified.kind == ProviderErrorKind::Unknown {
+            classified.kind = ProviderErrorKind::Network;
+        }
+        if classified.code.is_none() {
+            classified.code = Some("network_error".into());
+        }
+        return Some(classified);
+    }
+
+    if let Some(native) = native_reason.as_deref() {
+        let upper = native.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "SAFETY"
+                | "RECITATION"
+                | "BLOCKLIST"
+                | "PROHIBITED_CONTENT"
+                | "SPII"
+                | "IMAGE_SAFETY"
+                | "IMAGE_PROHIBITED_CONTENT"
+                | "IMAGE_RECITATION"
+                | "CONTENT_FILTER"
+                | "MODEL_ARMOR"
+                | "SENSITIVE"
+        ) {
+            classified.kind = ProviderErrorKind::Withheld;
+            if classified.code.is_none() {
+                classified.code = Some(native.into());
+            }
+            return Some(classified);
+        }
+        if matches!(
+            upper.as_str(),
+            "MISSING_THOUGHT_SIGNATURE"
+                | "FINISH_REASON_MISSING_THOUGHT_SIGNATURE"
+                | "TOO_MANY_TOOL_CALLS"
+                | "FINISH_REASON_TOO_MANY_TOOL_CALLS"
+                | "ESCALATION"
+                | "PUP_LIMITED_DISABLED"
+                | "NO_IMAGE"
+                | "FINISH_REASON_NO_IMAGE"
+                | "IMAGE_OTHER"
+                | "FINISH_REASON_IMAGE_OTHER"
+        ) {
+            classified.kind = ProviderErrorKind::InvalidRequest;
+            if classified.code.is_none() {
+                classified.code = Some(native.into());
+            }
+            return Some(classified);
+        }
+    }
+
+    if classified.kind == ProviderErrorKind::Unknown {
+        classified.kind = ProviderErrorKind::Overloaded;
+        if classified.code.is_none() {
+            classified.code = Some("server_error".into());
+        }
+    }
+    Some(classified)
 }
 
 /// How a Chat Completions response is consumed.
@@ -13654,6 +13792,94 @@ mod tests {
         assert!(!second
             .iter()
             .any(|e| matches!(e, ModelStreamEvent::MessageStart { .. })));
+    }
+
+    #[test]
+    fn chat_stream_surfaces_abnormal_choice_finish_reasons_as_classified_errors() {
+        assert_eq!(
+            map_chat_stop_reason(&RuntimeString::from("sensitive")),
+            ModelStopReason::Refusal
+        );
+
+        let mut state = ChatState::default();
+        let err = map_chat_stream_chunk(
+            &json!({
+                "id": "chatcmpl-err-1",
+                "model": "m",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "error",
+                    "native_finish_reason": "MALFORMED_FUNCTION_CALL"
+                }]
+            }),
+            &mut state,
+        )
+        .expect_err("error finish_reason must fail the stream");
+        assert_eq!(err.kind, ProviderErrorKind::Overloaded);
+        assert_eq!(
+            err.code,
+            Some(RuntimeString::from("MALFORMED_FUNCTION_CALL"))
+        );
+
+        let mut net_state = ChatState::default();
+        let net_err = map_chat_stream_chunk(
+            &json!({
+                "model": "m",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "network_error"
+                }]
+            }),
+            &mut net_state,
+        )
+        .expect_err("network_error finish_reason must fail as retryable network error");
+        assert_eq!(net_err.kind, ProviderErrorKind::Network);
+
+        let mut withheld_state = ChatState::default();
+        let withheld_err = map_chat_stream_chunk(
+            &json!({
+                "model": "m",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "error",
+                    "native_finish_reason": "PROHIBITED_CONTENT"
+                }]
+            }),
+            &mut withheld_state,
+        )
+        .expect_err("policy block native_finish_reason must classify as withheld");
+        assert_eq!(withheld_err.kind, ProviderErrorKind::Withheld);
+
+        let mut invalid_state = ChatState::default();
+        let invalid_err = map_chat_stream_chunk(
+            &json!({
+                "model": "m",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "error",
+                    "native_finish_reason": "MISSING_THOUGHT_SIGNATURE",
+                    "error": { "message": "Missing thought signature on tool replay" }
+                }]
+            }),
+            &mut invalid_state,
+        )
+        .expect_err("missing signature native_finish_reason must classify as invalid_request");
+        assert_eq!(invalid_err.kind, ProviderErrorKind::InvalidRequest);
+
+        let mut rate_state = ChatState::default();
+        let rate_err = map_chat_stream_chunk(
+            &json!({
+                "model": "m",
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "error",
+                    "error": { "code": 429, "message": "Upstream rate limit exceeded" }
+                }]
+            }),
+            &mut rate_state,
+        )
+        .expect_err("choice error with 429 must classify as rate_limit");
+        assert_eq!(rate_err.kind, ProviderErrorKind::RateLimit);
     }
 
     // ---- responses event mapping ----

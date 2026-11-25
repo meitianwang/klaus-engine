@@ -760,6 +760,7 @@ impl Session {
             signal: Some(signal.clone()),
             call_timeout_ms: Some(call_timeout_ms),
             mcp_elicitation_router: Some(router.clone()),
+            lazy_stdio_startup: Some(self.credential_store.is_some()),
             ..ConnectMcpOptions::new(self.process_context.clone())
         };
         let mut clients = Vec::new();

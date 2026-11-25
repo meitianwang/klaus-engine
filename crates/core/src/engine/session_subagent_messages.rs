@@ -1468,6 +1468,8 @@ impl Session {
         }
         drop(state);
         drop(admission);
+        self.background_processes
+            .kill_by_owner(&RuntimeString::from(id));
         Some(true)
     }
 
@@ -1675,6 +1677,9 @@ impl Session {
             .external_cancel_receipts
             .lock_recover()
             .push((id.to_owned(), receipt));
+        drop(admission);
+        self.background_processes
+            .kill_by_owner(&RuntimeString::from(id));
         true
     }
 
@@ -3196,6 +3201,8 @@ impl Session {
                         .await;
                 }
                 if !again {
+                    self.background_processes
+                        .kill_by_owner(&RuntimeString::from(id.as_str()));
                     break;
                 }
             }
@@ -3227,7 +3234,9 @@ impl Session {
             .lock_recover()
             .workers
             .get(id)
-            .is_some_and(|worker| !worker.one_shot && worker.snapshot.is_some())
+            .is_some_and(|worker| {
+                !worker.one_shot && !worker.user_cancelled && worker.snapshot.is_some()
+            })
     }
 
     pub(crate) async fn close_ordinary_worker_resources(&self) {

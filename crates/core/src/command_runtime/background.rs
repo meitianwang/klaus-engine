@@ -1112,6 +1112,34 @@ impl BackgroundCommandRegistry {
         self.close_admission_and_kill_all();
     }
 
+    pub fn kill_by_owner(&self, owner_agent_id: &RuntimeString) -> usize {
+        if owner_agent_id.is_empty() {
+            return 0;
+        }
+        let monitors = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tasks
+            .clone();
+        let mut stopped = 0;
+        for monitor in monitors {
+            let Some(shared) = monitor.shared.upgrade() else {
+                continue;
+            };
+            let owned = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .owner_agent_id
+                .as_ref()
+                .is_some_and(|owner| owner == owner_agent_id);
+            if owned && request_stop(&shared, Signal::Term, &self.now).accepted {
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+
     pub fn close_admission_and_kill_all(&self) {
         let monitors = {
             let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -2743,6 +2771,57 @@ mod tests {
         );
         assert!(!recovered.output_available);
         assert_eq!(persisted.lock().unwrap().as_slice(), &[recovered]);
+    }
+
+    #[tokio::test]
+    async fn kill_by_owner_stops_only_matching_subagent_shells() {
+        let registry = BackgroundCommandRegistry::new();
+        let mut parent_opts = start_options("sleep 30", None);
+        parent_opts.owner_agent_id = None;
+        let parent_id = registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                parent_opts,
+            )
+            .await
+            .unwrap();
+
+        let mut child_a_opts = start_options("sleep 30", None);
+        child_a_opts.owner_agent_id = Some("agent-child-a".into());
+        let child_a_id = registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                child_a_opts,
+            )
+            .await
+            .unwrap();
+
+        let mut child_b_opts = start_options("sleep 30", None);
+        child_b_opts.owner_agent_id = Some("agent-child-b".into());
+        let child_b_id = registry
+            .start(
+                crate::runtime_process::test_runtime_process_context(),
+                child_b_opts,
+            )
+            .await
+            .unwrap();
+
+        let stopped = registry.kill_by_owner(&RuntimeString::from("agent-child-a"));
+        assert_eq!(stopped, 1);
+        assert_eq!(
+            wait_for_terminal(&registry, &child_a_id).await.status,
+            BackgroundProcessStatus::Stopped
+        );
+
+        let statuses = registry.list();
+        let parent_status = statuses.iter().find(|s| s.id == parent_id).unwrap();
+        let child_b_status = statuses.iter().find(|s| s.id == child_b_id).unwrap();
+        assert_eq!(parent_status.status, BackgroundCommandStatus::Running);
+        assert_eq!(child_b_status.status, BackgroundCommandStatus::Running);
+
+        registry.kill_all();
+        let _ = wait_for_terminal(&registry, &parent_id).await;
+        let _ = wait_for_terminal(&registry, &child_b_id).await;
     }
 }
 

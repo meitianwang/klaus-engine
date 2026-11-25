@@ -2551,8 +2551,11 @@ impl Session {
         if signal.is_cancelled() {
             failure = crate::tools::subagent_stream::terminal_failure(TerminalReason::Aborted);
         }
-        // Terminal: count as idle so any remaining wait-for-idle waiters unblock.
+        // Terminal: count as idle so any remaining wait-for-idle waiters unblock,
+        // and reclaim any background processes the teammate left running.
         self.mark_teammate_idle(&agent_id).await;
+        self.background_processes
+            .kill_by_owner(&RuntimeString::from(agent_id.as_str()));
         if failure.is_none() {
             failure = self.retained_subagent_persistence_error(&agent_id);
         }

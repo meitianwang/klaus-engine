@@ -3607,6 +3607,16 @@ impl Session {
                 client.close().await;
             }
         }
+        let persistent_mailbox_live = self
+            .subagents
+            .background_agents
+            .lock_recover()
+            .get(effective_agent_id)
+            .is_some_and(|entry| entry.mailbox_live);
+        if !self.has_ordinary_runtime_identity(effective_agent_id) && !persistent_mailbox_live {
+            self.background_processes
+                .kill_by_owner(&RuntimeString::from(effective_agent_id));
+        }
         match persistence_error {
             Some(error) => {
                 self.note_subagent_persistence_error(effective_agent_id, error.clone());

@@ -835,6 +835,7 @@ mod tests {
         let mut resp = GenerateContentResponse {
             model_version: None,
             usage_metadata: None,
+            prompt_feedback: None,
             candidates: Some(vec![Candidate {
                 content: Some(Content {
                     role: "model".into(),
@@ -856,6 +857,7 @@ mod tests {
                     ],
                 }),
                 finish_reason: Some("STOP".into()),
+                finish_message: None,
                 grounding_metadata: None,
             }]),
         };

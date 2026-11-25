@@ -202,6 +202,7 @@ impl McpConnectionManager {
         let mut opts = self.connect_opts.clone();
         if bypass_needs_auth_cache {
             opts.skip_needs_auth_cache = Some(true);
+            opts.skip_tool_catalog_cache = Some(true);
         }
         self.announce_state(config.name(), McpConnectionState::Connecting);
         let client = connect_mcp_server(&config, &opts).await;

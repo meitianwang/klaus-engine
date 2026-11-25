@@ -41,6 +41,10 @@ use super::oauth::McpFetch;
 use super::oauth_provider::{
     mcp_oauth_server_key, McpAuthStatus, McpOAuthConfig, McpOAuthProvider, McpOAuthProviderOptions,
 };
+use super::stdio_catalog_cache::{
+    default_stdio_catalog_cache, stdio_catalog_fingerprint, StdioCatalogCache,
+    StdioCatalogSnapshot, STDIO_CATALOG_TTL_MS,
+};
 use super::tool_wrapper::{McpToolCall, WrapMcpToolOptions};
 use super::transports::{
     HttpTransport, InMemoryTransport, McpError, OAuthTransport, SseTransport, StdioTransport,
@@ -57,7 +61,7 @@ use super::types::{
 // ---------------------------------------------------------------------------
 
 /// The MCP protocol version advertised in the initialize handshake.
-const PROTOCOL_VERSION: &str = "2025-11-25";
+pub(crate) const PROTOCOL_VERSION: &str = "2025-11-25";
 /// Client identity advertised to MCP servers during initialization.
 const CLIENT_NAME: &str = "klaus-agent";
 const CLIENT_VERSION: &str = "0.1.0";
@@ -165,6 +169,13 @@ pub struct ConnectMcpOptions {
     pub oauth_fetch: Option<Arc<dyn McpFetch>>,
     /// Session-scoped router for server-initiated structured elicitation.
     pub mcp_elicitation_router: Option<McpElicitationRouter>,
+    /// When `Some(true)`, warm `stdio` servers load their cached catalog and
+    /// defer spawning the child process until a tool/resource/prompt is called.
+    pub lazy_stdio_startup: Option<bool>,
+    /// Optional explicit directory for the `stdio` catalog cache file.
+    pub tool_catalog_cache_dir: Option<String>,
+    /// Bypass the `stdio` catalog cache and dial live (used on explicit reconnect).
+    pub skip_tool_catalog_cache: Option<bool>,
 }
 
 impl ConnectMcpOptions {
@@ -183,6 +194,9 @@ impl ConnectMcpOptions {
             skip_needs_auth_cache: None,
             oauth_fetch: None,
             mcp_elicitation_router: None,
+            lazy_stdio_startup: None,
+            tool_catalog_cache_dir: None,
+            skip_tool_catalog_cache: None,
         }
     }
 }
@@ -250,7 +264,113 @@ pub struct ManagedClient {
     tool_refresh_lock: Option<Arc<Mutex<()>>>,
     lease: Option<Arc<ClientLease>>,
     client: Option<Client>,
+    lazy_stdio: Option<Arc<LazyStdioConnection>>,
     call_timeout_ms: u64,
+}
+
+enum LazyLiveState {
+    Standby,
+    Connected {
+        client: Client,
+        lease: Arc<ClientLease>,
+    },
+    Closed,
+}
+
+struct LazyStdioConnection {
+    opts: ConnectMcpOptions,
+    live: tokio::sync::Mutex<LazyLiveState>,
+    raw_tools: Arc<Mutex<Vec<McpToolDescriptor>>>,
+    tool_config: Arc<Mutex<McpServerConfig>>,
+    tool_refresh_lock: Arc<Mutex<()>>,
+    tools: Arc<Mutex<Vec<Arc<dyn Tool>>>>,
+    connect_timeout_ms: u64,
+    call_timeout_ms: u64,
+    stdio_cache: Option<(StdioCatalogCache, String)>,
+}
+
+impl LazyStdioConnection {
+    async fn ensure_client(
+        self: &Arc<Self>,
+        call_signal: Option<AbortSignal>,
+    ) -> Result<(Client, Arc<ClientLease>), RuntimeString> {
+        let mut guard = self.live.lock().await;
+        match &*guard {
+            LazyLiveState::Connected { client, lease } => {
+                return Ok((client.clone(), lease.clone()));
+            }
+            LazyLiveState::Closed => {
+                return Err(RuntimeString::from(
+                    "mcp_server_closed: connection was closed",
+                ));
+            }
+            LazyLiveState::Standby => {}
+        }
+
+        let current_config = self.tool_config.lock().unwrap().clone();
+        let mut dial_opts = self.opts.clone();
+        dial_opts.signal = call_signal;
+        dial_opts.lazy_stdio_startup = Some(false);
+        dial_opts.skip_tool_catalog_cache = Some(true);
+
+        let live_managed = Box::pin(connect_mcp_server_inner(&current_config, &dial_opts)).await;
+        if live_managed.state != McpConnectionState::Ready {
+            return Err(live_managed.error.unwrap_or_else(|| {
+                RuntimeString::from("mcp_server_unavailable: failed to start stdio server")
+            }));
+        }
+        let (Some(client), Some(lease)) = (live_managed.client, live_managed.lease) else {
+            return Err(RuntimeString::from(
+                "mcp_server_unavailable: no live connection",
+            ));
+        };
+
+        if let Some(live_raw) = live_managed.raw_tools {
+            let relisted = live_raw.lock().unwrap().clone();
+            let _refresh_guard = self.tool_refresh_lock.lock().unwrap();
+            *self.raw_tools.lock().unwrap() = relisted.clone();
+            let cfg = self.tool_config.lock().unwrap().clone();
+            let server_name = config_name(&cfg).to_string();
+            let wrapped = wrap_listed_with_call(
+                make_lazy_tool_call(Arc::clone(self), self.call_timeout_ms),
+                &server_name,
+                config_always_load(&cfg),
+                relisted,
+                &cfg,
+            );
+            *self.tools.lock().unwrap() = wrapped;
+        }
+
+        let server_name = config_name(&current_config).to_string();
+        install_tools_list_changed_listener(
+            &client,
+            &lease,
+            &self.tools,
+            &self.raw_tools,
+            &self.tool_config,
+            &self.tool_refresh_lock,
+            server_name,
+            self.connect_timeout_ms,
+            self.call_timeout_ms,
+            self.stdio_cache.clone(),
+        );
+
+        *guard = LazyLiveState::Connected {
+            client: client.clone(),
+            lease: lease.clone(),
+        };
+        Ok((client, lease))
+    }
+
+    async fn close(&self) {
+        let prev = {
+            let mut guard = self.live.lock().await;
+            std::mem::replace(&mut *guard, LazyLiveState::Closed)
+        };
+        if let LazyLiveState::Connected { client, .. } = prev {
+            safe_close_client(&client).await;
+        }
+    }
 }
 
 impl ManagedClient {
@@ -266,26 +386,27 @@ impl ManagedClient {
     }
 
     pub(crate) fn reconfigure_tool_visibility(&self, config: &McpServerConfig) -> bool {
-        let (Some(client), Some(raw), Some(current), Some(lock), Some(lease)) = (
-            &self.client,
-            &self.raw_tools,
-            &self.tool_config,
-            &self.tool_refresh_lock,
-            &self.lease,
-        ) else {
+        let (Some(raw), Some(current), Some(lock)) =
+            (&self.raw_tools, &self.tool_config, &self.tool_refresh_lock)
+        else {
+            return false;
+        };
+        let make_call = if let (Some(client), Some(lease)) = (&self.client, &self.lease) {
+            make_tool_call(client.clone(), self.call_timeout_ms, lease.clone())
+        } else if let Some(lazy) = &self.lazy_stdio {
+            make_lazy_tool_call(lazy.clone(), self.call_timeout_ms)
+        } else {
             return false;
         };
         let _guard = lock.lock().unwrap();
         *current.lock().unwrap() = config.clone();
         let listed = raw.lock().unwrap().clone();
-        let wrapped = wrap_listed(
-            client,
+        let wrapped = wrap_listed_with_call(
+            make_call,
             &self.name.try_to_utf8().unwrap_or_default(),
-            self.call_timeout_ms,
             config_always_load(config),
             listed,
             config,
-            lease.clone(),
         );
         *self.tools.lock().unwrap() = wrapped;
         true
@@ -293,10 +414,15 @@ impl ManagedClient {
 
     /// Read a resource's contents by uri.
     pub async fn read_resource(&self, uri: &RuntimeString) -> Vec<McpResourceContent> {
-        match &self.client {
-            Some(c) => read_resource_safe(c, uri, self.call_timeout_ms).await,
-            None => Vec::new(),
+        if let Some(c) = &self.client {
+            return read_resource_safe(c, uri, self.call_timeout_ms).await;
         }
+        if let Some(lazy) = &self.lazy_stdio {
+            if let Ok((c, _lease)) = lazy.ensure_client(None).await {
+                return read_resource_safe(&c, uri, self.call_timeout_ms).await;
+            }
+        }
+        Vec::new()
     }
 
     /// Call one of this server's tools by its RAW (server-declared) name.
@@ -312,15 +438,22 @@ impl ManagedClient {
         args: Json,
         signal: Option<AbortSignal>,
     ) -> Result<McpCallResult, RuntimeString> {
-        match &self.client {
-            Some(c) => c
+        if let Some(c) = &self.client {
+            return c
                 .call_tool(tool, args, self.call_timeout_ms, None, signal)
                 .await
-                .map_err(|e| e.message),
-            None => Err(RuntimeString::from(
-                "mcp_server_unavailable: no live connection",
-            )),
+                .map_err(|e| e.message);
         }
+        if let Some(lazy) = &self.lazy_stdio {
+            let (c, _lease) = lazy.ensure_client(signal.clone()).await?;
+            return c
+                .call_tool(tool, args, self.call_timeout_ms, None, signal)
+                .await
+                .map_err(|e| e.message);
+        }
+        Err(RuntimeString::from(
+            "mcp_server_unavailable: no live connection",
+        ))
     }
 
     /// Render a server prompt by name.
@@ -329,16 +462,24 @@ impl ManagedClient {
         name: &RuntimeString,
         args: Option<RuntimeObject>,
     ) -> RuntimeString {
-        match &self.client {
-            Some(c) => get_prompt_safe(c, name, args, self.call_timeout_ms).await,
-            None => RuntimeString::default(),
+        if let Some(c) = &self.client {
+            return get_prompt_safe(c, name, args, self.call_timeout_ms).await;
         }
+        if let Some(lazy) = &self.lazy_stdio {
+            if let Ok((c, _lease)) = lazy.ensure_client(None).await {
+                return get_prompt_safe(&c, name, args, self.call_timeout_ms).await;
+            }
+        }
+        RuntimeString::default()
     }
 
     /// Tear the transport down. Idempotent; a no-op for a degraded client.
     pub async fn close(&self) {
         if let Some(c) = &self.client {
             safe_close_client(c).await;
+        }
+        if let Some(lazy) = &self.lazy_stdio {
+            lazy.close().await;
         }
     }
 }
@@ -1655,6 +1796,84 @@ async fn connect_mcp_server_inner(
         }
     }
 
+    let stdio_cache = if opts.tool_catalog_cache_dir.is_some() || opts.credential_store.is_some() {
+        stdio_catalog_fingerprint(config, opts.cwd.as_ref()).map(|fp| {
+            (
+                default_stdio_catalog_cache(
+                    opts.tool_catalog_cache_dir.as_deref(),
+                    opts.oauth_lock_dir.as_deref(),
+                ),
+                fp,
+            )
+        })
+    } else {
+        None
+    };
+
+    if opts.lazy_stdio_startup == Some(true)
+        && opts.skip_tool_catalog_cache != Some(true)
+        && config.options().required != Some(true)
+    {
+        if let Some((ref cache, ref fingerprint)) = stdio_cache {
+            if let Some(cached) = cache
+                .get_fresh(fingerprint, STDIO_CATALOG_TTL_MS, now_ms())
+                .await
+            {
+                let server_always_load = config_always_load(config);
+                let raw_tools = Arc::new(Mutex::new(cached.tools.clone()));
+                let tool_config = Arc::new(Mutex::new(config.clone()));
+                let tool_refresh_lock = Arc::new(Mutex::new(()));
+                let tools_arc = Arc::new(Mutex::new(Vec::new()));
+                let mut standby_opts = opts.clone();
+                standby_opts.signal = None;
+                standby_opts.lazy_stdio_startup = Some(false);
+                standby_opts.skip_tool_catalog_cache = Some(true);
+
+                let lazy = Arc::new(LazyStdioConnection {
+                    opts: standby_opts,
+                    live: tokio::sync::Mutex::new(LazyLiveState::Standby),
+                    raw_tools: raw_tools.clone(),
+                    tool_config: tool_config.clone(),
+                    tool_refresh_lock: tool_refresh_lock.clone(),
+                    tools: tools_arc.clone(),
+                    connect_timeout_ms,
+                    call_timeout_ms,
+                    stdio_cache: stdio_cache.clone(),
+                });
+                let wrapped = wrap_listed_with_call(
+                    make_lazy_tool_call(lazy.clone(), call_timeout_ms),
+                    &name,
+                    server_always_load,
+                    cached.tools,
+                    config,
+                );
+                *tools_arc.lock().unwrap() = wrapped;
+                return ManagedClient {
+                    declaration: None,
+                    name: RuntimeString::from(name),
+                    state: McpConnectionState::Ready,
+                    resources: cached.resources,
+                    resource_templates: cached.resource_templates,
+                    prompts: cached.prompts,
+                    instructions: cached.instructions,
+                    server_info: cached.server_info,
+                    auth_status,
+                    authorization_url: None,
+                    failure_reason: None,
+                    error: None,
+                    tools: tools_arc,
+                    raw_tools: Some(raw_tools),
+                    tool_config: Some(tool_config),
+                    tool_refresh_lock: Some(tool_refresh_lock),
+                    lease: None,
+                    client: None,
+                    lazy_stdio: Some(lazy),
+                    call_timeout_ms,
+                };
+            }
+        }
+    }
+
     let pending_auth_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let pending_auth_url_sink = pending_auth_url.clone();
     let upstream_observer = base_opts.on_mcp_authorization_url.clone();
@@ -1695,6 +1914,11 @@ async fn connect_mcp_server_inner(
             // A 401/403 means "needs auth", not "failed".
             if !is_auth_error(&err) {
                 safe_close(&transport).await;
+                if !err.aborted {
+                    if let Some((ref cache, ref fingerprint)) = stdio_cache {
+                        cache.remove(fingerprint).await;
+                    }
+                }
                 return degraded_client_for(&name, &err, auth_status);
             }
             let redirect_uri = opts
@@ -1765,6 +1989,11 @@ async fn connect_mcp_server_inner(
             }
             Err(err) => {
                 safe_close_client(&client).await;
+                if !err.aborted {
+                    if let Some((ref cache, ref fingerprint)) = stdio_cache {
+                        cache.remove(fingerprint).await;
+                    }
+                }
                 if is_auth_error(&err) {
                     let pending_auth_url = pending_auth_url.lock().unwrap().clone();
                     return needs_auth_client(
@@ -1787,6 +2016,19 @@ async fn connect_mcp_server_inner(
     let resource_templates = list_resource_templates_safe(&client, connect_timeout_ms).await;
     let prompts = list_prompts_safe(&client, connect_timeout_ms).await;
     let instructions = truncate_instructions(client.instructions());
+    let server_info = client.server_info();
+
+    if let Some((ref cache, ref fingerprint)) = stdio_cache {
+        let snapshot = StdioCatalogSnapshot {
+            tools: raw_tools.lock().unwrap().clone(),
+            resources: resources.clone(),
+            resource_templates: resource_templates.clone(),
+            prompts: prompts.clone(),
+            instructions: instructions.clone(),
+            server_info: server_info.clone(),
+        };
+        cache.put(fingerprint, &snapshot, now_ms()).await;
+    }
 
     let tools_arc = Arc::new(Mutex::new(tools));
     let managed = ManagedClient {
@@ -1797,7 +2039,7 @@ async fn connect_mcp_server_inner(
         resource_templates,
         prompts,
         instructions,
-        server_info: client.server_info(),
+        server_info,
         auth_status,
         authorization_url: None,
         failure_reason: None,
@@ -1808,71 +2050,111 @@ async fn connect_mcp_server_inner(
         tool_refresh_lock: Some(tool_refresh_lock.clone()),
         lease: Some(lease.clone()),
         client: Some(client.clone()),
+        lazy_stdio: None,
         call_timeout_ms,
     };
 
-    // Mid-session tool re-discovery: subscribe to `tools/list_changed` when the
-    // server declares it can change its tool list. A monotonic generation guard
-    // makes the LATEST-fired relist the only one allowed to commit.
-    if server_capabilities_tools_list_changed(&client) {
-        let gen = Arc::new(AtomicI64::new(0));
-        let handler_client = client.clone();
-        let server_name = name.clone();
-        let config_for_relist = tool_config.clone();
-        let raw_for_relist = raw_tools.clone();
-        let weak_lease = Arc::downgrade(&lease);
-        let weak_tools = Arc::downgrade(&tools_arc);
-        let refresh_lock = tool_refresh_lock.clone();
-        client.set_notification_handler(
-            "notifications/tools/list_changed",
-            Arc::new(move |_params| {
-                let gen = gen.clone();
-                let client = handler_client.clone();
-                let weak_tools = weak_tools.clone();
-                let server_name = server_name.clone();
-                let config_for_relist = config_for_relist.clone();
-                let raw_for_relist = raw_for_relist.clone();
-                let weak_lease = weak_lease.clone();
-                let refresh_lock = refresh_lock.clone();
-                Box::pin(async move {
-                    let g = gen.fetch_add(1, Ordering::SeqCst) + 1;
-                    if let Ok(relisted) = client
-                        .list_tools(RequestOptions {
-                            timeout_ms: connect_timeout_ms,
-                            ..Default::default()
-                        })
-                        .await
-                    {
-                        if g == gen.load(Ordering::SeqCst) {
-                            let _guard = refresh_lock.lock().unwrap();
-                            if g != gen.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            let (Some(lease), Some(tools_arc)) =
-                                (weak_lease.upgrade(), weak_tools.upgrade())
-                            else {
-                                return;
-                            };
-                            *raw_for_relist.lock().unwrap() = relisted.clone();
-                            let config = config_for_relist.lock().unwrap().clone();
-                            let wrapped = wrap_listed(
-                                &client,
-                                &server_name,
-                                call_timeout_ms,
-                                config_always_load(&config),
-                                relisted,
-                                &config,
-                                lease,
-                            );
-                            *tools_arc.lock().unwrap() = wrapped;
-                        }
-                    }
-                }) as BoxFuture<'static, ()>
-            }),
-        );
-    }
+    install_tools_list_changed_listener(
+        &client,
+        &lease,
+        &tools_arc,
+        &raw_tools,
+        &tool_config,
+        &tool_refresh_lock,
+        name,
+        connect_timeout_ms,
+        call_timeout_ms,
+        stdio_cache,
+    );
 
     managed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_tools_list_changed_listener(
+    client: &Client,
+    lease: &Arc<ClientLease>,
+    tools_arc: &Arc<Mutex<Vec<Arc<dyn Tool>>>>,
+    raw_tools: &Arc<Mutex<Vec<McpToolDescriptor>>>,
+    tool_config: &Arc<Mutex<McpServerConfig>>,
+    tool_refresh_lock: &Arc<Mutex<()>>,
+    server_name: String,
+    connect_timeout_ms: u64,
+    call_timeout_ms: u64,
+    stdio_cache: Option<(StdioCatalogCache, String)>,
+) {
+    if !server_capabilities_tools_list_changed(client) {
+        return;
+    }
+    let gen = Arc::new(AtomicI64::new(0));
+    let handler_client = client.clone();
+    let config_for_relist = tool_config.clone();
+    let raw_for_relist = raw_tools.clone();
+    let weak_lease = Arc::downgrade(lease);
+    let weak_tools = Arc::downgrade(tools_arc);
+    let refresh_lock = tool_refresh_lock.clone();
+    client.set_notification_handler(
+        "notifications/tools/list_changed",
+        Arc::new(move |_params| {
+            let gen = gen.clone();
+            let client = handler_client.clone();
+            let weak_tools = weak_tools.clone();
+            let server_name = server_name.clone();
+            let config_for_relist = config_for_relist.clone();
+            let raw_for_relist = raw_for_relist.clone();
+            let weak_lease = weak_lease.clone();
+            let refresh_lock = refresh_lock.clone();
+            let stdio_cache = stdio_cache.clone();
+            Box::pin(async move {
+                let g = gen.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(relisted) = client
+                    .list_tools(RequestOptions {
+                        timeout_ms: connect_timeout_ms,
+                        ..Default::default()
+                    })
+                    .await
+                {
+                    if g == gen.load(Ordering::SeqCst) {
+                        let applied = {
+                            let _guard = refresh_lock.lock().unwrap();
+                            if g != gen.load(Ordering::SeqCst) {
+                                None
+                            } else if let (Some(lease), Some(tools_arc)) =
+                                (weak_lease.upgrade(), weak_tools.upgrade())
+                            {
+                                *raw_for_relist.lock().unwrap() = relisted.clone();
+                                let config = config_for_relist.lock().unwrap().clone();
+                                let wrapped = wrap_listed(
+                                    &client,
+                                    &server_name,
+                                    call_timeout_ms,
+                                    config_always_load(&config),
+                                    relisted.clone(),
+                                    &config,
+                                    lease,
+                                );
+                                *tools_arc.lock().unwrap() = wrapped;
+                                Some(relisted)
+                            } else {
+                                None
+                            }
+                        };
+                        if let (Some(updated_tools), Some((cache, fingerprint))) =
+                            (applied, stdio_cache)
+                        {
+                            let now = now_ms();
+                            let mut snapshot = cache
+                                .get_fresh(&fingerprint, STDIO_CATALOG_TTL_MS, now)
+                                .await
+                                .unwrap_or_default();
+                            snapshot.tools = updated_tools;
+                            cache.put(&fingerprint, &snapshot, now).await;
+                        }
+                    }
+                }
+            }) as BoxFuture<'static, ()>
+        }),
+    );
 }
 
 fn server_capabilities_has_tools(client: &Client) -> bool {
@@ -1900,6 +2182,22 @@ fn wrap_listed(
     listed: Vec<McpToolDescriptor>,
     config: &McpServerConfig,
     lease: Arc<ClientLease>,
+) -> Vec<Arc<dyn Tool>> {
+    wrap_listed_with_call(
+        make_tool_call(client.clone(), call_timeout_ms, lease),
+        server_name,
+        server_always_load,
+        listed,
+        config,
+    )
+}
+
+fn wrap_listed_with_call(
+    make_call: McpToolCall,
+    server_name: &str,
+    server_always_load: bool,
+    listed: Vec<McpToolDescriptor>,
+    config: &McpServerConfig,
 ) -> Vec<Arc<dyn Tool>> {
     // The server's own tool filter: an allow list first (when set, nothing else
     // is registered), then the deny list of names the user switched off. Filtering
@@ -1940,7 +2238,6 @@ fn wrap_listed(
         &crate::mcp::tool_naming::NormalizeOptions::default(),
     );
 
-    let make_call = make_tool_call(client.clone(), call_timeout_ms, lease);
     let prepared_config = Arc::new(config.clone());
     filtered
         .into_iter()
@@ -1983,6 +2280,34 @@ fn make_tool_call(client: Client, call_timeout_ms: u64, lease: Arc<ClientLease>)
             let client = client.clone();
             let lease = lease.clone();
             Box::pin(async move {
+                let _lease = lease;
+                client
+                    .call_tool(
+                        &name,
+                        Value::Object(args),
+                        call_timeout_ms,
+                        on_progress,
+                        Some(signal),
+                    )
+                    .await
+                    .map_err(|e| ToolError::new(e.message))
+            }) as BoxFuture<'static, Result<McpCallResult, ToolError>>
+        },
+    )
+}
+
+fn make_lazy_tool_call(lazy: Arc<LazyStdioConnection>, call_timeout_ms: u64) -> McpToolCall {
+    Arc::new(
+        move |name: RuntimeString,
+              args: RuntimeObject,
+              on_progress: Option<ToolProgress>,
+              signal: AbortSignal| {
+            let lazy = lazy.clone();
+            Box::pin(async move {
+                let (client, lease) = lazy
+                    .ensure_client(Some(signal.clone()))
+                    .await
+                    .map_err(ToolError::new)?;
                 let _lease = lease;
                 client
                     .call_tool(
@@ -2177,6 +2502,7 @@ fn stated_client(
         tool_refresh_lock: None,
         lease: None,
         client: None,
+        lazy_stdio: None,
         call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
     }
 }
@@ -5330,5 +5656,122 @@ mod tests {
         );
         assert_eq!(router.pending_count(), 0);
         let _ = client.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_catalog_cache_defers_subprocess_spawn_until_first_tool_call() {
+        use crate::mcp::connection_manager::{McpConnectionManager, McpConnectionManagerOptions};
+
+        let dir = std::env::temp_dir().join(format!(
+            "klaus-lazy-stdio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spawns_file = dir.join("spawns.log");
+        let script_file = dir.join("stdio_server.sh");
+        let script = format!(
+            r##"#!/bin/sh
+echo "spawn" >> "{}"
+while IFS= read -r line; do
+  req_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -z "$req_id" ]; then
+    continue
+  fi
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$req_id,\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"lazy-demo\",\"version\":\"0.1.0\"}},\"instructions\":\"Cached instructions.\"}}}}"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$req_id,\"result\":{{\"tools\":[{{\"name\":\"echo\",\"description\":\"Echo tool\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"msg\":{{\"type\":\"string\"}}}}}}}}]}}}}"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$req_id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"live-stdio-reply\"}}]}}}}"
+      ;;
+    *)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$req_id,\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}"
+      ;;
+  esac
+done
+"##,
+            spawns_file.display()
+        );
+        std::fs::write(&script_file, script).unwrap();
+
+        let count_spawns = || -> usize {
+            std::fs::read_to_string(&spawns_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        let config = McpServerConfig::Stdio {
+            name: "lazy".into(),
+            command: "/bin/sh".into(),
+            args: Some(vec![script_file.to_string_lossy().into_owned()]),
+            env: None,
+            options: McpServerOptions::default(),
+        };
+        let opts = ConnectMcpOptions {
+            cwd: Some(RuntimePath::from(dir.to_string_lossy().into_owned())),
+            lazy_stdio_startup: Some(true),
+            tool_catalog_cache_dir: Some(dir.to_string_lossy().into_owned()),
+            ..test_connect_options()
+        };
+
+        // 1. Cold session connects eagerly once and populates the catalog cache.
+        let cold = connect_mcp_server(&config, &opts).await;
+        assert_eq!(cold.state, McpConnectionState::Ready);
+        assert_eq!(count_spawns(), 1);
+        cold.close().await;
+
+        // 2. Warm session serves tools + instructions from cache with zero spawns,
+        //    and closing an unused warm standby client never spawns the subprocess.
+        let warm_unused = connect_mcp_server(&config, &opts).await;
+        assert_eq!(warm_unused.state, McpConnectionState::Ready);
+        assert_eq!(
+            warm_unused.instructions,
+            Some(RuntimeString::from("Cached instructions."))
+        );
+        assert_eq!(warm_unused.tools().len(), 1);
+        assert_eq!(warm_unused.tools()[0].name(), "mcp__lazy__echo");
+        assert_eq!(count_spawns(), 1);
+        warm_unused.close().await;
+        assert_eq!(count_spawns(), 1);
+
+        // 3. Invoking a wrapped tool on a warm client spawns once on demand and
+        //    reuses that live subprocess on subsequent calls.
+        let mut manager = McpConnectionManager::new(
+            crate::runtime_process::test_runtime_process_context(),
+            McpConnectionManagerOptions {
+                connect_options: Some(opts.clone()),
+                ..Default::default()
+            },
+        );
+        manager.connect_all(vec![config.clone()]).await;
+        assert_eq!(count_spawns(), 1);
+        let echo = manager
+            .get_tools()
+            .into_iter()
+            .find(|t| t.name() == "mcp__lazy__echo")
+            .expect("cached echo tool exposed");
+        assert!(call_text(&echo, json!({ "msg": "one" }))
+            .await
+            .contains("live-stdio-reply"));
+        assert_eq!(count_spawns(), 2);
+        assert!(call_text(&echo, json!({ "msg": "two" }))
+            .await
+            .contains("live-stdio-reply"));
+        assert_eq!(count_spawns(), 2);
+
+        // 4. Explicit reconnect bypasses standby cache and dials live.
+        assert_eq!(manager.reconnect("lazy").await, McpConnectionState::Ready);
+        assert_eq!(count_spawns(), 3);
+        manager.shutdown().await;
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

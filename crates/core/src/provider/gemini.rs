@@ -1046,6 +1046,10 @@ fn establish_and_map(
                     for ev in mapper.handle_chunk(&chunk) {
                         yield Ok(ev);
                     }
+                    if let Some(error) = mapper.take_terminal_error() {
+                        yield Err(error);
+                        return;
+                    }
                 }
                 Err(e) => {
                     let error = classify_error(&client.error_details(&e));
@@ -1193,6 +1197,7 @@ pub struct ChunkMapper {
     full_text: RuntimeString,
     grounding: Option<GroundingMetadata>,
     model_fallback: RuntimeString,
+    terminal_error: Option<ProviderError>,
 }
 
 impl ChunkMapper {
@@ -1209,6 +1214,7 @@ impl ChunkMapper {
             full_text: RuntimeString::default(),
             grounding: None,
             model_fallback,
+            terminal_error: None,
         }
     }
 
@@ -1321,15 +1327,40 @@ impl ChunkMapper {
                 }
             }
             if let Some(fr) = &cand.finish_reason {
-                self.stop_reason = map_finish_reason(fr);
-                self.terminal_received |= !fr.is_empty() && fr != "FINISH_REASON_UNSPECIFIED";
+                if let Some(error) =
+                    classify_terminal_finish_reason(fr, cand.finish_message.as_ref())
+                {
+                    self.terminal_error = Some(error);
+                    self.terminal_received = true;
+                } else {
+                    self.stop_reason = map_finish_reason(fr);
+                    self.terminal_received |= !fr.is_empty() && fr != "FINISH_REASON_UNSPECIFIED";
+                }
+            }
+        }
+        if let Some(feedback) = &chunk.prompt_feedback {
+            if feedback
+                .block_reason
+                .as_ref()
+                .is_some_and(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED")
+            {
+                self.stop_reason = ModelStopReason::Refusal;
+                self.terminal_received = true;
             }
         }
         out
     }
 
+    pub fn take_terminal_error(&mut self) -> Option<ProviderError> {
+        self.terminal_error.take()
+    }
+
     pub fn finish(&mut self) -> Vec<ModelStreamEvent> {
         let mut out = Vec::new();
+        if let Some(error) = self.terminal_error.take() {
+            out.push(ModelStreamEvent::Error { error });
+            return out;
+        }
         // Empty stream: synthesize the start so a start/stop pair is always seen.
         if !self.started {
             self.started = true;
@@ -1528,6 +1559,9 @@ fn map_finish_reason(reason: &RuntimeString) -> ModelStopReason {
         "PROHIBITED_CONTENT",
         "SPII",
         "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+        "MODEL_ARMOR",
     ]
     .iter()
     .any(|candidate| reason == *candidate)
@@ -1536,6 +1570,66 @@ fn map_finish_reason(reason: &RuntimeString) -> ModelStopReason {
     } else {
         ModelStopReason::EndTurn
     }
+}
+
+fn classify_terminal_finish_reason(
+    reason: &RuntimeString,
+    finish_message: Option<&RuntimeString>,
+) -> Option<ProviderError> {
+    let kind = if [
+        "ERROR",
+        "FINISH_REASON_ERROR",
+        "MALFORMED_FUNCTION_CALL",
+        "FINISH_REASON_MALFORMED_FUNCTION_CALL",
+        "MALFORMED_RESPONSE",
+        "FINISH_REASON_MALFORMED_RESPONSE",
+        "UNEXPECTED_TOOL_CALL",
+        "FINISH_REASON_UNEXPECTED_TOOL_CALL",
+    ]
+    .iter()
+    .any(|candidate| reason == *candidate)
+    {
+        ProviderErrorKind::Overloaded
+    } else if [
+        "MISSING_THOUGHT_SIGNATURE",
+        "FINISH_REASON_MISSING_THOUGHT_SIGNATURE",
+        "TOO_MANY_TOOL_CALLS",
+        "FINISH_REASON_TOO_MANY_TOOL_CALLS",
+        "ESCALATION",
+        "PUP_LIMITED_DISABLED",
+        "NO_IMAGE",
+        "FINISH_REASON_NO_IMAGE",
+        "IMAGE_OTHER",
+        "FINISH_REASON_IMAGE_OTHER",
+    ]
+    .iter()
+    .any(|candidate| reason == *candidate)
+    {
+        ProviderErrorKind::InvalidRequest
+    } else {
+        return None;
+    };
+
+    let detail = finish_message
+        .map(crate::engine::session::trim_runtime_string)
+        .filter(|msg: &RuntimeString| !msg.is_empty());
+    let prefix = RuntimeString::from("Gemini generation stopped with ").concat(reason);
+    let message = match detail {
+        Some(detail) => prefix.concat(&RuntimeString::from(": ")).concat(&detail),
+        None => prefix,
+    };
+    Some(ProviderError {
+        kind,
+        message,
+        status: None,
+        code: Some(reason.clone()),
+        error_type: None,
+        media_origins: None,
+        media_repair_complete: false,
+        credential_recovery: None,
+        retry_after_ms: None,
+        request_id: None,
+    })
 }
 
 // ---- request building ----
@@ -1592,6 +1686,7 @@ fn build_gemini_request_with_policy(
 ) -> GenerateContentParameters {
     let system_text = join_runtime_strings(req.system.iter().map(|part| &part.text), "\n\n");
     let thinking_config = map_thinking(
+        &req.model,
         caps,
         thinking_dialect,
         req.thinking,
@@ -1668,12 +1763,18 @@ fn to_function_declaration(t: &ToolSpec) -> FunctionDeclaration {
     }
 }
 
+fn is_gemini_4_model(model: &RuntimeString) -> bool {
+    ascii_lowercase(model).contains("gemini-4")
+}
+
 /// Convert the engine's 3-state thinking onto Gemini's family-specific knob,
 /// chosen by the client-declared dialect rather than the model id. The `Level`
-/// dialect (Gemini 3+) uses `thinkingLevel` LOW/HIGH; the `Budget` dialect
+/// dialect uses `thinkingLevel` (`LOW`/`HIGH` on Gemini 3 Pro, and
+/// `MINIMAL`/`LOW`/`MEDIUM`/`HIGH`/`XHIGH` on Gemini 4); the `Budget` dialect
 /// (Gemini 2.5) uses a numeric `thinkingBudget` within its declared range. A
 /// model with no declared thinking capability gets no thinkingConfig.
 fn map_thinking(
+    model: &RuntimeString,
     caps: &ModelCapabilities,
     dialect: GeminiThinkingDialect,
     thinking: Option<ThinkingConfig>,
@@ -1693,9 +1794,25 @@ fn map_thinking(
             // thinking configuration drives the level.
             if !matches!(thinking, Some(ThinkingConfig::Disabled)) {
                 if let Some(level) = native_effort {
-                    let level = match level {
-                        EffortLevel::Low | EffortLevel::Medium => "LOW",
-                        _ => "HIGH",
+                    let level = if is_gemini_4_model(model) {
+                        match level {
+                            EffortLevel::None | EffortLevel::Minimal => "MINIMAL",
+                            EffortLevel::Low => "LOW",
+                            EffortLevel::Medium => "MEDIUM",
+                            EffortLevel::High => "HIGH",
+                            EffortLevel::Xhigh
+                            | EffortLevel::Max
+                            | EffortLevel::Ultra
+                            | EffortLevel::Persistent => "XHIGH",
+                        }
+                    } else {
+                        match level {
+                            EffortLevel::None
+                            | EffortLevel::Minimal
+                            | EffortLevel::Low
+                            | EffortLevel::Medium => "LOW",
+                            _ => "HIGH",
+                        }
                     };
                     return Some(ThinkingConfigWire {
                         include_thoughts: Some(true),
@@ -2535,6 +2652,7 @@ fn decode_code_assist(payload: &RuntimeString) -> Option<GenerateContentResponse
         model_version: inner.model_version,
         candidates: Some(inner.candidates.unwrap_or_default()),
         usage_metadata: inner.usage_metadata,
+        prompt_feedback: inner.prompt_feedback,
     })
 }
 
@@ -2985,6 +3103,7 @@ pub struct GenerateContentResponse {
     pub model_version: Option<RuntimeString>,
     pub candidates: Option<Vec<Candidate>>,
     pub usage_metadata: Option<UsageMetadata>,
+    pub prompt_feedback: Option<PromptFeedback>,
 }
 
 impl RuntimeDecode for GenerateContentResponse {
@@ -2994,6 +3113,44 @@ impl RuntimeDecode for GenerateContentResponse {
                 model_version: object.optional("modelVersion", &[])?,
                 candidates: object.optional("candidates", &[])?,
                 usage_metadata: object.optional("usageMetadata", &[])?,
+                prompt_feedback: object.optional("promptFeedback", &["prompt_feedback"])?,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PromptFeedback {
+    pub block_reason: Option<RuntimeString>,
+    pub block_reason_message: Option<RuntimeString>,
+}
+
+impl RuntimeDecode for PromptFeedback {
+    fn decode_runtime(value: &RuntimeJson) -> Result<Self, RuntimeCodecError> {
+        runtime_codec::decode_object(value, false, |object| {
+            let raw_reason: Option<RuntimeJson> =
+                object.optional("blockReason", &["block_reason"])?;
+            let block_reason = raw_reason.and_then(|raw| {
+                if let Some(text) = raw.as_string() {
+                    Some(text.clone())
+                } else if let Some(code) = raw.as_i64() {
+                    match code {
+                        0 => None,
+                        1 => Some("SAFETY".into()),
+                        2 => Some("OTHER".into()),
+                        3 => Some("BLOCKLIST".into()),
+                        4 => Some("PROHIBITED_CONTENT".into()),
+                        5 => Some("IMAGE_SAFETY".into()),
+                        _ => Some("BLOCKED".into()),
+                    }
+                } else {
+                    None
+                }
+            });
+            Ok(Self {
+                block_reason,
+                block_reason_message: object
+                    .optional("blockReasonMessage", &["block_reason_message"])?,
             })
         })
     }
@@ -3003,6 +3160,7 @@ impl RuntimeDecode for GenerateContentResponse {
 pub struct Candidate {
     pub content: Option<Content>,
     pub finish_reason: Option<RuntimeString>,
+    pub finish_message: Option<RuntimeString>,
     pub grounding_metadata: Option<GroundingMetadata>,
 }
 
@@ -3012,6 +3170,7 @@ impl RuntimeDecode for Candidate {
             Ok(Self {
                 content: object.optional("content", &[])?,
                 finish_reason: object.optional("finishReason", &[])?,
+                finish_message: object.optional("finishMessage", &["finish_message"])?,
                 grounding_metadata: object.optional("groundingMetadata", &[])?,
             })
         })
@@ -3148,6 +3307,7 @@ struct CodeAssistInner {
     candidates: Option<Vec<Candidate>>,
     usage_metadata: Option<UsageMetadata>,
     model_version: Option<RuntimeString>,
+    prompt_feedback: Option<PromptFeedback>,
 }
 
 impl RuntimeDecode for CodeAssistInner {
@@ -3157,6 +3317,7 @@ impl RuntimeDecode for CodeAssistInner {
                 candidates: object.optional("candidates", &[])?,
                 usage_metadata: object.optional("usageMetadata", &[])?,
                 model_version: object.optional("modelVersion", &[])?,
+                prompt_feedback: object.optional("promptFeedback", &["prompt_feedback"])?,
             })
         })
     }
@@ -5758,6 +5919,143 @@ mod tests {
         assert_eq!(
             build_gemini_request(&req, &caps, GeminiThinkingDialect::Level).routing_session_key,
             Some("parent-session:subagent:Explore".into())
+        );
+    }
+
+    #[test]
+    fn gemini_chunk_mapper_classifies_terminal_error_and_refusal_finish_reasons() {
+        for (reason, expected_kind) in [
+            ("MALFORMED_FUNCTION_CALL", ProviderErrorKind::Overloaded),
+            ("ERROR", ProviderErrorKind::Overloaded),
+            ("UNEXPECTED_TOOL_CALL", ProviderErrorKind::Overloaded),
+            (
+                "MISSING_THOUGHT_SIGNATURE",
+                ProviderErrorKind::InvalidRequest,
+            ),
+            ("TOO_MANY_TOOL_CALLS", ProviderErrorKind::InvalidRequest),
+            ("NO_IMAGE", ProviderErrorKind::InvalidRequest),
+        ] {
+            let mut mapper = ChunkMapper::new("gemini-4-pro".into());
+            let payload = runtime_json::parse(&RuntimeString::from(format!(
+                r#"{{"candidates":[{{"finishReason":"{reason}","finishMessage":"detail from backend"}}]}}"#
+            )))
+            .unwrap();
+            let decoded: GenerateContentResponse = runtime_codec::decode_value(&payload).unwrap();
+            let _ = mapper.handle_chunk(&decoded);
+            let err = mapper
+                .take_terminal_error()
+                .unwrap_or_else(|| panic!("expected terminal error for {reason}"));
+            assert_eq!(err.kind, expected_kind, "reason: {reason}");
+            assert_eq!(err.code, Some(RuntimeString::from(reason)));
+            assert!(
+                err.message
+                    .try_to_utf8()
+                    .unwrap()
+                    .contains("detail from backend"),
+                "finishMessage must be preserved: {:?}",
+                err.message
+            );
+        }
+
+        for refusal_reason in [
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+            "MODEL_ARMOR",
+        ] {
+            let mut mapper = ChunkMapper::new("gemini-4-pro".into());
+            let payload = runtime_json::parse(&RuntimeString::from(format!(
+                r#"{{"candidates":[{{"finishReason":"{refusal_reason}"}}]}}"#
+            )))
+            .unwrap();
+            let decoded: GenerateContentResponse = runtime_codec::decode_value(&payload).unwrap();
+            let mut events = mapper.handle_chunk(&decoded);
+            assert!(mapper.take_terminal_error().is_none());
+            events.extend(mapper.finish());
+            assert!(matches!(
+                events.last(),
+                Some(ModelStreamEvent::MessageStop {
+                    stop_reason: ModelStopReason::Refusal,
+                    ..
+                })
+            ));
+        }
+
+        let mut blocked_mapper = ChunkMapper::new("gemini-4-pro".into());
+        let blocked_chunk: GenerateContentResponse = runtime_codec::decode_value(&exact_json!({
+            "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" }
+        }))
+        .unwrap();
+        let mut blocked_events = blocked_mapper.handle_chunk(&blocked_chunk);
+        blocked_events.extend(blocked_mapper.finish());
+        assert!(matches!(
+            blocked_events.last(),
+            Some(ModelStreamEvent::MessageStop {
+                stop_reason: ModelStopReason::Refusal,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gemini_4_level_dialect_maps_native_effort_including_xhigh() {
+        use crate::types::provider::{EffortCapability, ThinkingCapability};
+
+        let mut caps = ModelCapabilities {
+            thinking: Some(ThinkingCapability {
+                adaptive: true,
+                interleaved: true,
+                can_disable_thinking: true,
+            }),
+            effort: Some(EffortCapability {
+                levels: vec![
+                    EffortLevel::Minimal,
+                    EffortLevel::Low,
+                    EffortLevel::Medium,
+                    EffortLevel::High,
+                    EffortLevel::Xhigh,
+                ],
+                default: Some(EffortLevel::High),
+            }),
+            ..Default::default()
+        };
+
+        for (effort, expected) in [
+            (EffortLevel::Minimal, "MINIMAL"),
+            (EffortLevel::Low, "LOW"),
+            (EffortLevel::Medium, "MEDIUM"),
+            (EffortLevel::High, "HIGH"),
+            (EffortLevel::Xhigh, "XHIGH"),
+            (EffortLevel::Max, "XHIGH"),
+        ] {
+            let mut req = base_req();
+            req.model = "gemini-4-pro".into();
+            req.effort = Some(EffortValue::Level(effort));
+            let built = build_gemini_request(&req, &caps, GeminiThinkingDialect::Level);
+            assert_eq!(
+                built
+                    .config
+                    .thinking_config
+                    .and_then(|tc| tc.thinking_level),
+                Some(RuntimeString::from(expected)),
+                "effort: {effort:?}"
+            );
+        }
+
+        // When the model capability ceiling is High (e.g. a Flash variant), Xhigh clamps to HIGH.
+        caps.effort = Some(EffortCapability {
+            levels: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            default: Some(EffortLevel::Medium),
+        });
+        let mut flash_req = base_req();
+        flash_req.model = "gemini-4-flash".into();
+        flash_req.effort = Some(EffortValue::Level(EffortLevel::Xhigh));
+        let built = build_gemini_request(&flash_req, &caps, GeminiThinkingDialect::Level);
+        assert_eq!(
+            built
+                .config
+                .thinking_config
+                .and_then(|tc| tc.thinking_level),
+            Some(RuntimeString::from("HIGH"))
         );
     }
 }

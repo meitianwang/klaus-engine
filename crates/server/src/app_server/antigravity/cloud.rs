@@ -1389,6 +1389,19 @@ fn classify_finish_reason_value(
             0 => (FinishReasonKind::Unspecified, Some(None)),
             1 => (FinishReasonKind::OtherTerminal, Some(Some("STOP"))),
             2 => (FinishReasonKind::MaxTokens, Some(Some("MAX_TOKENS"))),
+            3 => (FinishReasonKind::OtherTerminal, Some(Some("SAFETY"))),
+            4 => (FinishReasonKind::OtherTerminal, Some(Some("RECITATION"))),
+            6 => (FinishReasonKind::OtherTerminal, Some(Some("BLOCKLIST"))),
+            7 => (
+                FinishReasonKind::OtherTerminal,
+                Some(Some("PROHIBITED_CONTENT")),
+            ),
+            8 => (FinishReasonKind::OtherTerminal, Some(Some("SPII"))),
+            9 => (
+                FinishReasonKind::OtherTerminal,
+                Some(Some("MALFORMED_FUNCTION_CALL")),
+            ),
+            10 => (FinishReasonKind::OtherTerminal, Some(Some("IMAGE_SAFETY"))),
             18 => (
                 FinishReasonKind::Continuation,
                 Some(Some("FINISH_REASON_CONTINUATION")),
@@ -1984,6 +1997,7 @@ impl StreamContinuationTracker {
                     parts: Vec::new(),
                 }),
                 finish_reason: Some("MAX_TOKENS".into()),
+                finish_message: None,
                 grounding_metadata: None,
             }]),
             usage_metadata: if self.has_last_usage {
@@ -1991,6 +2005,7 @@ impl StreamContinuationTracker {
             } else {
                 None
             },
+            prompt_feedback: None,
         }
     }
 }
@@ -2341,6 +2356,13 @@ fn adapt_model_request(request: &mut RuntimeJson, details: &Value) -> Result<(),
         == Some(true)
     {
         config.remove("thinkingBudget");
+    }
+    if config
+        .get("thinkingLevel")
+        .and_then(RuntimeJson::as_string)
+        .is_some_and(|level| level == "XHIGH")
+    {
+        config.insert("thinkingLevel", RuntimeJson::String("EXTRA_HIGH".into()));
     }
     Ok(())
 }
@@ -2922,9 +2944,11 @@ impl GeminiClient for CloudClient {
                                         }],
                                     }),
                                     finish_reason: None,
+                                    finish_message: None,
                                     grounding_metadata: None,
                                 }]),
                                 usage_metadata: None,
+                                prompt_feedback: None,
                             });
                         }
                         return;
@@ -2944,9 +2968,11 @@ impl GeminiClient for CloudClient {
                                         }],
                                     }),
                                     finish_reason: None,
+                                    finish_message: None,
                                     grounding_metadata: None,
                                 }]),
                                 usage_metadata: None,
+                                prompt_feedback: None,
                             });
                         }
                         yield Ok(tracker.new_synthetic_max_tokens_response());
@@ -3019,9 +3045,11 @@ impl GeminiClient for CloudClient {
                                                         ],
                                                     }),
                                                     finish_reason: None,
+                                                    finish_message: None,
                                                     grounding_metadata: None,
                                                 }]),
                                                 usage_metadata: None,
+                                                prompt_feedback: None,
                                             });
                                         }
                                         yield Ok(tracker.new_synthetic_max_tokens_response());

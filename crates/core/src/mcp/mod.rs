@@ -22,6 +22,7 @@ pub mod oauth;
 pub mod oauth_provider;
 pub mod persist_blob;
 pub mod runtime_snapshot;
+pub mod stdio_catalog_cache;
 pub mod tool_naming;
 pub mod tool_wrapper;
 pub mod transports;

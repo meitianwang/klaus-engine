@@ -258,6 +258,13 @@ fn unwrap_code_assist(res: &Value) -> Value {
             out.insert("modelVersion", model_version.clone());
         }
     }
+    if let Some(prompt_feedback) =
+        inner.and_then(|i| i.get("promptFeedback").or_else(|| i.get("prompt_feedback")))
+    {
+        if js_truthy(prompt_feedback) {
+            out.insert("promptFeedback", prompt_feedback.clone());
+        }
+    }
     if let Some(trace_id) = res.get("traceId") {
         if js_truthy(trace_id) {
             out.insert("responseId", trace_id.clone());

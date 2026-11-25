@@ -1343,6 +1343,7 @@ impl Session {
                     oauth_redirect_uri: init.mcp_oauth_redirect_uri.clone(),
                     call_timeout_ms: Some(init.config.tool_timeout_ms),
                     mcp_elicitation_router: Some(mcp_elicitation_router.clone()),
+                    lazy_stdio_startup: Some(init.credential_store.is_some()),
                     ..ConnectMcpOptions::new(init.process_context.clone())
                 }),
                 status_observer: Some(mcp_status_observer.clone()),
