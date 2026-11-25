@@ -362,6 +362,18 @@ impl Session {
                 apply_add_rules(&mut self.mode.permission.lock_recover(), &add);
             }
             add @ PermissionUpdate::AddRules { .. } => self.durable_permissions.grant_pending(add),
+            add @ PermissionUpdate::AddDirectories {
+                destination: crate::types::permission::PermissionDestination::Session,
+                ..
+            } => {
+                if self.config.task_resource_scope.is_none() {
+                    crate::permission::permission_update::apply_add_directories(
+                        &mut self.mode.permission.lock_recover(),
+                        &add,
+                    );
+                }
+            }
+            PermissionUpdate::AddDirectories { .. } => {}
         }
     }
 
@@ -435,8 +447,16 @@ impl Session {
                 .bound_task_resource_scope()
                 .map(|scope| scope.writable_roots())
                 .unwrap_or_default();
-        } else if let Some(dir) = self.memory_roots.main() {
-            roots.push(resolve_abs(&RuntimePath::from(dir.clone())));
+        } else {
+            if let Some(dir) = self.memory_roots.main() {
+                roots.push(resolve_abs(&RuntimePath::from(dir.clone())));
+            }
+            for dir in &sp.writable_directories {
+                let resolved = resolve_abs(dir);
+                if !roots.contains(&resolved) {
+                    roots.push(resolved);
+                }
+            }
         }
         PermissionContext {
             allow_rules: sp.allow_rules.clone(),

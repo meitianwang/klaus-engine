@@ -1,9 +1,10 @@
 //! Session-scoped permission-rule accumulation + the "always allow" suggestion.
 
+use crate::engine::session::resolve_abs;
 use crate::permission::bash::split::{
     extract_output_redirections, is_command_list, is_unsafe_compound_command, split_bash_command,
 };
-use crate::runtime_values::RuntimeString;
+use crate::runtime_values::{RuntimePath, RuntimeString};
 use crate::types::permission::{
     PermissionBehavior, PermissionDestination, PermissionRule, PermissionUpdate,
 };
@@ -41,6 +42,7 @@ pub struct SessionPermissionState {
     pub allow_rules: Vec<PermissionRule>,
     pub deny_rules: Vec<PermissionRule>,
     pub ask_rules: Vec<PermissionRule>,
+    pub writable_directories: Vec<RuntimePath>,
 }
 
 /// A fresh, empty session permission state.
@@ -81,7 +83,7 @@ pub fn apply_add_rules(state: &mut SessionPermissionState, update: &PermissionUp
         PermissionUpdate::AddRules {
             rules, behavior, ..
         } => (rules, *behavior),
-        PermissionUpdate::SetMode { .. } => return,
+        PermissionUpdate::AddDirectories { .. } | PermissionUpdate::SetMode { .. } => return,
     };
     let target = match behavior {
         PermissionBehavior::Allow => &mut state.allow_rules,
@@ -92,6 +94,20 @@ pub fn apply_add_rules(state: &mut SessionPermissionState, update: &PermissionUp
         let key = rule_key(rule);
         if !target.iter().any(|r| rule_key(r) == key) {
             target.push(rule.clone());
+        }
+    }
+}
+
+/// Apply an `addDirectories` update to the session state in place, normalizing
+/// each granted directory with `resolve_abs` and deduplicating preserving order.
+pub fn apply_add_directories(state: &mut SessionPermissionState, update: &PermissionUpdate) {
+    let PermissionUpdate::AddDirectories { directories, .. } = update else {
+        return;
+    };
+    for directory in directories {
+        let resolved = resolve_abs(directory);
+        if !state.writable_directories.contains(&resolved) {
+            state.writable_directories.push(resolved);
         }
     }
 }

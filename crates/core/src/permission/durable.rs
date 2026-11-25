@@ -38,6 +38,7 @@ fn parsed(rules: &DurableRules) -> SessionPermissionState {
             .iter()
             .filter_map(|rule| parse_rule_string(rule))
             .collect(),
+        writable_directories: Vec::new(),
     }
 }
 

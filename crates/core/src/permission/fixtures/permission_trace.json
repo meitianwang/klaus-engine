@@ -328,7 +328,16 @@
         },
         "reason": {
           "type": "default"
-        }
+        },
+        "suggestions": [
+          {
+            "type": "addDirectories",
+            "directories": [
+              "/tmp/klaus-permission-trace/outside"
+            ],
+            "destination": "session"
+          }
+        ]
       }
     },
     {

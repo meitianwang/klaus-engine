@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261124_outside_write_directory_grant.rs"]
+mod r20261124_outside_write_directory_grant;
+
 #[path = "regressions/r20261124_prediction_preserves_system_prompt_append.rs"]
 mod r20261124_prediction_preserves_system_prompt_append;
 

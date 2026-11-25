@@ -672,14 +672,17 @@ impl RuntimeDecode for PermissionDestination {
     }
 }
 
-/// A permission change to apply. Scoped to the two
-/// variants the approval flow produces (v1): `addRules` (the "always allow this
-/// command/tool" grant) and `setMode` ("accept edits for this session").
+/// A permission change to apply: `addRules` (tool/command rule grant),
+/// `addDirectories` (session-scoped writable directory grant), or `setMode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionUpdate {
     AddRules {
         rules: Vec<PermissionRule>,
         behavior: PermissionBehavior,
+        destination: PermissionDestination,
+    },
+    AddDirectories {
+        directories: Vec<RuntimePath>,
         destination: PermissionDestination,
     },
     SetMode {
@@ -702,6 +705,15 @@ impl RuntimeEncode for PermissionUpdate {
                 fields.field("destination", destination)?;
                 ("addRules", fields.finish())
             }
+            Self::AddDirectories {
+                directories,
+                destination,
+            } => {
+                let mut fields = RuntimeObjectEncoder::new();
+                fields.field("directories", directories)?;
+                fields.field("destination", destination)?;
+                ("addDirectories", fields.finish())
+            }
             Self::SetMode { mode, destination } => {
                 let mut fields = RuntimeObjectEncoder::new();
                 fields.field("mode", mode)?;
@@ -717,6 +729,7 @@ impl RuntimeDecode for PermissionUpdate {
     fn decode_runtime(value: &RuntimeJson) -> Result<Self, RuntimeCodecError> {
         const VARIANTS: &[RuntimeEnumVariant<'_>] = &[
             RuntimeEnumVariant::new("addRules", &[]),
+            RuntimeEnumVariant::new("addDirectories", &[]),
             RuntimeEnumVariant::new("setMode", &[]),
         ];
         runtime_codec::decode_internal(value, false, "type", &[], VARIANTS, |variant, object| {
@@ -726,7 +739,11 @@ impl RuntimeDecode for PermissionUpdate {
                     behavior: object.required("behavior", &[])?,
                     destination: object.required("destination", &[])?,
                 },
-                1 => Self::SetMode {
+                1 => Self::AddDirectories {
+                    directories: object.required("directories", &[])?,
+                    destination: object.required("destination", &[])?,
+                },
+                2 => Self::SetMode {
                     mode: object.required("mode", &[])?,
                     destination: object.required("destination", &[])?,
                 },

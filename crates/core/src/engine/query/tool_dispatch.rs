@@ -133,7 +133,10 @@ impl RuntimePermissionStamp {
                 PermissionUpdate::SetMode { .. } => return Err("The approval changed the runtime policy; retry this action under the new policy.".into()),
                 PermissionUpdate::AddRules { destination: crate::types::permission::PermissionDestination::Session, .. } => {
                     let mut state = crate::permission::permission_update::SessionPermissionState {
-                        allow_rules: self.allow.clone(), deny_rules: self.deny.clone(), ask_rules: self.ask.clone(),
+                        allow_rules: self.allow.clone(),
+                        deny_rules: self.deny.clone(),
+                        ask_rules: self.ask.clone(),
+                        writable_directories: Vec::new(),
                     };
                     crate::permission::permission_update::apply_add_rules(&mut state, update);
                     self.allow = state.allow_rules;
@@ -141,6 +144,18 @@ impl RuntimePermissionStamp {
                     self.ask = state.ask_rules;
                 }
                 PermissionUpdate::AddRules { .. } => crate::permission::permission_update::apply_add_rules(&mut self.durable, update),
+                PermissionUpdate::AddDirectories {
+                    destination: crate::types::permission::PermissionDestination::Session,
+                    ..
+                } => {
+                    let mut state = crate::permission::permission_update::SessionPermissionState {
+                        writable_directories: self.roots.clone(),
+                        ..Default::default()
+                    };
+                    crate::permission::permission_update::apply_add_directories(&mut state, update);
+                    self.roots = state.writable_directories;
+                }
+                PermissionUpdate::AddDirectories { .. } => {}
             }
         }
         Ok(())
@@ -2110,7 +2125,10 @@ async fn request_approval(
                             rules.retain(|rule| rule.argument_prefix.is_none());
                         }
                     }
-                    updates.retain(|update| !matches!(update, PermissionUpdate::AddRules { rules, .. } if rules.is_empty()));
+                    updates.retain(|update| {
+                        !matches!(update, PermissionUpdate::AddDirectories { .. })
+                            && !matches!(update, PermissionUpdate::AddRules { rules, .. } if rules.is_empty())
+                    });
                 }
                 if !updates.is_empty() {
                     if let Some(cb) = &shared.params.on_permission_update {
@@ -2120,6 +2138,7 @@ async fn request_approval(
                     for update in &updates {
                         let destination = match update {
                             PermissionUpdate::AddRules { destination, .. } => *destination,
+                            PermissionUpdate::AddDirectories { destination, .. } => *destination,
                             PermissionUpdate::SetMode { destination, .. } => *destination,
                         };
                         if destination != crate::types::permission::PermissionDestination::Session {

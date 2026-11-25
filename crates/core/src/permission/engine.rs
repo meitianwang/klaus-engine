@@ -13,15 +13,13 @@ use async_trait::async_trait;
 use dunce::simplified;
 use std::sync::{Arc, OnceLock};
 
-use crate::fs::node_path::resolve_runtime;
+use crate::fs::node_path::{components_runtime, dirname_runtime, resolve_runtime};
 #[cfg(windows)]
-use crate::fs::node_path::{
-    components_runtime, is_absolute_runtime, project_runtime_path, runtime_path_from_native,
-};
+use crate::fs::node_path::{is_absolute_runtime, project_runtime_path, runtime_path_from_native};
 use crate::fs::path_safety::{get_paths_for_permission_check, is_within_roots};
-#[cfg(windows)]
-use crate::fs::sensitive_paths::has_suspicious_path_pattern;
-use crate::fs::sensitive_paths::{classify_sensitive_path, SensitiveClassification};
+use crate::fs::sensitive_paths::{
+    classify_sensitive_path, has_suspicious_path_pattern, SensitiveClassification,
+};
 use crate::permission::bash::decision::{
     evaluate_bash_command, BashDecision, BashDecisionOptions, BashRuleSets,
 };
@@ -38,8 +36,8 @@ use crate::schemas::config::ResolvedConfig;
 use crate::types::errors::ToolError;
 use crate::types::json::Json;
 use crate::types::permission::{
-    ApprovalPolicy, ApprovalPromptKind, ApprovalsReviewer, PermissionMode, PermissionReason,
-    PermissionResult, PermissionRule, PermissionUpdate, SandboxMode,
+    ApprovalPolicy, ApprovalPromptKind, ApprovalsReviewer, PermissionDestination, PermissionMode,
+    PermissionReason, PermissionResult, PermissionRule, PermissionUpdate, SandboxMode,
 };
 use crate::types::sandbox::SandboxKind;
 use crate::types::tool::{PermissionPathKind, Tool, ToolContext};
@@ -687,22 +685,22 @@ impl StaticPermissionEngine {
         // silently grant a write that the captured sandbox would reject.
         if let Some(sandbox_mode) = ctx.sandbox_mode.filter(|_| !ctx.planning_read_only) {
             if !read_only && path_kind == Some(PermissionPathKind::Edit) {
+                let mut workspace_roots = Vec::new();
                 let permitted = match sandbox_mode {
                     SandboxMode::DangerFullAccess => true,
                     SandboxMode::ReadOnly => false,
                     SandboxMode::WorkspaceWrite => {
-                        let mut roots = Vec::new();
                         for root in std::iter::once(&ctx.cwd)
                             .chain(ctx.permission.additional_writable_roots.iter())
                         {
-                            roots.extend(get_paths_for_permission_check(root).await);
+                            workspace_roots.extend(get_paths_for_permission_check(root).await);
                         }
                         file_paths.as_ref().is_some_and(|paths| {
                             !paths.deny_ask.is_empty()
                                 && paths
                                     .deny_ask
                                     .iter()
-                                    .all(|path| is_within_roots(path, &roots))
+                                    .all(|path| is_within_roots(path, &workspace_roots))
                         })
                     }
                 };
@@ -720,7 +718,22 @@ impl StaticPermissionEngine {
                         reason: PermissionReason::Default,
                     }
                 } else {
-                    PermissionDecision::Ask { message: "This write exceeds the current filesystem policy. Allow this operation?".into(), input: input.clone(), reason: PermissionReason::Default, suggestions: None }
+                    let suggestions = if sandbox_mode == SandboxMode::WorkspaceWrite
+                        && scope.is_none()
+                        && ctx.permission.pinned_memory_root.is_none()
+                        && !raw_path_values(tool, input, None).is_empty()
+                    {
+                        suggest_outside_write_directories(file_paths.as_ref(), &workspace_roots)
+                            .await
+                    } else {
+                        None
+                    };
+                    PermissionDecision::Ask {
+                        message: "This write exceeds the current filesystem policy. Allow this operation?".into(),
+                        input: input.clone(),
+                        reason: PermissionReason::Default,
+                        suggestions,
+                    }
                 };
             }
             if sandbox_mode == SandboxMode::DangerFullAccess && ask_message_self.is_none() {
@@ -1228,6 +1241,125 @@ fn suggestions_for(
     command: Option<&str>,
 ) -> Option<Vec<PermissionUpdate>> {
     suggest_rule_for_ask(&permission_prompt_text(tool_name), command).map(|s| vec![s])
+}
+
+/// Derive a session-scoped directory grant (`addDirectories`) for outside-workspace
+/// file edits when every out-of-workspace target resolves cleanly within a non-broad,
+/// non-sensitive parent directory.
+async fn suggest_outside_write_directories(
+    file_paths: Option<&FilePaths>,
+    existing_roots: &[RuntimePath],
+) -> Option<Vec<PermissionUpdate>> {
+    let paths = file_paths?;
+    if paths.allow.is_empty() || paths.deny_ask.is_empty() {
+        return None;
+    }
+    let broad_env_roots = collect_broad_env_roots().await;
+    let mut directories: Vec<RuntimePath> = Vec::new();
+    for target in &paths.allow {
+        let target_forms = get_paths_for_permission_check(target).await;
+        if !target_forms.is_empty()
+            && target_forms
+                .iter()
+                .all(|form| is_within_roots(form, existing_roots))
+        {
+            continue;
+        }
+        let parent = dirname_runtime(target);
+        if !is_suggestable_write_directory(&parent, target, &target_forms, &broad_env_roots).await {
+            return None;
+        }
+        if !directories.contains(&parent) {
+            directories.push(parent);
+        }
+    }
+    if directories.is_empty() {
+        return None;
+    }
+    Some(vec![PermissionUpdate::AddDirectories {
+        directories,
+        destination: PermissionDestination::Session,
+    }])
+}
+
+async fn collect_broad_env_roots() -> Vec<RuntimePath> {
+    let mut out = Vec::new();
+    for key in ["HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP"] {
+        let Some(raw) = std::env::var(key).ok().filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        let path = RuntimePath::from(raw);
+        for form in get_paths_for_permission_check(&path).await {
+            if !out.contains(&form) {
+                out.push(form);
+            }
+        }
+    }
+    out
+}
+
+async fn is_suggestable_write_directory(
+    parent: &RuntimePath,
+    target: &RuntimePath,
+    target_forms: &[RuntimePath],
+    broad_env_roots: &[RuntimePath],
+) -> bool {
+    if parent.as_runtime_string().is_empty() || parent == target {
+        return false;
+    }
+    if has_suspicious_path_pattern(parent) || has_sensitive_directory_segment(parent) {
+        return false;
+    }
+    let parent_forms = get_paths_for_permission_check(parent).await;
+    if parent_forms.is_empty() {
+        return false;
+    }
+    for form in &parent_forms {
+        if is_broad_shared_directory(form, broad_env_roots)
+            || has_suspicious_path_pattern(form)
+            || has_sensitive_directory_segment(form)
+        {
+            return false;
+        }
+    }
+    !target_forms.is_empty()
+        && target_forms
+            .iter()
+            .all(|form| is_within_roots(form, &parent_forms))
+}
+
+fn has_sensitive_directory_segment(path: &RuntimePath) -> bool {
+    const SENSITIVE_SEGMENTS: &[&str] = &[
+        ".git", ".vscode", ".idea", ".klaus", ".ssh", ".gnupg", ".aws", ".kube",
+    ];
+    components_runtime(path).iter().any(|segment| {
+        SENSITIVE_SEGMENTS
+            .iter()
+            .any(|expected| runtime_ascii_name_eq(segment, expected))
+    })
+}
+
+fn is_broad_shared_directory(path: &RuntimePath, broad_env_roots: &[RuntimePath]) -> bool {
+    let up_one = dirname_runtime(path);
+    // Reject filesystem root (`/`, `C:\`, UNC share root) and depth-1 system roots
+    // directly beneath it (`/tmp`, `/etc`, `/var`, `/Users`, `/home`, `C:\Users`, etc.).
+    if &up_one == path || dirname_runtime(&up_one) == up_one {
+        return true;
+    }
+    if broad_env_roots.contains(path) {
+        return true;
+    }
+    const SHARED_ROOTS: &[&str] = &[
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/private/var/tmp",
+        "/private/etc",
+        "/var/tmp",
+    ];
+    SHARED_ROOTS
+        .iter()
+        .any(|shared| runtime_ascii_name_eq(path.as_runtime_string(), shared))
 }
 
 /// Project the bash-tool rules to the splitter's entries (content = the `Bash(...)`
