@@ -2402,10 +2402,16 @@ fn leading_newlines_capped(text: &RuntimeString) -> usize {
 /// together, incoming structured envelopes keep their exact leading prefix,
 /// and no whitespace-only `Part` is introduced.
 fn separate_adjacent_text_parts(prev_parts: &mut [Part], next_parts: &mut [Part]) {
-    let Some(prev) = prev_parts.last_mut().filter(|part| is_plain_text_part(part)) else {
+    let Some(prev) = prev_parts
+        .last_mut()
+        .filter(|part| is_plain_text_part(part))
+    else {
         return;
     };
-    let Some(next) = next_parts.first_mut().filter(|part| is_plain_text_part(part)) else {
+    let Some(next) = next_parts
+        .first_mut()
+        .filter(|part| is_plain_text_part(part))
+    else {
         return;
     };
     let (Some(prev_text), Some(next_text)) = (prev.text.as_mut(), next.text.as_mut()) else {
@@ -4826,12 +4832,22 @@ mod tests {
                 user(vec![text_part(next)]),
             ]);
             assert_eq!(
-                out[0].parts[0].text.as_ref().unwrap().try_to_utf8().unwrap(),
+                out[0].parts[0]
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .try_to_utf8()
+                    .unwrap(),
                 expected_prev,
                 "boundary ({prev:?}, {next:?})"
             );
             assert_eq!(
-                out[0].parts[1].text.as_ref().unwrap().try_to_utf8().unwrap(),
+                out[0].parts[1]
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .try_to_utf8()
+                    .unwrap(),
                 next,
                 "incoming part must stay verbatim for ({prev:?}, {next:?})"
             );
