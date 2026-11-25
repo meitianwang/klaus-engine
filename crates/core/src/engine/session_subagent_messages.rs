@@ -1151,7 +1151,7 @@ impl Session {
             let launch = request.trigger_turn && !worker.running;
             if launch {
                 // Message-driven continuation is detached even for an originally foreground child.
-                worker.notify_completion = true;
+                worker.notify_completion = worker.observable;
                 worker.running = true;
                 worker.abort = CancellationToken::new();
             }
@@ -1919,6 +1919,11 @@ impl Session {
                 .or(known_record);
             // Only malformed or missing authority metadata is permanent; transport availability is retried.
             let name = saved_name;
+            let observable = creation_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("observable"))
+                .and_then(RuntimeJson::as_bool)
+                .unwrap_or(true);
             let builtin = creation_metadata.as_ref().and_then(|metadata| {
                 required::<Option<RuntimeString>>(metadata, "builtinIdentity")
                     .ok()
@@ -1943,7 +1948,7 @@ impl Session {
                     loaded: None,
                     locally_evicted: false,
                     evicted_capabilities: None,
-                    observable: true,
+                    observable,
                     terminal_status: None,
                     residency_config: None,
 
@@ -1968,13 +1973,13 @@ impl Session {
                         .unwrap_or(0)
                         .max(cancel_generation),
                     cancel_receipts: Vec::new(),
-                    notify_completion: true,
+                    notify_completion: observable,
                     event_followers: Vec::new(),
                     worktree: None,
                 },
             );
             // Incomplete authority is a refusal target, not a fabricated completion handle.
-            if bindings_restored {
+            if bindings_restored && observable {
                 // Publish the handle with the lifecycle record's REAL terminal
                 // state, not a hardcoded "completed". A task the restart caught
                 // mid-flight is Interrupted: its process is gone, it will never
@@ -2238,6 +2243,12 @@ impl Session {
                 return Err("The original direct-parent binding changed.".into());
             }
             let mut metadata = snapshot.encode(&worker.bindings.spawn_turn_id)?;
+            if !worker.observable {
+                metadata
+                    .as_object_mut()
+                    .expect("creation metadata object")
+                    .insert("observable", RuntimeJson::Bool(false));
+            }
             if !worker.committed {
                 metadata
                     .as_object_mut()
@@ -2677,7 +2688,7 @@ impl Session {
             activation: Notify::new(),
             publication: Mutex::new(None),
             owner_started: AtomicBool::new(false),
-            observable: opts.memory_dir.is_none(),
+            observable: opts.memory_dir.is_none() && opts.orchestration_guard.is_none(),
             cleanup_token: Mutex::new(Some(runtime.pending_cleanup.token())),
         });
         let pending = PendingCreation {
@@ -2696,7 +2707,7 @@ impl Session {
                     loaded: Some(Arc::new(tokio::sync::RwLock::new(()))),
                     locally_evicted: false,
                     evicted_capabilities: None,
-                    observable: opts.memory_dir.is_none(),
+                    observable: opts.memory_dir.is_none() && opts.orchestration_guard.is_none(),
                     terminal_status: None,
                     residency_config: Some(inference.bundle.config.clone()),
 
@@ -2799,13 +2810,15 @@ impl Session {
             if worker.user_cancelled || worker.abort.is_cancelled() {
                 return Err("A newer cancellation superseded this continuation.".into());
             }
-            self.publish_ordinary_handle(
-                id,
-                worker.abort.clone(),
-                BackgroundTaskStatus::Running,
-                RuntimeString::default(),
-                &worker.bindings,
-            );
+            if worker.observable {
+                self.publish_ordinary_handle(
+                    id,
+                    worker.abort.clone(),
+                    BackgroundTaskStatus::Running,
+                    RuntimeString::default(),
+                    &worker.bindings,
+                );
+            }
         }
         let this = self.clone();
         let id = id.to_owned();
@@ -2831,7 +2844,13 @@ impl Session {
                     .as_ref()
                     .and_then(|(_, _, run)| run.collaboration_mode)
                     .unwrap_or_else(|| self.planning.mode());
-                let (abort, initiating_turn_id, parent_agent_id, resumed_orchestration_guard) = {
+                let (
+                    abort,
+                    initiating_turn_id,
+                    parent_agent_id,
+                    resumed_orchestration_guard,
+                    worker_observable,
+                ) = {
                     let mut state = runtime.state.lock_recover();
                     let worker = state.workers.get_mut(&id).expect("published worker");
                     (
@@ -2839,6 +2858,7 @@ impl Session {
                         worker.bindings.spawn_turn_id.clone(),
                         worker.bindings.parent_agent_id.clone(),
                         worker.orchestration_guard.take(),
+                        worker.observable,
                     )
                 };
                 // Each run owns its partial output. Earlier completed answers
@@ -2865,7 +2885,13 @@ impl Session {
                         }
                         Err(error)
                     }
-                    (Ok(()), Some((opts, permission, run))) => Ok((opts, permission, run, depth)),
+                    (Ok(()), Some((opts, permission, mut run))) => {
+                        run.observable_override = Some(worker_observable);
+                        if !worker_observable {
+                            run.lifecycle_kind = None;
+                        }
+                        Ok((opts, permission, run, depth))
+                    }
                     (Ok(()), None) => {
                         match self.ordinary_snapshot_for_recovery(&id, true, false).await {
                             Ok(snapshot) => match self.begin_inference_activity() {
@@ -2905,7 +2931,9 @@ impl Session {
                                             parent_agent_id: snapshot.parent_agent_id.clone(),
                                             initiating_turn_id,
                                             task_plan: Some(snapshot.task_plan.fork()),
-                                            lifecycle_kind: Some(SubagentKind::Background),
+                                            observable_override: Some(worker_observable),
+                                            lifecycle_kind: worker_observable
+                                                .then_some(SubagentKind::Background),
                                             ..Default::default()
                                         },
                                         snapshot.depth,
@@ -3152,32 +3180,36 @@ impl Session {
                     let mut notice = None;
                     if again {
                         worker.abort = CancellationToken::new();
-                        worker.notify_completion = true;
-                        self.publish_ordinary_handle(
-                            &id,
-                            worker.abort.clone(),
-                            BackgroundTaskStatus::Running,
-                            RuntimeString::default(),
-                            &worker.bindings,
-                        );
+                        worker.notify_completion = worker.observable;
+                        if worker.observable {
+                            self.publish_ordinary_handle(
+                                &id,
+                                worker.abort.clone(),
+                                BackgroundTaskStatus::Running,
+                                RuntimeString::default(),
+                                &worker.bindings,
+                            );
+                        }
                     } else {
                         worker.running = false;
                         let expect_notice =
                             worker.notify_completion && !aborted && !abort.is_cancelled();
-                        self.publish_ordinary_handle_with_notice(
-                            &id,
-                            worker.abort.clone(),
-                            if aborted || abort.is_cancelled() {
-                                BackgroundTaskStatus::Interrupted
-                            } else if failure.is_some() {
-                                BackgroundTaskStatus::Failed
-                            } else {
-                                BackgroundTaskStatus::Completed
-                            },
-                            RuntimeString::default(),
-                            &worker.bindings,
-                            expect_notice,
-                        );
+                        if worker.observable {
+                            self.publish_ordinary_handle_with_notice(
+                                &id,
+                                worker.abort.clone(),
+                                if aborted || abort.is_cancelled() {
+                                    BackgroundTaskStatus::Interrupted
+                                } else if failure.is_some() {
+                                    BackgroundTaskStatus::Failed
+                                } else {
+                                    BackgroundTaskStatus::Completed
+                                },
+                                RuntimeString::default(),
+                                &worker.bindings,
+                                expect_notice,
+                            );
+                        }
                         if expect_notice {
                             notice = self.take_background_completion_notice(&id);
                             if notice.is_none() {

@@ -1203,8 +1203,10 @@ impl Session {
         mut run_opts: RunSubAgentOpts,
     ) -> EngineEventStream {
         self.capture_subagent_goal_lease(&agent_id, &mut run_opts);
-        let observable = opts.memory_dir.is_none();
-        if !observable {
+        let subagent_observable = opts.memory_dir.is_none()
+            && opts.orchestration_guard.is_none()
+            && run_opts.observable_override.unwrap_or(true);
+        if opts.memory_dir.is_some() {
             // Private memory maintenance keeps its independent admission lifetime.
             return self.run_sub_agent_inner(
                 opts,
@@ -1331,7 +1333,7 @@ impl Session {
                 this.finish_external_subagent(&identity, &admission).await;
             }
         });
-        if observable {
+        if subagent_observable {
             self.observe_subagent_stream(observed_id, events)
         } else {
             events
@@ -1362,7 +1364,10 @@ impl Session {
                     self.runtime_capability_snapshot_for_turn(&super::TurnOptions::default()),
                 )
             });
-        let observable = opts.memory_dir.is_none();
+        let memory_dir_is_none = opts.memory_dir.is_none();
+        let observable = memory_dir_is_none
+            && opts.orchestration_guard.is_none()
+            && run_opts.observable_override.unwrap_or(true);
         let goal_lease = run_opts.goal_lease.take().unwrap_or_else(|| {
             self.goal_runtime().map(|goal| {
                 Arc::new(
@@ -1432,7 +1437,7 @@ impl Session {
                 Some(snapshot) => capture.with_bundle(snapshot.bundle.clone()),
                 None => capture,
             };
-            if observable && !run_opts.execution_checked {
+            if memory_dir_is_none && !run_opts.execution_checked {
                 if let Err(error) = this.governor.check_execution_capacity(Some(&parent_signal)) {
                     yield EngineEvent::TurnFailed { inference: None, error: internal_err(&error.to_string()) };
                     return;
@@ -2027,8 +2032,8 @@ impl Session {
                 &bundle,
                 &child_swarm,
                 fork_path,
-                opts.memory_dir.is_none(),
-                opts.memory_dir.is_none(),
+                memory_dir_is_none,
+                observable,
                 &child_tools,
                 skill_catalog.clone(),
                 &child_file_state,
@@ -2304,7 +2309,7 @@ impl Session {
             }
             // Execution ownership begins with the running task, independently
             // from the earlier read-only creation capacity check.
-            let _release_guard = SlotGuard(observable.then(|| this.governor.admit_turn()));
+            let _release_guard = SlotGuard(memory_dir_is_none.then(|| this.governor.admit_turn()));
             if opts.memory_dir.is_none() {
                 for prompt in &initial_prompts {
                     this.publish_subagent_prompt(&effective_agent_id, prompt);
@@ -2534,7 +2539,7 @@ impl Session {
                     let bundle = bundle.clone();
                     Arc::new(move || bundle.clone())
                 })),
-                multi_agent_instructions: observable,
+                multi_agent_instructions: memory_dir_is_none,
                 thread_id: this.id.concat(&sub_thread_suffix),
                 turn_id: child_turn_id.clone(),
                 model: child_model.clone(),

@@ -3593,8 +3593,51 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
     }
     let probe = gate();
     probe.release.add_permits(31);
-    let fixture = IsolatedHardeningFixture::new(turns, vec![probe.clone()]);
-    let session = &fixture.session;
+    let root_guard = HardeningConfigRoot::new();
+    let root = root_guard.path();
+    let store = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+        dir: Some(root.to_str().unwrap().to_owned()),
+        archive_dir: None,
+    }));
+    let rollout: RolloutSink = Arc::from(
+        store
+            .create(SessionMeta {
+                id: "s1".into(),
+                created_at: 1,
+                cwd: runtime_path_from_host_path(root).into_runtime_string(),
+                model: "fake-model".into(),
+                title: None,
+                originator: None,
+                cli_version: None,
+                source: None,
+                role: None,
+                parent_thread_id: None,
+                forked_from_id: None,
+                git: None,
+                host_metadata: None,
+            })
+            .await
+            .unwrap(),
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let make_session = |turns, rollout| {
+        let mut config = default_config();
+        config.agent_memory = false;
+        config.memory_recall = false;
+        config.fork = false;
+        mk_session_with_provider_memory_store_and_agents(
+            Arc::new(fake_provider()),
+            unique_subagent_test_deps(recording_deps(requests.clone(), turns)),
+            config,
+            vec![probe.clone()],
+            None,
+            rollout,
+            Some(store.clone()),
+            None,
+            None,
+        )
+    };
+    let session = make_session(turns, Some(rollout));
     let mut ctx = crate::tools::builtins::test_ctx::make_ctx("/tmp");
     ctx.permission = session.permission_context();
     ctx.background_tasks = Some(session.background_task_registry());
@@ -3607,11 +3650,26 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
         None,
         None,
     ));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    ctx.emit = Arc::new(move |event| {
+        sink.lock().unwrap().push(event);
+        Box::pin(async {})
+    });
     let first = session
         .run_orchestration_stage_for_test(&ctx, None)
         .await
         .unwrap();
     let first = first.serializable.output;
+    assert!(session.background_agent_summaries().is_empty());
+    assert_eq!(
+        first.get("kind"),
+        Some(&RuntimeJson::from("orchestrated_stage"))
+    );
+    assert!(first
+        .get("items")
+        .and_then(RuntimeJson::as_array)
+        .is_some_and(|items| !items.is_empty()));
     assert_eq!(
         first.get("stopReason"),
         Some(&RuntimeJson::from("stage_checkpoint_reached")),
@@ -3619,12 +3677,13 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
     );
     assert_eq!(first.get("stepsUsed"), Some(&RuntimeJson::from(30_i64)));
     let id = first.get("agentId").and_then(RuntimeJson::as_str).unwrap();
-    let resume_index = fixture.requests.lock().unwrap().len();
+    let resume_index = requests.lock().unwrap().len();
     let resumed = session
         .run_orchestration_stage_for_test(&ctx, Some(id.clone()))
         .await
         .unwrap();
     let resumed = resumed.serializable.output;
+    assert!(session.background_agent_summaries().is_empty());
     assert_eq!(resumed.get("agentId"), first.get("agentId"));
     assert_eq!(
         resumed.get("stopReason"),
@@ -3633,13 +3692,75 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
     );
     assert_eq!(resumed.get("stepsUsed"), Some(&RuntimeJson::from(1_i64)));
     assert_eq!(probe.permissions.lock().unwrap().len(), 31);
-    let requests = fixture.requests.lock().unwrap();
-    let system_role = crate::engine::session::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE;
-    assert!(requests[0].system.iter().any(|part| part
-        .text
-        .try_to_utf8()
+    use crate::types::events::ToolDomainEvent;
+    {
+        let events = captured.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+        ToolDomainEvent::OrchestratorStageProgress { event, .. }
+            if matches!(event.as_ref(), EngineEvent::TextDelta { phase: Some(phase), .. } if phase == &RuntimeString::from("commentary"))
+    )));
+        assert!(events.iter().all(|event| matches!(event,
+        ToolDomainEvent::OrchestratorStageProgress { event, .. }
+            if !matches!(event.as_ref(), EngineEvent::TurnStarted { .. } | EngineEvent::TurnCompleted { .. } | EngineEvent::TurnFailed { .. } | EngineEvent::Notification { .. })
+    )));
+        let observed_requests = requests.lock().unwrap();
+        let system_role = crate::engine::session::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE;
+        assert!(observed_requests[0].system.iter().any(|part| part
+            .text
+            .try_to_utf8()
+            .unwrap()
+            .contains(system_role)));
+        assert_eq!(
+            observed_requests[0].system,
+            observed_requests[resume_index].system
+        );
+        assert_eq!(
+            observed_requests[0].tools,
+            observed_requests[resume_index].tools
+        );
+    }
+    assert!(session
+        .turn_index
+        .lock()
         .unwrap()
-        .contains(system_role)));
-    assert_eq!(requests[0].system, requests[resume_index].system);
-    assert_eq!(requests[0].tools, requests[resume_index].tools);
+        .agent_notifications
+        .is_empty());
+    drop(ctx);
+    session.shutdown_and_wait().await.unwrap();
+    let parent = store.read_thread("s1").await.unwrap();
+    assert!(parent
+        .raw_items
+        .iter()
+        .all(|item| !matches!(item, RolloutItem::SubagentLifecycle(_))));
+    let cold = make_session(vec![text_turn("cold stage done")], None);
+    assert!(cold.background_agent_summaries().is_empty());
+    let mut ctx = crate::tools::builtins::test_ctx::make_ctx("/tmp");
+    ctx.permission = cold.permission_context();
+    ctx.background_tasks = Some(cold.background_task_registry());
+    ctx.spawn_sub_agent = Some(cold.make_spawn_sub_agent(
+        0,
+        CancellationToken::new(),
+        ctx.permission.clone(),
+        Arc::new(Vec::new),
+        false,
+        None,
+        None,
+    ));
+    let output = cold
+        .run_orchestration_stage_for_test(&ctx, Some(id.clone()))
+        .await
+        .unwrap()
+        .serializable
+        .output;
+    assert_eq!(output.get("ok"), Some(&RuntimeJson::Bool(true)));
+    assert_eq!(output.get("agentId"), first.get("agentId"));
+    assert!(cold.background_agent_summaries().is_empty());
+    assert!(cold
+        .turn_index
+        .lock()
+        .unwrap()
+        .agent_notifications
+        .is_empty());
+    drop(ctx);
+    cold.shutdown_and_wait().await.unwrap();
 }

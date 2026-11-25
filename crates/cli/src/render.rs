@@ -401,7 +401,8 @@ fn tool_event(painter: &Painter, event: &ToolDomainEvent) -> Rendered {
         // A sub-agent's own event stream. Inlining it interleaves two turns'
         // worth of output with no way to tell them apart; the transcript is
         // available through `klaus subagent transcript`.
-        ToolDomainEvent::AgentProgress { .. } => Rendered::Nothing,
+        ToolDomainEvent::AgentProgress { .. }
+        | ToolDomainEvent::OrchestratorStageProgress { .. } => Rendered::Nothing,
         // Browser steps are a UI affordance for a windowed host, not a log.
         ToolDomainEvent::Browser { .. } => Rendered::Nothing,
         // Desktop hosts project this state edge into their Spec control. The CLI
@@ -571,6 +572,9 @@ fn permission_update(
     let body = match update {
         PermissionUpdate::SetMode { mode, .. } => format!("mode {}", wire_tag(mode)),
         PermissionUpdate::AddRules { rules, .. } => format!("{} rule(s) added", rules.len()),
+        PermissionUpdate::AddDirectories { directories, .. } => {
+            format!("{} director(ies) added", directories.len())
+        }
     };
     bullet(
         painter,

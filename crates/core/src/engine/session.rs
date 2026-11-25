@@ -1252,7 +1252,10 @@ fn collect_file_changes<'a>(event: &'a EngineEvent, out: &mut Vec<&'a FileChange
     if let EngineEvent::ToolEvent { event, .. } = event {
         match event {
             ToolDomainEvent::FileChange { change } => out.push(change),
-            ToolDomainEvent::AgentProgress { event, .. } => collect_file_changes(event, out),
+            ToolDomainEvent::AgentProgress { event, .. }
+            | ToolDomainEvent::OrchestratorStageProgress { event, .. } => {
+                collect_file_changes(event, out)
+            }
             _ => {}
         }
     }

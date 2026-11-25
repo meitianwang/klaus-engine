@@ -1120,6 +1120,7 @@ pub(crate) struct PreparedSubagentConfig {
 /// Options for `run_sub_agent` (the per-run knobs beyond the spawn options).
 #[derive(Default)]
 pub(crate) struct RunSubAgentOpts {
+    pub(crate) observable_override: Option<bool>,
     pub(crate) prepared: Option<PreparedSubagentConfig>,
     pub(crate) creation_admission: Option<Arc<subagent_messages::OrdinaryCreationAdmission>>,
     pub(crate) execution_checked: bool,

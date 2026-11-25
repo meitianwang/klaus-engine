@@ -692,6 +692,10 @@ pub enum ToolDomainEvent {
         agent_id: RuntimeJson,
         event: Box<EngineEvent>,
     },
+    OrchestratorStageProgress {
+        agent_id: RuntimeJson,
+        event: Box<EngineEvent>,
+    },
     /// Browser runtime progress/log/artifact events emitted by browser_* tools.
     Browser {
         event: BrowserRuntimeEvent,
@@ -747,6 +751,11 @@ impl RuntimeEncode for ToolDomainEvent {
                 object.field("event", event)?;
                 "agent_progress"
             }
+            Self::OrchestratorStageProgress { agent_id, event } => {
+                object.field("agentId", agent_id)?;
+                object.field("event", event)?;
+                "orchestrator_stage_progress"
+            }
             Self::Browser { event } => {
                 object.field("event", event)?;
                 "browser"
@@ -795,6 +804,7 @@ impl RuntimeDecode for ToolDomainEvent {
             RuntimeEnumVariant::new("plan_mode_changed", &[]),
             RuntimeEnumVariant::new("plan_updated", &[]),
             RuntimeEnumVariant::new("orchestrator_fallback", &[]),
+            RuntimeEnumVariant::new("orchestrator_stage_progress", &[]),
         ];
         runtime_codec::decode_internal(value, false, "type", &[], VARIANTS, |variant, object| {
             Ok(match variant {
@@ -832,6 +842,10 @@ impl RuntimeDecode for ToolDomainEvent {
                     failed_model: object.required("failedModel", &[])?,
                     main_model: object.required("mainModel", &[])?,
                     reason: object.required("reason", &[])?,
+                },
+                10 => Self::OrchestratorStageProgress {
+                    agent_id: object.required("agentId", &[])?,
+                    event: object.required("event", &[])?,
                 },
                 _ => unreachable!("closed ToolDomainEvent variant table"),
             })
