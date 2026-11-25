@@ -2345,12 +2345,94 @@ fn replay_retained_parts(parts: &mut Vec<Part>, signature: &RuntimeString) {
     }
 }
 
-/// A tool_use input is a JSON value; Gemini's functionCall.args wants an object.
+fn is_plain_text_part(part: &Part) -> bool {
+    part.text.as_ref().is_some_and(|text| !text.is_empty())
+        && part.thought != Some(true)
+        && part.inline_data.is_none()
+        && part.function_call.is_none()
+        && part.function_response.is_none()
+}
+
+fn trailing_newlines_capped(text: &RuntimeString) -> usize {
+    let units = text.as_utf16();
+    let mut index = units.len();
+    let mut count = 0usize;
+    while count < 2 && index > 0 {
+        if units[index - 1] == b'\n' as u16 {
+            count += 1;
+            index -= 1;
+            if index > 0 && units[index - 1] == b'\r' as u16 {
+                index -= 1;
+            }
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+fn leading_newlines_capped(text: &RuntimeString) -> usize {
+    let units = text.as_utf16();
+    let mut index = 0usize;
+    let mut count = 0usize;
+    while count < 2 && index < units.len() {
+        if units[index] == b'\r' as u16
+            && index + 1 < units.len()
+            && units[index + 1] == b'\n' as u16
+        {
+            count += 1;
+            index += 2;
+        } else if units[index] == b'\n' as u16 {
+            count += 1;
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Gemini concatenates adjacent text `parts` inside a single `Content` with no
+/// delimiter. When merging two same-role `Content`s whose boundary sits between
+/// two plain text parts, append only the missing newlines (up to `\n\n`) onto
+/// the preceding unsigned text part (falling back to prepending onto the
+/// incoming unsigned part if the preceding part carries a `thoughtSignature`)
+/// so separate messages (for example `AGENTS.md` instructions followed by the
+/// user request, or a prompt followed by `<system-reminder>`) never glue
+/// together, incoming structured envelopes keep their exact leading prefix,
+/// and no whitespace-only `Part` is introduced.
+fn separate_adjacent_text_parts(prev_parts: &mut [Part], next_parts: &mut [Part]) {
+    let Some(prev) = prev_parts.last_mut().filter(|part| is_plain_text_part(part)) else {
+        return;
+    };
+    let Some(next) = next_parts.first_mut().filter(|part| is_plain_text_part(part)) else {
+        return;
+    };
+    let (Some(prev_text), Some(next_text)) = (prev.text.as_mut(), next.text.as_mut()) else {
+        return;
+    };
+    let existing = trailing_newlines_capped(prev_text) + leading_newlines_capped(next_text);
+    let separator = match existing {
+        0 => "\n\n",
+        1 => "\n",
+        _ => "",
+    };
+    if separator.is_empty() {
+        return;
+    }
+    if prev.thought_signature.is_none() {
+        *prev_text = prev_text.concat(&RuntimeString::from(separator));
+    } else if next.thought_signature.is_none() {
+        *next_text = RuntimeString::from(separator).concat(next_text);
+    }
+}
+
 fn merge_adjacent_same_role(contents: Vec<Content>) -> Vec<Content> {
     let mut out: Vec<Content> = Vec::new();
-    for c in contents {
+    for mut c in contents {
         if let Some(prev) = out.last_mut() {
             if prev.role == c.role {
+                separate_adjacent_text_parts(&mut prev.parts, &mut c.parts);
                 prev.parts.extend(c.parts);
                 continue;
             }
@@ -4692,7 +4774,226 @@ mod tests {
         assert_eq!(contents.as_array().unwrap().len(), 1);
         assert_eq!(
             contents[0]["parts"],
-            exact_json!([{ "text": "a" }, { "text": "b" }])
+            exact_json!([{ "text": "a\n\n" }, { "text": "b" }])
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_same_role_separates_plain_text_without_mutating_signed_parts() {
+        let text_part = |s: &str| Part {
+            text: Some(s.into()),
+            ..Part::default()
+        };
+        let user = |parts: Vec<Part>| Content {
+            role: "user".into(),
+            parts,
+        };
+
+        // 1. Consecutive plain text messages (e.g. AGENTS.md -> prompt -> reminder)
+        //    terminate each preceding text part with \n\n so incoming prompts and
+        //    structured envelopes keep their exact leading prefix.
+        let merged = merge_adjacent_same_role(vec![
+            user(vec![text_part("AGENTS.md tail.")]),
+            user(vec![text_part("Run health check.")]),
+            user(vec![text_part("<system-reminder>ctx</system-reminder>")]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0]
+                .parts
+                .iter()
+                .map(|p| p.text.as_ref().unwrap().try_to_utf8().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "AGENTS.md tail.\n\n",
+                "Run health check.\n\n",
+                "<system-reminder>ctx</system-reminder>",
+            ]
+        );
+
+        // 2. Existing boundary newlines (LF and CRLF) are respected without over-padding.
+        for (prev, next, expected_prev) in [
+            ("a\n", "b", "a\n\n"),
+            ("a", "\nb", "a\n"),
+            ("a\n", "\nb", "a\n"),
+            ("a\n\n", "b", "a\n\n"),
+            ("a", "\n\nb", "a"),
+            ("a\r\n", "b", "a\r\n\n"),
+            ("a\r\n\r\n", "b", "a\r\n\r\n"),
+        ] {
+            let out = merge_adjacent_same_role(vec![
+                user(vec![text_part(prev)]),
+                user(vec![text_part(next)]),
+            ]);
+            assert_eq!(
+                out[0].parts[0].text.as_ref().unwrap().try_to_utf8().unwrap(),
+                expected_prev,
+                "boundary ({prev:?}, {next:?})"
+            );
+            assert_eq!(
+                out[0].parts[1].text.as_ref().unwrap().try_to_utf8().unwrap(),
+                next,
+                "incoming part must stay verbatim for ({prev:?}, {next:?})"
+            );
+        }
+
+        // 3. Non-text parts (media, thought) stay untouched.
+        let non_text = merge_adjacent_same_role(vec![
+            user(vec![Part {
+                inline_data: Some(InlineData {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }),
+                ..Part::default()
+            }]),
+            user(vec![text_part("describe")]),
+        ]);
+        assert_eq!(
+            non_text[0].parts[1]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "describe"
+        );
+
+        let thought_then_text = merge_adjacent_same_role(vec![
+            Content {
+                role: "model".into(),
+                parts: vec![Part {
+                    text: Some("thinking".into()),
+                    thought: Some(true),
+                    ..Part::default()
+                }],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![text_part("answer")],
+            },
+        ]);
+        assert_eq!(
+            thought_then_text[0].parts[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "thinking"
+        );
+        assert_eq!(
+            thought_then_text[0].parts[1]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "answer"
+        );
+
+        // 4. Signed parts are never mutated: signed prev falls back to prefixing unsigned next;
+        //    unsigned prev suffixes itself and leaves signed next verbatim; two signed parts stay untouched.
+        let signed_prev = merge_adjacent_same_role(vec![
+            Content {
+                role: "model".into(),
+                parts: vec![Part {
+                    text: Some("signed-first".into()),
+                    thought_signature: Some("sig-1".into()),
+                    ..Part::default()
+                }],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![text_part("second")],
+            },
+        ]);
+        assert_eq!(
+            signed_prev[0].parts[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "signed-first"
+        );
+        assert_eq!(
+            signed_prev[0].parts[1]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "\n\nsecond"
+        );
+
+        let signed_next = merge_adjacent_same_role(vec![
+            Content {
+                role: "model".into(),
+                parts: vec![text_part("first")],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![Part {
+                    text: Some("signed-second".into()),
+                    thought_signature: Some("sig-2".into()),
+                    ..Part::default()
+                }],
+            },
+        ]);
+        assert_eq!(
+            signed_next[0].parts[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "first\n\n"
+        );
+        assert_eq!(
+            signed_next[0].parts[1]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "signed-second"
+        );
+
+        let both_signed = merge_adjacent_same_role(vec![
+            Content {
+                role: "model".into(),
+                parts: vec![Part {
+                    text: Some("signed-a".into()),
+                    thought_signature: Some("sig-a".into()),
+                    ..Part::default()
+                }],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![Part {
+                    text: Some("signed-b".into()),
+                    thought_signature: Some("sig-b".into()),
+                    ..Part::default()
+                }],
+            },
+        ]);
+        assert_eq!(
+            both_signed[0].parts[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "signed-a"
+        );
+        assert_eq!(
+            both_signed[0].parts[1]
+                .text
+                .as_ref()
+                .unwrap()
+                .try_to_utf8()
+                .unwrap(),
+            "signed-b"
         );
     }
 
