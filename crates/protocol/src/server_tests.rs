@@ -12809,7 +12809,7 @@ async fn delete_current_session_interrupts_then_disposes_before_removing_rollout
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_title_waits_for_active_turn_before_rewriting_rollout() {
+async fn update_title_uses_the_live_writer_without_waiting_for_active_turn() {
     let dir = unique_temp_dir("title-active-session");
     let store = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
         dir: Some(dir.to_string_lossy().into_owned()),
@@ -12862,32 +12862,30 @@ async fn update_title_waits_for_active_turn_before_rewriting_rollout() {
                 .await
         });
         started.notified().await;
-        let title_client = client.clone();
-        let update = tokio::spawn(async move {
-            title_client
-                .update_title("thread-title".into(), "Updated safely".into())
-                .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            title_calls.load(Ordering::SeqCst),
-            0,
-            "title rewrite raced the active turn"
+        let updated = timeout(
+            Duration::from_secs(2),
+            client.update_title("thread-title".into(), "Updated safely".into()),
+        )
+        .await
+        .expect("title update must finish while the turn is still blocked")
+        .expect("title update");
+        assert_eq!(updated.title, "Updated safely");
+        assert!(
+            !run.is_finished(),
+            "title update must not interrupt the active turn"
         );
-        client.interrupt().await;
-        run.await
-            .expect("run task should settle")
-            .expect("run result");
-        update
-            .await
-            .expect("title task should settle")
-            .expect("title update");
         assert_eq!(
             title_calls.load(Ordering::SeqCst),
             0,
             "active sessions must use their owned rollout writer instead of a second store writer"
         );
+        let listed = store.list(ListOptions::default()).await.unwrap();
+        assert_eq!(listed.items[0].title, Some("Updated safely".into()));
+
+        client.interrupt().await;
+        run.await
+            .expect("run task should settle")
+            .expect("run result");
         assert_eq!(
             store.resume("thread-title").await.unwrap().meta.title,
             Some("Updated safely".into())

@@ -8563,7 +8563,8 @@ impl ServerInner {
         });
     }
 
-    /// `UpdateTitle`: chain a persisted-session title update through the host lifecycle hook.
+    /// `UpdateTitle`: persist a thread title through the thread's writer or the
+    /// host lifecycle hook without waiting for an active model turn to finish.
     async fn dispatch_update_title(
         self: &Arc<Self>,
         submission_id: String,
@@ -8591,11 +8592,15 @@ impl ServerInner {
             .await;
             return;
         }
-        let inner = self.clone();
-        let sid = submission_id.clone();
-        self.enqueue(submission_id, move || -> ChainFuture {
-            Box::pin(async move { inner.handle_update_title(sid, thread_id, title).await })
-        });
+        // Titles live in `thread-metadata.sqlite3` and never mutate `.jsonl`
+        // bytes or `Session` turn state, so execute directly instead of queuing
+        // behind an active model turn or compaction on the serial chain.
+        if let Err(error) = self
+            .handle_update_title(submission_id.clone(), thread_id, title)
+            .await
+        {
+            self.report_op_error(&submission_id, error).await;
+        }
     }
 
     /// `RenameThread`: re-key a persisted thread through the host storage hook.
@@ -9694,7 +9699,6 @@ impl ServerInner {
             .ok_or_else(|| -> BoxError { "update_title requires a session store".into() })?
             .clone();
         if let Some(session) = self.current_session_for_thread(&thread_id) {
-            session.wait_for_active_turns().await;
             session
                 .persist_title(&RuntimeString::from(title.clone()))
                 .await

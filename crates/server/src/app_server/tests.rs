@@ -4011,3 +4011,111 @@ async fn rollout_persistence_failure_evicts_drained_session_on_close_and_unload_
 
     client.close().await;
 }
+
+#[tokio::test]
+async fn session_update_title_delivers_ack_event_while_session_is_unsubscribed() {
+    use klaus_agent_core::store::jsonl_store::{JsonlSessionStore, JsonlSessionStoreOptions};
+    use klaus_agent_core::store::session_store::SessionStore;
+
+    let root = tempfile::tempdir().unwrap();
+    let sessions_dir = root.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(JsonlSessionStoreOptions {
+        dir: Some(sessions_dir.to_string_lossy().into_owned()),
+        archive_dir: None,
+    }));
+    let agent = make_agent_for_tests(vec![text_turn("seed reply")]);
+    let create =
+        crate::lifecycle::engine_sessions(agent.clone(), Some(store.clone())).create_session;
+    let lifecycle = crate::lifecycle::protocol_lifecycle(agent, Some(store.clone()));
+    let mut client = TestClient::start_with(create, Some(lifecycle));
+
+    client
+        .send(json!({
+            "id": 1,
+            "method": "initialize",
+            "params": { "capabilities": { "productEvents": true } }
+        }))
+        .await;
+    let _ = client.response_for(1).await;
+
+    client
+        .send(json!({
+            "id": 2,
+            "method": "session/start",
+            "params": { "init": { "threadId": "unsub-title-thread", "cwd": root.path() } }
+        }))
+        .await;
+    let (started, _) = client.response_for(2).await;
+    assert_eq!(started["result"]["sessionId"], json!("unsub-title-thread"));
+
+    client
+        .send(json!({
+            "id": 3,
+            "method": "turn/start",
+            "params": { "sessionId": "unsub-title-thread", "input": "seed" }
+        }))
+        .await;
+    let (_, mut seed_events) = client.response_for(3).await;
+    while !seed_events
+        .iter()
+        .any(|m| m.get("method").and_then(Value::as_str) == Some("turn/completed"))
+    {
+        seed_events.push(client.next_message().await);
+    }
+
+    client
+        .send(json!({
+            "id": 4,
+            "method": "session/unsubscribe",
+            "params": { "sessionId": "unsub-title-thread" }
+        }))
+        .await;
+    let (unsub, _) = client.response_for(4).await;
+    assert_eq!(unsub["result"]["subscribed"], json!(false));
+
+    client
+        .send(json!({
+            "id": 5,
+            "method": "session/updateTitle",
+            "params": {
+                "sessionId": "unsub-title-thread",
+                "threadId": "unsub-title-thread",
+                "title": "Renamed while unsubscribed"
+            }
+        }))
+        .await;
+    let (ack, mut events) = client.response_for(5).await;
+    let sub_id = ack["result"]["submissionId"]
+        .as_str()
+        .expect("submissionId")
+        .to_string();
+
+    while !events.iter().any(|m| {
+        m.get("method").and_then(Value::as_str) == Some("session/rawEvent")
+            && m["params"]["event"]["submissionId"] == json!(sub_id)
+    }) {
+        events.push(
+            tokio::time::timeout(Duration::from_secs(3), client.next_message())
+                .await
+                .expect("correlated session/rawEvent must reach caller while unsubscribed"),
+        );
+    }
+    let raw = events
+        .iter()
+        .find(|m| {
+            m.get("method").and_then(Value::as_str) == Some("session/rawEvent")
+                && m["params"]["event"]["submissionId"] == json!(sub_id)
+        })
+        .unwrap();
+    assert_eq!(
+        raw["params"]["event"]["title"]["title"],
+        json!("Renamed while unsubscribed")
+    );
+    assert_eq!(
+        store.resume("unsub-title-thread").await.unwrap().meta.title,
+        Some("Renamed while unsubscribed".into())
+    );
+
+    client.close().await;
+}

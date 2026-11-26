@@ -149,6 +149,9 @@ struct SessionHandle {
     /// method). Stream events (`{ event: ... }`) never settle a waiter.
     waiters: Arc<Mutex<HashMap<String, oneshot::Sender<WaiterReply>>>>,
     ordered_responses: Mutex<HashMap<String, OrderedResponse>>,
+    /// Submission ids of in-flight `feed_acked_op` requests on a bound session,
+    /// whose correlated reply must still reach the caller when unsubscribed.
+    acked_submissions: Mutex<std::collections::HashSet<String>>,
     interrupt_changes: Mutex<HashMap<String, queue::InterruptChange>>,
     pending_interrupt_replies: Mutex<HashMap<String, PendingInterruptReply>>,
     event_stream_closed: AtomicBool,
@@ -175,6 +178,7 @@ impl SessionHandle {
             self.event_stream_closed.store(true, Ordering::Release);
             waiters.clear();
         }
+        self.acked_submissions.lock().unwrap().clear();
         self.interrupt_changes.lock().unwrap().clear();
         let parked: Vec<_> = self
             .pending_interrupt_replies
@@ -579,18 +583,20 @@ impl AppServerState {
         }
     }
 
-    async fn notify_session_runtime(
+    async fn notify_session_runtime_with_policy(
         &self,
         session_id: &str,
         method: &str,
         mut params: RuntimeJson,
         stream: Option<(&str, u64)>,
+        allow_unsubscribed: bool,
     ) {
-        if self
-            .unsubscribed_sessions
-            .lock()
-            .unwrap()
-            .contains(session_id)
+        if !allow_unsubscribed
+            && self
+                .unsubscribed_sessions
+                .lock()
+                .unwrap()
+                .contains(session_id)
         {
             return;
         }
@@ -601,6 +607,17 @@ impl AppServerState {
             }
         }
         self.notify_runtime(method, params).await;
+    }
+
+    async fn notify_session_runtime(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: RuntimeJson,
+        stream: Option<(&str, u64)>,
+    ) {
+        self.notify_session_runtime_with_policy(session_id, method, params, stream, false)
+            .await;
     }
 
     fn next_submission_id(&self, prefix: &str) -> String {
@@ -1597,6 +1614,7 @@ fn ensure_control_handle(state: &Arc<AppServerState>) -> Arc<SessionHandle> {
         turns: Arc::new(Mutex::new(std::collections::HashSet::new())),
         waiters: Arc::new(Mutex::new(HashMap::new())),
         ordered_responses: Mutex::new(HashMap::new()),
+        acked_submissions: Mutex::new(std::collections::HashSet::new()),
         interrupt_changes: Mutex::new(HashMap::new()),
         pending_interrupt_replies: Mutex::new(HashMap::new()),
         event_stream_closed: AtomicBool::new(false),
@@ -1877,6 +1895,11 @@ async fn forward_promoted_request(
                     .lock()
                     .unwrap()
                     .contains_key(&requested)
+                || handle
+                    .acked_submissions
+                    .lock()
+                    .unwrap()
+                    .contains(&requested)
                 || handle.turns.lock().unwrap().contains(&requested);
             if collides {
                 return state
@@ -2013,6 +2036,11 @@ async fn forward_follow_snapshot(
                     .lock()
                     .unwrap()
                     .contains_key(&requested)
+                || handle
+                    .acked_submissions
+                    .lock()
+                    .unwrap()
+                    .contains(&requested)
                 || handle.turns.lock().unwrap().contains(&requested);
             if collides {
                 return state
@@ -2166,6 +2194,11 @@ async fn feed_acked_op(
                     .lock()
                     .unwrap()
                     .contains_key(&requested)
+                || handle
+                    .acked_submissions
+                    .lock()
+                    .unwrap()
+                    .contains(&requested)
                 || handle.turns.lock().unwrap().contains(&requested);
             if collides {
                 return state
@@ -2227,9 +2260,24 @@ async fn feed_acked_op(
         }
         return;
     }
-    let _ = handle
+    if session_id.is_some() && !handle.event_stream_closed.load(Ordering::Acquire) {
+        handle
+            .acked_submissions
+            .lock()
+            .unwrap()
+            .insert(submission_id.clone());
+    }
+    if handle
         .op_tx
-        .send(exact_payload::object([("id", submission_id.clone().into()), ("op", op)]).into());
+        .send(exact_payload::object([("id", submission_id.clone().into()), ("op", op)]).into())
+        .is_err()
+    {
+        handle
+            .acked_submissions
+            .lock()
+            .unwrap()
+            .remove(&submission_id);
+    }
     let result = wire::SubmissionAck { submission_id };
     state
         .send(wire::response(id, serde_json::to_value(result).unwrap()))
@@ -9104,6 +9152,7 @@ async fn session_start_impl(
         turns: Arc::new(Mutex::new(std::collections::HashSet::new())),
         waiters: Arc::new(Mutex::new(HashMap::new())),
         ordered_responses: Mutex::new(HashMap::new()),
+        acked_submissions: Mutex::new(std::collections::HashSet::new()),
         interrupt_changes: Mutex::new(HashMap::new()),
         pending_interrupt_replies: Mutex::new(HashMap::new()),
         event_stream_closed: AtomicBool::new(false),
@@ -10050,6 +10099,7 @@ async fn pump_session_events(
                 )
                 .await;
         }
+        let mut allow_unsubscribed = false;
         if state.product_events.load(Ordering::Acquire) {
             let projected = emit_exact_product_notifications(
                 &state,
@@ -10062,8 +10112,14 @@ async fn pump_session_events(
             )
             .await;
             if !projected && !tracked_turn_completed {
+                allow_unsubscribed = !submission_id.is_empty()
+                    && handle
+                        .acked_submissions
+                        .lock()
+                        .unwrap()
+                        .remove(&submission_id);
                 state
-                    .notify_session_runtime(
+                    .notify_session_runtime_with_policy(
                         &session_id,
                         "session/rawEvent",
                         exact_payload::object([
@@ -10071,9 +10127,16 @@ async fn pump_session_events(
                             ("event", event.clone()),
                         ]),
                         Some((&stream_id, stream_revision)),
+                        allow_unsubscribed,
                     )
                     .await;
             }
+        } else if !submission_id.is_empty() && !tracked_turn_completed {
+            allow_unsubscribed = handle
+                .acked_submissions
+                .lock()
+                .unwrap()
+                .remove(&submission_id);
         }
         if let Some(deleted) = event.get("deleted") {
             if let Ok(deleted) = exact_payload::scalar(deleted) {
@@ -10081,11 +10144,12 @@ async fn pump_session_events(
             }
         }
         state
-            .notify_session_runtime(
+            .notify_session_runtime_with_policy(
                 &session_id,
                 "session/event",
                 exact_payload::object([("sessionId", session_id.clone().into()), ("event", event)]),
                 Some((&stream_id, stream_revision)),
+                allow_unsubscribed,
             )
             .await;
     }
@@ -10638,6 +10702,7 @@ mod model_provider_tests {
             turns: Arc::new(Mutex::new(HashSet::new())),
             waiters: Arc::new(Mutex::new(HashMap::new())),
             ordered_responses: Mutex::new(HashMap::new()),
+            acked_submissions: Mutex::new(HashSet::new()),
             interrupt_changes: Mutex::new(HashMap::new()),
             pending_interrupt_replies: Mutex::new(HashMap::new()),
             event_stream_closed: AtomicBool::new(false),
@@ -10699,6 +10764,7 @@ mod model_provider_tests {
             event_stream_closed: AtomicBool::new(false),
             realtime_events: broadcast::channel(512).0,
             ordered_responses: Mutex::new(HashMap::new()),
+            acked_submissions: Mutex::new(HashSet::new()),
             interrupt_changes: Mutex::new(HashMap::new()),
             pending_interrupt_replies: Mutex::new(HashMap::new()),
             read_items: Mutex::new(items),
