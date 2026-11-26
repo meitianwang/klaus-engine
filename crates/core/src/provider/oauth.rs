@@ -674,6 +674,7 @@ struct OAuthInner {
     now: Now,
     refresh_lock_dir: String,
     refresh_lock_key: String,
+    explicit_credential_lineage: Option<String>,
     access: ProviderAuthAccess,
     credential: Mutex<Option<CredentialState>>,
     /// The in-flight single-flight force-refresh, tagged with a generation so it
@@ -1200,6 +1201,15 @@ impl OAuthAuth {
             .access
             .unwrap_or_else(|| ProviderAuthAccess::allow_all("oauth"));
         let refresh_lock_dir = opts.refresh_lock_dir.unwrap_or_else(config_home);
+        let explicit_credential_lineage = opts
+            .refresh_lock_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                key.strip_prefix("provider-anthropic-")
+                    .unwrap_or(key)
+                    .to_string()
+            });
         let refresh_lock_key = opts
             .refresh_lock_key
             .unwrap_or_else(|| opts.config.client_id.clone());
@@ -1228,6 +1238,7 @@ impl OAuthAuth {
                 now,
                 refresh_lock_dir,
                 refresh_lock_key,
+                explicit_credential_lineage,
                 access,
                 credential: Mutex::new(credential),
                 pending: Mutex::new(None),
@@ -1312,6 +1323,16 @@ impl AuthSource for OAuthAuth {
             .ok()
             .flatten()
             .and_then(|snapshot| snapshot.identity.account_id)
+    }
+    fn credential_lineage(&self) -> Option<String> {
+        if let Some(lineage) = &self.inner.explicit_credential_lineage {
+            return Some(lineage.clone());
+        }
+        self.inner.credential.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|state| format!("oauth-gen:{}", state.generation))
+        })
     }
     fn credential_changes(
         &self,

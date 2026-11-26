@@ -101,6 +101,12 @@ impl AuthSource for PausedAuth {
     fn credential_account_id(&self) -> Option<String> {
         self.inner.credential_account_id()
     }
+    fn credential_lineage(&self) -> Option<String> {
+        self.inner.credential_lineage()
+    }
+    fn credential_lineage_for_account(&self, account_id: &str) -> Option<String> {
+        self.inner.credential_lineage_for_account(account_id)
+    }
     fn credential_account_ids(&self) -> Vec<String> {
         self.inner.credential_account_ids()
     }
@@ -138,12 +144,18 @@ pub(super) enum Reply {
     RateLimited,
     StreamRateLimited,
     Success,
+    SignedSuccess {
+        signature: &'static str,
+        redacted: &'static str,
+    },
+    InvalidSignature400,
     Unauthorized,
 }
 
 #[derive(Clone)]
 struct CapturedRequest {
     account: String,
+    x_session_id: Option<String>,
     body: Value,
     persisted_order: Option<Vec<String>>,
 }
@@ -165,7 +177,7 @@ fn persisted_order(path: &Path) -> Vec<String> {
         .collect()
 }
 
-async fn read_request(socket: &mut TcpStream) -> (String, Value) {
+async fn read_request(socket: &mut TcpStream) -> (String, Option<String>, Value) {
     let mut received = Vec::new();
     let mut framing = None;
     loop {
@@ -206,9 +218,10 @@ async fn read_request(socket: &mut TcpStream) -> (String, Value) {
                 if headers.starts_with("POST /never-refresh ") {
                     let form = std::str::from_utf8(&received[end..end + length]).unwrap();
                     assert!(form.contains("refresh_token=fixture-refresh-a"));
-                    return ("refresh".to_owned(), Value::Null);
+                    return ("refresh".to_owned(), None, Value::Null);
                 }
                 let mut account = "no-auth".to_owned();
+                let mut x_session_id = None;
                 for line in headers.lines() {
                     let Some((name, value)) = line.split_once(':') else {
                         continue;
@@ -222,10 +235,13 @@ async fn read_request(socket: &mut TcpStream) -> (String, Value) {
                     } else if name.eq_ignore_ascii_case("x-api-key") {
                         assert_eq!(value.trim(), "fixture-api-key");
                         account = "api-key".to_owned();
+                    } else if name.eq_ignore_ascii_case("x-session-id") {
+                        x_session_id = Some(value.trim().to_owned());
                     }
                 }
                 return (
                     account,
+                    x_session_id,
                     serde_json::from_slice(&received[end..end + length]).unwrap(),
                 );
             }
@@ -240,7 +256,7 @@ async fn serve(
 ) {
     loop {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let (account, body) = read_request(&mut socket).await;
+        let (account, x_session_id, body) = read_request(&mut socket).await;
         if account == "refresh" {
             state.lock().unwrap().refresh_requests += 1;
             let body = r#"{"error":"invalid_grant"}"#;
@@ -255,11 +271,13 @@ async fn serve(
             let mut state = state.lock().unwrap();
             state.requests.push(CapturedRequest {
                 account: account.clone(),
+                x_session_id,
                 body,
                 persisted_order: account_file.as_deref().map(persisted_order),
             });
             state.replies.pop_front()
         };
+        let dynamic_sse;
         let (status, content_type, response) = match reply {
             Some((expected, _)) if account != expected => (
                 "400 Bad Request",
@@ -267,6 +285,33 @@ async fn serve(
                 r#"{"type":"error","error":{"type":"invalid_request_error","message":"unexpected fixture account"}}"#,
             ),
             Some((_, Reply::Success)) => ("200 OK", "text/event-stream", SSE_SUCCESS),
+            Some((_, Reply::SignedSuccess { signature, redacted })) => {
+                dynamic_sse = format!(
+                    concat!(
+                        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_signed\",\"model\":\"rotation-fixture\",\"usage\":{{\"input_tokens\":4,\"output_tokens\":0}}}}}}\n\n",
+                        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\n",
+                        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"private reasoning\"}}}}\n\n",
+                        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{sig}\"}}}}\n\n",
+                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"redacted_thinking\",\"data\":\"{redacted}\"}}}}\n\n",
+                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+                        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":2,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n",
+                        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":2}}\n\n",
+                        "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":6}}}}\n\n",
+                        "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                    ),
+                    sig = signature,
+                    redacted = redacted,
+                    text = FINAL_TEXT,
+                );
+                ("200 OK", "text/event-stream", dynamic_sse.as_str())
+            }
+            Some((_, Reply::InvalidSignature400)) => (
+                "400 Bad Request",
+                "application/json",
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#,
+            ),
             Some((_, Reply::StreamRateLimited)) => (
                 "200 OK",
                 "text/event-stream",
@@ -815,6 +860,577 @@ async fn exhausting_every_account_is_terminal_with_a_bounded_cycle() {
     fixture.assert_trace(&["a", "b", "c", "a", "a", "b"]);
     fixture.assert_order(&["b", "c", "a"]);
     fixture.shutdown().await;
+}
+
+fn body_contains_str(body: &Value, needle: &str) -> bool {
+    serde_json::to_string(body)
+        .expect("captured request body serializes")
+        .contains(needle)
+}
+
+fn tokens(account: &str) -> OAuthTokens {
+    OAuthTokens {
+        access_token: format!("fixture-token-{account}").into(),
+        ..Default::default()
+    }
+}
+
+fn decode_req(value: Value) -> klaus_agent_core::types::provider::ModelRequest {
+    klaus_agent_core::runtime_values::runtime_codec::decode_text(&value.to_string().into()).unwrap()
+}
+
+#[tokio::test]
+async fn single_account_multi_turn_preserves_signed_thinking_and_identity_verbatim() {
+    let root = FixtureRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let server = tokio::spawn(serve(listener, state.clone(), None));
+
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+    let auth: Arc<dyn AuthSource> = Arc::new(OAuthAuth::new(OAuthAuthOptions {
+        config: OAuthConfig {
+            client_id: "single-account-cache-check".into(),
+            token_url: format!("{base_url}/never-refresh"),
+            ..Default::default()
+        },
+        store: Some(store),
+        tokens: Some(tokens("a")),
+        base_url: Some(base_url.clone()),
+        refresh_lock_dir: Some(root.0.join("locks").to_string_lossy().into_owned()),
+        refresh_lock_key: Some("provider-anthropic-subscription-single-a".into()),
+        ..Default::default()
+    }));
+    let initial_uid = r#"{"device_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","account_uuid":"acct-uuid-a","session_id":"11111111-2222-4333-8444-555555555555"}"#;
+    let provider = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some(base_url),
+        default_model: Some("claude-sonnet-4-6".into()),
+        auth_source: Some(auth),
+        metadata_user_id: Some(initial_uid.into()),
+        retry: Some(RetryOptions {
+            max_attempts: Some(1),
+            congestion_hold_ms: Some(0),
+            unbounded_network_retries: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    {
+        let mut s = state.lock().unwrap();
+        s.replies.push_back((
+            "a",
+            Reply::SignedSuccess {
+                signature: "sig-single-a-turn1",
+                redacted: "redacted-single-a-turn1",
+            },
+        ));
+        s.replies.push_back((
+            "a",
+            Reply::SignedSuccess {
+                signature: "sig-single-a-turn2",
+                redacted: "redacted-single-a-turn2",
+            },
+        ));
+    }
+
+    let turn1_req = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": "conv-single-account-warm",
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "hello"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    let _events1: Vec<ModelStreamEvent> = {
+        use futures::StreamExt;
+        provider
+            .stream(turn1_req, AbortSignal::new())
+            .collect()
+            .await
+    };
+
+    let turn2_req = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": "conv-single-account-warm",
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "hello"}]},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "private reasoning", "signature": "sig-single-a-turn1"},
+                    {"type": "redacted_thinking", "data": "redacted-single-a-turn1"},
+                    {"type": "text", "text": FINAL_TEXT}
+                ]
+            },
+            {"type": "user", "uuid": "u2", "content": [{"type": "text", "text": "follow up"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    let _events2: Vec<ModelStreamEvent> = {
+        use futures::StreamExt;
+        provider
+            .stream(turn2_req, AbortSignal::new())
+            .collect()
+            .await
+    };
+
+    let captured = state.lock().unwrap().requests.clone();
+    assert_eq!(captured.len(), 2);
+    assert!(body_contains_str(&captured[1].body, "sig-single-a-turn1"));
+    assert!(body_contains_str(
+        &captured[1].body,
+        "redacted-single-a-turn1"
+    ));
+    assert_eq!(
+        captured[1].body["metadata"]["user_id"].as_str(),
+        Some(initial_uid),
+        "single-account turns must preserve metadata.user_id verbatim"
+    );
+    assert!(captured[1].x_session_id.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn automatic_429_rotation_and_manual_switch_isolate_identity_and_strip_foreign_signatures() {
+    let root = FixtureRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let account_path = root.0.join("claude-subscription-oauth.json");
+    std::fs::write(
+        &account_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "accounts": [
+                {"id": "a", "tokens": {"accessToken": "fixture-token-a"}},
+                {"id": "b", "tokens": {"accessToken": "fixture-token-b"}}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let server = tokio::spawn(serve(listener, state.clone(), Some(account_path.clone())));
+
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+    let config = OAuthConfig {
+        client_id: "multi-isolation-check".into(),
+        token_url: format!("{base_url}/never-refresh"),
+        ..Default::default()
+    };
+    let queue = Arc::new(
+        MultiAccountAuthSource::new(RotationInit {
+            file_path: account_path.to_string_lossy().into_owned(),
+            config: config.clone(),
+            base_url: Some(base_url.clone()),
+            extra_headers: HashMap::new(),
+            store: store.clone(),
+            accounts: vec![
+                RotationAccountSpec {
+                    id: "a".into(),
+                    credential_id: "subscription-iso-a".into(),
+                    tokens: tokens("a"),
+                },
+                RotationAccountSpec {
+                    id: "b".into(),
+                    credential_id: "subscription-iso-b".into(),
+                    tokens: tokens("b"),
+                },
+            ],
+        })
+        .unwrap(),
+    );
+    let initial_uid = r#"{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"uuid-of-account-a","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}"#;
+    let provider = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some(base_url.clone()),
+        default_model: Some("claude-sonnet-4-6".into()),
+        auth_source: Some(queue),
+        metadata_user_id: Some(initial_uid.into()),
+        ..Default::default()
+    });
+
+    {
+        let mut s = state.lock().unwrap();
+        // Turn 1 succeeds on Account A with signed thinking + redacted thinking.
+        s.replies.push_back((
+            "a",
+            Reply::SignedSuccess {
+                signature: "sig-owned-by-account-a",
+                redacted: "redacted-owned-by-account-a",
+            },
+        ));
+        // Turn 2 hits HTTP 429 on Account A and fails over mid-request to Account B.
+        s.replies.push_back(("a", Reply::RateLimited));
+        s.replies.push_back((
+            "b",
+            Reply::SignedSuccess {
+                signature: "sig-owned-by-account-b",
+                redacted: "redacted-owned-by-account-b",
+            },
+        ));
+        // Turn 3 continues on Account B.
+        s.replies.push_back((
+            "b",
+            Reply::SignedSuccess {
+                signature: "sig-owned-by-account-b-turn3",
+                redacted: "redacted-owned-by-account-b-turn3",
+            },
+        ));
+        // Turn 4 after manual switch back to Account A.
+        s.replies.push_back(("a", Reply::Success));
+    }
+
+    let conv_key = "conv-auto-and-manual-switch";
+    // Turn 1 (Account A)
+    let req1 = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": conv_key,
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "turn 1"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    {
+        use futures::StreamExt;
+        let _: Vec<_> = provider.stream(req1, AbortSignal::new()).collect().await;
+    }
+
+    // Turn 2: starts on Account A (429) -> automatically rotates to Account B!
+    let req2 = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": conv_key,
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "turn 1"}]},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "a thought", "signature": "sig-owned-by-account-a"},
+                    {"type": "redacted_thinking", "data": "redacted-owned-by-account-a"},
+                    {
+                        "type": "web_search_call",
+                        "id": "srvtoolu_1",
+                        "query": "rust",
+                        "results": [{"title": "Rust", "url": "https://rust-lang.org", "encryptedToken": "enc-search-a"}]
+                    },
+                    {
+                        "type": "text",
+                        "text": FINAL_TEXT,
+                        "citations": [{"url": "https://rust-lang.org", "title": "Rust", "citedText": "Rust", "encryptedIndex": "enc-cite-a"}]
+                    }
+                ]
+            },
+            {"type": "user", "uuid": "u2", "content": [{"type": "text", "text": "turn 2"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    {
+        use futures::StreamExt;
+        let events2: Vec<_> = provider.stream(req2, AbortSignal::new()).collect().await;
+        assert!(
+            events2
+                .iter()
+                .any(|e| matches!(e, ModelStreamEvent::MessageStop { .. })),
+            "intra-request failover to account B must succeed"
+        );
+    }
+
+    // Turn 3: continues on Account B, carrying both Account A's old turn and Account B's new turn!
+    let req3 = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": conv_key,
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "turn 1"}]},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "a thought", "signature": "sig-owned-by-account-a"},
+                    {"type": "redacted_thinking", "data": "redacted-owned-by-account-a"},
+                    {"type": "text", "text": FINAL_TEXT}
+                ]
+            },
+            {"type": "user", "uuid": "u2", "content": [{"type": "text", "text": "turn 2"}]},
+            {
+                "type": "assistant",
+                "uuid": "a2",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "b thought", "signature": "sig-owned-by-account-b"},
+                    {"type": "redacted_thinking", "data": "redacted-owned-by-account-b"},
+                    {"type": "text", "text": FINAL_TEXT}
+                ]
+            },
+            {"type": "user", "uuid": "u3", "content": [{"type": "text", "text": "turn 3"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    {
+        use futures::StreamExt;
+        let _: Vec<_> = provider.stream(req3, AbortSignal::new()).collect().await;
+    }
+
+    // Simulate manual account switch back to Account A (`session/reconfigureModel` builds a new provider with A at head).
+    let manual_switch_back_queue = Arc::new(
+        MultiAccountAuthSource::new(RotationInit {
+            file_path: account_path.to_string_lossy().into_owned(),
+            config,
+            base_url: Some(base_url.clone()),
+            extra_headers: HashMap::new(),
+            store,
+            accounts: vec![
+                RotationAccountSpec {
+                    id: "a".into(),
+                    credential_id: "subscription-iso-a".into(),
+                    tokens: tokens("a"),
+                },
+                RotationAccountSpec {
+                    id: "b".into(),
+                    credential_id: "subscription-iso-b".into(),
+                    tokens: tokens("b"),
+                },
+            ],
+        })
+        .unwrap(),
+    );
+    let provider_after_manual_switch = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some(base_url),
+        default_model: Some("claude-sonnet-4-6".into()),
+        auth_source: Some(manual_switch_back_queue),
+        metadata_user_id: Some(initial_uid.into()),
+        ..Default::default()
+    });
+    let req4 = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": conv_key,
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "turn 1"}]},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "a thought", "signature": "sig-owned-by-account-a"},
+                    {"type": "text", "text": FINAL_TEXT}
+                ]
+            },
+            {"type": "user", "uuid": "u2", "content": [{"type": "text", "text": "turn 2"}]},
+            {
+                "type": "assistant",
+                "uuid": "a2",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "b thought", "signature": "sig-owned-by-account-b"},
+                    {"type": "text", "text": FINAL_TEXT}
+                ]
+            },
+            {"type": "user", "uuid": "u4", "content": [{"type": "text", "text": "turn 4 after manual switch"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    {
+        use futures::StreamExt;
+        let _: Vec<_> = provider_after_manual_switch
+            .stream(req4, AbortSignal::new())
+            .collect()
+            .await;
+    }
+
+    let captured = state.lock().unwrap().requests.clone();
+    assert_eq!(
+        captured.len(),
+        5,
+        "1 (A) + 2 (A->B failover) + 1 (B) + 1 (manual A)"
+    );
+
+    // Attempt index 1 was Account A before 429: still carried Account A's own signature.
+    assert_eq!(captured[1].account, "a");
+    assert!(body_contains_str(
+        &captured[1].body,
+        "sig-owned-by-account-a"
+    ));
+
+    // Attempt index 2 was Account B after 429 failover: MUST strip all of Account A's cryptographic artifacts & isolate identity!
+    assert_eq!(captured[2].account, "b");
+    assert!(!body_contains_str(
+        &captured[2].body,
+        "sig-owned-by-account-a"
+    ));
+    assert!(!body_contains_str(
+        &captured[2].body,
+        "redacted-owned-by-account-a"
+    ));
+    assert!(!body_contains_str(&captured[2].body, "enc-search-a"));
+    assert!(!body_contains_str(&captured[2].body, "enc-cite-a"));
+    assert!(
+        body_contains_str(&captured[2].body, FINAL_TEXT),
+        "visible assistant text stays intact across account switch"
+    );
+    let b_uid: Value =
+        serde_json::from_str(captured[2].body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        b_uid["account_uuid"].as_str(),
+        Some(""),
+        "prior account_uuid must never leak to switched account"
+    );
+    assert_ne!(
+        b_uid["device_id"].as_str(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    let b_session_id = b_uid["session_id"].as_str().unwrap().to_string();
+    assert_ne!(b_session_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+    // Attempt index 3 (Turn 3 on Account B): keeps Account B's own signature while still stripping Account A's!
+    assert_eq!(captured[3].account, "b");
+    assert!(!body_contains_str(
+        &captured[3].body,
+        "sig-owned-by-account-a"
+    ));
+    assert!(
+        body_contains_str(&captured[3].body, "sig-owned-by-account-b"),
+        "Account B's own signed thinking stays warm on subsequent Account B turns"
+    );
+    let b_turn3_uid: Value =
+        serde_json::from_str(captured[3].body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        b_turn3_uid["session_id"].as_str(),
+        Some(b_session_id.as_str()),
+        "session_id stays stable within Account B's conversation segment"
+    );
+
+    // Attempt index 4 (Turn 4 after manual switch back to Account A): segment 2 strips BOTH old segments and uses a fresh session_id!
+    assert_eq!(captured[4].account, "a");
+    assert!(!body_contains_str(
+        &captured[4].body,
+        "sig-owned-by-account-a"
+    ));
+    assert!(!body_contains_str(
+        &captured[4].body,
+        "sig-owned-by-account-b"
+    ));
+    let a_seg2_uid: Value =
+        serde_json::from_str(captured[4].body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    let a_seg2_session = a_seg2_uid["session_id"].as_str().unwrap();
+    assert_ne!(a_seg2_session, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    assert_ne!(a_seg2_session, b_session_id);
+    server.abort();
+}
+
+#[tokio::test]
+async fn cold_resumed_foreign_signature_400_self_heals_once_into_clean_segment() {
+    let root = FixtureRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let server = tokio::spawn(serve(listener, state.clone(), None));
+
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+    let auth: Arc<dyn AuthSource> = Arc::new(OAuthAuth::new(OAuthAuthOptions {
+        config: OAuthConfig {
+            client_id: "cold-resume-self-heal".into(),
+            token_url: format!("{base_url}/never-refresh"),
+            ..Default::default()
+        },
+        store: Some(store),
+        tokens: Some(tokens("b")),
+        base_url: Some(base_url.clone()),
+        refresh_lock_dir: Some(root.0.join("locks").to_string_lossy().into_owned()),
+        refresh_lock_key: Some("provider-anthropic-subscription-cold-b".into()),
+        ..Default::default()
+    }));
+    let cold_uid = r#"{"device_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","account_uuid":"uuid-before-restart","session_id":"22222222-3333-4444-8555-666666666666"}"#;
+    let provider = AnthropicProvider::new(AnthropicProviderOptions {
+        base_url: Some(base_url),
+        default_model: Some("claude-sonnet-4-6".into()),
+        auth_source: Some(auth),
+        metadata_user_id: Some(cold_uid.into()),
+        retry: Some(RetryOptions {
+            max_attempts: Some(1),
+            congestion_hold_ms: Some(0),
+            unbounded_network_retries: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    {
+        let mut s = state.lock().unwrap();
+        s.replies.push_back(("b", Reply::InvalidSignature400));
+        s.replies.push_back(("b", Reply::Success));
+    }
+
+    let cold_req = decode_req(json!({
+        "model": "claude-sonnet-4-6",
+        "cacheDomain": "conv-cold-resumed-after-restart",
+        "system": [],
+        "messages": [
+            {"type": "user", "uuid": "u1", "content": [{"type": "text", "text": "before restart"}]},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "thinking", "text": "persisted thought from old account", "signature": "sig-from-previous-process"},
+                    {"type": "text", "text": "answer before restart"}
+                ]
+            },
+            {"type": "user", "uuid": "u2", "content": [{"type": "text", "text": "after restart on new account"}]}
+        ],
+        "tools": [],
+        "maxOutputTokens": 64
+    }));
+    let events: Vec<_> = {
+        use futures::StreamExt;
+        provider
+            .stream(cold_req, AbortSignal::new())
+            .collect()
+            .await
+    };
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ModelStreamEvent::MessageStop { .. })),
+        "cold foreign-signature 400 should self-heal cleanly"
+    );
+
+    let captured = state.lock().unwrap().requests.clone();
+    assert_eq!(captured.len(), 2);
+    assert!(body_contains_str(
+        &captured[0].body,
+        "sig-from-previous-process"
+    ));
+    assert!(!body_contains_str(
+        &captured[1].body,
+        "sig-from-previous-process"
+    ));
+    assert!(
+        body_contains_str(&captured[1].body, "answer before restart"),
+        "visible assistant text from prior process stays intact after stripping foreign thinking"
+    );
+    let healed_uid: Value =
+        serde_json::from_str(captured[1].body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    assert_ne!(
+        healed_uid["session_id"].as_str(),
+        Some("22222222-3333-4444-8555-666666666666")
+    );
+    assert_eq!(healed_uid["account_uuid"].as_str(), Some(""));
+    server.abort();
 }
 
 #[tokio::test]

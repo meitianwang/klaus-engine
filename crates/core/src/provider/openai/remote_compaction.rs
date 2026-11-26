@@ -119,6 +119,12 @@ impl AuthSource for ScopedAuth {
     fn base_url(&self) -> Option<&str> {
         self.inner.base_url()
     }
+    fn credential_lineage(&self) -> Option<String> {
+        self.inner.credential_lineage()
+    }
+    fn credential_lineage_for_account(&self, account_id: &str) -> Option<String> {
+        self.inner.credential_lineage_for_account(account_id)
+    }
     async fn force_refresh(&self) -> Option<bool> {
         self.inner.force_refresh().await
     }

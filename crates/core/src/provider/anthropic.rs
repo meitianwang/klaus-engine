@@ -61,10 +61,12 @@ use crate::types::provider::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const DEFAULT_MAX_OUTPUT: u64 = 8_192;
@@ -899,6 +901,13 @@ impl AnthropicProvider {
             && self.bedrock.is_none()
     }
 
+    fn active_subscription_lineage(&self) -> Option<String> {
+        let auth = self.auth_source.as_ref()?;
+        auth.credential_account_id()
+            .and_then(|id| auth.credential_lineage_for_account(&id))
+            .or_else(|| auth.credential_lineage())
+    }
+
     /// Spend a stored API key on the configured carrier header. Gateways in
     /// front of the Anthropic surface are split on which scheme they validate:
     /// the native `x-api-key`, or an `Authorization: Bearer` carrier. The
@@ -941,6 +950,18 @@ impl AnthropicProvider {
         );
         let mut req = req.clone();
         req.wire_caps = Some(self.resolved_wire_caps(&req));
+        if self.requires_claude_code_identity() {
+            if let Some(lineage) = self.active_subscription_lineage() {
+                let base_key = subscription_base_conversation_key(&req);
+                let (_segment, owner, switching) =
+                    peek_subscription_account_segment(&base_key, &lineage);
+                if let Some(sanitized) =
+                    isolate_foreign_subscription_messages(&req.messages, &owner, switching)
+                {
+                    req.messages = sanitized;
+                }
+            }
+        }
         let params = build_params_with_media_limits(
             &req,
             req.output_schema.is_some(),
@@ -1338,8 +1359,65 @@ impl ModelProvider for AnthropicProvider {
                     .system
                     .first()
                     .is_some_and(|p| p.cache_scope == Some(CacheScope::Global));
+            let initial_subscription_lineage = if require_claude_code_identity {
+                auth_source.as_ref().and_then(|auth| {
+                    auth.credential_account_id()
+                        .and_then(|id| auth.credential_lineage_for_account(&id))
+                        .or_else(|| auth.credential_lineage())
+                })
+            } else {
+                None
+            };
+            let subscription_base_key = initial_subscription_lineage
+                .as_ref()
+                .map(|_| subscription_base_conversation_key(&req));
+            let initial_subscription_segment = match (
+                subscription_base_key.as_deref(),
+                initial_subscription_lineage.as_deref(),
+            ) {
+                (Some(base_key), Some(lineage)) => Some(resolve_subscription_account_segment(
+                    base_key,
+                    lineage,
+                    &req.messages,
+                )),
+                _ => None,
+            };
+            let effective_req: Cow<'_, ModelRequest> = match &initial_subscription_segment {
+                Some((_segment, owner, _has_unattributed)) => {
+                    match isolate_foreign_subscription_messages(&req.messages, owner, false) {
+                        Some(sanitized) => {
+                            let mut cloned = req.clone();
+                            cloned.messages = sanitized;
+                            Cow::Owned(cloned)
+                        }
+                        None => Cow::Borrowed(&req),
+                    }
+                }
+                None => Cow::Borrowed(&req),
+            };
+            let (effective_metadata_user_id, effective_affinity_session_id) = match (
+                subscription_base_key.as_deref(),
+                initial_subscription_lineage.as_deref(),
+                &initial_subscription_segment,
+            ) {
+                (Some(base_key), Some(lineage), Some((segment, _owner, _))) => (
+                    isolate_subscription_metadata_user_id(
+                        metadata_user_id.as_deref(),
+                        base_key,
+                        lineage,
+                        *segment,
+                    ),
+                    isolate_subscription_affinity_session_id(
+                        affinity_session_id.as_deref(),
+                        base_key,
+                        lineage,
+                        *segment,
+                    ),
+                ),
+                _ => (metadata_user_id.clone(), affinity_session_id.clone()),
+            };
             let params = match build_params_with_media_limits(
-                &req, structured, cache_scope_enabled, defer_loading_supported,
+                &effective_req, structured, cache_scope_enabled, defer_loading_supported,
                 tool_change_mode, output_mode,
                 require_claude_code_identity, image_limits, media_budget,
             ) {
@@ -1418,8 +1496,8 @@ impl ModelProvider for AnthropicProvider {
                     .as_ref()
                     .is_some_and(|intent| intent.state.is_beta_unsupported(&req.model));
             let mut context_hints =
-                ContextHintController::new(req.context_hints.as_ref(), hint_beta_supported);
-            if let Some(hint) = context_hints.build_request(&req.messages) {
+                ContextHintController::new(effective_req.context_hints.as_ref(), hint_beta_supported);
+            if let Some(hint) = context_hints.build_request(&effective_req.messages) {
                 if hint.enabled {
                     request_params.insert("context_hint", vobj(vec![
                         ("enabled", Value::Bool(true)),
@@ -1431,7 +1509,7 @@ impl ModelProvider for AnthropicProvider {
             // for OAuth subscription traffic, matching the official client. First-party
             // only — Vertex/Bedrock route bodies must not carry it.
             if bedrock.is_none() && vertex.is_none() {
-                if let Some(uid) = &metadata_user_id {
+                if let Some(uid) = &effective_metadata_user_id {
                     request_params
                         .insert("metadata", vobj(vec![("user_id", vs(uid.clone()))]));
                 }
@@ -1483,6 +1561,37 @@ impl ModelProvider for AnthropicProvider {
             };
             let body = Value::Object(request_params);
 
+            let subscription_isolator = match (
+                subscription_base_key,
+                initial_subscription_lineage,
+                initial_subscription_segment,
+            ) {
+                (Some(base_key), Some(built_lineage), Some((_segment, active_owner, has_unattributed))) => {
+                    Some(SubscriptionAttemptIsolator {
+                        base_key,
+                        req: req.clone(),
+                        structured,
+                        cache_scope_enabled,
+                        defer_loading_supported,
+                        tool_change_mode,
+                        output_mode,
+                        image_limits,
+                        media_budget,
+                        hint_beta_supported,
+                        allow_metadata_user_id: bedrock.is_none() && vertex.is_none(),
+                        raw_metadata_user_id: metadata_user_id,
+                        raw_affinity_session_id: affinity_session_id,
+                        state: Mutex::new(SubscriptionAttemptState {
+                            built_lineage,
+                            active_owner,
+                            stripped_unattributed_cold_history: false,
+                            has_unattributed_history_artifacts: has_unattributed,
+                        }),
+                    })
+                }
+                _ => None,
+            };
+
             let credential_request_id = uuid::Uuid::new_v4().to_string();
             let ctx = Arc::new(AttemptCtx {
                 client,
@@ -1502,12 +1611,13 @@ impl ModelProvider for AnthropicProvider {
                 task_budget: task_budget_active,
                 context_management: context_editing_active,
                 context_hints: Mutex::new(context_hints),
-                hint_messages: req.messages.clone(),
+                hint_messages: Mutex::new(effective_req.messages.clone()),
                 hint_model: req.model.clone(),
                 native_tool_support,
                 tool_search_beta,
                 emits_global: emits_global_scope,
-                affinity_session_id,
+                affinity_session_id: Mutex::new(effective_affinity_session_id),
+                subscription_isolator,
                 use_native,
                 vertex: uses_vertex,
                 bedrock: bedrock_attempt,
@@ -1672,7 +1782,9 @@ impl ModelProvider for AnthropicProvider {
                         cleared_thinking_turns,
                     };
                 }
+                let active_subscription_owner = ctx.active_subscription_owner();
                 for e in out.events {
+                    record_subscription_stream_event(active_subscription_owner.as_deref(), &e);
                     if buffer_result_text {
                         if let ModelStreamEvent::TextDelta { text } = &e {
                             structured_text = structured_text.concat(text);
@@ -1748,7 +1860,9 @@ impl ModelProvider for AnthropicProvider {
                             cleared_thinking_turns,
                         };
                     }
+                    let active_subscription_owner = ctx.active_subscription_owner();
                     for e in out.events {
+                        record_subscription_stream_event(active_subscription_owner.as_deref(), &e);
                         if buffer_result_text {
                             if let ModelStreamEvent::TextDelta { text } = &e {
                                 structured_text = structured_text.concat(text);
@@ -1832,6 +1946,691 @@ impl ModelProvider for AnthropicProvider {
 // Establishment attempt
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Subscription account conversation & signature isolation
+// ---------------------------------------------------------------------------
+
+const MAX_SUBSCRIPTION_ISOLATION_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone)]
+struct ConversationAccountSegment {
+    lineage: String,
+    segment: u64,
+}
+
+#[derive(Default)]
+struct SubscriptionAccountIsolationState {
+    conversation_segments: HashMap<String, ConversationAccountSegment>,
+    artifact_owners: HashMap<u128, String>,
+}
+
+fn subscription_isolation_state() -> &'static Mutex<SubscriptionAccountIsolationState> {
+    static STATE: OnceLock<Mutex<SubscriptionAccountIsolationState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(SubscriptionAccountIsolationState::default()))
+}
+
+fn subscription_artifact_digest(tag: &[u8], payload: &RuntimeString) -> Option<u128> {
+    let text = payload
+        .try_to_utf8()
+        .unwrap_or_else(|_| diagnostic_string(payload));
+    if text.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(tag);
+    hasher.update([0]);
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    let mut prefix = [0u8; 16];
+    prefix.copy_from_slice(&digest[..16]);
+    Some(u128::from_le_bytes(prefix))
+}
+
+fn collect_message_artifact_digests(messages: &[Message]) -> Vec<u128> {
+    let mut digests = Vec::new();
+    for msg in messages {
+        let Message::Assistant(assistant) = msg else {
+            continue;
+        };
+        for block in &assistant.content {
+            match block {
+                ContentBlock::Thinking(thinking) => {
+                    if let Some(sig) = &thinking.signature {
+                        if let Some(d) = subscription_artifact_digest(b"thinking_sig", sig) {
+                            digests.push(d);
+                        }
+                    }
+                }
+                ContentBlock::RedactedThinking(redacted) => {
+                    if let Some(d) =
+                        subscription_artifact_digest(b"redacted_thinking", &redacted.data)
+                    {
+                        digests.push(d);
+                    }
+                }
+                ContentBlock::WebSearchCall(search) => {
+                    for result in &search.results {
+                        if let Some(token) = &result.encrypted_token {
+                            if let Some(d) =
+                                subscription_artifact_digest(b"web_search_token", token)
+                            {
+                                digests.push(d);
+                            }
+                        }
+                    }
+                }
+                ContentBlock::Text(text) => {
+                    if let Some(citations) = &text.citations {
+                        for citation in citations {
+                            if let Some(index) = &citation.encrypted_index {
+                                if let Some(d) =
+                                    subscription_artifact_digest(b"citation_index", index)
+                                {
+                                    digests.push(d);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    digests
+}
+
+fn subscription_base_conversation_key(req: &ModelRequest) -> String {
+    if let Some(raw) = req
+        .cache_domain
+        .as_ref()
+        .or(req.cache_key.as_ref())
+        .map(diagnostic_string)
+        .filter(|key| !key.is_empty())
+    {
+        let base = raw
+            .split(":subagent:")
+            .next()
+            .unwrap_or(raw.as_str())
+            .split(":readonly:")
+            .next()
+            .unwrap_or(raw.as_str())
+            .strip_suffix(":approval-review")
+            .unwrap_or(raw.as_str());
+        if !base.is_empty() {
+            return base.to_string();
+        }
+    }
+    if let Some(first_uuid) = req.messages.first().map(|msg| match msg {
+        Message::User(m) => &m.uuid,
+        Message::Assistant(m) => &m.uuid,
+        Message::ToolResult(m) => &m.uuid,
+        Message::System(m) => &m.uuid,
+        Message::CompactBoundary(m) => &m.uuid,
+    }) {
+        let key = diagnostic_string(first_uuid);
+        if !key.is_empty() {
+            return format!("msg:{key}");
+        }
+    }
+    "ephemeral-subscription-conversation".to_string()
+}
+
+fn trim_subscription_map<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut HashMap<K, V>,
+    keep: Option<&K>,
+) {
+    if map.len() < MAX_SUBSCRIPTION_ISOLATION_ENTRIES {
+        return;
+    }
+    let victim = map
+        .keys()
+        .find(|candidate| keep.is_none_or(|protected| *candidate != protected))
+        .cloned();
+    if let Some(key) = victim {
+        map.remove(&key);
+    }
+}
+
+fn resolve_subscription_account_segment(
+    base_key: &str,
+    lineage: &str,
+    messages: &[Message],
+) -> (u64, String, bool) {
+    let digests = collect_message_artifact_digests(messages);
+    let mut state = subscription_isolation_state().lock_recover();
+    let key_owned = base_key.to_string();
+    trim_subscription_map(&mut state.conversation_segments, Some(&key_owned));
+    let switched_from = match state.conversation_segments.get_mut(&key_owned) {
+        Some(entry) if entry.lineage == lineage => None,
+        Some(entry) => {
+            let previous_owner = format!("{}#{}", entry.lineage, entry.segment);
+            entry.lineage = lineage.to_string();
+            entry.segment = entry.segment.saturating_add(1);
+            Some((previous_owner, entry.segment))
+        }
+        None => {
+            state.conversation_segments.insert(
+                key_owned.clone(),
+                ConversationAccountSegment {
+                    lineage: lineage.to_string(),
+                    segment: 0,
+                },
+            );
+            None
+        }
+    };
+    let segment = match switched_from {
+        Some((previous_owner, next_segment)) => {
+            for digest in &digests {
+                if !state.artifact_owners.contains_key(digest) {
+                    trim_subscription_map(&mut state.artifact_owners, None);
+                    state
+                        .artifact_owners
+                        .insert(*digest, previous_owner.clone());
+                }
+            }
+            next_segment
+        }
+        None => state
+            .conversation_segments
+            .get(&key_owned)
+            .map_or(0, |entry| entry.segment),
+    };
+    let owner = format!("{lineage}#{segment}");
+    let has_unattributed = digests
+        .iter()
+        .any(|digest| !state.artifact_owners.contains_key(digest));
+    (segment, owner, has_unattributed)
+}
+
+fn peek_subscription_account_segment(base_key: &str, lineage: &str) -> (u64, String, bool) {
+    let state = subscription_isolation_state().lock_recover();
+    match state.conversation_segments.get(base_key) {
+        Some(entry) if entry.lineage == lineage => {
+            (entry.segment, format!("{lineage}#{}", entry.segment), false)
+        }
+        Some(entry) => {
+            let next = entry.segment.saturating_add(1);
+            (next, format!("{lineage}#{next}"), true)
+        }
+        None => (0, format!("{lineage}#0"), false),
+    }
+}
+
+fn record_subscription_artifact_owner(owner: &str, digest: Option<u128>) {
+    let Some(digest) = digest else {
+        return;
+    };
+    let mut state = subscription_isolation_state().lock_recover();
+    if !state.artifact_owners.contains_key(&digest) {
+        trim_subscription_map(&mut state.artifact_owners, None);
+        state.artifact_owners.insert(digest, owner.to_string());
+    }
+}
+
+fn record_subscription_stream_event(owner: Option<&str>, event: &ModelStreamEvent) {
+    let Some(owner) = owner else {
+        return;
+    };
+    match event {
+        ModelStreamEvent::ThinkingBlock {
+            signature: Some(sig),
+            ..
+        } => {
+            record_subscription_artifact_owner(
+                owner,
+                subscription_artifact_digest(b"thinking_sig", sig),
+            );
+        }
+        ModelStreamEvent::RedactedThinkingBlock { data } => {
+            record_subscription_artifact_owner(
+                owner,
+                subscription_artifact_digest(b"redacted_thinking", data),
+            );
+        }
+        ModelStreamEvent::WebSearchResult { results, .. } => {
+            for result in results {
+                if let Some(token) = &result.encrypted_token {
+                    record_subscription_artifact_owner(
+                        owner,
+                        subscription_artifact_digest(b"web_search_token", token),
+                    );
+                }
+            }
+        }
+        ModelStreamEvent::Citation { citation } => {
+            if let Some(index) = &citation.encrypted_index {
+                record_subscription_artifact_owner(
+                    owner,
+                    subscription_artifact_digest(b"citation_index", index),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn isolate_foreign_subscription_messages(
+    messages: &[Message],
+    current_owner: &str,
+    strip_unattributed: bool,
+) -> Option<Vec<Message>> {
+    let state = subscription_isolation_state().lock_recover();
+    let is_foreign = |digest: Option<u128>| -> bool {
+        let Some(digest) = digest else {
+            return false;
+        };
+        match state.artifact_owners.get(&digest) {
+            Some(owner) => owner != current_owner,
+            None => strip_unattributed,
+        }
+    };
+    let any_foreign =
+        messages.iter().any(|msg| {
+            let Message::Assistant(assistant) = msg else {
+                return false;
+            };
+            assistant.content.iter().any(|block| match block {
+                ContentBlock::Thinking(thinking) => is_foreign(
+                    thinking
+                        .signature
+                        .as_ref()
+                        .and_then(|sig| subscription_artifact_digest(b"thinking_sig", sig)),
+                ),
+                ContentBlock::RedactedThinking(redacted) => is_foreign(
+                    subscription_artifact_digest(b"redacted_thinking", &redacted.data),
+                ),
+                ContentBlock::WebSearchCall(search) => search.results.iter().any(|result| {
+                    is_foreign(
+                        result
+                            .encrypted_token
+                            .as_ref()
+                            .and_then(|tok| subscription_artifact_digest(b"web_search_token", tok)),
+                    )
+                }),
+                ContentBlock::Text(text) => {
+                    text.citations.as_ref().is_some_and(|citations| {
+                        citations.iter().any(|citation| {
+                            is_foreign(citation.encrypted_index.as_ref().and_then(|idx| {
+                                subscription_artifact_digest(b"citation_index", idx)
+                            }))
+                        })
+                    })
+                }
+                _ => false,
+            })
+        });
+    if !any_foreign {
+        return None;
+    }
+
+    let mut sanitized = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let Message::Assistant(assistant) = msg else {
+            sanitized.push(msg.clone());
+            continue;
+        };
+        let mut kept_blocks = Vec::with_capacity(assistant.content.len());
+        for block in &assistant.content {
+            match block {
+                ContentBlock::Thinking(thinking) => {
+                    let foreign = is_foreign(
+                        thinking
+                            .signature
+                            .as_ref()
+                            .and_then(|sig| subscription_artifact_digest(b"thinking_sig", sig)),
+                    );
+                    if !foreign {
+                        kept_blocks.push(block.clone());
+                    }
+                }
+                ContentBlock::RedactedThinking(redacted) => {
+                    if !is_foreign(subscription_artifact_digest(
+                        b"redacted_thinking",
+                        &redacted.data,
+                    )) {
+                        kept_blocks.push(block.clone());
+                    }
+                }
+                ContentBlock::WebSearchCall(search) => {
+                    let foreign =
+                        search.results.iter().any(|result| {
+                            is_foreign(result.encrypted_token.as_ref().and_then(|tok| {
+                                subscription_artifact_digest(b"web_search_token", tok)
+                            }))
+                        });
+                    if !foreign {
+                        kept_blocks.push(block.clone());
+                    }
+                }
+                ContentBlock::Text(text) => {
+                    let mut cloned = text.clone();
+                    if let Some(citations) = &cloned.citations {
+                        let filtered: Vec<Citation> = citations
+                            .iter()
+                            .filter(|citation| {
+                                !is_foreign(citation.encrypted_index.as_ref().and_then(|idx| {
+                                    subscription_artifact_digest(b"citation_index", idx)
+                                }))
+                            })
+                            .cloned()
+                            .collect();
+                        cloned.citations = (!filtered.is_empty()).then_some(filtered);
+                    }
+                    kept_blocks.push(ContentBlock::Text(cloned));
+                }
+                _ => kept_blocks.push(block.clone()),
+            }
+        }
+        let mut cloned_assistant = assistant.clone();
+        cloned_assistant.content = kept_blocks;
+        sanitized.push(Message::Assistant(cloned_assistant));
+    }
+    Some(sanitized)
+}
+
+fn derive_isolated_subscription_uuid(seed: &str, lineage: &str, segment: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anthropic-subscription-conversation-segment:");
+    hasher.update(seed.as_bytes());
+    hasher.update([0]);
+    hasher.update(lineage.as_bytes());
+    hasher.update([0]);
+    hasher.update(segment.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .to_string()
+}
+
+fn derive_isolated_subscription_hex64(seed: &str, lineage: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anthropic-subscription-device-scope:");
+    hasher.update(seed.as_bytes());
+    hasher.update([0]);
+    hasher.update(lineage.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn isolate_subscription_metadata_user_id(
+    raw: Option<&str>,
+    base_key: &str,
+    lineage: &str,
+    segment: u64,
+) -> Option<String> {
+    let raw = raw?;
+    if segment == 0 {
+        return Some(raw.to_string());
+    }
+    let session_uuid = derive_isolated_subscription_uuid(
+        if base_key.is_empty() { raw } else { base_key },
+        lineage,
+        segment,
+    );
+    if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(raw) {
+        if obj.contains_key("device_id") {
+            obj.insert(
+                "device_id".to_string(),
+                serde_json::Value::String(derive_isolated_subscription_hex64(raw, lineage)),
+            );
+        }
+        if obj.contains_key("account_uuid") {
+            obj.insert(
+                "account_uuid".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+        }
+        obj.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_uuid.clone()),
+        );
+        if let Ok(serialized) = serde_json::to_string(&obj) {
+            return Some(serialized);
+        }
+    }
+    if raw.starts_with("user_") && raw.contains("_session_") {
+        return Some(format!(
+            "user_{}_account__session_{session_uuid}",
+            derive_isolated_subscription_hex64(raw, lineage)
+        ));
+    }
+    Some(session_uuid)
+}
+
+fn isolate_subscription_affinity_session_id(
+    raw: Option<&str>,
+    base_key: &str,
+    lineage: &str,
+    segment: u64,
+) -> Option<String> {
+    let raw = raw?;
+    if segment == 0 {
+        return Some(raw.to_string());
+    }
+    Some(derive_isolated_subscription_uuid(
+        if base_key.is_empty() { raw } else { base_key },
+        lineage,
+        segment,
+    ))
+}
+
+struct SubscriptionAttemptState {
+    built_lineage: String,
+    active_owner: String,
+    stripped_unattributed_cold_history: bool,
+    has_unattributed_history_artifacts: bool,
+}
+
+struct SubscriptionAttemptIsolator {
+    base_key: String,
+    req: ModelRequest,
+    structured: bool,
+    cache_scope_enabled: bool,
+    defer_loading_supported: bool,
+    tool_change_mode: ToolChangeMode,
+    output_mode: StructuredOutputMode,
+    image_limits: ImageLimits,
+    media_budget: MediaBudget,
+    hint_beta_supported: bool,
+    allow_metadata_user_id: bool,
+    raw_metadata_user_id: Option<String>,
+    raw_affinity_session_id: Option<String>,
+    state: Mutex<SubscriptionAttemptState>,
+}
+
+impl AttemptCtx {
+    fn active_subscription_owner(&self) -> Option<String> {
+        self.subscription_isolator
+            .as_ref()
+            .map(|iso| iso.state.lock_recover().active_owner.clone())
+    }
+}
+
+fn rebuild_subscription_attempt_payload(
+    ctx: &AttemptCtx,
+    iso: &SubscriptionAttemptIsolator,
+    lineage: &str,
+    segment: u64,
+    owner: &str,
+    strip_unattributed: bool,
+) -> Result<(), String> {
+    let effective_req: Cow<'_, ModelRequest> =
+        match isolate_foreign_subscription_messages(&iso.req.messages, owner, strip_unattributed) {
+            Some(sanitized) => {
+                let mut cloned = iso.req.clone();
+                cloned.messages = sanitized;
+                Cow::Owned(cloned)
+            }
+            None => Cow::Borrowed(&iso.req),
+        };
+    let params = build_params_with_media_limits(
+        &effective_req,
+        iso.structured,
+        iso.cache_scope_enabled,
+        iso.defer_loading_supported,
+        iso.tool_change_mode,
+        iso.output_mode,
+        true,
+        iso.image_limits,
+        iso.media_budget,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut hint_controller = ContextHintController::new(
+        effective_req.context_hints.as_ref(),
+        iso.hint_beta_supported,
+    );
+    let hint_value = hint_controller
+        .build_request(&effective_req.messages)
+        .filter(|hint| hint.enabled)
+        .map(|hint| {
+            vobj(vec![
+                ("enabled", Value::Bool(true)),
+                ("target_tokens_saved", Value::from(hint.target_tokens_saved)),
+            ])
+        });
+    let metadata_uid = isolate_subscription_metadata_user_id(
+        iso.raw_metadata_user_id.as_deref(),
+        &iso.base_key,
+        lineage,
+        segment,
+    );
+    let affinity_sid = isolate_subscription_affinity_session_id(
+        iso.raw_affinity_session_id.as_deref(),
+        &iso.base_key,
+        lineage,
+        segment,
+    );
+
+    {
+        let mut body = ctx.body.lock_recover();
+        if let Some(obj) = body.as_object_mut() {
+            for key in ["messages", "system", "tools", "tool_choice"] {
+                match params.get(key) {
+                    Some(val) => {
+                        obj.insert(key, val.clone());
+                    }
+                    None => {
+                        obj.remove(key);
+                    }
+                }
+            }
+            match hint_value {
+                Some(val) => {
+                    obj.insert("context_hint", val);
+                }
+                None => {
+                    obj.remove("context_hint");
+                }
+            }
+            if iso.allow_metadata_user_id {
+                match metadata_uid {
+                    Some(uid) => {
+                        obj.insert("metadata", vobj(vec![("user_id", vs(uid))]));
+                    }
+                    None => {
+                        obj.remove("metadata");
+                    }
+                }
+            }
+        }
+    }
+    *ctx.context_hints.lock_recover() = hint_controller;
+    *ctx.hint_messages.lock_recover() = effective_req.messages.clone();
+    *ctx.affinity_session_id.lock_recover() = affinity_sid;
+    *ctx.media_repair.lock_recover() = MediaRepairState::default();
+    Ok(())
+}
+
+fn ensure_attempt_subscription_isolated(
+    ctx: &AttemptCtx,
+    attempt_lineage: &str,
+) -> Result<(), String> {
+    let Some(iso) = &ctx.subscription_isolator else {
+        return Ok(());
+    };
+    {
+        let state = iso.state.lock_recover();
+        if state.built_lineage == attempt_lineage {
+            return Ok(());
+        }
+    }
+    let (segment, owner, has_unattributed) =
+        resolve_subscription_account_segment(&iso.base_key, attempt_lineage, &iso.req.messages);
+    rebuild_subscription_attempt_payload(ctx, iso, attempt_lineage, segment, &owner, false)?;
+    let mut state = iso.state.lock_recover();
+    state.built_lineage = attempt_lineage.to_string();
+    state.active_owner = owner;
+    state.has_unattributed_history_artifacts = has_unattributed;
+    Ok(())
+}
+
+fn is_foreign_signature_rejection(status: Option<u16>, message: &str) -> bool {
+    if status != Some(400) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("signature") && lower.contains("thinking"))
+        || (lower.contains("redacted_thinking") && lower.contains("invalid"))
+        || (lower.contains("encrypted_content") && lower.contains("invalid"))
+}
+
+fn remediate_cold_foreign_signature_rejection(ctx: &AttemptCtx, raw: &RawProviderError) -> bool {
+    if !is_foreign_signature_rejection(raw.status, &raw.message) {
+        return false;
+    }
+    let Some(iso) = &ctx.subscription_isolator else {
+        return false;
+    };
+    let current_lineage = {
+        let state = iso.state.lock_recover();
+        if state.stripped_unattributed_cold_history || !state.has_unattributed_history_artifacts {
+            return false;
+        }
+        state.built_lineage.clone()
+    };
+    let digests = collect_message_artifact_digests(&iso.req.messages);
+    let (segment, owner) = {
+        let mut global = subscription_isolation_state().lock_recover();
+        for digest in digests {
+            global
+                .artifact_owners
+                .entry(digest)
+                .or_insert_with(|| "cold-foreign#0".to_string());
+        }
+        let next_segment = match global.conversation_segments.get_mut(&iso.base_key) {
+            Some(entry) => {
+                entry.lineage = current_lineage.clone();
+                entry.segment = entry.segment.saturating_add(1);
+                entry.segment
+            }
+            None => {
+                global.conversation_segments.insert(
+                    iso.base_key.clone(),
+                    ConversationAccountSegment {
+                        lineage: current_lineage.clone(),
+                        segment: 1,
+                    },
+                );
+                1
+            }
+        };
+        (next_segment, format!("{current_lineage}#{next_segment}"))
+    };
+    if rebuild_subscription_attempt_payload(ctx, iso, &current_lineage, segment, &owner, true)
+        .is_err()
+    {
+        return false;
+    }
+    let mut state = iso.state.lock_recover();
+    state.active_owner = owner;
+    state.stripped_unattributed_cold_history = true;
+    state.has_unattributed_history_artifacts = false;
+    true
+}
+
 /// Per-request transport state. Request-local budget and media repairs update
 /// only the normalized body across establishment attempts.
 struct AttemptCtx {
@@ -1852,14 +2651,15 @@ struct AttemptCtx {
     task_budget: bool,
     context_management: bool,
     context_hints: Mutex<ContextHintController>,
-    hint_messages: Vec<Message>,
+    hint_messages: Mutex<Vec<Message>>,
     hint_model: RuntimeString,
     native_tool_support: super::native_tools::NativeToolSupport,
     /// Search-channel beta header to advertise while the deferred-tool
     /// protocol is active for this request, if any.
     tool_search_beta: Option<&'static str>,
     emits_global: bool,
-    affinity_session_id: Option<String>,
+    affinity_session_id: Mutex<Option<String>>,
+    subscription_isolator: Option<SubscriptionAttemptIsolator>,
     use_native: bool,
     /// Vertex routing: the API version travels in the body, so suppress the
     /// `anthropic-version` header and the first-party `x-api-key` (GCP bearer
@@ -2100,6 +2900,13 @@ async fn attempt_with_media_remediation(
                     continue;
                 }
             }
+            if !signal.is_cancelled() && remediate_cold_foreign_signature_rejection(ctx, raw) {
+                tracing::warn!(
+                    "Retrying subscription request with isolated conversation state after foreign signature rejection"
+                );
+                crate::observability::provider_timing::note_stream_liveness();
+                continue;
+            }
             let kind = classify_error(raw).kind;
             let media_rejection = parse_media_rejection(raw.status, &raw.message).is_some()
                 && !matches!(
@@ -2159,10 +2966,11 @@ async fn attempt_with_media_remediation(
                     let directory = intent
                         .as_ref()
                         .and_then(|intent| intent.artifact_dir.as_ref());
-                    let projection = project_hint_edits(&ctx.hint_messages, directory).await;
+                    let hint_messages = ctx.hint_messages.lock_recover().clone();
+                    let projection = project_hint_edits(&hint_messages, directory).await;
                     if let Some(intent) = intent {
                         intent.state.record_projection(&ctx.hint_model, &projection);
-                        invalidate_cleared_reads(&ctx.hint_messages, &projection, &intent);
+                        invalidate_cleared_reads(&hint_messages, &projection, &intent);
                     }
                     projection
                 } else {
@@ -2224,7 +3032,7 @@ async fn attempt_once(
                 Some(id) => a.get_headers_for_account(id, signal).await,
                 None => a.get_headers(signal).await,
             };
-            result.map_err(|error| {
+            let headers = result.map_err(|error| {
                 // Credential preparation can fail before there is an HTTP
                 // status. Preserve its auth classification through retry.
                 let authentication_failed = error.kind == ProviderErrorKind::Auth;
@@ -2233,7 +3041,21 @@ async fn attempt_once(
                     raw.error_type = Some("authentication_error".to_string());
                 }
                 raw
-            })?
+            })?;
+            let attempt_lineage = id
+                .as_deref()
+                .and_then(|account_id| a.credential_lineage_for_account(account_id))
+                .or_else(|| a.credential_lineage());
+            if let Some(lineage) = attempt_lineage.as_deref() {
+                ensure_attempt_subscription_isolated(ctx, lineage).map_err(|message| {
+                    RawProviderError {
+                        error_type: Some("invalid_request_error".to_string()),
+                        message,
+                        ..Default::default()
+                    }
+                })?;
+            }
+            headers
         }
         None => HashMap::new(),
     };
@@ -2282,8 +3104,8 @@ async fn attempt_once(
                 merge_beta_header(&mut headers, beta);
             }
         }
-        if let Some(session) = &ctx.affinity_session_id {
-            headers.insert("x-session-id".to_string(), session.clone());
+        if let Some(session) = ctx.affinity_session_id.lock_recover().clone() {
+            headers.insert("x-session-id".to_string(), session);
         }
         if ctx.use_native {
             merge_beta_header(&mut headers, STRUCTURED_OUTPUTS_BETA);

@@ -424,6 +424,25 @@ impl AuthSource for MultiAccountAuthSource {
         (self.account_count() > 1).then(|| self.current_account_id())
     }
 
+    fn credential_lineage(&self) -> Option<String> {
+        let current = self.current_account_id();
+        self.credential_lineage_for_account(&current)
+    }
+
+    fn credential_lineage_for_account(&self, account_id: &str) -> Option<String> {
+        let accounts = self.inner.accounts.lock().unwrap();
+        accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .map(|account| {
+                if account.credential_id.is_empty() {
+                    account.id.clone()
+                } else {
+                    account.credential_id.clone()
+                }
+            })
+    }
+
     fn credential_account_ids(&self) -> Vec<String> {
         self.inner
             .accounts

@@ -271,6 +271,18 @@ pub trait AuthSource: Send + Sync {
         None
     }
 
+    /// Stable non-secret lineage identifier for the active subscription credential,
+    /// present for both single-account and multi-account OAuth sources so session
+    /// wire identity and cryptographic signatures never cross accounts.
+    fn credential_lineage(&self) -> Option<String> {
+        None
+    }
+
+    /// Stable non-secret lineage identifier for a specific queued account id.
+    fn credential_lineage_for_account(&self, _account_id: &str) -> Option<String> {
+        self.credential_lineage()
+    }
+
     /// Current queue membership, for request-local recovery accounting.
     fn credential_account_ids(&self) -> Vec<String> {
         self.credential_account_id().into_iter().collect()
