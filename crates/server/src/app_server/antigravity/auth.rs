@@ -490,6 +490,7 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
             clear_generation_disabled(generation);
             super::prune_generation(generation);
         }
+        MANUAL_SWITCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(ref generation) = removed_generation {
             super::egress::reset_pool(Some(generation)).await;
         }
@@ -502,6 +503,8 @@ pub async fn logout_account(account_id: Option<&str>) -> Result<Value, String> {
     }
     super::login::invalidate_pending();
     with_store_file_lock(|| write_accounts_unlocked(&[]))?;
+    MANUAL_SWITCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    super::cloud::clear_session_leases();
     disabled_generations()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -622,7 +625,9 @@ pub(super) fn usable_generations() -> Vec<String> {
     let now = chrono::Utc::now().timestamp_millis();
     accounts()
         .into_iter()
-        .filter(|entry| !entry_needs_login(entry, now))
+        .filter(|entry| {
+            !entry_needs_login(entry, now) && !is_generation_disabled(&entry.generation)
+        })
         .map(|entry| entry.generation)
         .collect()
 }

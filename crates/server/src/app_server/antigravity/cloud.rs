@@ -63,48 +63,233 @@ fn safe_identity_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-/// Read the (version, changelist) pair of the installed hub application: the
-/// marketing version from the bundle's Info.plist and the source changelist
-/// from the language server's build stamp — the same two sources the hub
-/// itself combines into its protocol identity. Both must come from the same
-/// install, or the pair is not trustworthy and the fallback is used instead.
-#[cfg(target_os = "macos")]
-fn installed_hub_build() -> Option<(String, String)> {
-    let home = std::env::var_os("HOME")?;
-    let app = [
-        std::path::PathBuf::from("/Applications/Antigravity.app"),
-        std::path::Path::new(&home).join("Applications/Antigravity.app"),
-    ]
-    .into_iter()
-    .find(|path| path.is_dir())?;
-    let version = std::process::Command::new("/usr/bin/plutil")
-        .args(["-extract", "CFBundleShortVersionString", "raw"])
-        .arg(app.join("Contents/Info.plist"))
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| safe_identity_token(value))?;
-    let stamp = std::process::Command::new(app.join("Contents/Resources/bin/language_server"))
-        .arg("--stamp")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())?;
-    let cl = stamp
+fn parse_hub_package_version(bytes: &[u8]) -> Option<String> {
+    let pkg: Value = serde_json::from_slice(bytes).ok()?;
+    let is_hub = pkg
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("antigravity"));
+    if !is_hub {
+        return None;
+    }
+    pkg.get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| safe_identity_token(value))
+        .map(str::to_string)
+}
+
+fn read_package_json_version(pkg_path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(pkg_path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 256 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(pkg_path).ok()?;
+    parse_hub_package_version(&bytes)
+}
+
+/// Extract the application version from a packaged `app.asar` archive without
+/// unpacking the bundle on disk.
+fn read_asar_package_version(asar_path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(asar_path).ok()?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).ok()?;
+    if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != 4 {
+        return None;
+    }
+    let header_size = u64::from(u32::from_le_bytes([
+        header[4], header[5], header[6], header[7],
+    ]));
+    let json_len = usize::try_from(u32::from_le_bytes([
+        header[12], header[13], header[14], header[15],
+    ]))
+    .ok()?;
+    if !(8..=32 * 1024 * 1024).contains(&header_size)
+        || json_len == 0
+        || json_len > 16 * 1024 * 1024
+        || (json_len as u64) > header_size
+    {
+        return None;
+    }
+    let mut toc_bytes = vec![0u8; json_len];
+    file.read_exact(&mut toc_bytes).ok()?;
+    let toc: Value = serde_json::from_slice(&toc_bytes).ok()?;
+    let entry = toc.get("files")?.get("package.json")?;
+    if entry.get("unpacked").and_then(Value::as_bool) == Some(true) {
+        let unpacked = asar_path
+            .parent()?
+            .join("app.asar.unpacked")
+            .join("package.json");
+        return read_package_json_version(&unpacked);
+    }
+    let size = usize::try_from(entry.get("size")?.as_u64()?).ok()?;
+    if size == 0 || size > 256 * 1024 {
+        return None;
+    }
+    let offset = entry.get("offset").and_then(|value| {
+        value
+            .as_str()
+            .and_then(|text| text.parse::<u64>().ok())
+            .or_else(|| value.as_u64())
+    })?;
+    let data_start = 8u64.checked_add(header_size)?.checked_add(offset)?;
+    file.seek(SeekFrom::Start(data_start)).ok()?;
+    let mut pkg_bytes = vec![0u8; size];
+    file.read_exact(&mut pkg_bytes).ok()?;
+    parse_hub_package_version(&pkg_bytes)
+}
+
+fn run_language_server_stamp(bin_path: &std::path::Path) -> Option<String> {
+    if !bin_path.is_file() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new(bin_path);
+    cmd.arg("--stamp")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdout_pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(256);
+        let _ = stdout_pipe.take(64 * 1024).read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(_) => break None,
+        }
+    }?;
+    if !status.success() {
+        return None;
+    }
+    let stdout = reader.join().ok()?;
+    let stamp = String::from_utf8(stdout).ok()?;
+    stamp
         .lines()
         .find_map(|line| line.strip_prefix("Built at CL: "))
-        .map(|value| value.trim().to_string())
-        .filter(|value| safe_identity_token(value))?;
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && safe_identity_token(value)
+        })
+        .map(str::to_string)
+}
+
+/// Inspect a hub `resources` directory (`Contents/Resources` on macOS or
+/// `resources` on Windows/Linux) and return `(version, cl)` only when both
+/// values come from the same installation.
+fn read_hub_build_from_resources_dir(resources_dir: &std::path::Path) -> Option<(String, String)> {
+    if !resources_dir.is_dir() {
+        return None;
+    }
+    let version = read_asar_package_version(&resources_dir.join("app.asar"))
+        .or_else(|| read_package_json_version(&resources_dir.join("app").join("package.json")))?;
+    let bin_dir = resources_dir.join("bin");
+    let server_bin = if cfg!(windows) {
+        let exe = bin_dir.join("language_server.exe");
+        if exe.is_file() {
+            exe
+        } else {
+            bin_dir.join("language_server")
+        }
+    } else {
+        bin_dir.join("language_server")
+    };
+    let cl = run_language_server_stamp(&server_bin)?;
     Some((version, cl))
 }
 
-/// Install inspection is only implemented where the hub's on-disk layout is
-/// known; other platforms fall back to the captured build pair.
-#[cfg(not(target_os = "macos"))]
+/// Read the (version, changelist) pair of the installed hub application. Both
+/// values must come from the same install, or the fallback pair is used instead.
+#[cfg(target_os = "macos")]
 fn installed_hub_build() -> Option<(String, String)> {
+    let mut candidates = vec![std::path::PathBuf::from("/Applications/Antigravity.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::Path::new(&home).join("Applications/Antigravity.app"));
+    }
+    for app in candidates {
+        if !app.is_dir() {
+            continue;
+        }
+        let resources = app.join("Contents/Resources");
+        if let Some(pair) = read_hub_build_from_resources_dir(&resources) {
+            return Some(pair);
+        }
+        let version = std::process::Command::new("/usr/bin/plutil")
+            .args(["-extract", "CFBundleShortVersionString", "raw"])
+            .arg(app.join("Contents/Info.plist"))
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| safe_identity_token(value));
+        let cl = run_language_server_stamp(&resources.join("bin/language_server"));
+        if let (Some(version), Some(cl)) = (version, cl) {
+            return Some((version, cl));
+        }
+    }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn installed_hub_build() -> Option<(String, String)> {
+    let mut roots = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let base = std::path::Path::new(&local);
+        roots.push(base.join("Programs").join("Antigravity"));
+        roots.push(base.join("Antigravity"));
+    }
+    for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(env_key) {
+            let candidate = std::path::Path::new(&dir).join("Antigravity");
+            if !roots.contains(&candidate) {
+                roots.push(candidate);
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .find_map(|root| read_hub_build_from_resources_dir(&root.join("resources")))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn installed_hub_build() -> Option<(String, String)> {
+    let mut roots = vec![
+        std::path::PathBuf::from("/opt/Antigravity"),
+        std::path::PathBuf::from("/opt/antigravity"),
+        std::path::PathBuf::from("/usr/lib/antigravity"),
+        std::path::PathBuf::from("/usr/share/antigravity"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_dir = std::path::Path::new(&home);
+        roots.push(home_dir.join(".local/share/Antigravity"));
+        roots.push(home_dir.join(".local/share/antigravity"));
+    }
+    roots
+        .into_iter()
+        .find_map(|root| read_hub_build_from_resources_dir(&root.join("resources")))
 }
 
 /// Identity pair pinned via the environment as "version:changelist". Tests
@@ -1123,6 +1308,8 @@ async fn not_offered_or_original(
 
 const DEFAULT_ROTATION_COOLDOWN_MS: u64 = 1_200;
 const SESSION_LEASE_TTL_MS: i64 = 30 * 60 * 1000;
+const MAX_RECORDED_SIGNATURES: usize = 4096;
+const SKIP_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 
 struct SessionLease {
     generation: String,
@@ -1130,11 +1317,300 @@ struct SessionLease {
     manual_switch_epoch: u64,
 }
 
+struct ConversationSegment {
+    generation: String,
+    segment: u64,
+    first_step: usize,
+}
+
 #[derive(Default)]
 struct AccountPoolRouting {
     in_flight: std::collections::HashMap<String, usize>,
     last_upstream_activity_ms: std::collections::HashMap<String, i64>,
     leases: std::collections::HashMap<String, SessionLease>,
+    conversation_segments: std::collections::HashMap<String, ConversationSegment>,
+    conversation_last_generation: std::collections::HashMap<String, String>,
+    signature_generations: std::collections::HashMap<u64, String>,
+}
+
+fn fnv1a_u64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn base_conversation_key(conversation_id: &str) -> &str {
+    let without_sub = conversation_id
+        .split_once(":sub:")
+        .map_or(conversation_id, |(base, _)| base);
+    without_sub
+        .split_once(":readonly:")
+        .map_or(without_sub, |(base, _)| base)
+}
+
+fn derive_isolated_conversation_id(
+    conversation_id: &str,
+    generation: &str,
+    segment: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"antigravity-conv-segment\0");
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(generation.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(segment.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .to_string()
+}
+
+/// Derive the isolated `(wire_conversation_id, wire_step, wire_session_id)` tuple
+/// for `(conversation_id, generation, step)`.
+///
+/// Conversations that stay on their initial account (`segment == 0`) preserve the
+/// exact original `conversation_id`, `step`, and `compute_session_id(conversation_id)`.
+/// Any automatic failover or manual account switch advances `segment`, derives a
+/// fresh UUID v4 `wire_conversation_id` and matching `sessionId`, and resets
+/// `wire_step` to `0` so two accounts never share upstream session or request IDs.
+pub(super) fn wire_conversation_context(
+    conversation_id: &str,
+    generation: &str,
+    step: usize,
+) -> (String, usize, String) {
+    if generation.is_empty() || conversation_id.is_empty() {
+        return (
+            conversation_id.to_string(),
+            step,
+            compute_session_id(conversation_id),
+        );
+    }
+    let base_key = base_conversation_key(conversation_id);
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    if state.conversation_segments.len() > MAX_RECORDED_SIGNATURES
+        && !state.conversation_segments.contains_key(base_key)
+    {
+        let live = auth::generations();
+        state
+            .conversation_segments
+            .retain(|_, seg| live.contains(&seg.generation));
+        if state.conversation_segments.len() > MAX_RECORDED_SIGNATURES {
+            state.conversation_segments.clear();
+        }
+    }
+    let entry = state
+        .conversation_segments
+        .entry(base_key.to_string())
+        .or_insert_with(|| ConversationSegment {
+            generation: generation.to_string(),
+            segment: 0,
+            first_step: step,
+        });
+    if entry.generation != generation {
+        entry.generation = generation.to_string();
+        entry.segment = entry.segment.saturating_add(1);
+        entry.first_step = step;
+    }
+    let (wire_conv_id, wire_step) = if entry.segment == 0 {
+        (conversation_id.to_string(), step)
+    } else {
+        (
+            derive_isolated_conversation_id(conversation_id, generation, entry.segment),
+            step.saturating_sub(entry.first_step),
+        )
+    };
+    let wire_session_id = compute_session_id(&wire_conv_id);
+    (wire_conv_id, wire_step, wire_session_id)
+}
+
+fn record_response_signatures(generation: &str, response: &GenerateContentResponse) {
+    if generation.is_empty() {
+        return;
+    }
+    let Some(candidates) = response.candidates.as_ref() else {
+        return;
+    };
+    let mut hashes = Vec::new();
+    for cand in candidates {
+        let Some(content) = cand.content.as_ref() else {
+            continue;
+        };
+        for part in &content.parts {
+            if let Some(sig) = part
+                .thought_signature
+                .as_ref()
+                .and_then(|s| s.try_to_utf8().ok())
+                .filter(|s| !s.is_empty() && s != SKIP_SIGNATURE_VALIDATOR)
+            {
+                hashes.push(fnv1a_u64(sig.as_bytes()));
+            }
+        }
+    }
+    if hashes.is_empty() {
+        return;
+    }
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    if state
+        .signature_generations
+        .len()
+        .saturating_add(hashes.len())
+        > MAX_RECORDED_SIGNATURES
+    {
+        let live = auth::generations();
+        state
+            .signature_generations
+            .retain(|_, owner| live.contains(owner));
+        if state
+            .signature_generations
+            .len()
+            .saturating_add(hashes.len())
+            > MAX_RECORDED_SIGNATURES
+        {
+            state.signature_generations.clear();
+        }
+    }
+    for hash in hashes {
+        state
+            .signature_generations
+            .insert(hash, generation.to_string());
+    }
+}
+
+/// Strip foreign-account `thoughtSignature` and signed `thought` blocks when an
+/// existing conversation continues after a manual account switch, while leaving
+/// same-account requests byte-identical.
+fn isolate_foreign_account_signatures(
+    conversation_id: &str,
+    generation: &str,
+    request: &mut RuntimeJson,
+) {
+    if generation.is_empty() {
+        return;
+    }
+    let base_key = base_conversation_key(conversation_id);
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    let previous = state
+        .conversation_last_generation
+        .insert(base_key.to_string(), generation.to_string());
+
+    let Some(contents) = request
+        .as_object_mut()
+        .and_then(|root| root.get_mut("contents"))
+        .and_then(RuntimeJson::as_array_mut)
+    else {
+        return;
+    };
+
+    if let Some(prev_gen) = previous.as_deref().filter(|prev| *prev != generation) {
+        for content in contents.iter() {
+            let Some(parts) = content.get("parts").and_then(RuntimeJson::as_array) else {
+                continue;
+            };
+            for part in parts {
+                if let Some(sig) = part
+                    .get("thoughtSignature")
+                    .and_then(RuntimeJson::as_string)
+                    .and_then(|s| s.try_to_utf8().ok())
+                    .filter(|s| !s.is_empty() && s != SKIP_SIGNATURE_VALIDATOR)
+                {
+                    state
+                        .signature_generations
+                        .entry(fnv1a_u64(sig.as_bytes()))
+                        .or_insert_with(|| prev_gen.to_string());
+                }
+            }
+        }
+    }
+
+    if state.signature_generations.is_empty() {
+        return;
+    }
+
+    for content in contents.iter_mut() {
+        let Some(content_obj) = content.as_object_mut() else {
+            continue;
+        };
+        if content_obj
+            .get("role")
+            .and_then(RuntimeJson::as_string)
+            .is_none_or(|role| role != "model")
+        {
+            continue;
+        }
+        let Some(parts) = content_obj
+            .get_mut("parts")
+            .and_then(RuntimeJson::as_array_mut)
+        else {
+            continue;
+        };
+        let has_foreign_sig = parts.iter().any(|part| {
+            part.get("thoughtSignature")
+                .and_then(RuntimeJson::as_string)
+                .and_then(|s| s.try_to_utf8().ok())
+                .filter(|s| !s.is_empty() && s != SKIP_SIGNATURE_VALIDATOR)
+                .and_then(|sig| state.signature_generations.get(&fnv1a_u64(sig.as_bytes())))
+                .is_some_and(|owner| owner != generation)
+        });
+        if !has_foreign_sig {
+            continue;
+        }
+        let has_non_thought_part = parts.iter().any(|part| {
+            part.get("functionCall").is_some()
+                || part.get("functionResponse").is_some()
+                || part.get("inlineData").is_some()
+                || (part.get("thought").and_then(RuntimeJson::as_bool) != Some(true)
+                    && part
+                        .get("text")
+                        .and_then(RuntimeJson::as_string)
+                        .is_some_and(|t| !t.is_empty()))
+        });
+        if has_non_thought_part {
+            parts.retain(|part| {
+                !(part.get("thought").and_then(RuntimeJson::as_bool) == Some(true)
+                    && part.get("functionCall").is_none())
+            });
+            let mut marked_first_call = false;
+            for part in parts.iter_mut() {
+                let Some(part_obj) = part.as_object_mut() else {
+                    continue;
+                };
+                if !marked_first_call && part_obj.get("functionCall").is_some() {
+                    marked_first_call = true;
+                    part_obj.insert(
+                        "thoughtSignature",
+                        RuntimeJson::String(RuntimeString::from(SKIP_SIGNATURE_VALIDATOR)),
+                    );
+                } else {
+                    part_obj.remove("thoughtSignature");
+                    if part_obj.get("thought").and_then(RuntimeJson::as_bool) == Some(true) {
+                        part_obj.remove("thought");
+                    }
+                }
+            }
+        } else {
+            let combined = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(RuntimeJson::as_string))
+                .filter(|t| !t.is_empty())
+                .fold(RuntimeString::default(), |acc, t| acc.concat(t));
+            let fallback = if combined.is_empty() {
+                RuntimeString::from(" ")
+            } else {
+                combined
+            };
+            parts.clear();
+            let mut plain = klaus_agent_core::runtime_values::RuntimeObject::default();
+            plain.insert("text", RuntimeJson::String(fallback));
+            parts.push(RuntimeJson::Object(plain));
+        }
+    }
 }
 
 fn record_upstream_activity(generation: Option<&str>) {
@@ -1178,11 +1654,11 @@ fn pool_routing() -> &'static std::sync::Mutex<AccountPoolRouting> {
 }
 
 pub(super) fn clear_session_leases() {
-    pool_routing()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .leases
-        .clear();
+    let mut state = pool_routing().lock().unwrap_or_else(|p| p.into_inner());
+    state.leases.clear();
+    state.conversation_segments.clear();
+    state.conversation_last_generation.clear();
+    state.signature_generations.clear();
 }
 
 pub(super) fn switch_session_leases(generation: &str, epoch: u64) {
@@ -1200,6 +1676,9 @@ pub(super) fn prune_session_leases(generation: &str) {
     state
         .leases
         .retain(|_, lease| lease.generation != generation);
+    state
+        .signature_generations
+        .retain(|_, owner| owner != generation);
 }
 
 struct ActiveGenerationGuard {
@@ -1504,8 +1983,11 @@ fn decode_raw_frame_observed(
                 false
             }
         });
-    let response =
+    let response: GenerateContentResponse =
         runtime_codec::decode_value(&inner).map_err(|_| api_error("antigravity_stream_invalid"))?;
+    if let Some(generation) = generation {
+        record_response_signatures(generation, &response);
+    }
     Ok(DecodedCloudFrame {
         response,
         continuation_token,
@@ -2404,6 +2886,8 @@ async fn establish_initial_leg_for_generation(
 ) -> Result<
     (
         String,
+        String,
+        usize,
         RuntimeJson,
         super::sanitize::ToolProjection,
         Option<u64>,
@@ -2411,13 +2895,16 @@ async fn establish_initial_leg_for_generation(
     ),
     GeminiApiError,
 > {
+    let (wire_conv_id, wire_step, wire_session_id) =
+        wire_conversation_context(conversation_id, generation, step);
     let mut base_request = generate_content_request(params);
     if let Some(req_obj) = base_request.as_object_mut() {
         req_obj.insert(
             "sessionId",
-            RuntimeJson::String(RuntimeString::from(compute_session_id(conversation_id))),
+            RuntimeJson::String(RuntimeString::from(wire_session_id)),
         );
     }
+    isolate_foreign_account_signatures(conversation_id, generation, &mut base_request);
     let tool_projection = super::sanitize::sanitize_outbound_request(&mut base_request);
     if let Some(details) = super::model_details(generation, model) {
         adapt_model_request(&mut base_request, &details)?;
@@ -2436,8 +2923,8 @@ async fn establish_initial_leg_for_generation(
         generation,
         model,
         &mut project,
-        conversation_id,
-        step,
+        &wire_conv_id,
+        wire_step,
         &base_request,
         None,
         signal,
@@ -2446,6 +2933,8 @@ async fn establish_initial_leg_for_generation(
     .await?;
     Ok((
         project,
+        wire_conv_id,
+        wire_step,
         base_request,
         tool_projection,
         initial_max_output_tokens,
@@ -2515,6 +3004,8 @@ impl GeminiClient for CloudClient {
             mut generation,
             active_guard,
             mut project,
+            mut wire_conv_id,
+            mut wire_step,
             mut base_request,
             mut tool_projection,
             initial_max_output_tokens,
@@ -2546,7 +3037,15 @@ impl GeminiClient for CloudClient {
             )
             .await
             {
-                Ok((project, base_request, projection, max_tokens, response)) => {
+                Ok((
+                    project,
+                    wire_conv_id,
+                    wire_step,
+                    base_request,
+                    projection,
+                    max_tokens,
+                    response,
+                )) => {
                     if pooled {
                         rebind_session_lease(sticky_key.as_deref(), &candidate_gen, routing_epoch);
                     }
@@ -2554,6 +3053,8 @@ impl GeminiClient for CloudClient {
                         candidate_gen,
                         guard,
                         project,
+                        wire_conv_id,
+                        wire_step,
                         base_request,
                         projection,
                         max_tokens,
@@ -2764,8 +3265,18 @@ impl GeminiClient for CloudClient {
                                 )
                                 .await
                                 {
-                                    Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
+                                    Ok((
+                                        next_proj,
+                                        next_wire_conv,
+                                        next_wire_step,
+                                        next_base,
+                                        next_proj_map,
+                                        _,
+                                        next_resp,
+                                    )) => {
                                         project = next_proj;
+                                        wire_conv_id = next_wire_conv;
+                                        wire_step = next_wire_step;
                                         base_request = next_base;
                                         tool_projection = next_proj_map;
                                         response = next_resp;
@@ -2825,10 +3336,20 @@ impl GeminiClient for CloudClient {
                             )
                             .await
                             {
-                                Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
+                                Ok((
+                                    next_proj,
+                                    next_wire_conv,
+                                    next_wire_step,
+                                    next_base,
+                                    next_proj_map,
+                                    _,
+                                    next_resp,
+                                )) => {
                                     _active_guard = next_guard;
                                     rebind_session_lease(sticky_key.as_deref(), &generation, routing_epoch);
                                     project = next_proj;
+                                    wire_conv_id = next_wire_conv;
+                                    wire_step = next_wire_step;
                                     base_request = next_base;
                                     tool_projection = next_proj_map;
                                     response = next_resp;
@@ -2890,8 +3411,18 @@ impl GeminiClient for CloudClient {
                     )
                     .await
                     {
-                        Ok((next_proj, next_base, next_proj_map, _, next_resp)) => {
+                        Ok((
+                            next_proj,
+                            next_wire_conv,
+                            next_wire_step,
+                            next_base,
+                            next_proj_map,
+                            _,
+                            next_resp,
+                        )) => {
                             project = next_proj;
+                            wire_conv_id = next_wire_conv;
+                            wire_step = next_wire_step;
                             base_request = next_base;
                             tool_projection = next_proj_map;
                             response = next_resp;
@@ -3012,8 +3543,8 @@ impl GeminiClient for CloudClient {
                                 &generation,
                                 &model,
                                 &mut project,
-                                &conversation_id,
-                                step,
+                                &wire_conv_id,
+                                wire_step,
                                 &base_request,
                                 token.as_ref(),
                                 &signal,
@@ -4475,5 +5006,147 @@ mod tests {
             "KLAUS_ANTIGRAVITY_API_URL",
         );
         auth::logout().await.unwrap();
+    }
+
+    fn build_synthetic_asar(toc: &Value, payload: &[u8]) -> Vec<u8> {
+        let toc_bytes = serde_json::to_vec(toc).unwrap();
+        let json_len = u32::try_from(toc_bytes.len()).unwrap();
+        // Chromium pickle header: [4, header_size, header_size - 4, json_len], padded to 4 bytes.
+        let padded_json_len = (json_len + 3) & !3;
+        let header_size = 8 + padded_json_len;
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&header_size.to_le_bytes());
+        out.extend_from_slice(&(header_size - 4).to_le_bytes());
+        out.extend_from_slice(&json_len.to_le_bytes());
+        out.extend_from_slice(&toc_bytes);
+        out.resize(16 + padded_json_len as usize, 0);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn asar_and_resources_hub_build_inspector_verifies_same_install_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = dir.path().join("resources");
+        let bin_dir = resources.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let pkg = br#"{"name":"antigravity","version":"2.40.1"}"#;
+        let toc = json!({
+            "files": {
+                "package.json": {
+                    "size": pkg.len(),
+                    "offset": "0"
+                }
+            }
+        });
+        let asar_path = resources.join("app.asar");
+        std::fs::write(&asar_path, build_synthetic_asar(&toc, pkg)).unwrap();
+        assert_eq!(
+            read_asar_package_version(&asar_path).as_deref(),
+            Some("2.40.1")
+        );
+
+        // Non-hub ASAR packages are rejected even when structurally valid.
+        let wrong_pkg = br#"{"name":"other-electron-app","version":"9.9.9"}"#;
+        let wrong_asar = dir.path().join("other.asar");
+        std::fs::write(&wrong_asar, build_synthetic_asar(&toc, wrong_pkg)).unwrap();
+        assert!(read_asar_package_version(&wrong_asar).is_none());
+
+        // Missing stamp binary rejects partial detection rather than mixing sources.
+        assert!(read_hub_build_from_resources_dir(&resources).is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let stamp_bin = bin_dir.join("language_server");
+            std::fs::write(
+                &stamp_bin,
+                "#!/bin/sh\nif [ \"$1\" = \"--stamp\" ]; then\n  echo \"Built at CL: 1099887766\"\nfi\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&stamp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                read_hub_build_from_resources_dir(&resources),
+                Some(("2.40.1".to_string(), "1099887766".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn account_switch_isolates_wire_conversation_session_id_and_strips_foreign_signatures() {
+        clear_session_leases();
+        let decode_rt = |val: Value| -> RuntimeJson {
+            runtime_codec::decode_text(&RuntimeString::from(val.to_string())).unwrap()
+        };
+        let encode_serde = |val: &RuntimeJson| -> Value {
+            serde_json::from_slice(&runtime_codec::encode_bytes(val).unwrap()).unwrap()
+        };
+
+        // Initial account keeps the canonical conversation ID, step, and sessionId, and replays its own signatures intact.
+        let (alpha_conv, alpha_step, alpha_sid) =
+            wire_conversation_context("conv-iso", "gen-alpha", 3);
+        assert_eq!(alpha_conv, "conv-iso");
+        assert_eq!(alpha_step, 3);
+        assert_eq!(alpha_sid, compute_session_id("conv-iso"));
+        let _ = decode_raw_frame(
+            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"alpha-thought","thoughtSignature":"sig-alpha-thought"},{"functionCall":{"id":"c1","name":"read","args":{}},"thoughtSignature":"sig-alpha-call"}]}}]}}"#,
+            Some("gen-alpha"),
+        )
+        .unwrap();
+        let turn_payload = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "alpha-thought", "thoughtSignature": "sig-alpha-thought"},
+                    {"functionCall": {"id": "c1", "name": "read", "args": {}}, "thoughtSignature": "sig-alpha-call"}
+                ]},
+                {"role": "user", "parts": [{"functionResponse": {"id": "c1", "name": "read", "response": {"output": "ok"}}}]}
+            ]
+        });
+        let mut same_acct = decode_rt(turn_payload.clone());
+        isolate_foreign_account_signatures("conv-iso", "gen-alpha", &mut same_acct);
+        assert_eq!(encode_serde(&same_acct), turn_payload);
+
+        // Automatic or manual failover to a second account assigns a fresh UUID v4 wire conversation ID,
+        // resets wire step to 0, derives a matching sessionId, and strips Account A's signatures.
+        let (beta_conv, beta_step0, beta_sid) =
+            wire_conversation_context("conv-iso", "gen-beta", 4);
+        assert_ne!(beta_conv, "conv-iso");
+        assert!(uuid::Uuid::parse_str(&beta_conv).is_ok());
+        assert_eq!(beta_step0, 0);
+        assert_eq!(beta_sid, compute_session_id(&beta_conv));
+        assert_ne!(beta_sid, compute_session_id("conv-iso"));
+
+        // Follow-up turn on Account B reuses the same isolated conversation UUID and sessionId with step 1.
+        let (beta_conv_next, beta_step1, beta_sid_next) =
+            wire_conversation_context("conv-iso", "gen-beta", 5);
+        assert_eq!(beta_conv_next, beta_conv);
+        assert_eq!(beta_step1, 1);
+        assert_eq!(beta_sid_next, beta_sid);
+
+        // Readonly/subagent forks on Account B also derive isolated IDs without advancing the segment.
+        let (fork_conv, _, fork_sid) =
+            wire_conversation_context("conv-iso:readonly:fork", "gen-beta", 0);
+        assert_ne!(fork_conv, "conv-iso:readonly:fork");
+        assert_ne!(fork_conv, beta_conv);
+        assert_eq!(fork_sid, compute_session_id(&fork_conv));
+
+        let mut cross_acct = decode_rt(turn_payload);
+        isolate_foreign_account_signatures("conv-iso", "gen-beta", &mut cross_acct);
+        let scrubbed = encode_serde(&cross_acct);
+        let model_parts = scrubbed["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(
+            model_parts.len(),
+            1,
+            "foreign signed thought block must be stripped"
+        );
+        assert_eq!(model_parts[0]["functionCall"]["name"], "read");
+        assert_eq!(
+            model_parts[0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        clear_session_leases();
     }
 }

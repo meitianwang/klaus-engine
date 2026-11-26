@@ -1375,20 +1375,19 @@ async fn generate_content_with_rotation(
         let model = resolve_native_model(&generation, model_field, requested_model).await?;
         let outcome: Result<Value, String> = async {
             let project = project(Some(&generation), signal).await?;
+            let (wire_conv_id, wire_step, wire_session_id) =
+                cloud::wire_conversation_context(&conversation_id, &generation, 0);
             let mut inner_request = build_request(&model);
             if let Some(obj) = inner_request.as_object_mut() {
-                obj.insert(
-                    "sessionId".into(),
-                    Value::String(cloud::compute_session_id(&conversation_id)),
-                );
+                obj.insert("sessionId".into(), Value::String(wire_session_id));
             }
             let body = cloud::envelope_with_context(
                 &project,
                 &model,
                 inner_request,
                 request_type,
-                Some(&conversation_id),
-                Some(0),
+                Some(&wire_conv_id),
+                Some(wire_step),
             );
             cloud::rpc("generateContent", body, Some(&generation), signal).await
         }

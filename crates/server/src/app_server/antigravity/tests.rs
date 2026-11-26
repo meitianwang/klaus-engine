@@ -3869,3 +3869,448 @@ async fn sticky_conversations_shard_across_accounts_and_fail_over_on_503_overloa
     remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
     remove_process_environment_var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS");
 }
+
+#[tokio::test]
+async fn automatic_failover_isolates_wire_conversation_session_id_and_foreign_signatures() {
+    use klaus_agent_core::provider::gemini::{GeminiProvider, GeminiProviderOptions};
+    use klaus_agent_core::types::provider::{ModelProvider, ModelRequest, ModelStreamEvent};
+    use std::collections::VecDeque;
+
+    #[derive(Clone)]
+    enum WireReply {
+        Http429,
+        SignedToolCall {
+            thought: &'static str,
+            thought_sig: &'static str,
+            call_id: &'static str,
+            call_sig: &'static str,
+        },
+        FinalText(&'static str),
+    }
+
+    let plans: Arc<Mutex<HashMap<String, VecDeque<WireReply>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let captured_stream_bodies: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let plans_srv = plans.clone();
+    let captured_srv = captured_stream_bodies.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let plans = plans_srv.clone();
+            let captured = captured_srv.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (header_end, content_len) = loop {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let hdr = String::from_utf8_lossy(&raw[..pos]);
+                        let len = hdr
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while raw.len() < header_end + content_len {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let hdr = String::from_utf8_lossy(&raw[..header_end]);
+                let first_line = hdr.lines().next().unwrap_or("");
+                let bearer = hdr
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("authorization: bearer ")
+                            .map(|_| line[22..].trim().to_string())
+                    })
+                    .unwrap_or_default();
+                if first_line.contains("fetchAvailableModels") {
+                    let body = json!({
+                        "models": {
+                            "gemini-3.8-flash-medium": {
+                                "displayName": "Gemini 3.8 Flash",
+                                "maxTokens": 1048576,
+                                "maxOutputTokens": 65536,
+                                "supportsThinking": true
+                            }
+                        }
+                    })
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    return;
+                }
+                let body_json: Value =
+                    serde_json::from_slice(&raw[header_end..header_end + content_len])
+                        .unwrap_or(Value::Null);
+                captured.lock().unwrap().push((bearer.clone(), body_json));
+                let step = plans
+                    .lock()
+                    .unwrap()
+                    .get_mut(&bearer)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(WireReply::FinalText("done"));
+                match step {
+                    WireReply::Http429 => {
+                        let err = json!({
+                            "error": {
+                                "code": 429,
+                                "status": "RESOURCE_EXHAUSTED",
+                                "message": "Quota exhausted",
+                                "details": [{"reason": "QUOTA_EXHAUSTED"}]
+                            }
+                        })
+                        .to_string();
+                        let reply = format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    WireReply::SignedToolCall {
+                        thought,
+                        thought_sig,
+                        call_id,
+                        call_sig,
+                    } => {
+                        let sse = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "response": {
+                                    "candidates": [{
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [
+                                                {
+                                                    "thought": true,
+                                                    "text": thought,
+                                                    "thoughtSignature": thought_sig
+                                                },
+                                                {
+                                                    "functionCall": {
+                                                        "id": call_id,
+                                                        "name": "read",
+                                                        "args": {"path": "/tmp/a.txt"}
+                                                    },
+                                                    "thoughtSignature": call_sig
+                                                }
+                                            ]
+                                        },
+                                        "finishReason": "STOP"
+                                    }]
+                                }
+                            })
+                        );
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    WireReply::FinalText(text) => {
+                        let sse = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "response": {
+                                    "candidates": [{
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [{"text": text}]
+                                        },
+                                        "finishReason": "STOP"
+                                    }]
+                                }
+                            })
+                        );
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                            sse.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    set_config_root(root.path());
+    cloud::clear_session_leases();
+    set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", &endpoint);
+    set_process_environment_var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS", "0");
+
+    auth::adopt(auth::Credential {
+        access_token: "acct-a-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("a@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-a".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+    auth::adopt(auth::Credential {
+        access_token: "acct-b-tok".into(),
+        refresh_token: None,
+        expires_at: None,
+        account: Some("b@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("proj-b".into()),
+        client_id: None,
+        client_secret: None,
+    })
+    .await
+    .unwrap();
+
+    {
+        let mut p = plans.lock().unwrap();
+        p.insert(
+            "acct-a-tok".into(),
+            VecDeque::from([
+                WireReply::SignedToolCall {
+                    thought: "alpha-secret-thought",
+                    thought_sig: "sig-acct-a-thought",
+                    call_id: "call-1",
+                    call_sig: "sig-acct-a-call",
+                },
+                WireReply::Http429,
+            ]),
+        );
+        p.insert(
+            "acct-b-tok".into(),
+            VecDeque::from([
+                WireReply::SignedToolCall {
+                    thought: "beta-own-thought",
+                    thought_sig: "sig-acct-b-thought",
+                    call_id: "call-2",
+                    call_sig: "sig-acct-b-call",
+                },
+                WireReply::FinalText("all-done-on-b"),
+            ]),
+        );
+    }
+
+    let init: ProtocolSessionInit = decode(json!({
+        "threadId": "conv-auto-iso",
+        "modelSource": {"source": "antigravity"},
+    }));
+    let base: Arc<dyn ModelProvider> = Arc::new(GeminiProvider::new(GeminiProviderOptions {
+        default_model: Some("gemini-3.8-flash-medium".into()),
+        ..Default::default()
+    }));
+    let provider = decorate(base, &init);
+
+    use klaus_agent_core::schemas::content::{
+        ContentBlock, OutputBlock, TextBlock, ThinkingBlock, ToolUseBlock,
+    };
+    use klaus_agent_core::schemas::message::{
+        AssistantMessage, Message, ToolResultMessage, UserMessage,
+    };
+
+    let make_base_req = || -> ModelRequest {
+        decode(json!({
+            "model": "gemini-3.8-flash-medium",
+            "system": [],
+            "messages": [],
+            "tools": [],
+            "maxOutputTokens": 128,
+            "thinking": {"type": "adaptive"}
+        }))
+    };
+    let user_msg = Message::User(UserMessage {
+        uuid: "u-0".into(),
+        is_meta: None,
+        question_answer: None,
+        content: vec![ContentBlock::Text(TextBlock {
+            text: "inspect /tmp/a.txt".into(),
+            citations: None,
+            harness_envelope: None,
+            message_id: None,
+            phase: None,
+        })],
+    });
+    let assistant_from_events = |uuid: &str, events: &[ModelStreamEvent]| {
+        let mut content = Vec::new();
+        for ev in events {
+            match ev {
+                ModelStreamEvent::ThinkingBlock {
+                    text, signature, ..
+                } => {
+                    content.push(ContentBlock::Thinking(ThinkingBlock {
+                        text: text.clone(),
+                        message_id: None,
+                        signature: signature.clone(),
+                        encrypted_content: None,
+                    }));
+                }
+                ModelStreamEvent::ToolUseStart {
+                    id,
+                    name,
+                    thought_signature,
+                    ..
+                } => {
+                    content.push(ContentBlock::ToolUse(ToolUseBlock {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: klaus_agent_core::runtime_values::runtime_codec::decode_text(
+                            &RuntimeString::from(r#"{"path":"/tmp/a.txt"}"#),
+                        )
+                        .unwrap(),
+                        tool_kind: None,
+                        thought_signature: thought_signature.clone(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Message::Assistant(AssistantMessage {
+            uuid: uuid.into(),
+            model: "gemini-3.8-flash-medium".into(),
+            usage: None,
+            content,
+        })
+    };
+    let tool_res = |uuid: &str, call_id: &str, out: &str| {
+        Message::ToolResult(ToolResultMessage {
+            uuid: uuid.into(),
+            tool_use_id: call_id.into(),
+            content: vec![OutputBlock::Text(TextBlock {
+                text: out.into(),
+                citations: None,
+                harness_envelope: None,
+                message_id: None,
+                phase: None,
+            })],
+            is_error: false,
+            tool_kind: None,
+            native_tool_output: None,
+            output: None,
+            extra_user_blocks: None,
+        })
+    };
+
+    // Turn 1: runs on Account A and records Account A's signatures.
+    let mut req1 = make_base_req();
+    req1.messages = vec![user_msg.clone()];
+    let events1: Vec<ModelStreamEvent> = provider.stream(req1, AbortSignal::new()).collect().await;
+    assert!(events1
+        .iter()
+        .any(|ev| matches!(ev, ModelStreamEvent::ToolUseStart { .. })));
+
+    // Turn 2: replays Account A's signed assistant turn -> Account A returns 429 -> auto-rotates to Account B!
+    let turn1_asst = assistant_from_events("a-1", &events1);
+    let turn1_res = tool_res("r-1", "call-1", "alpha-data");
+    let mut req2 = make_base_req();
+    req2.messages = vec![user_msg.clone(), turn1_asst.clone(), turn1_res.clone()];
+    let events2: Vec<ModelStreamEvent> = provider.stream(req2, AbortSignal::new()).collect().await;
+    assert!(events2
+        .iter()
+        .any(|ev| matches!(ev, ModelStreamEvent::ToolUseStart { .. })));
+
+    // Turn 3: continues on Account B, carrying both Account A's Turn 1 and Account B's Turn 2.
+    let turn2_asst = assistant_from_events("a-2", &events2);
+    let turn2_res = tool_res("r-2", "call-2", "beta-data");
+    let mut req3 = make_base_req();
+    req3.messages = vec![user_msg, turn1_asst, turn1_res, turn2_asst, turn2_res];
+    let events3: Vec<ModelStreamEvent> = provider.stream(req3, AbortSignal::new()).collect().await;
+    let final_text: String = events3
+        .into_iter()
+        .filter_map(|ev| match ev {
+            ModelStreamEvent::TextDelta { text } => text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(final_text, "all-done-on-b");
+
+    let calls = captured_stream_bodies.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[0].0, "acct-a-tok");
+    assert_eq!(calls[1].0, "acct-a-tok");
+    assert_eq!(calls[2].0, "acct-b-tok");
+    assert_eq!(calls[3].0, "acct-b-tok");
+
+    let parse_req_id = |body: &Value| -> (String, String) {
+        let req_id = body["requestId"].as_str().unwrap();
+        let parts: Vec<&str> = req_id.split('/').collect();
+        assert_eq!(parts.len(), 4, "unexpected requestId: {req_id}");
+        (parts[2].to_string(), parts[3].to_string())
+    };
+
+    // Account A keeps canonical conversation ID and signatures.
+    let (conv_a0, step_a0) = parse_req_id(&calls[0].1);
+    let (conv_a1, step_a1) = parse_req_id(&calls[1].1);
+    assert_eq!(conv_a0, "conv-auto-iso");
+    assert_eq!(step_a0, "0");
+    assert_eq!(conv_a1, "conv-auto-iso");
+    assert_eq!(step_a1, "1");
+    assert_eq!(
+        calls[1].1["request"]["sessionId"],
+        cloud::compute_session_id("conv-auto-iso")
+    );
+    assert!(calls[1].1.to_string().contains("sig-acct-a-thought"));
+
+    // Automatic failover to Account B rotates onto a brand-new UUID v4 conversation ID, step 0,
+    // matching new sessionId, and strips Account A's thoughts and signatures completely.
+    let (conv_b0, step_b0) = parse_req_id(&calls[2].1);
+    assert_ne!(conv_b0, "conv-auto-iso");
+    assert!(uuid::Uuid::parse_str(&conv_b0).is_ok());
+    assert_eq!(step_b0, "0");
+    let expected_b_sid = cloud::compute_session_id(&conv_b0);
+    assert_eq!(calls[2].1["request"]["sessionId"], expected_b_sid);
+    assert_ne!(expected_b_sid, cloud::compute_session_id("conv-auto-iso"));
+    let b0_wire = calls[2].1.to_string();
+    assert!(!b0_wire.contains("sig-acct-a-thought"));
+    assert!(!b0_wire.contains("sig-acct-a-call"));
+    assert!(!b0_wire.contains("alpha-secret-thought"));
+    assert_eq!(
+        calls[2].1["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+        "skip_thought_signature_validator"
+    );
+
+    // Follow-up turn on Account B reuses the same isolated conversation UUID and sessionId (step 1),
+    // keeps Account A's turn stripped, and preserves Account B's own signed thoughts intact.
+    let (conv_b1, step_b1) = parse_req_id(&calls[3].1);
+    assert_eq!(conv_b1, conv_b0);
+    assert_eq!(step_b1, "1");
+    assert_eq!(calls[3].1["request"]["sessionId"], expected_b_sid);
+    let b1_wire = calls[3].1.to_string();
+    assert!(!b1_wire.contains("sig-acct-a-thought"));
+    assert!(!b1_wire.contains("alpha-secret-thought"));
+    assert!(b1_wire.contains("sig-acct-b-thought"));
+    assert!(b1_wire.contains("sig-acct-b-call"));
+    assert!(b1_wire.contains("beta-own-thought"));
+
+    server.abort();
+    auth::logout().await.unwrap();
+    cloud::clear_session_leases();
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+    remove_process_environment_var("KLAUS_ANTIGRAVITY_ROTATION_COOLDOWN_MS");
+}
