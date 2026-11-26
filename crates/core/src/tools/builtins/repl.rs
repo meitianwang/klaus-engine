@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::engine::code_mode::runtime::repl_session::{
-    ReplExecOutcome, ReplExecRequest, ReplToolBinding, REPL_DEFAULT_TIMEOUT_MS, REPL_MAX_TIMEOUT_MS,
+    REPL_DEFAULT_TIMEOUT_MS, REPL_MAX_TIMEOUT_MS, ReplExecOutcome, ReplExecRequest, ReplToolBinding,
 };
 use crate::engine::code_mode::session::{CodeModeSessionProvider, ReplSessionHandle};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString};
@@ -486,6 +486,150 @@ mod tests {
             .collect()
         }));
         ctx
+    }
+
+    #[tokio::test]
+    async fn repl_projects_wrapped_mcp_results_and_routes_aliases() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let mut ctx = browser_ctx(Default::default());
+        ctx.invoke_tool = Some(Arc::new(|name, input| {
+            Box::pin(async move {
+                let body = if name == "mcp__klaus-browser__ax_state" {
+                    "- button: Continue"
+                } else {
+                    assert_eq!(name, "mcp__klaus-browser__ax_action");
+                    assert_eq!(input.get("tab"), Some(&rjson!(1)));
+                    r#"{"ok":true}"#
+                };
+                let block = |text| {
+                    OutputBlock::Text(crate::schemas::content::TextBlock {
+                        text: rs(text),
+                        citations: None,
+                        harness_envelope: None,
+                        message_id: None,
+                        phase: None,
+                    })
+                };
+                let mut entry = RuntimeObject::new();
+                entry.insert("type", rjson!("text"));
+                entry.insert("text", RuntimeJson::String(rs(body)));
+                let mut output = RuntimeObject::new();
+                output.insert(
+                    "content",
+                    RuntimeJson::Array(vec![RuntimeJson::Object(entry)]),
+                );
+                output.insert("structuredContent", rjson!({"ignored": true}));
+                Ok(InvokeToolResult {
+                    is_error: false,
+                    output: Some(RuntimeJson::Object(output)),
+                    content: vec![
+                        block("Wall time: 0.0142 seconds\nOutput:"),
+                        block(body),
+                        block("Structured content:\n{\"ignored\":true}"),
+                    ],
+                })
+            })
+        }));
+        let result = tool.call({ let mut input = RuntimeObject::new(); input.insert("code", RuntimeJson::String(rs(r#"
+          const a = await globalThis["mcp__klaus-browser__ax_action"]({tab: 1});
+          const b = await call_mcp_tool({name: "mcp__klaus-browser__ax_action", arguments: {tab: 1}});
+          const state = await call_mcp_tool({server: "klaus-browser", name: "ax_state"});
+          return [a.ok, b.ok, state];
+        "#))); RuntimeJson::Object(input) }, &ctx, None).await.unwrap();
+        assert_eq!(
+            result.serializable.output.get("result"),
+            Some(&rjson!([true, true, "- button: Continue"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_returns_early_and_persists_initialized_declarations() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let ctx = make_ctx(".");
+        for (code, expected) in [
+            ("return 2;", rjson!(2)),
+            (
+                "const base = await Promise.resolve(40); function inner() { return 2; } if (base) return base + inner(); 0;",
+                rjson!(42),
+            ),
+            ("base + inner()", rjson!(42)),
+        ] {
+            let mut input = RuntimeObject::new();
+            input.insert("code", RuntimeJson::String(rs(code)));
+            let result = tool
+                .call(RuntimeJson::Object(input), &ctx, None)
+                .await
+                .unwrap();
+            assert_eq!(result.serializable.output.get("result"), Some(&expected));
+        }
+        let bare = tool
+            .call(
+                rjson!({"code": "return; throw new Error('unreachable');"}),
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(bare.serializable.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn repl_url_globals_resolve_mutate_and_keep_search_params_live() {
+        let tool = create_repl_tool(Arc::new(
+            crate::engine::code_mode::runtime::InProcessCodeModeSessionProvider,
+        ));
+        let result = tool
+            .call(
+                {
+                    let mut input = RuntimeObject::new();
+                    input.insert(
+                        "code",
+                        RuntimeJson::String(rs(r#"
+          const url = new URL('../a?b=2&b=3#old', 'https://bücher.example:443/x/y');
+          const p = url.searchParams;
+          const original = [url.origin, url.port, url.pathname, p.getAll('b')];
+          url.search = '?z=x+y';
+          p.append('a', '~'); p.set('z', 'two words'); p.sort();
+          url.pathname = '/new path'; url.hash = 'new';
+          const standalone = new URLSearchParams([['x', '1'], ['x', '2']]);
+          standalone.delete('x', '1');
+          const visited = [];
+          standalone.forEach((v, k) => visited.push(k + v));
+          return [original, String(url), p === url.searchParams, [...p],
+            URL.canParse('../a', url), URL.canParse('../a'), standalone.size,
+            standalone.has('x', '2'), standalone.get('x'), [...standalone.keys()],
+            [...standalone.values()], visited, standalone.toString()];
+        "#)),
+                    );
+                    RuntimeJson::Object(input)
+                },
+                &make_ctx("."),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.serializable.output.get("result"),
+            Some(&rjson!([
+                ["https://xn--bcher-kva.example", "", "/a", ["2", "3"]],
+                "https://xn--bcher-kva.example/new%20path?a=%7E&z=two+words#new",
+                true,
+                [["a", "~"], ["z", "two words"]],
+                true,
+                false,
+                1,
+                true,
+                "2",
+                ["x"],
+                ["2"],
+                ["x2"],
+                "x=2"
+            ]))
+        );
     }
 
     // ---- metadata + schema -----------------------------------------------------

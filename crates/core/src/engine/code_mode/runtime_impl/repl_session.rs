@@ -20,26 +20,26 @@
 //! console output is preserved, and later calls continue in the same context.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use futures::future::{BoxFuture, Either};
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::code_mode::protocol::{CodeModeToolKind, NestedToolMetadata};
-use crate::runtime_values::{runtime_json, RuntimeJson, RuntimeObject, RuntimeString};
+use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString, runtime_json};
 use crate::schemas::content::OutputBlock;
 use crate::types::errors::{CodeModeToolRejection, ToolError};
 use crate::types::tool::{InvokeToolFn, InvokeToolResult};
 use crate::v8_platform::{
-    heap_limited_isolate, initialize_v8, HeapLimitWatch, SCRIPT_HEAP_LIMIT_BYTES,
+    HeapLimitWatch, SCRIPT_HEAP_LIMIT_BYTES, heap_limited_isolate, initialize_v8,
 };
 
 use super::isolate::value::{
@@ -115,6 +115,124 @@ const REPL_BOOTSTRAP_SOURCE: &str = r#"
       value: value, configurable: true, writable: true, enumerable: false,
     });
   }
+  defineHidden('__klausCallMcpTool', async function helper({ name, server, arguments: args }) {
+    const qualified = server ? `mcp__${server}__${name}` : name;
+    for (const key of [name, qualified, name.replace(/[^A-Za-z0-9_$]/g, '_'),
+        qualified.replace(/[^A-Za-z0-9_$]/g, '_')]) {
+      const fn = globalThis[key];
+      if (typeof fn === 'function' && fn !== helper) return fn(args ?? {});
+    }
+    throw new Error(`MCP tool not found: ${qualified}`);
+  });
+  const parseUrl = globalThis.__klausParseUrl;
+  delete globalThis.__klausParseUrl;
+  const scalar = value => String(value).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+  const formEncode = value => encodeURIComponent(value).replace(/%20/g, '+')
+    .replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const params = new WeakMap();
+  function parseForm(value) {
+    return parseUrl('form', value);
+  }
+  class URLSearchParams {
+    constructor(init = '') {
+      let pairs;
+      if (init != null && typeof init[Symbol.iterator] === 'function' && typeof init !== 'string') {
+        pairs = Array.from(init, pair => {
+          const values = Array.from(pair);
+          if (values.length !== 2) throw new TypeError('Expected a name/value pair');
+          return values.map(scalar);
+        });
+      } else if (init !== null && typeof init === 'object') {
+        pairs = Object.entries(init).map(pair => pair.map(scalar));
+      } else {
+        pairs = parseForm(scalar(init).replace(/^\?/, ''));
+      }
+      params.set(this, { pairs });
+    }
+    get size() { return params.get(this).pairs.length; }
+    append(name, value) { params.get(this).pairs.push([scalar(name), scalar(value)]); this.#sync(); }
+    delete(name, value = undefined) {
+      name = scalar(name);
+      if (value !== undefined) value = scalar(value);
+      const state = params.get(this);
+      state.pairs = state.pairs.filter(([k, v]) => k !== name || (value !== undefined && v !== value));
+      this.#sync();
+    }
+    get(name) { name = scalar(name); return params.get(this).pairs.find(([k]) => k === name)?.[1] ?? null; }
+    getAll(name) { name = scalar(name); return params.get(this).pairs.filter(([k]) => k === name).map(([, v]) => v); }
+    has(name, value = undefined) {
+      name = scalar(name);
+      if (value !== undefined) value = scalar(value);
+      return params.get(this).pairs.some(([k, v]) => k === name && (value === undefined || v === value));
+    }
+    set(name, value) {
+      name = scalar(name); value = scalar(value);
+      let found = false;
+      const state = params.get(this);
+      state.pairs = state.pairs.filter(pair => {
+        if (pair[0] !== name) return true;
+        if (found) return false;
+        found = true; pair[1] = value;
+        return true;
+      });
+      if (!found) state.pairs.push([name, value]);
+      this.#sync();
+    }
+    sort() { params.get(this).pairs.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0); this.#sync(); }
+    *entries() {
+      const state = params.get(this);
+      for (let i = 0; i < state.pairs.length; i++) yield state.pairs[i].slice();
+    }
+    *keys() { for (const [key] of this.entries()) yield key; }
+    *values() { for (const [, value] of this.entries()) yield value; }
+    forEach(callback, thisArg) { for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this); }
+    toString() { return params.get(this).pairs.map(([k, v]) => `${formEncode(k)}=${formEncode(v)}`).join('&'); }
+    #sync() { params.get(this).update?.(this.toString()); }
+  }
+  Object.defineProperty(URLSearchParams.prototype, Symbol.iterator, {
+    value: URLSearchParams.prototype.entries, configurable: true, writable: true,
+  });
+  const urls = new WeakMap();
+  class URL {
+    constructor(input, base = undefined) {
+      const parts = parseUrl('parse', scalar(input), base === undefined ? undefined : scalar(base));
+      if (!parts) throw new TypeError('Invalid URL');
+      const searchParams = new URLSearchParams(parts.search);
+      const state = { parts, searchParams };
+      urls.set(this, state);
+      params.get(searchParams).update = query => {
+        state.parts = parseUrl('search', state.parts.href, query ? '?' + query : '');
+      };
+    }
+    static canParse(input, base = undefined) {
+      return !!parseUrl('parse', scalar(input), base === undefined ? undefined : scalar(base));
+    }
+    get searchParams() { return urls.get(this).searchParams; }
+    toString() { return this.href; }
+    toJSON() { return this.href; }
+  }
+  for (const key of ['href', 'origin', 'protocol', 'username', 'password', 'host',
+      'hostname', 'port', 'pathname', 'search', 'hash']) {
+    Object.defineProperty(URL.prototype, key, {
+      enumerable: true, configurable: true,
+      get() { return urls.get(this).parts[key]; },
+      set: key === 'origin' ? undefined : function (value) {
+        const state = urls.get(this);
+        const parts = key === 'href' ? parseUrl('parse', scalar(value))
+          : parseUrl(key, state.parts.href, scalar(value));
+        if (!parts) {
+          if (key === 'href') throw new TypeError('Invalid URL');
+          return;
+        }
+        state.parts = parts;
+        if (key === 'href' || key === 'search') {
+          params.get(state.searchParams).pairs = parseForm(parts.search.replace(/^\?/, ''));
+        }
+      },
+    });
+  }
+  defineHidden('URL', URL);
+  defineHidden('URLSearchParams', URLSearchParams);
   defineHidden('console', consoleObject);
   defineHidden('__klausCapture', capture);
   defineHidden('__klausResetCapture', function () {
@@ -313,6 +431,19 @@ fn run_repl_runtime(
 }
 
 fn bootstrap(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__klausParseUrl").unwrap();
+    let callback = v8::Function::new(scope, repl_url_callback)
+        .ok_or_else(|| RuntimeString::from("failed to create URL callback"))?;
+    if global.define_own_property(
+        scope,
+        key.into(),
+        callback.into(),
+        v8::PropertyAttribute::DONT_ENUM,
+    ) != Some(true)
+    {
+        return Err(RuntimeString::from("failed to install URL callback"));
+    }
     eval_acorn(scope)?;
     for source in [
         FORMAT_SOURCE,
@@ -325,6 +456,92 @@ fn bootstrap(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> {
     }
     install_timers(scope)?;
     Ok(())
+}
+
+fn repl_url_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let op = args.get(0).to_rust_string_lossy(scope);
+    let input = args.get(1).to_rust_string_lossy(scope);
+    let arg = (!args.get(2).is_undefined()).then(|| args.get(2).to_rust_string_lossy(scope));
+    let result = if op == "form" {
+        RuntimeJson::Array(
+            url::form_urlencoded::parse(input.as_bytes())
+                .map(|(key, value)| {
+                    RuntimeJson::Array(vec![
+                        RuntimeJson::String(RuntimeString::from_utf8(&key)),
+                        RuntimeJson::String(RuntimeString::from_utf8(&value)),
+                    ])
+                })
+                .collect(),
+        )
+    } else {
+        let mut parsed = if op == "parse" {
+            let base = match arg.as_deref() {
+                Some(base) => match url::Url::parse(base) {
+                    Ok(base) => Some(base),
+                    Err(_) => return,
+                },
+                None => None,
+            };
+            url::Url::options().base_url(base.as_ref()).parse(&input)
+        } else {
+            url::Url::parse(&input)
+        };
+        let Ok(ref mut parsed) = parsed else { return };
+        let value = arg.as_deref().unwrap_or_default();
+        match op.as_str() {
+            "parse" => {}
+            "protocol" => {
+                let _ = url::quirks::set_protocol(parsed, value);
+            }
+            "username" => {
+                let _ = url::quirks::set_username(parsed, value);
+            }
+            "password" => {
+                let _ = url::quirks::set_password(parsed, value);
+            }
+            "host" => {
+                let _ = url::quirks::set_host(parsed, value);
+            }
+            "hostname" => {
+                let _ = url::quirks::set_hostname(parsed, value);
+            }
+            "port" => {
+                let _ = url::quirks::set_port(parsed, value);
+            }
+            "pathname" => url::quirks::set_pathname(parsed, value),
+            "search" => url::quirks::set_search(parsed, value),
+            "hash" => url::quirks::set_hash(parsed, value),
+            _ => return,
+        }
+        let origin = parsed.origin().ascii_serialization();
+        let mut parts = RuntimeObject::new();
+        for (key, value) in [
+            ("href", parsed.as_str()),
+            ("origin", origin.as_str()),
+            ("protocol", url::quirks::protocol(parsed)),
+            ("username", parsed.username()),
+            ("password", parsed.password().unwrap_or_default()),
+            ("host", url::quirks::host(parsed)),
+            ("hostname", url::quirks::hostname(parsed)),
+            ("port", url::quirks::port(parsed)),
+            ("pathname", parsed.path()),
+            ("search", url::quirks::search(parsed)),
+            ("hash", url::quirks::hash(parsed)),
+        ] {
+            parts.insert(
+                RuntimeString::from(key),
+                RuntimeJson::String(RuntimeString::from_utf8(value)),
+            );
+        }
+        RuntimeJson::Object(parts)
+    };
+    if let Some(value) = json_to_v8(scope, &result) {
+        retval.set(value);
+    }
 }
 
 /// Evaluate the vendored parser as a module and publish its `parse` entry
@@ -762,10 +979,22 @@ fn install_tools(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> 
     // Tools are bare context globals under their identifier-safe key, so a
     // script calls `read_file({...})` directly.
     let global = scope.get_current_context().global(scope);
-    for (index, tool) in enabled_tools.iter().enumerate() {
+    let helper_key = v8::String::new(scope, "call_mcp_tool").unwrap();
+    if let Some(helper) = get_field(scope, global, "__klausCallMcpTool") {
+        if global.define_own_property(
+            scope,
+            helper_key.into(),
+            helper,
+            v8::PropertyAttribute::DONT_ENUM,
+        ) != Some(true)
+        {
+            return Err(RuntimeString::from("failed to install MCP tool helper"));
+        }
+    }
+    for tool in &enabled_tools {
         let name = runtime_string_to_v8(scope, &tool.global_name)
             .ok_or_else(|| RuntimeString::from("failed to allocate tool name"))?;
-        let data = v8::String::new(scope, &index.to_string())
+        let data = runtime_string_to_v8(scope, &tool.tool_name)
             .ok_or_else(|| RuntimeString::from("failed to allocate tool callback data"))?;
         let template = v8::FunctionTemplate::builder(repl_tool_callback)
             .data(data.into())
@@ -776,6 +1005,13 @@ fn install_tools(scope: &mut v8::PinScope<'_, '_>) -> Result<(), RuntimeString> 
         if global.set(scope, name.into(), function.into()) != Some(true) {
             return Err(RuntimeString::from("failed to install tool global"));
         }
+        if tool.tool_name != tool.global_name {
+            let alias = runtime_string_to_v8(scope, &tool.tool_name)
+                .ok_or_else(|| RuntimeString::from("failed to allocate tool alias"))?;
+            if global.set(scope, alias.into(), function.into()) != Some(true) {
+                return Err(RuntimeString::from("failed to install tool alias"));
+            }
+        }
     }
     Ok(())
 }
@@ -785,13 +1021,8 @@ fn repl_tool_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let tool_index = match v8_value_to_runtime_string(scope, args.data())
-        .ok()
-        .and_then(|value| value.try_to_utf8().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        Some(index) => index,
-        None => return,
+    let Ok(tool_name) = v8_value_to_runtime_string(scope, args.data()) else {
+        return;
     };
     let input = if args.length() == 0 {
         RuntimeJson::Object(RuntimeObject::new())
@@ -810,7 +1041,11 @@ fn repl_tool_callback(
         let Some(state) = scope.get_slot_mut::<ReplRuntimeState>() else {
             return;
         };
-        let Some(tool) = state.enabled_tools.get(tool_index) else {
+        let Some(tool) = state
+            .enabled_tools
+            .iter()
+            .find(|entry| entry.tool_name == tool_name)
+        else {
             return;
         };
         let id = state.next_tool_call_id;
@@ -1257,7 +1492,56 @@ pub(crate) fn project_invoke_result(
     result: Result<InvokeToolResult, ToolError>,
 ) -> Result<RuntimeJson, CodeModeToolRejection> {
     let result = result.map_err(CodeModeToolRejection::tool)?;
-    let text = text_of_blocks(&result.content);
+    let content = &result.content;
+    let wrapped = matches!(content.first(), Some(OutputBlock::Text(block))
+        if block.text.starts_with("Wall time: ") && block.text.ends_with("\nOutput:"));
+    let text = if wrapped {
+        if let Some(entries) = result
+            .output
+            .as_ref()
+            .and_then(|output| output.get("content"))
+            .and_then(RuntimeJson::as_array)
+        {
+            let mut text = RuntimeString::default();
+            for (index, line) in entries
+                .iter()
+                .filter_map(|entry| {
+                    let kind = entry.get("type")?.as_str()?;
+                    if kind != "text" {
+                        return None;
+                    }
+                    entry.get("text")?.as_str()
+                })
+                .enumerate()
+            {
+                if index > 0 {
+                    text = text.concat(&RuntimeString::from("\n"));
+                }
+                text = text.concat(line);
+            }
+            if !result.is_error && text.is_empty() {
+                if let Some(structured) = result
+                    .output
+                    .as_ref()
+                    .and_then(|output| output.get("structuredContent"))
+                    .filter(|value| !matches!(value, RuntimeJson::Null))
+                {
+                    return Ok(structured.clone());
+                }
+            }
+            text
+        } else if result.output.is_none() {
+            let body = &content[1..];
+            let trim = body.len() > 1
+                && matches!(body.last(), Some(OutputBlock::Text(block))
+                if block.text.starts_with("Structured content:\n"));
+            text_of_blocks(&body[..body.len() - usize::from(trim)])
+        } else {
+            text_of_blocks(content)
+        }
+    } else {
+        text_of_blocks(content)
+    };
     if result.is_error {
         let message = if text.as_utf16().is_empty() {
             RuntimeString::from("tool ")

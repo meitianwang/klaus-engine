@@ -61,11 +61,48 @@
     }
   }
 
+  function collectReturns(stmt, out) {
+    if (!stmt) return;
+    switch (stmt.type) {
+      case 'ReturnStatement':
+        out.push(stmt);
+        break;
+      case 'Program':
+      case 'BlockStatement':
+        for (const child of stmt.body) collectReturns(child, out);
+        break;
+      case 'IfStatement':
+        collectReturns(stmt.consequent, out);
+        collectReturns(stmt.alternate, out);
+        break;
+      case 'SwitchStatement':
+        for (const branch of stmt.cases) {
+          for (const child of branch.consequent) collectReturns(child, out);
+        }
+        break;
+      case 'TryStatement':
+        collectReturns(stmt.block, out);
+        collectReturns(stmt.handler?.body, out);
+        collectReturns(stmt.finalizer, out);
+        break;
+      case 'ForStatement':
+      case 'ForInStatement':
+      case 'ForOfStatement':
+      case 'WhileStatement':
+      case 'DoWhileStatement':
+      case 'WithStatement':
+      case 'LabeledStatement':
+        collectReturns(stmt.body, out);
+        break;
+    }
+  }
+
   function transform(source) {
     const parse = globalThis.__acornParse;
     const ast = parse(source, {
       sourceType: 'module',
       allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
       ecmaVersion: 'latest',
     });
     const declNames = [];
@@ -75,20 +112,28 @@
       if (stmt.type === 'ExpressionStatement') lastExprStmt = stmt;
     }
     const hasLastExpr = lastExprStmt !== null;
-    let body;
-    if (hasLastExpr) {
-      const head = source.slice(0, lastExprStmt.start);
-      const expr = source.slice(lastExprStmt.expression.start, lastExprStmt.expression.end);
-      const tail = source.slice(lastExprStmt.end);
-      body = `${head}__klausLast = (${expr});${tail}`;
-    } else {
-      body = source;
+    const returns = [];
+    collectReturns(ast, returns);
+    const edits = returns.map((stmt) => {
+      const arg = stmt.argument;
+      const value = arg ? source.slice(arg.start, arg.end) : 'undefined';
+      return { start: stmt.start, end: stmt.end,
+        text: `return { last: (${value}), decls: __klausDecls() };` };
+    });
+    if (lastExprStmt) {
+      const expr = lastExprStmt.expression;
+      edits.push({ start: lastExprStmt.start, end: lastExprStmt.end,
+        text: `__klausLast = (${source.slice(expr.start, expr.end)});` });
+    }
+    let body = source;
+    for (const { start, end, text } of edits.sort((a, b) => b.start - a.start)) {
+      body = body.slice(0, start) + text + body.slice(end);
     }
     const declsExpr = declNames
       .map((name) => `${JSON.stringify(name)}: (() => { try { return ${name}; } catch { return undefined; } })()`)
       .join(', ');
     const wrapped =
-      `(async () => {\nlet __klausLast = null;\n${body}\nreturn { last: __klausLast, decls: { ${declsExpr} } };\n})()`;
+      `(async () => {\nlet __klausLast = null;\nconst __klausDecls = () => ({ ${declsExpr} });\n${body}\nreturn { last: __klausLast, decls: __klausDecls() };\n})()`;
     return { wrapped, declNames, hasLastExpr };
   }
 
