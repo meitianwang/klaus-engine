@@ -500,13 +500,23 @@ fn checkpoint_budget(details: Option<&Value>) -> Option<(u64, u64)> {
             | "MODEL_PLACEHOLDER_M419"
             | "MODEL_PLACEHOLDER_M427"
             | "MODEL_PLACEHOLDER_M437"
-            | "MODEL_PLACEHOLDER_M438",
+            | "MODEL_PLACEHOLDER_M438"
+            | "MODEL_PLACEHOLDER_M532"
+            | "MODEL_PLACEHOLDER_M533"
+            | "MODEL_PLACEHOLDER_M534"
+            | "MODEL_PLACEHOLDER_M535"
+            | "MODEL_PLACEHOLDER_M536"
+            | "MODEL_PLACEHOLDER_M537"
+            | "MODEL_PLACEHOLDER_M667"
+            | "MODEL_PLACEHOLDER_M681",
         ) => (256_000, 32_768),
         Some(
             "MODEL_PLACEHOLDER_M525"
             | "MODEL_PLACEHOLDER_M526"
             | "MODEL_PLACEHOLDER_M527"
-            | "MODEL_PLACEHOLDER_M528",
+            | "MODEL_PLACEHOLDER_M528"
+            | "MODEL_PLACEHOLDER_M530"
+            | "MODEL_PLACEHOLDER_M531",
         ) => (512_000, 32_768),
         Some(
             "MODEL_PLACEHOLDER_M400"
@@ -1321,6 +1331,7 @@ mod tests {
     fn conversation_budgets_do_not_replace_service_windows_or_generation_limits() {
         let rows = selectable_models(&bundled_payload());
         for (prefix, count, window, output, budget) in [
+            ("gemini-4-neon-", 4, 1_048_576, 262_144, 256_000),
             ("gemini-4-carbon-", 3, 1_048_576, 262_144, 256_000),
             ("gemini-4-argon-", 3, 1_048_576, 65_536, 256_000),
             ("gemini-4-hydrogen-", 4, 1_048_576, 262_144, 512_000),
@@ -1352,7 +1363,8 @@ mod tests {
         for (model, summary) in [
             ("MODEL_PLACEHOLDER_M525", Some(32_768)),
             ("MODEL_OPENAI_GPT_OSS_120B_MEDIUM", Some(8_192)),
-            ("MODEL_PLACEHOLDER_M532", None),
+            ("MODEL_PLACEHOLDER_M532", Some(32_768)),
+            ("MODEL_PLACEHOLDER_M999", None),
         ] {
             let raw = json!({"model":model});
             let defaults = output_token_defaults(Some(&raw));

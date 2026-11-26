@@ -758,6 +758,7 @@ pub(crate) struct SessionTurnState {
     /// Speculative composer predictions reuse it so their system prompt stays
     /// byte-identical to the main turn's cached prefix.
     last_system_prompt_append: Mutex<Option<RuntimeString>>,
+    last_completed_wire_request: Mutex<Option<crate::types::provider::ModelRequest>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

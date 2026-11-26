@@ -1763,6 +1763,7 @@ impl Session {
                     rec.replacement_history = this
                         .conversation
                         .apply_compaction(rec.replacement_history, &rec.source_message_ids);
+                    this.turn.last_completed_wire_request.lock_recover().take();
                     let mut compacted = to_store_compaction(&rec);
                     compacted.approval_parent_history = this.review_parent_checkpoint_payload();
                     records.push(crate::schemas::rollout::RolloutItem::Compacted(
@@ -1843,7 +1844,7 @@ impl Session {
         // prompt cache has certainly expired, so the whole prefix re-sends
         // regardless and the budget pass may trade aged full-size results down
         // to their persisted previews at no extra cache cost.
-        let cold_cache_window_ms = if initial_bundle.config.is_antigravity_source()
+        let cold_cache_window_ms = if initial_bundle.provider.info().name == "gemini"
             && this
                 .effective_session_cache_ttl(&initial_bundle.config)
                 .is_none()
@@ -2665,6 +2666,7 @@ impl Session {
                     )
                 {
                     let latest_req = last_wire_request.lock_recover().take();
+                    *this2.turn.last_completed_wire_request.lock_recover() = latest_req.clone();
                     let warm = last_step_warm_tokens.load(Ordering::SeqCst);
                     this2.arm_cache_keepalive_after_turn(
                         &inference_slot,

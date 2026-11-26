@@ -1649,6 +1649,42 @@ fn signed_model_identity(
     }
 }
 
+fn same_signed_model_family(left: &RuntimeString, right: &RuntimeString) -> bool {
+    fn gemini_stem(model: &str) -> Option<&str> {
+        if !model.starts_with("gemini-") {
+            return None;
+        }
+        Some(
+            [
+                "-extra-high",
+                "-extra-low",
+                "-minimal",
+                "-medium",
+                "-xhigh",
+                "-high",
+                "-low",
+                "-max",
+            ]
+            .into_iter()
+            .find_map(|suffix| {
+                model
+                    .strip_suffix(suffix)
+                    .filter(|stem| stem.starts_with("gemini-"))
+            })
+            .unwrap_or(model),
+        )
+    }
+    if left == right {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (left.try_to_utf8(), right.try_to_utf8()) else {
+        return false;
+    };
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    matches!((gemini_stem(&left), gemini_stem(&right)), (Some(left), Some(right)) if left == right)
+}
+
 /// Signatures are bound to the model that produced them. Alter only this
 /// outgoing request so switching back can still replay the original history.
 fn clear_foreign_model_signatures(request: &mut ModelRequest) {
@@ -1656,7 +1692,7 @@ fn clear_foreign_model_signatures(request: &mut ModelRequest) {
         let Message::Assistant(assistant) = message else {
             continue;
         };
-        if assistant.model == request.model {
+        if same_signed_model_family(&assistant.model, &request.model) {
             continue;
         }
         for block in &mut assistant.content {
@@ -3414,6 +3450,16 @@ impl RuntimeDecode for CodeAssistInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_model_family_normalizes_one_gemini_effort_suffix() {
+        let same = |left: &str, right: &str| same_signed_model_family(&left.into(), &right.into());
+        assert!(same("gemini-4-neon-EXTRA-HIGH", "gemini-4-neon-medium"));
+        assert!(!same("gemini-4-neon-low-high", "gemini-4-neon-medium"));
+        assert!(!same("gemini-4-neon-high", "gemini-4-carbon-high"));
+        assert!(!same("gemini-2.5-pro", "gemini-2.5-flash"));
+        assert!(!same("model-a", "model-b"));
+    }
     use crate::schemas::content::{
         DocumentBlock, TextBlock, ThinkingBlock as CThinkingBlock, ToolUseBlock,
     };

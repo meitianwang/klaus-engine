@@ -1890,12 +1890,33 @@ impl EngineConfig {
         self.is_claude_subscription_source() || self.is_antigravity_source()
     }
 
+    pub fn is_quota_metered_subscription_source(&self) -> bool {
+        self.is_claude_subscription_source()
+            || self.is_antigravity_source()
+            || matches!(
+                self.model_source
+                    .as_ref()
+                    .and_then(|source| source.source.as_deref()),
+                Some(
+                    "cursor"
+                        | "kiro"
+                        | "qoder"
+                        | "qwenwork"
+                        | "workbuddy"
+                        | "trae"
+                        | "kimi"
+                        | "bailian"
+                        | "minimax"
+                        | "zhipu"
+                        | "ark"
+                )
+            )
+    }
+
     /// Whether per-message tool-result spill budgeting and cold-cache reclaim
     /// are active: explicit opt-in or quota-metered subscription sessions.
     pub fn effective_aggregate_tool_results(&self) -> bool {
-        self.aggregate_tool_results
-            || self.is_claude_subscription_source()
-            || self.is_antigravity_source()
+        self.aggregate_tool_results || self.is_quota_metered_subscription_source()
     }
 
     /// Resident capacity is resolved from the configuration of each load request.

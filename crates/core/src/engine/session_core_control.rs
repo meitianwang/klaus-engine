@@ -289,6 +289,7 @@ impl Session {
             next_hist.extend(new_visible);
             let surviving_messages = next_hist.clone();
             *hist = next_hist;
+            self.turn.last_completed_wire_request.lock_recover().take();
             self.update_prediction_source_checkpoint(generation, None);
             let remaining_turns = count_user_turns(&hist[prefix_len..]);
             let messages = hist.len().saturating_sub(prefix_len);
@@ -441,6 +442,146 @@ impl Session {
         Ok(outcome)
     }
 
+    async fn compaction_prefix_request(
+        self: &Arc<Self>,
+        bundle: &super::InferenceBundle,
+        history: &[Message],
+    ) -> crate::types::provider::ModelRequest {
+        let config = &bundle.config;
+        let model = config.model.clone();
+        let is_main_role = self.meta.role.is_none()
+            || self.meta.role == Some(crate::schemas::rollout::SessionRole::Main);
+        let turn_collaboration_mode = self.collaboration_mode();
+        let plugin_mcp_clients = self.plugin_mcp_clients_snapshot();
+        let plugin_mcp_tools = Session::mcp_tools_from_clients(&plugin_mcp_clients);
+        let late_mcp_expected = !plugin_mcp_clients.is_empty() && plugin_mcp_tools.is_empty();
+        let web_selection = crate::engine::web_search_select::select_web_search(
+            crate::tools::builtins::tool_search::ensure_tool_search_with_late_mcp(
+                crate::tools::pool::build_tool_pool(crate::tools::pool::BuildPoolOptions {
+                    builtins: self.current_tools(),
+                    mcp_tools: if plugin_mcp_tools.is_empty() {
+                        None
+                    } else {
+                        Some(plugin_mcp_tools)
+                    },
+                    plugin_tools: None,
+                }),
+                late_mcp_expected,
+            ),
+            Some(&bundle.config.web_search),
+            bundle.provider.capabilities(&model).web_search,
+        );
+        let advisor_enabled = bundle.advisor_target.is_some();
+        let orchestration_enabled = is_main_role
+            && bundle.orchestration_mode
+            && turn_collaboration_mode != crate::planning::CollaborationMode::Plan;
+        let mut available_tools = web_selection.tools;
+        available_tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
+        crate::planning::tools::retain_for_mode(
+            &mut available_tools,
+            turn_collaboration_mode,
+            is_main_role,
+            self.config.request_user_input_default,
+        );
+        if orchestration_enabled {
+            crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
+                &mut available_tools,
+            );
+            available_tools.push(
+                crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(Arc::new(
+                    |_, _| {
+                        Box::pin(async {
+                            Err(crate::types::errors::ToolError::new(
+                                "tool execution disabled during prediction",
+                            ))
+                        })
+                    },
+                )),
+            );
+        }
+        if let Some(definition) = &self.root_agent_definition {
+            definition.retain_tools(&mut available_tools);
+        }
+        self.prepare_subagent_tool_inventory(&mut available_tools, &bundle.config);
+        let tools = if bundle.provider.capabilities(&model).tools {
+            available_tools
+        } else {
+            Vec::new()
+        };
+        let tool_specs = crate::tools::pool::to_tool_specs(&tools);
+
+        let advisor_exposed = tools.iter().any(|tool| tool.name() == "advisor");
+        let orchestration_exposed = tools.iter().any(|tool| {
+            tool.name() == crate::tools::builtins::orchestrate::ORCHESTRATE_EXECUTION_TOOL_NAME
+        });
+        let subagents_exposed = tools.iter().any(|tool| tool.name() == "task");
+        let parts = self
+            .assemble_turn_system_prompt_parts(
+                bundle,
+                &model,
+                turn_collaboration_mode,
+                subagents_exposed,
+                advisor_exposed,
+                orchestration_exposed,
+                self.turn.last_system_prompt_append().as_ref(),
+                false,
+            )
+            .await;
+        let (system, messages) =
+            crate::context::instruction_policy::project_workspace_instructions(&parts, history);
+        let profile = crate::provider::behavior::resolve_provider_behavior_profile(
+            Some(bundle.provider.info()),
+            &model,
+        );
+        let metadata = bundle.provider.model_metadata(&model);
+        let delegation = crate::engine::query::orchestration::DelegationBinding {
+            model: Some(&model),
+            family: profile.family,
+            source_kind: config
+                .model_source
+                .as_ref()
+                .and_then(|source| source.source.as_deref()),
+            model_messages: metadata.model_messages.as_ref(),
+            ..Default::default()
+        };
+        let policy = self.runtime_policy_snapshot();
+        let mut context = super::bare_tool_context(
+            self.process_context.clone(),
+            self.background_processes.clone(),
+            self.cwd_now(),
+            AbortSignal::new(),
+            self.file_state.clone(),
+            self.permission_context_for_policy(&policy),
+            policy.sandbox_backend.clone(),
+        );
+        policy.apply_to_context(&mut context);
+        context.planning_read_only =
+            turn_collaboration_mode == crate::planning::CollaborationMode::Plan;
+        let system = crate::engine::query::finalize_instruction_system(
+            system,
+            &context,
+            self.approval_handler.is_some(),
+            config.ultra_mode,
+            is_main_role,
+            &tool_specs,
+            None,
+            &profile,
+            &delegation,
+        );
+        let mut req = self.manual_compaction_request(config, history).await;
+        req.system = system;
+        req.messages = crate::engine::resume_repair::normalize_tool_history_owned(messages);
+        req.tools =
+            crate::provider::behavior::render_tool_specs_for_behavior(&tool_specs, &profile);
+        req.web_search = web_selection.request;
+        crate::context::runtime_reminders::project_for_source(
+            &mut req,
+            config,
+            Some(bundle.provider.info()),
+        );
+        req
+    }
+
     async fn compact_with_selection_inner(
         &self,
         instructions: Option<RuntimeString>,
@@ -455,11 +596,15 @@ impl Session {
         let config = captured_bundle
             .select(self.pending_model().as_ref())?
             .config;
+        let bundle = self.auxiliary_bundle_for(captured_bundle)?;
         let full_snapshot = self.history_snapshot();
-        let snapshot = self.model_history();
-        let before_tokens = estimate_context_tokens(&snapshot);
-        let before_messages = snapshot.len();
-        let snapshot = crate::context::runtime_reminders::without_steps(&snapshot);
+        let mut raw_snapshot = self.model_history();
+        if self.meta.role != Some(crate::schemas::rollout::SessionRole::SideTask) {
+            self.inject_proposed_plan_into_history(&mut raw_snapshot, &bundle.config.model);
+        }
+        let before_tokens = estimate_context_tokens(&raw_snapshot);
+        let before_messages = raw_snapshot.len();
+        let snapshot = crate::context::runtime_reminders::without_steps(&raw_snapshot);
         let unchanged = |reason, diagnostics| {
             (
                 CompactOutcome {
@@ -524,8 +669,41 @@ impl Session {
                 );
             }
         }
-        let required_request = self.manual_compaction_request(&config, &snapshot).await;
-        let bundle = self.auxiliary_bundle_for(captured_bundle)?;
+        let canonical = |message: &Message| {
+            !crate::context::instruction_policy::is_workspace_instruction_projection(message)
+                && !crate::context::runtime_reminders::is_step(message)
+                && !matches!(message, Message::System(system)
+                    if system.subtype == crate::schemas::message::SystemSubtype::UserDisplay)
+        };
+        let live = self.turn.last_completed_wire_request.lock_recover().clone();
+        let live = live
+            .filter(|request| request.model == bundle.config.model)
+            .and_then(|mut request| {
+                let mut remaining = raw_snapshot.iter().filter(|message| canonical(message));
+                for message in request.messages.iter().filter(|message| canonical(message)) {
+                    if remaining.next().map(super::message_uuid)
+                        != Some(super::message_uuid(message))
+                    {
+                        return None;
+                    }
+                }
+                request.messages.extend(
+                    crate::engine::resume_repair::normalize_tool_history_owned(
+                        remaining.cloned().collect(),
+                    ),
+                );
+                Some(request)
+            });
+        let required_request = match live {
+            Some(request) => request,
+            None => {
+                self.snapshot
+                    .resolve_self()
+                    .ok_or_else(|| "Session is no longer available".to_owned())?
+                    .compaction_prefix_request(&bundle, &raw_snapshot)
+                    .await
+            }
+        };
         bundle
             .deps
             .compactor
@@ -606,6 +784,7 @@ impl Session {
             .map(|message| super::message_uuid(message).clone())
             .collect::<Vec<_>>();
         replacement = self.conversation.apply_compaction(replacement, &source_ids);
+        self.turn.last_completed_wire_request.lock_recover().take();
         let after_tokens = estimate_context_tokens(&replacement);
         let after_messages = replacement.len();
         let boundary = replacement.iter().rev().find_map(|message| match message {
@@ -4692,11 +4871,10 @@ impl Session {
 
         let mut config = bundle.config_for_model(&model);
         config.max_retries = 0;
-        // A suggestion is one short line. On Antigravity Gemini the generation
+        // A suggestion is one short line. On Gemini the generation
         // settings are outside the implicit cache key, so the request can drop
         // reasoning and cap output without losing the warm main prefix.
-        let lean_gemini_prediction =
-            bundle.config.is_antigravity_source() && bundle.provider.info().name == "gemini";
+        let lean_gemini_prediction = bundle.provider.info().name == "gemini";
         if lean_gemini_prediction {
             config.max_output_tokens = Some(
                 config

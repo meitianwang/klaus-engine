@@ -60,7 +60,7 @@ pub(crate) fn is_prefix_cached_compat_source(
     match source {
         Some(
             "codex" | "kimi" | "bailian" | "minimax" | "zhipu" | "ark" | "qoder" | "qwenwork"
-            | "workbuddy" | "trae",
+            | "workbuddy" | "trae" | "cursor" | "kiro" | "openrouter",
         ) => true,
         Some("custom") => provider_info
             .and_then(|info| info.base_url.as_ref())
@@ -311,6 +311,9 @@ mod tests {
             "qwenwork",
             "workbuddy",
             "trae",
+            "cursor",
+            "kiro",
+            "openrouter",
         ] {
             let cfg = config_with_source(Some(source));
             assert!(

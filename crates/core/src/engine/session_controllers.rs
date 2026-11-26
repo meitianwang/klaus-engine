@@ -4441,6 +4441,7 @@ mod thinking_context_cold_tests {
             user_interrupted_turn: Mutex::new(None),
             last_capacity_failed_turn: Mutex::new(None),
             last_system_prompt_append: Mutex::new(None),
+            last_completed_wire_request: Mutex::new(None),
         }
     }
 
