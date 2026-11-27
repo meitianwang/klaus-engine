@@ -1,11 +1,12 @@
 //! QwenWork (千问办公) subscription support.
 //!
-//! QwenWork uses the same COSY-signed agent wire as Qoder with a distinct
-//! product scene, account store and gateway. The shared loopback bridge keeps
-//! Klaus as the only agent runtime; no QwenWork or Qoder CLI is nested inside a
-//! session.
+//! QwenWork serves its model directory on `/api/desktop/chat-modes` and issues
+//! short-lived MaaS inference credentials through `/api/desktop-sessions`. The
+//! in-process loopback bridge exchanges and rotates those session credentials per
+//! request while keeping Klaus as the only agent runtime.
 
 pub mod auth;
+pub mod bridge;
 pub mod capabilities;
 pub mod catalog;
 
@@ -23,6 +24,18 @@ pub fn set_config_root(root: &Path) {
     }
 }
 
+pub(crate) fn home_dir() -> PathBuf {
+    for key in ["HOME", "USERPROFILE"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+    }
+    PathBuf::new()
+}
+
 pub(crate) fn config_root() -> PathBuf {
     if let Ok(guard) = CONFIG_ROOT.read() {
         if let Some(root) = guard.as_ref() {
@@ -31,7 +44,7 @@ pub(crate) fn config_root() -> PathBuf {
     }
     match std::env::var("KLAUS_CONFIG_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".klaus"),
+        _ => home_dir().join(".klaus"),
     }
 }
 
@@ -63,16 +76,19 @@ pub async fn resolve(selection: &str) -> Result<(Value, Value), String> {
     if catalog::access_token().is_err() {
         return Err("not signed in to a QwenWork subscription".to_string());
     }
-    let (base_url, token) =
-        super::qoder::bridge::ensure_started_for(super::qoder::bridge::BridgeSource::QwenWork)
-            .await
-            .map_err(|error| format!("cannot start the QwenWork bridge: {error}"))?;
+    let (base_url, token) = bridge::ensure_started()
+        .await
+        .map_err(|error| format!("cannot start the QwenWork bridge: {error}"))?;
     let model = resolved_model(selection).await;
     let provider = json!({
         "type": "openai",
         "api": "chat",
         "model": model,
         "baseUrl": base_url,
+        "compatibility": {
+            "instructionRole": "system",
+            "useModelDefaultEffort": true,
+        },
     });
     let auth = json!({ "type": "static_bearer", "token": token });
     Ok((provider, auth))
@@ -86,10 +102,7 @@ pub use catalog::{
 };
 
 pub fn set_thinking_level(level: Option<String>) {
-    super::qoder::bridge::set_thinking_level_for(
-        super::qoder::bridge::BridgeSource::QwenWork,
-        level,
-    );
+    bridge::set_thinking_level(level);
 }
 
 pub async fn ensure_fresh_token() -> Result<(), String> {

@@ -58,7 +58,7 @@ pub(crate) fn local_auth_dirs() -> Vec<PathBuf> {
             dirs.extend([root.join(".auth"), root.join("cli/.auth"), root]);
         }
     }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = super::home_dir();
     if cfg!(target_os = "macos") {
         let support = home.join("Library/Application Support");
         dirs.extend([
@@ -94,7 +94,7 @@ pub(crate) fn local_catalog_dirs() -> Vec<PathBuf> {
             dirs.extend([root.join("cli"), root.join("cli/.auth"), root]);
         }
     }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = super::home_dir();
     // The official CLI keeps its catalog one level above its auth dir, so both
     // are candidates for the `models` read.
     let roots = if cfg!(target_os = "macos") {
@@ -127,7 +127,7 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
-fn with_client_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) fn with_client_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     request
         .header("Accept", "application/json")
         .header("User-Agent", format!("qoderwork/{CLIENT_VERSION}"))
@@ -689,7 +689,7 @@ fn expiry_seconds(payload: &Value, absolute: &str, relative: &str) -> Option<i64
         .map(|seconds| now_seconds().saturating_add(seconds))
 }
 
-fn login_rejected(status: u16, body: &str) -> bool {
+pub(crate) fn login_rejected(status: u16, body: &str) -> bool {
     if status == 401 {
         return true;
     }

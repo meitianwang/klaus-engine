@@ -26,6 +26,7 @@ pub(crate) fn changes() -> &'static tokio::sync::watch::Sender<u64> {
 
 pub(crate) fn credential_changed() {
     changes().send_modify(|generation| *generation = generation.wrapping_add(1));
+    super::bridge::forget_session();
 }
 
 fn generation() -> u64 {
@@ -231,7 +232,7 @@ struct NativeSession {
     generation: u64,
 }
 
-fn checked_base(value: &str) -> Result<String, String> {
+pub(crate) fn checked_base(value: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(value).map_err(|_| "qwenwork_service_origin_invalid")?;
     let host = url.host_str().ok_or("qwenwork_service_origin_invalid")?;
     let trusted =

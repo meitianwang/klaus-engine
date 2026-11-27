@@ -54,21 +54,18 @@ struct Running {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum BridgeSource {
     Qoder,
-    QwenWork,
 }
 
 impl BridgeSource {
     fn label(self) -> &'static str {
         match self {
             Self::Qoder => "Qoder",
-            Self::QwenWork => "QwenWork",
         }
     }
 
     fn owned_by(self) -> &'static str {
         match self {
             Self::Qoder => "qoder",
-            Self::QwenWork => "qwenwork",
         }
     }
 }
@@ -400,9 +397,6 @@ async fn handle_conn(
     if request.method == "GET" && path == "/v1/models" {
         let models = match source {
             BridgeSource::Qoder => super::catalog::fetch_models().await.unwrap_or_default(),
-            BridgeSource::QwenWork => super::super::qwenwork::fetch_models()
-                .await
-                .unwrap_or_default(),
         };
         let data: Vec<Value> = models
             .iter()
@@ -476,7 +470,6 @@ async fn handle_chat_completions(
         .to_string();
     let model_info = match source {
         BridgeSource::Qoder => super::catalog::lookup_model(&model_key).await,
-        BridgeSource::QwenWork => super::super::qwenwork::lookup_model(&model_key).await,
     };
     if let Err(error) = validate_fast_mode(&body, model_info.as_ref()) {
         return write_json(
@@ -498,7 +491,6 @@ async fn handle_chat_completions(
     // the whole turn.
     let refresh = match source {
         BridgeSource::Qoder => super::auth::ensure_fresh_token().await,
-        BridgeSource::QwenWork => super::super::qwenwork::ensure_fresh_token().await,
     };
     if let Err(error) = refresh {
         return write_json(
@@ -714,10 +706,6 @@ fn sign_for(
         BridgeSource::Qoder => {
             super::catalog::sign_infer_request(body_json, model_key).map_err(|error| error.message)
         }
-        BridgeSource::QwenWork => {
-            super::super::qwenwork::catalog::sign_infer_request(body_json, model_key)
-                .map_err(|error| error.message)
-        }
     }
 }
 
@@ -816,7 +804,6 @@ fn parse_upstream_body(body: &str) -> Option<Value> {
 async fn reread_local_credential(source: BridgeSource) -> &'static str {
     let outcome = match source {
         BridgeSource::Qoder => super::auth::import_local(),
-        BridgeSource::QwenWork => super::super::qwenwork::import_local(),
     };
     match outcome {
         Ok(result) if result.get("ok") == Some(&json!(true)) => "ok",
@@ -1928,28 +1915,28 @@ mod tests {
     #[tokio::test]
     async fn a_retired_endpoint_is_replaced_and_keeps_the_pushed_tier() {
         let _endpoint = endpoint_lock().lock().await;
-        set_thinking_level_for(BridgeSource::QwenWork, Some("max".to_string()));
-        let (qwenwork_first, qwenwork_second) = tokio::join!(
-            ensure_started_for(BridgeSource::QwenWork),
-            ensure_started_for(BridgeSource::QwenWork)
+        set_thinking_level_for(BridgeSource::Qoder, Some("max".to_string()));
+        let (concurrent_first, concurrent_second) = tokio::join!(
+            ensure_started_for(BridgeSource::Qoder),
+            ensure_started_for(BridgeSource::Qoder)
         );
         assert_eq!(
-            qwenwork_first.expect("first QwenWork bridge start"),
-            qwenwork_second.expect("second QwenWork bridge start"),
+            concurrent_first.expect("first bridge start"),
+            concurrent_second.expect("second bridge start"),
             "concurrent starters must converge on one endpoint"
         );
-        let qwenwork_tier = state()
+        let initial_tier = state()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .running
-            .get(&BridgeSource::QwenWork)
-            .expect("QwenWork running")
+            .get(&BridgeSource::Qoder)
+            .expect("Qoder running")
             .thinking
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         assert_eq!(
-            qwenwork_tier.as_deref(),
+            initial_tier.as_deref(),
             Some("max"),
             "a tier pushed before startup must reach the first endpoint"
         );

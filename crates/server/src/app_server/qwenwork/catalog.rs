@@ -1,35 +1,32 @@
-//! QwenWork COSY signing and model catalog.
+//! QwenWork model catalog discovery, projection, and caching.
 
-use super::super::qoder::sign::{CosyProfile, SignedRequest, SigningContext};
-use serde_json::{json, Value};
+use super::super::qoder::sign::{CosyProfile, SigningContext};
+use serde_json::{json, Map, Value};
 use std::sync::Mutex;
 
-const MODEL_LIST_PATH: &str = "/algo/api/v2/model/list?Encode=1";
+const CHAT_MODES_PATH: &str = "/api/desktop/chat-modes";
 const CATALOG_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS: u64 = 10_000;
 const WARM_TIMEOUT_MS: u64 = 1500;
 const DESKTOP_CLIENT_TYPE: &str = "6";
+const PROJECTION_VERSION: u64 = 1;
+const CANONICAL_EFFORT_ORDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// The gateway host the signed routes use; the plain OpenAPI media routes live
-/// on the same host (the official client resolves one OpenAPI domain).
+/// The gateway host serving QwenWork account, catalog, and session endpoints.
 pub(crate) fn api_base() -> String {
     std::env::var("QWENWORK_API_BASE")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        // QwenWork serves its own gateway: the official client's logs show
-        // every signed call — model list and inference alike — on
-        // gateway.qwenwork.cn. Qoder's gateway answers the same paths but
-        // rejects QwenWork credentials with 403 code 105.
         .unwrap_or_else(|| "https://gateway.qwenwork.cn".into())
 }
 
 pub struct QwenWorkError {
     pub message: String,
     pub not_found: bool,
-    /// The gateway rejected the access token as a dead login (403 code 105).
-    /// The stored session may still be refreshable, so the catalog path trades
-    /// the refresh token in and retries once before giving up.
+    /// The gateway rejected the access token as a dead login (401 or 403 code 105).
+    /// The stored session may still be rereadable from a local cache, so the
+    /// catalog path tries rereading once before surfacing expiry.
     pub login_expired: bool,
 }
 
@@ -45,7 +42,7 @@ impl QwenWorkError {
 
 struct CachedContext {
     fingerprint: String,
-    context: SigningContext,
+    _context: SigningContext,
     user_info: Value,
 }
 
@@ -61,8 +58,8 @@ pub(crate) fn forget_context() {
     forget_cache();
 }
 
-fn with_context<T>(
-    action: impl FnOnce(&SigningContext, &Value) -> Result<T, QwenWorkError>,
+fn with_user_info<T>(
+    action: impl FnOnce(&Value) -> Result<T, QwenWorkError>,
 ) -> Result<T, QwenWorkError> {
     let Some((machine_id, user_info)) = super::auth::credential() else {
         return Err(QwenWorkError {
@@ -96,12 +93,12 @@ fn with_context<T>(
         .map_err(QwenWorkError::msg)?;
         *guard = Some(CachedContext {
             fingerprint,
-            context,
+            _context: context,
             user_info,
         });
     }
     let cached = guard.as_ref().expect("context populated above");
-    action(&cached.context, &cached.user_info)
+    action(&cached.user_info)
 }
 
 fn account_label(user_info: &Value) -> String {
@@ -121,10 +118,17 @@ pub struct QwenWorkToken {
 }
 
 pub fn access_token() -> Result<QwenWorkToken, QwenWorkError> {
-    with_context(|_, user_info| {
+    with_user_info(|user_info| {
         let access_token = user_info
-            .get("access_token")
+            .get("security_oauth_token")
             .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .or_else(|| {
+                user_info
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
+            })
             .unwrap_or_default()
             .to_string();
         if access_token.is_empty() {
@@ -159,11 +163,7 @@ fn catalog_cache() -> &'static Mutex<Option<CatalogCache>> {
 }
 
 /// The catalog head's key from the fresh in-process cache, then Klaus's own
-/// on-disk snapshot. The picker offers no synthetic automatic route, so an
-/// unmapped tier or a bare default names this entry. Both readers follow the
-/// config root and neither fetches: the official CLI cache `read_local_models`
-/// also mirrors is a third-party directory a selection must not depend on.
-/// `None` leaves the caller on the legacy wire alias.
+/// on-disk snapshot.
 pub(crate) fn first_model_key() -> Option<String> {
     {
         let guard = catalog_cache()
@@ -181,8 +181,6 @@ pub(crate) fn first_model_key() -> Option<String> {
     read_owned_catalog().as_deref().and_then(default_key_in)
 }
 
-/// The catalog's first entry key. The picker offers no synthetic automatic
-/// route, so an unmapped tier or a bare default names this entry.
 fn first_key_in(models: &[Value]) -> Option<String> {
     models
         .first()
@@ -191,19 +189,6 @@ fn first_key_in(models: &[Value]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The model a bare default names.
-///
-/// Prefers the entry whose display name is the plan's flagship chat model, so the
-/// default is a product decision rather than an accident of the order the service
-/// happens to list. Matching is on the name and not the key because this catalog
-/// keys its entries with opaque `mode-<uuid>` identifiers that carry no model
-/// identity and are not stable across catalog generations — a hardcoded key would
-/// silently stop matching and fall through to the head.
-///
-/// The name comparison is normalized (case, separators and internal punctuation
-/// folded away) but exact, because the lineup also carries a longer-named variant
-/// of the same model that must not be picked up by a prefix match. Falls back to
-/// the list head when the catalog serves no entry with that name.
 fn default_key_in(models: &[Value]) -> Option<String> {
     models
         .iter()
@@ -219,8 +204,6 @@ fn default_key_in(models: &[Value]) -> Option<String> {
         .or_else(|| first_key_in(models))
 }
 
-/// A display name with case, whitespace and separators folded away, so one
-/// spelling of a model name matches however the service punctuates it.
 fn normalize_model_name(name: &str) -> String {
     name.chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -228,8 +211,6 @@ fn normalize_model_name(name: &str) -> String {
         .collect()
 }
 
-/// The normalized display name of the model a bare default lands on. Produced by
-/// [`normalize_model_name`] from the name as the picker paints it.
 const DEFAULT_MODEL_NAME: &str = "qwen4max";
 
 fn now_ms() -> i64 {
@@ -237,16 +218,20 @@ fn now_ms() -> i64 {
 }
 
 async fn fetch_live_models() -> Result<Vec<Value>, QwenWorkError> {
-    let signed = with_context(|context, _| Ok(context.sign_get(&api_base(), MODEL_LIST_PATH)))?;
+    let token = access_token()?.access_token;
+    if token.chars().any(char::is_control) {
+        return Err(QwenWorkError::msg("QwenWork credential token is invalid"));
+    }
+    let mut auth_header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| QwenWorkError::msg("QwenWork credential token is invalid"))?;
+    auth_header.set_sensitive(true);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(FETCH_TIMEOUT_MS))
         .build()
         .map_err(|error| QwenWorkError::msg(error.to_string()))?;
-    let mut request = client.get(&signed.url);
-    for (name, value) in &signed.headers {
-        request = request.header(name, value);
-    }
-    let response = request
+    let url = format!("{}{CHAT_MODES_PATH}", api_base().trim_end_matches('/'));
+    let response = super::auth::with_client_headers(client.get(&url))
+        .header(reqwest::header::AUTHORIZATION, auth_header)
         .send()
         .await
         .map_err(|error| QwenWorkError::msg(error.to_string()))?;
@@ -255,28 +240,18 @@ async fn fetch_live_models() -> Result<Vec<Value>, QwenWorkError> {
     if !status.is_success() {
         let detail: String = text.chars().take(200).collect();
         return Err(QwenWorkError {
-            message: format!("model/list {}: {detail}", status.as_u16()),
+            message: format!("chat-modes {}: {detail}", status.as_u16()),
             not_found: false,
-            login_expired: status.as_u16() == 403 && is_login_expired_body(&text),
+            login_expired: super::auth::login_rejected(status.as_u16(), &text)
+                || (status.as_u16() == 403 && is_login_expired_body(&text)),
         });
     }
-    // QwenWork's catalog route uses `Encode=1` for the response as well. The
-    // official wrapper falls back to the raw body when decoding throws, which
-    // also keeps test gateways and gradual server rollouts that return plain
-    // JSON compatible.
     let decoded = super::super::qoder::sign::decode_server_response(&text).unwrap_or(text);
     let parsed: Value = serde_json::from_str(&decoded)
-        .map_err(|error| QwenWorkError::msg(format!("model/list body is not JSON: {error}")))?;
-    // The official client reads the scene directly from the decrypted object.
-    // Some gateways wrap that same object in `data`, so accept the wrapper only
-    // as a fallback. Preferring `data` unconditionally loses a valid top-level
-    // catalog when the response also carries unrelated response metadata there.
+        .map_err(|error| QwenWorkError::msg(format!("chat-modes body is not JSON: {error}")))?;
     Ok(parse_live_model_response(&parsed))
 }
 
-/// The gateway reports a dead login as HTTP 403 with `{"code":"105"}`; the body
-/// may arrive through the same `Encode=1` envelope as a success, so decode
-/// before reading the code.
 fn is_login_expired_body(body: &str) -> bool {
     let decoded =
         super::super::qoder::sign::decode_server_response(body).unwrap_or(body.to_string());
@@ -287,10 +262,288 @@ fn is_login_expired_body(body: &str) -> bool {
     ) || parsed.get("code") == Some(&json!(105))
 }
 
+fn truthy(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(text)) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes"
+        ),
+        _ => false,
+    }
+}
+
+fn positive_i64(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number.as_i64().filter(|n| *n > 0),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok().filter(|n| *n > 0),
+        _ => None,
+    }
+}
+
+fn localized_text(model: &Value, top_key: &str, i18n_key: &str) -> Option<String> {
+    if let Some(direct) = model
+        .get(top_key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(direct.to_string());
+    }
+    let group = model.get("i18n").and_then(|i18n| i18n.get(i18n_key))?;
+    for locale in ["zh", "zh-CN", "en"] {
+        if let Some(value) = group
+            .get(locale)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn parse_thinking_policy(model: &Value) -> Option<(Vec<String>, Option<String>, bool, bool)> {
+    let policy = model.get("thinking_policy")?.as_object()?;
+    let levels = policy.get("levels").and_then(Value::as_object);
+    let mut supported: Vec<String> = Vec::new();
+    let mut supports_disabled = truthy(policy.get("supports_disabled"));
+    if let Some(levels) = levels {
+        for (level_key, entry) in levels {
+            if matches!(
+                level_key.trim().to_ascii_lowercase().as_str(),
+                "off" | "none" | "disabled"
+            ) {
+                supports_disabled = true;
+            }
+            if let Some(raw_effort) = entry.get("effort").and_then(Value::as_str) {
+                if matches!(
+                    raw_effort.trim().to_ascii_lowercase().as_str(),
+                    "off" | "none" | "disabled"
+                ) {
+                    supports_disabled = true;
+                } else if let Some(normalized) =
+                    super::super::qoder::catalog::engine_effort_level(raw_effort)
+                {
+                    if !supported.iter().any(|existing| existing == normalized) {
+                        supported.push(normalized.to_string());
+                    }
+                }
+            }
+        }
+    }
+    supported.sort_by_key(|effort| {
+        CANONICAL_EFFORT_ORDER
+            .iter()
+            .position(|known| known == effort)
+            .unwrap_or(usize::MAX)
+    });
+
+    let default_effort = policy
+        .get("default_level")
+        .and_then(Value::as_str)
+        .and_then(|default_level| {
+            levels
+                .and_then(|map| map.get(default_level))
+                .and_then(|entry| entry.get("effort"))
+                .and_then(Value::as_str)
+                .and_then(super::super::qoder::catalog::engine_effort_level)
+                .or_else(|| super::super::qoder::catalog::engine_effort_level(default_level))
+        })
+        .filter(|effort| supported.iter().any(|existing| existing == effort))
+        .map(str::to_string)
+        .or_else(|| supported.first().cloned());
+
+    let can_enable = !supported.is_empty() || truthy(model.get("is_reasoning"));
+    Some((supported, default_effort, supports_disabled, can_enable))
+}
+
+fn parse_chat_modes_catalog(parsed: &Value) -> Vec<Value> {
+    let Some(items) = parsed.get("catalog").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    for model in items {
+        let Some(key) = model
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+
+        let mut context_tokens: Vec<i64> = model
+            .get("available_context_windows")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| positive_i64(Some(item)))
+            .collect();
+        let mut default_from_context_config: Option<i64> = None;
+        if let Some(config) = model.get("context_config").and_then(Value::as_object) {
+            for entry in config.values() {
+                if let Some(tokens) = positive_i64(entry.get("token_count")) {
+                    context_tokens.push(tokens);
+                    if truthy(entry.get("is_default")) && default_from_context_config.is_none() {
+                        default_from_context_config = Some(tokens);
+                    }
+                }
+            }
+        }
+        context_tokens.sort_unstable();
+        context_tokens.dedup();
+
+        let (efforts, default_effort, can_disable_thinking, can_enable_from_policy) =
+            if let Some(parsed_policy) = parse_thinking_policy(model) {
+                parsed_policy
+            } else {
+                let legacy = super::super::qoder::catalog::parse_model_scene_names(
+                    &json!({ "qwork": [model] }),
+                    &["qwork"],
+                )
+                .into_iter()
+                .next();
+                let efforts = legacy
+                    .as_ref()
+                    .and_then(|row| row.get("efforts"))
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let default_effort = legacy
+                    .as_ref()
+                    .and_then(|row| row.get("defaultEffort"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let can_disable = legacy
+                    .as_ref()
+                    .and_then(|row| row.get("canDisableThinking"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let can_enable = legacy
+                    .as_ref()
+                    .and_then(|row| row.get("canEnableThinking"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (efforts, default_effort, can_disable, can_enable)
+            };
+
+        let model_params_enables_thinking = model
+            .get("model_params")
+            .and_then(|params| params.get("thinking"))
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+            == Some("enabled");
+        let is_reasoning = truthy(model.get("is_reasoning"));
+        let can_enable_thinking =
+            can_enable_from_policy || is_reasoning || model_params_enables_thinking;
+
+        let mut out = Map::new();
+        out.insert("key".into(), json!(key));
+        out.insert(
+            "display_name".into(),
+            localized_text(model, "display_name", "display_name")
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        if let Some(description) = localized_text(model, "description", "description") {
+            out.insert("description".into(), json!(description));
+        }
+        if let Some(i18n) = model.get("i18n") {
+            out.insert("i18n".into(), i18n.clone());
+        }
+        out.insert("is_reasoning".into(), json!(is_reasoning));
+        out.insert("is_vl".into(), json!(truthy(model.get("is_vl"))));
+        if let Some(tokens) = positive_i64(model.get("max_input_tokens")) {
+            out.insert("max_input_tokens".into(), json!(tokens));
+        }
+        if let Some(tokens) = positive_i64(model.get("max_output_tokens")) {
+            out.insert("max_output_tokens".into(), json!(tokens));
+        }
+        if let Some(tokens) = positive_i64(
+            model
+                .get("default_context_window")
+                .or_else(|| model.get("defaultContextWindow")),
+        )
+        .or(default_from_context_config)
+        {
+            out.insert("default_context_window".into(), json!(tokens));
+        }
+        if !context_tokens.is_empty() {
+            out.insert("contextTokens".into(), json!(context_tokens));
+        }
+        if !efforts.is_empty() {
+            out.insert("efforts".into(), json!(efforts));
+        }
+        if let Some(default_effort) = default_effort {
+            out.insert("defaultEffort".into(), json!(default_effort));
+        }
+        if can_disable_thinking {
+            out.insert("canDisableThinking".into(), json!(true));
+        }
+        if can_enable_thinking {
+            out.insert("canEnableThinking".into(), json!(true));
+        }
+        if let Some(factor) = model
+            .get("priceFactor")
+            .or_else(|| model.get("price_factor"))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+        {
+            out.insert("priceFactor".into(), json!(factor));
+        }
+        for passthrough in [
+            "format",
+            "source",
+            "enable",
+            "disabled",
+            "status",
+            "tags",
+            "badges",
+            "promotion",
+            "frontier",
+            "show_zero_price_factor",
+            "feature_switches",
+            "thinking_policy",
+            "thinking_config",
+            "model_params",
+            "context_config",
+            "is_default",
+            "is_new",
+            "is_free",
+            "icon",
+        ] {
+            if let Some(value) = model.get(passthrough).filter(|value| !value.is_null()) {
+                out.insert(passthrough.into(), value.clone());
+            }
+        }
+        super::super::conversation_catalog::mark_purpose("qwenwork", model, &mut out);
+        models.push(Value::Object(out));
+    }
+    models
+}
+
 fn parse_live_model_response(parsed: &Value) -> Vec<Value> {
-    let direct = super::super::qoder::catalog::parse_model_scene_names(parsed, &["qwork"]);
-    if !direct.is_empty() {
-        return direct;
+    let direct_catalog = parse_chat_modes_catalog(parsed);
+    if !direct_catalog.is_empty() {
+        return direct_catalog;
+    }
+    if let Some(wrapped) = parsed.get("data") {
+        let wrapped_catalog = parse_chat_modes_catalog(wrapped);
+        if !wrapped_catalog.is_empty() {
+            return wrapped_catalog;
+        }
+    }
+    let legacy_direct = super::super::qoder::catalog::parse_model_scene_names(parsed, &["qwork"]);
+    if !legacy_direct.is_empty() {
+        return legacy_direct;
     }
     parsed
         .get("data")
@@ -299,8 +552,7 @@ fn parse_live_model_response(parsed: &Value) -> Vec<Value> {
 }
 
 /// Read Klaus's own non-secret catalog snapshot first, then the official CLI's
-/// plain-JSON cache. QwenWork desktop encrypts its private cache, so Klaus never
-/// reaches into that format; a signed live refresh remains the authority.
+/// plain-JSON cache when present.
 fn read_local_models() -> Vec<Value> {
     if let Some(models) = read_owned_catalog() {
         return models;
@@ -311,9 +563,7 @@ fn read_local_models() -> Vec<Value> {
             std::fs::read_to_string(dir.join("models"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .map(|parsed| {
-                    super::super::qoder::catalog::parse_model_scene_names(&parsed, &["qwork"])
-                })
+                .map(|parsed| parse_live_model_response(&parsed))
                 .filter(|models| !models.is_empty())
         })
         .unwrap_or_default()
@@ -327,7 +577,7 @@ fn read_owned_catalog() -> Option<Vec<Value>> {
     let fingerprint = super::auth::catalog_fingerprint()?;
     let raw = std::fs::read_to_string(owned_catalog_path()).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
-    if value.get("projectionVersion").and_then(Value::as_u64) != Some(1)
+    if value.get("projectionVersion").and_then(Value::as_u64) != Some(PROJECTION_VERSION)
         || value.get("fingerprint").and_then(Value::as_str) != Some(fingerprint.as_str())
     {
         return None;
@@ -347,7 +597,7 @@ fn write_owned_catalog(models: &[Value], fingerprint: &str) {
         }
     }
     let Ok(serialized) = serde_json::to_string_pretty(&json!({
-        "projectionVersion": 1,
+        "projectionVersion": PROJECTION_VERSION,
         "updatedAt": now_ms(),
         "fingerprint": fingerprint,
         "models": models,
@@ -367,13 +617,6 @@ async fn refresh_live_catalog() -> Result<Vec<Value>, QwenWorkError> {
     let fingerprint = super::auth::catalog_fingerprint();
     let models = match fetch_live_models().await {
         Ok(models) => models,
-        // A 403/105 means the copied access token died: the official client
-        // refreshes are one-time, so whoever refreshed last holds the only
-        // live token. Reread before spending anything — re-reading the
-        // official CLI store costs no refresh token, while refreshing here
-        // would invalidate the official client's copy in turn. Only when no
-        // store can be reread does the error travel up to the host, which
-        // owns the desktop store's decryption and the last-resort refresh.
         Err(error) if error.login_expired => {
             if fingerprint != super::auth::catalog_fingerprint() {
                 return Err(error);
@@ -520,9 +763,8 @@ pub async fn fetch_models_warm() -> Result<Vec<Value>, QwenWorkError> {
     }
 }
 
-/// Resolve QwenWork's legacy `auto` aliases against the actual qwork catalog.
-/// Exact keys win. Then the official compatibility order is tried, followed by
-/// the service default and finally the first enabled entry.
+/// Resolve QwenWork's legacy `auto` aliases against the actual catalog while
+/// keeping explicit auxiliary keys such as `lite` intact.
 pub(crate) fn resolve_model_key(models: &[Value], requested: &str) -> String {
     let requested = if requested.is_empty() {
         "auto"
@@ -534,7 +776,7 @@ pub(crate) fn resolve_model_key(models: &[Value], requested: &str) -> String {
             .iter()
             .any(|model| model.get("key").and_then(Value::as_str) == Some(key))
     };
-    if has(requested) {
+    if has(requested) || requested == "lite" {
         return requested.to_string();
     }
     if matches!(requested, "auto" | "qwork-auto") {
@@ -548,13 +790,6 @@ pub(crate) fn resolve_model_key(models: &[Value], requested: &str) -> String {
         return default;
     }
     requested.to_string()
-}
-
-pub(crate) fn sign_infer_request(
-    body_json: &str,
-    model_key: &str,
-) -> Result<SignedRequest, QwenWorkError> {
-    with_context(|context, _| Ok(context.sign_infer(&api_base(), body_json, model_key, "system")))
 }
 
 pub(crate) async fn lookup_model(key: &str) -> Option<Value> {
@@ -608,7 +843,73 @@ mod tests {
     });
 
     #[test]
-    fn live_catalog_prefers_the_official_top_level_scene_then_accepts_a_data_wrapper() {
+    fn live_catalog_prefers_chat_modes_and_falls_back_to_legacy_scene_or_data_wrapper() {
+        let chat_modes = json!({
+            "schema_version": 2,
+            "catalog": [{
+                "key": "ling-3.1-flash",
+                "i18n": {
+                    "display_name": { "zh": "Ling-3.1-Flash", "en": "Ling-3.1-Flash" },
+                    "description": { "zh": "高效编程模型", "en": "Fast coding model" }
+                },
+                "is_reasoning": true,
+                "is_vl": false,
+                "max_input_tokens": 200000,
+                "max_output_tokens": 32000,
+                "context_config": {
+                    "standard": { "token_count": 200000, "is_default": true }
+                },
+                "model_params": {
+                    "thinking": { "type": "enabled" }
+                },
+                "price_factor": 0.25,
+                "enable": true,
+                "format": "openai/chat-completions",
+                "source": "system"
+            }, {
+                "key": "qwen4-max",
+                "i18n": {
+                    "display_name": { "zh": "Qwen4-Max", "en": "Qwen4-Max" }
+                },
+                "is_reasoning": true,
+                "is_vl": true,
+                "max_input_tokens": 900000,
+                "max_output_tokens": 64000,
+                "context_config": {
+                    "standard": { "token_count": 200000, "is_default": true },
+                    "medium": { "token_count": 400000 },
+                    "large": { "token_count": 1000000 }
+                },
+                "thinking_policy": {
+                    "default_level": "auto",
+                    "levels": {
+                        "auto": { "effort": "high" },
+                        "high": { "effort": "max" },
+                        "low": { "effort": "low" }
+                    }
+                },
+                "price_factor": 2.0,
+                "enable": true,
+                "format": "anthropic/messages"
+            }]
+        });
+        let parsed = parse_live_model_response(&chat_modes);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["key"], "ling-3.1-flash");
+        assert_eq!(parsed[0]["display_name"], "Ling-3.1-Flash");
+        assert_eq!(parsed[0]["description"], "高效编程模型");
+        assert_eq!(parsed[0]["priceFactor"], json!(0.25));
+        assert_eq!(parsed[0]["model_params"]["thinking"]["type"], "enabled");
+        assert!(parsed[0].get("efforts").is_none());
+
+        assert_eq!(parsed[1]["key"], "qwen4-max");
+        assert_eq!(parsed[1]["efforts"], json!(["low", "high", "max"]));
+        assert_eq!(parsed[1]["defaultEffort"], "high");
+        assert_eq!(parsed[1]["default_context_window"], 200000);
+        assert_eq!(parsed[1]["contextTokens"], json!([200000, 400000, 1000000]));
+        assert_eq!(default_key_in(&parsed).as_deref(), Some("qwen4-max"));
+        assert_eq!(resolve_model_key(&parsed, "lite"), "lite");
+
         let direct = json!({
             "qwork": [{ "key": "qwork-auto", "display_name": "Standard" }],
             "data": { "trace": "not-a-catalog" }
@@ -665,7 +966,6 @@ mod tests {
             }, {
                 "key": "qwork-lite",
                 "display_name": "Economy",
-                // The server layer spells the multiplier snake_case.
                 "price_factor": 0.1
             }]
         });
@@ -681,8 +981,6 @@ mod tests {
         assert_eq!(models[0]["max_output_tokens"], 32768);
         assert_eq!(models[0]["format"], "openai");
         assert_eq!(models[0]["source"], "system");
-        // The official selector shows the gateway's credit multiplier and brand
-        // glyph beside each name; dropping them here would starve the client.
         assert_eq!(
             models[0]["description"],
             json!("【高可信模型】软件工程与深度推理，可处理L1-L4数据")
