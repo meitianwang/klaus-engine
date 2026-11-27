@@ -511,7 +511,9 @@ async fn orchestration_main_retains_guidance_across_compaction_and_executor_rece
     assert!(
         resumed_messages.contains(
             "continuing as the execution model for the next stage prepared by the main planning model"
-        ) && resumed_messages.contains("subagent-message-origin provenance marks message transport only"),
+        ) && resumed_messages.contains("legitimately updates or extends earlier stage file lists")
+            && !resumed_messages.contains("subagent-message-origin")
+            && !resumed_messages.contains("\"userInitiated\":false"),
         "resumed stage must carry explicit stage-continuation scope authorization:\n{resumed_messages}"
     );
 

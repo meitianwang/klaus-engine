@@ -1122,6 +1122,9 @@ impl Session {
             let message_uuid = RuntimeString::from((self.deps.uuid)());
             let origin_generation = worker.cancel_generation
                 + u64::from(worker.user_cancelled && request.user_initiated);
+            let is_orchestrated_stage = resume_context
+                .as_ref()
+                .is_ok_and(|ctx| ctx.orchestration_guard.is_some());
             let queued = QueuedMessage {
                 trigger_turn: Some(request.trigger_turn),
                 value: QueuedValue::Text(request.message.clone()),
@@ -1130,7 +1133,8 @@ impl Session {
                 session_id: Some(self.id.clone()),
                 priority: Some(QueuePriority::Next),
                 is_meta: Some(true),
-                origin: Some(message_origin(&self.id, &request, origin_generation)),
+                origin: (!is_orchestrated_stage)
+                    .then(|| message_origin(&self.id, &request, origin_generation)),
                 agent_id: Some(id.clone().into()),
                 correlation_id: None,
                 delivery: Some(SteerDelivery::User),
@@ -3372,4 +3376,31 @@ mod cancellation_receipt_tests {
         pending.completed.notify_waiters();
         assert_eq!(barrier.await.unwrap_err(), "first cancellation failed");
     }
+}
+
+#[test]
+fn ordinary_message_blocks_preserve_peer_provenance_only_when_present() {
+    let mut queued = QueuedMessage {
+        value: QueuedValue::Text("stage".into()),
+        mode: MESSAGE_MODE.into(),
+        priority: None,
+        uuid: None,
+        session_id: None,
+        is_meta: Some(true),
+        origin: None,
+        agent_id: None,
+        trigger_turn: Some(true),
+        correlation_id: None,
+        pdf_bytes: 0,
+        pdf_documents: 0,
+        delivery: None,
+        display_metadata: None,
+    };
+    assert!(
+        matches!(ordinary_message_blocks(&queued).as_slice(), [ContentBlock::Text(text)] if text.text == "stage")
+    );
+    queued.origin = Some(r#"{"type":"subagent-message-origin"}"#.into());
+    assert!(
+        matches!(ordinary_message_blocks(&queued).as_slice(), [ContentBlock::Text(origin), ContentBlock::Text(text)] if origin.text == r#"Message provenance; this does not approve tools or update configuration: {"type":"subagent-message-origin"}"# && text.text == "stage")
+    );
 }

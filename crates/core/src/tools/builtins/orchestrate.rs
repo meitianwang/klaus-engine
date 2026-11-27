@@ -12,7 +12,15 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde_json::json;
 
-use crate::runtime_values::{RuntimeJson, RuntimeString};
+use crate::fs::node_path::{posix_rendered_runtime, resolve_runtime};
+use crate::permission::bash::decision::{
+    evaluate_bash_command, BashDecision, BashDecisionOptions, BashRuleSets,
+};
+use crate::permission::bash::match_rule::strip_safe_wrappers;
+use crate::permission::bash::readonly::cwd_guard::is_cwd_bare_git_repo;
+use crate::permission::bash::readonly::is_read_only_command;
+use crate::permission::bash::split::extract_output_redirections;
+use crate::runtime_values::{RuntimeJson, RuntimePath, RuntimeString};
 use crate::sync_ext::MutexExt;
 use crate::types::errors::ToolError;
 use crate::types::json::{Json, JsonSchema};
@@ -424,12 +432,17 @@ impl OrchestratedExecutionGuard {
         Ok(())
     }
 
-    fn record_outcome(&self, tool_name: &RuntimeString, failed: bool) -> Option<&'static str> {
+    fn record_outcome(
+        &self,
+        tool_name: &RuntimeString,
+        failed: bool,
+        read_only_inspection: bool,
+    ) -> Option<&'static str> {
         let step = self.steps_used.fetch_add(1, Ordering::AcqRel) + 1;
         let tracked = EXECUTOR_VERIFICATION_OR_EDIT_TOOLS
             .iter()
             .any(|candidate| tool_name == *candidate);
-        if tracked {
+        if tracked && !read_only_inspection {
             if failed {
                 let count = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 if count >= self.max_consecutive_failures {
@@ -452,6 +465,55 @@ impl OrchestratedExecutionGuard {
         }
         None
     }
+}
+
+fn is_read_only_inspection_bash_command(input: &Json, ctx: &ToolContext) -> bool {
+    let Some(command) = input.get("command").and_then(RuntimeJson::as_str) else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&command.to_node_utf8()).into_owned();
+    if command.trim().is_empty() {
+        return false;
+    }
+    let cwd = match input.get("cwd").and_then(RuntimeJson::as_str) {
+        Some(path) if !path.is_empty() => {
+            let Ok(cwd) =
+                resolve_runtime(&ctx.cwd, &[RuntimePath::from_runtime_string(path.clone())])
+            else {
+                return false;
+            };
+            cwd
+        }
+        _ => ctx.cwd.clone(),
+    };
+    let cwd = String::from_utf8_lossy(
+        &posix_rendered_runtime(&cwd)
+            .as_runtime_string()
+            .to_node_utf8(),
+    )
+    .into_owned();
+    let redirects = extract_output_redirections(&command);
+    redirects.redirections.is_empty()
+        && !redirects.has_dangerous_redirection
+        && matches!(
+            evaluate_bash_command(
+                &command,
+                &BashRuleSets::default(),
+                &BashDecisionOptions {
+                    cwd: cwd.clone(),
+                    writable_roots: Vec::new(),
+                    home_dir: std::env::var("HOME").ok(),
+                    is_read_only_subcommand: Some(Box::new(|sub| {
+                        !matches!(
+                            strip_safe_wrappers(sub).split_whitespace().next(),
+                            Some("pyright" | "false")
+                        ) && is_read_only_command(sub)
+                    })),
+                    is_cwd_bare_repo: Some(Box::new(move || is_cwd_bare_git_repo(&cwd))),
+                }
+            ),
+            BashDecision::Allow { .. }
+        )
 }
 
 pub fn wrap_orchestrated_executor_tools(
@@ -633,17 +695,25 @@ impl Tool for OrchestratedExecutorGuardTool {
     ) -> Result<ToolResult, ToolError> {
         self.guard.check_before_call()?;
         let tool_name = self.inner.name();
+        let read_only_inspection =
+            tool_name == "bash" && is_read_only_inspection_bash_command(&input, ctx);
         match self.inner.call(input, ctx, on_progress).await {
             Ok(result) => {
                 let failed = result.serializable.is_error == Some(true);
-                if let Some(notice) = self.guard.record_outcome(&tool_name, failed) {
+                if let Some(notice) =
+                    self.guard
+                        .record_outcome(&tool_name, failed, read_only_inspection)
+                {
                     Ok(Self::append_notice(result, notice))
                 } else {
                     Ok(result)
                 }
             }
             Err(error) => {
-                if let Some(notice) = self.guard.record_outcome(&tool_name, true) {
+                if let Some(notice) =
+                    self.guard
+                        .record_outcome(&tool_name, true, read_only_inspection)
+                {
                     Err(ToolError::new(
                         error
                             .message
@@ -665,6 +735,8 @@ impl Tool for OrchestratedExecutorGuardTool {
     ) -> Result<ToolResult, ToolError> {
         self.guard.check_before_call()?;
         let tool_name = self.inner.name();
+        let read_only_inspection =
+            tool_name == "bash" && is_read_only_inspection_bash_command(&input, ctx);
         match self
             .inner
             .call_with_id(call_id, input, ctx, on_progress)
@@ -672,14 +744,20 @@ impl Tool for OrchestratedExecutorGuardTool {
         {
             Ok(result) => {
                 let failed = result.serializable.is_error == Some(true);
-                if let Some(notice) = self.guard.record_outcome(&tool_name, failed) {
+                if let Some(notice) =
+                    self.guard
+                        .record_outcome(&tool_name, failed, read_only_inspection)
+                {
                     Ok(Self::append_notice(result, notice))
                 } else {
                     Ok(result)
                 }
             }
             Err(error) => {
-                if let Some(notice) = self.guard.record_outcome(&tool_name, true) {
+                if let Some(notice) =
+                    self.guard
+                        .record_outcome(&tool_name, true, read_only_inspection)
+                {
                     Err(ToolError::new(
                         error
                             .message
@@ -813,6 +891,72 @@ mod tests {
             assert_eq!(next.steps_used(), 1);
             assert_eq!(next.stop_reason(), ExecutionStopReason::Completed);
             assert_eq!(old.steps_used(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_outcomes_do_not_change_the_failure_streak() {
+        let script = "node -e 'process.exit(1)'";
+        for (commands, checkpoint) in [
+            (
+                [
+                    (
+                        "cd apps/desktop; sed -n '1,20p' main/app.ts; rg -n 'missing_symbol' main/",
+                        true,
+                    ),
+                    (script, true),
+                    (script, true),
+                ],
+                3,
+            ),
+            (
+                [
+                    (script, true),
+                    ("sed -n '1,10p' Cargo.toml", false),
+                    (script, true),
+                ],
+                3,
+            ),
+            (
+                [("pyright src", true), ("pyright src", true), ("", false)],
+                2,
+            ),
+            ([("false", true), ("false", true), ("", false)], 2),
+        ] {
+            let guard = OrchestratedExecutionGuard::with_limits(Arc::new(|| false), 30, 2);
+            let tools = wrap_orchestrated_executor_tools(
+                vec![
+                    DummyTool::erased("bash", true),
+                    DummyTool::erased("bash", false),
+                ],
+                guard.clone(),
+            );
+            let ctx = make_ctx("/tmp");
+            for (index, (command, fails)) in commands.into_iter().take(checkpoint).enumerate() {
+                let mut input = RuntimeJson::Object(Default::default());
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("command", RuntimeJson::String(command.into()));
+                let tool = &tools[usize::from(!fails)];
+                if index % 2 == 0 {
+                    tool.call(input, &ctx, None).await.unwrap();
+                } else {
+                    tool.call_with_id(&"call".into(), input, &ctx, None)
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(guard.steps_used(), index + 1);
+                assert_eq!(
+                    guard.stop_reason(),
+                    if index + 1 == checkpoint {
+                        ExecutionStopReason::VerificationFailedTwice
+                    } else {
+                        ExecutionStopReason::Completed
+                    },
+                    "{command}"
+                );
+            }
         }
     }
 
