@@ -1,7 +1,9 @@
 //! Registry + dispatcher for lifecycle hooks.
 
 use crate::extensions::failure::{ExtensionFailure, ExtensionFailureKind, ExtensionFailureSink};
-use crate::hooks::command_handler::run_command_hook;
+use crate::hooks::command_handler::{
+    bound_hook_outcome, run_command_hook, truncate_hook_text, MAX_HOOK_ADDITIONAL_CONTEXT_CHARS,
+};
 use crate::hooks::types::{
     CombinedHookOutcome, Hook, HookDecision, HookEvent, HookHandler, HookInput, HookOutcome,
     HookResult, HookTrigger,
@@ -168,6 +170,7 @@ impl HookBus {
             .collect();
         let matching_hooks = matching.len();
         let mut combined = CombinedHookOutcome::default();
+        let mut context_remaining = MAX_HOOK_ADDITIONAL_CONTEXT_CHARS;
         let mut failed_hooks = 0;
         for hook in matching {
             if hook.is_async && !force_sync {
@@ -228,8 +231,18 @@ impl HookBus {
                 }
             }
             if let Some(additional_context) = outcome.additional_context {
-                if !additional_context.is_empty() {
-                    combined.additional_context.push(additional_context);
+                let separator = usize::from(!combined.additional_context.is_empty());
+                let available = context_remaining.saturating_sub(separator);
+                if available > 0 && !additional_context.is_empty() {
+                    let context = if additional_context.len_utf16() > available {
+                        truncate_hook_text(&additional_context, available)
+                    } else {
+                        additional_context
+                    };
+                    if !context.is_empty() {
+                        context_remaining -= separator + context.len_utf16();
+                        combined.additional_context.push(context);
+                    }
                 }
             }
             if let Some(worktree_path) = outcome.worktree_path {
@@ -441,7 +454,7 @@ async fn run_hook(
     hook: &Hook,
     input: &HookInput,
 ) -> HookOutcome {
-    match &hook.handler {
+    let outcome = match &hook.handler {
         HookHandler::Fn(f) => {
             // A panicking fn-hook degrades to failed_continue rather than tearing down the
             // dispatch.
@@ -465,7 +478,8 @@ async fn run_hook(
             )
             .await
         }
-    }
+    };
+    bound_hook_outcome(outcome)
 }
 
 #[cfg(test)]
@@ -531,6 +545,37 @@ mod tests {
             handler: fn_handler(f),
             is_async: false,
         }
+    }
+
+    #[tokio::test]
+    async fn bounds_fn_hook_context_individually_and_across_dispatch() {
+        let event = HookEvent::PreToolUse;
+        let input = base_input(event);
+        let first = fn_hook(event, |_| HookOutcome {
+            additional_context: Some(RuntimeString::from("a".repeat(30_000).as_str())),
+            ..HookOutcome::default()
+        });
+        let second = fn_hook(event, |_| HookOutcome {
+            additional_context: Some(RuntimeString::from("b".repeat(50_000).as_str())),
+            ..HookOutcome::default()
+        });
+        let process = crate::runtime_process::test_runtime_process_context();
+        let single = run_hook(&process, &second, &input).await;
+        assert_eq!(
+            single.additional_context.unwrap().len_utf16(),
+            MAX_HOOK_ADDITIONAL_CONTEXT_CHARS
+        );
+        let combined = test_bus(vec![first, second]).dispatch(event, &input).await;
+        assert_eq!(combined.additional_context.len(), 2);
+        assert_eq!(
+            combined
+                .additional_context
+                .iter()
+                .map(RuntimeString::len_utf16)
+                .sum::<usize>()
+                + 1,
+            MAX_HOOK_ADDITIONAL_CONTEXT_CHARS
+        );
     }
 
     fn decision_outcome(decision: HookDecision) -> HookOutcome {

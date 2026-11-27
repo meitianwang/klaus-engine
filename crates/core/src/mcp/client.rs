@@ -21,6 +21,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::TaskTracker;
 use url::Url;
 
+use crate::mcp::transports::TransportSendError;
 use crate::runtime_process::RuntimeProcessContext;
 use crate::runtime_values::{
     runtime_codec, runtime_json, RuntimeJson as Value, RuntimeObject, RuntimePath, RuntimeString,
@@ -265,7 +266,253 @@ pub struct ManagedClient {
     lease: Option<Arc<ClientLease>>,
     client: Option<Client>,
     lazy_stdio: Option<Arc<LazyStdioConnection>>,
+    recoverable_remote: Option<Arc<RecoverableRemoteConnection>>,
     call_timeout_ms: u64,
+}
+
+enum RemoteLiveState {
+    Connected {
+        generation: u64,
+        client: Client,
+        lease: Arc<ClientLease>,
+    },
+    Closed,
+}
+
+struct RecoverableRemoteConnection {
+    live: tokio::sync::Mutex<RemoteLiveState>,
+    opts: ConnectMcpOptions,
+    tools: std::sync::Weak<Mutex<Vec<Arc<dyn Tool>>>>,
+    raw_tools: Arc<Mutex<Vec<McpToolDescriptor>>>,
+    tool_config: Arc<Mutex<McpServerConfig>>,
+    tool_refresh_lock: Arc<Mutex<()>>,
+    connect_timeout_ms: u64,
+    call_timeout_ms: u64,
+}
+
+struct PendingDialCleanup(Option<(Client, Arc<dyn Transport>)>);
+impl Drop for PendingDialCleanup {
+    fn drop(&mut self) {
+        if let Some((client, transport)) = self.0.take() {
+            tokio::spawn(async move {
+                safe_close_client(&client).await;
+                safe_close(&transport).await;
+            });
+        }
+    }
+}
+
+fn remaining_timeout_ms(start: Instant, total: u64) -> Result<u64, McpError> {
+    if total == 0 {
+        return Ok(0);
+    }
+    let left = u128::from(total).saturating_sub(start.elapsed().as_millis()) as u64;
+    if left == 0 {
+        Err(McpError::with_code("Request timed out", -32001))
+    } else {
+        Ok(left)
+    }
+}
+
+impl RecoverableRemoteConnection {
+    async fn dial_replacement(
+        self: &Arc<Self>,
+        state: &mut RemoteLiveState,
+        start: Instant,
+        signal: Option<AbortSignal>,
+    ) -> Result<(Client, Arc<ClientLease>), McpError> {
+        let RemoteLiveState::Connected {
+            generation,
+            client: old,
+            ..
+        } = state
+        else {
+            return Err(McpError::new("connection closed"));
+        };
+        if signal.as_ref().is_some_and(AbortSignal::is_cancelled) {
+            return Err(McpError::aborted());
+        }
+        let config = self.tool_config.lock().unwrap().clone();
+        let mut opts = self.opts.clone();
+        opts.signal = signal.clone();
+        let transport = create_transport(&config, &opts).await?;
+        let client = Client::new_for_server(
+            opts.cwd.clone(),
+            config_name(&config).to_string(),
+            opts.mcp_elicitation_router.clone(),
+        );
+        let mut cleanup = PendingDialCleanup(Some((client.clone(), transport.clone())));
+        let timeout = remaining_timeout_ms(start, self.call_timeout_ms)?;
+        let timeout_ms = match (timeout, self.connect_timeout_ms) {
+            (0, t) | (t, 0) => t,
+            (a, b) => a.min(b),
+        };
+        client
+            .connect(
+                transport,
+                RequestOptions {
+                    timeout_ms,
+                    signal,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        cleanup.0 = None;
+        let lease = Arc::new(ClientLease {
+            client: client.clone(),
+        });
+        self.install_listener(&client);
+        let old = old.clone();
+        *state = RemoteLiveState::Connected {
+            generation: *generation + 1,
+            client: client.clone(),
+            lease: lease.clone(),
+        };
+        tokio::spawn(async move {
+            safe_close_client(&old).await;
+        });
+        Ok((client, lease))
+    }
+
+    async fn run_with_recovery<T, F, Fut>(
+        self: &Arc<Self>,
+        signal: Option<AbortSignal>,
+        op: F,
+    ) -> Result<T, McpError>
+    where
+        F: Fn(Client, u64, Option<AbortSignal>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, TransportSendError>>,
+    {
+        let start = Instant::now();
+        let (generation, client, _lease, reconnected) = {
+            let mut state = self.live.lock().await;
+            match &*state {
+                RemoteLiveState::Closed => return Err(McpError::new("connection closed")),
+                RemoteLiveState::Connected { client, .. } if client.is_closed() => {
+                    let (client, lease) = self
+                        .dial_replacement(&mut state, start, signal.clone())
+                        .await?;
+                    (0, client, lease, true)
+                }
+                RemoteLiveState::Connected {
+                    generation,
+                    client,
+                    lease,
+                } => (*generation, client.clone(), lease.clone(), false),
+            }
+        };
+        if signal.as_ref().is_some_and(AbortSignal::is_cancelled) {
+            return Err(McpError::aborted());
+        }
+        let timeout = if reconnected {
+            remaining_timeout_ms(start, self.call_timeout_ms)?
+        } else {
+            self.call_timeout_ms
+        };
+        let error = match op(client, timeout, signal.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if !reconnected
+                    && error.recoverable_session_loss
+                    && !error.error.aborted
+                    && !signal.as_ref().is_some_and(AbortSignal::is_cancelled) =>
+            {
+                error.error
+            }
+            Err(error) => return Err(error.error),
+        };
+        let (client, _lease) = {
+            let mut state = self.live.lock().await;
+            match &*state {
+                RemoteLiveState::Closed => return Err(error),
+                RemoteLiveState::Connected {
+                    generation: current,
+                    client,
+                    lease,
+                } if *current != generation && !client.is_closed() => {
+                    (client.clone(), lease.clone())
+                }
+                _ => {
+                    self.dial_replacement(&mut state, start, signal.clone())
+                        .await?
+                }
+            }
+        };
+        if signal.as_ref().is_some_and(AbortSignal::is_cancelled) {
+            return Err(McpError::aborted());
+        }
+        op(
+            client,
+            remaining_timeout_ms(start, self.call_timeout_ms)?,
+            signal,
+        )
+        .await
+        .map_err(|e| e.error)
+    }
+
+    async fn call_tool(
+        self: &Arc<Self>,
+        name: &RuntimeString,
+        args: Json,
+        progress: Option<ToolProgress>,
+        signal: Option<AbortSignal>,
+    ) -> Result<McpCallResult, McpError> {
+        let progress = progress.map(Arc::new);
+        self.run_with_recovery(signal, |client, timeout, signal| {
+            let args = args.clone();
+            let progress = progress.clone().map(|callback| {
+                let forward: ToolProgress = Box::new(move |event| callback(event));
+                forward
+            });
+            async move {
+                client
+                    .call_tool_classified(name, args, timeout, progress, signal)
+                    .await
+            }
+        })
+        .await
+    }
+
+    fn install_listener(self: &Arc<Self>, client: &Client) {
+        if !server_capabilities_tools_list_changed(client) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let client_handle = client.clone();
+        client.set_notification_handler("notifications/tools/list_changed", Arc::new(move |_| {
+            let weak = weak.clone(); let client = client_handle.clone();
+            Box::pin(async move {
+                let Some(remote) = weak.upgrade() else { return; };
+                let Ok(listed) = client.list_tools(timeout_opts(remote.connect_timeout_ms)).await else { return; };
+                let state = remote.live.lock().await;
+                if !matches!(&*state, RemoteLiveState::Connected { client: current, .. } if Arc::ptr_eq(&current.inner, &client.inner)) { return; }
+                let Some(tools) = remote.tools.upgrade() else { return; };
+                let _guard = remote.tool_refresh_lock.lock().unwrap();
+                let config = remote.tool_config.lock().unwrap().clone();
+                *remote.raw_tools.lock().unwrap() = listed.clone();
+                *tools.lock().unwrap() = wrap_listed_with_call(make_recoverable_tool_call(remote.clone()), config_name(&config), config_always_load(&config), listed, &config);
+            }) as BoxFuture<'static, ()>
+        }));
+    }
+
+    async fn close(&self) {
+        let prior = std::mem::replace(&mut *self.live.lock().await, RemoteLiveState::Closed);
+        if let RemoteLiveState::Connected { client, .. } = prior {
+            safe_close_client(&client).await;
+        }
+    }
+}
+
+fn make_recoverable_tool_call(remote: Arc<RecoverableRemoteConnection>) -> McpToolCall {
+    Arc::new(move |name, args, progress, signal| {
+        let remote = remote.clone();
+        Box::pin(async move {
+            remote
+                .call_tool(&name, Value::Object(args), progress, Some(signal))
+                .await
+                .map_err(|e| ToolError::new(e.message))
+        })
+    })
 }
 
 enum LazyLiveState {
@@ -391,7 +638,9 @@ impl ManagedClient {
         else {
             return false;
         };
-        let make_call = if let (Some(client), Some(lease)) = (&self.client, &self.lease) {
+        let make_call = if let Some(remote) = &self.recoverable_remote {
+            make_recoverable_tool_call(remote.clone())
+        } else if let (Some(client), Some(lease)) = (&self.client, &self.lease) {
             make_tool_call(client.clone(), self.call_timeout_ms, lease.clone())
         } else if let Some(lazy) = &self.lazy_stdio {
             make_lazy_tool_call(lazy.clone(), self.call_timeout_ms)
@@ -414,6 +663,16 @@ impl ManagedClient {
 
     /// Read a resource's contents by uri.
     pub async fn read_resource(&self, uri: &RuntimeString) -> Vec<McpResourceContent> {
+        if let Some(remote) = &self.recoverable_remote {
+            return remote
+                .run_with_recovery(None, |c, timeout, signal| async move {
+                    c.read_resource_classified(uri, timeout, signal).await
+                })
+                .await
+                .as_ref()
+                .map(parse_resource_contents)
+                .unwrap_or_default();
+        }
         if let Some(c) = &self.client {
             return read_resource_safe(c, uri, self.call_timeout_ms).await;
         }
@@ -438,6 +697,12 @@ impl ManagedClient {
         args: Json,
         signal: Option<AbortSignal>,
     ) -> Result<McpCallResult, RuntimeString> {
+        if let Some(remote) = &self.recoverable_remote {
+            return remote
+                .call_tool(tool, args, None, signal)
+                .await
+                .map_err(|e| e.message);
+        }
         if let Some(c) = &self.client {
             return c
                 .call_tool(tool, args, self.call_timeout_ms, None, signal)
@@ -462,6 +727,17 @@ impl ManagedClient {
         name: &RuntimeString,
         args: Option<RuntimeObject>,
     ) -> RuntimeString {
+        if let Some(remote) = &self.recoverable_remote {
+            return remote
+                .run_with_recovery(None, |c, timeout, signal| {
+                    let args = args.clone();
+                    async move { c.get_prompt_classified(name, args, timeout, signal).await }
+                })
+                .await
+                .as_ref()
+                .map(format_prompt_messages)
+                .unwrap_or_default();
+        }
         if let Some(c) = &self.client {
             return get_prompt_safe(c, name, args, self.call_timeout_ms).await;
         }
@@ -475,6 +751,9 @@ impl ManagedClient {
 
     /// Tear the transport down. Idempotent; a no-op for a degraded client.
     pub async fn close(&self) {
+        if let Some(remote) = &self.recoverable_remote {
+            remote.close().await;
+        }
         if let Some(c) = &self.client {
             safe_close_client(c).await;
         }
@@ -710,6 +989,10 @@ impl Client {
 
     /// Start the transport, run the initialize handshake, and send the
     /// `initialized` notification.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.close_signal.is_cancelled()
+    }
+
     pub async fn connect(
         &self,
         transport: Arc<dyn Transport>,
@@ -717,7 +1000,27 @@ impl Client {
     ) -> Result<(), McpError> {
         *self.inner.transport.lock().unwrap() = Some(transport.clone());
         let (tx, rx) = mpsc::unbounded_channel();
-        transport.start(tx).await?;
+        let started = tokio::select! {
+            biased;
+            _ = async {
+                match opts.signal.as_ref() {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Err(McpError::aborted()),
+            _ = async {
+                if opts.timeout_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(opts.timeout_ms)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => Err(McpError::with_code("Transport start timed out", -32001)),
+            result = transport.start(tx) => result,
+        };
+        if let Err(error) = started {
+            safe_close_client(self).await;
+            return Err(error);
+        }
         let inner = self.inner.clone();
         tokio::spawn(async move { pump(inner, rx).await });
 
@@ -756,7 +1059,14 @@ impl Client {
                 ..Default::default()
             },
         )
-        .await?;
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                safe_close_client(self).await;
+                return Err(error);
+            }
+        };
         if let Some(caps) = result.get("capabilities") {
             *self.inner.server_caps.lock().unwrap() = Some(caps.clone());
         }
@@ -773,7 +1083,10 @@ impl Client {
                 title: info.get("title").and_then(Value::as_str).cloned(),
             });
         }
-        notify(&self.inner, "notifications/initialized", None).await?;
+        if let Err(error) = notify(&self.inner, "notifications/initialized", None).await {
+            safe_close_client(self).await;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -824,6 +1137,19 @@ impl Client {
         on_progress: Option<ToolProgress>,
         signal: Option<AbortSignal>,
     ) -> Result<McpCallResult, McpError> {
+        self.call_tool_classified(name, args, timeout_ms, on_progress, signal)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn call_tool_classified(
+        &self,
+        name: &RuntimeString,
+        args: Json,
+        timeout_ms: u64,
+        on_progress: Option<ToolProgress>,
+        signal: Option<AbortSignal>,
+    ) -> Result<McpCallResult, TransportSendError> {
         // Forward MCP progress to the engine's tool event stream as status lines.
         let progress_delivery = Arc::new(ProgressDelivery::new());
         let mcp_progress: Option<ProgressCb> = on_progress.map(|op| {
@@ -863,7 +1189,7 @@ impl Client {
                 None
             },
         };
-        let raw = request(
+        let raw = request_classified(
             &self.inner,
             "tools/call",
             Some(runtime_object([
@@ -901,11 +1227,26 @@ impl Client {
     }
 
     async fn read_resource(&self, uri: &RuntimeString, timeout_ms: u64) -> Result<Value, McpError> {
-        request(
+        self.read_resource_classified(uri, timeout_ms, None)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    async fn read_resource_classified(
+        &self,
+        uri: &RuntimeString,
+        timeout_ms: u64,
+        signal: Option<AbortSignal>,
+    ) -> Result<Value, TransportSendError> {
+        request_classified(
             &self.inner,
             "resources/read",
             Some(runtime_object([("uri", Value::String(uri.clone()))])),
-            timeout_opts(timeout_ms),
+            RequestOptions {
+                timeout_ms,
+                signal,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -920,23 +1261,41 @@ impl Client {
         args: Option<RuntimeObject>,
         timeout_ms: u64,
     ) -> Result<Value, McpError> {
+        self.get_prompt_classified(name, args, timeout_ms, None)
+            .await
+            .map_err(|e| e.error)
+    }
+
+    async fn get_prompt_classified(
+        &self,
+        name: &RuntimeString,
+        args: Option<RuntimeObject>,
+        timeout_ms: u64,
+        signal: Option<AbortSignal>,
+    ) -> Result<Value, TransportSendError> {
         let mut params = RuntimeObject::new();
         params.insert("name", Value::String(name.clone()));
         if let Some(args) = args {
             params.insert("arguments", Value::Object(args));
         }
-        request(
+        request_classified(
             &self.inner,
             "prompts/get",
             Some(Value::Object(params)),
-            timeout_opts(timeout_ms),
+            RequestOptions {
+                timeout_ms,
+                signal,
+                ..Default::default()
+            },
         )
         .await
     }
 
     /// Close the transport and fail any in-flight requests. Idempotent.
     pub async fn close(&self) -> Result<(), McpError> {
-        self.inner.close_signal.cancel();
+        if !self.is_closed() {
+            self.inner.close_signal.cancel();
+        }
         // Drop notification handlers so their captured client handles don't keep
         // the connection alive.
         self.inner.notif_handlers.lock().unwrap().clear();
@@ -983,6 +1342,7 @@ fn timeout_opts(timeout_ms: u64) -> RequestOptions {
 
 /// Pump inbound transport events into the pending map / handlers until close.
 async fn pump(inner: Arc<ClientInner>, mut rx: mpsc::UnboundedReceiver<TransportEvent>) {
+    let mut close_error = None;
     loop {
         let ev = tokio::select! {
             biased;
@@ -992,6 +1352,9 @@ async fn pump(inner: Arc<ClientInner>, mut rx: mpsc::UnboundedReceiver<Transport
         let Some(ev) = ev else { break };
         match ev {
             TransportEvent::Message(v) => dispatch(&inner, v).await,
+            TransportEvent::Error(err) if matches!(err.code, Some(404 | 410)) => {
+                close_error = Some(err);
+            }
             TransportEvent::Error(_) => {}
             TransportEvent::Close => break,
         }
@@ -999,7 +1362,9 @@ async fn pump(inner: Arc<ClientInner>, mut rx: mpsc::UnboundedReceiver<Transport
     // Fail any request still waiting on this connection.
     let drained: Vec<_> = inner.pending.lock().unwrap().drain().collect();
     for (_, tx) in drained {
-        let _ = tx.send(Err(McpError::new("connection closed")));
+        let _ = tx.send(Err(close_error
+            .clone()
+            .unwrap_or_else(|| McpError::new("connection closed"))));
     }
     // Settle in-flight server requests (elicitation waits) too.
     let requests: Vec<_> = inner.server_requests.lock().unwrap().drain().collect();
@@ -1241,6 +1606,17 @@ async fn request(
     params: Option<Value>,
     opts: RequestOptions,
 ) -> Result<Value, McpError> {
+    request_classified(inner, method, params, opts)
+        .await
+        .map_err(|err| err.error)
+}
+
+async fn request_classified(
+    inner: &Arc<ClientInner>,
+    method: &str,
+    params: Option<Value>,
+    opts: RequestOptions,
+) -> Result<Value, TransportSendError> {
     let id = inner.next_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel();
 
@@ -1297,10 +1673,13 @@ async fn request(
         None => {
             inner.pending.lock().unwrap().remove(&id);
             inner.progress.lock().unwrap().remove(&id);
-            return Err(McpError::new("not connected to a transport"));
+            return Err(TransportSendError {
+                error: McpError::new("not connected to a transport"),
+                recoverable_session_loss: true,
+            });
         }
     };
-    if let Err(e) = transport.send(Value::Object(msg)).await {
+    if let Err(e) = transport.send_classified(Value::Object(msg)).await {
         inner.pending.lock().unwrap().remove(&id);
         inner.progress.lock().unwrap().remove(&id);
         return Err(e);
@@ -1330,7 +1709,7 @@ async fn request(
             inner.pending.lock().unwrap().remove(&id);
             inner.progress.lock().unwrap().remove(&id);
             send_cancelled(inner, id, "timeout").await;
-            return Err(McpError::with_code("Request timed out", -32001));
+            return Err(McpError::with_code("Request timed out", -32001).into());
         }
         // While paused the stale deadline must not spin: the timer arm is
         // disarmed until the pause ends and the deadline shifts forward.
@@ -1346,8 +1725,8 @@ async fn request(
             res = &mut rx => {
                 inner.progress.lock().unwrap().remove(&id);
                 return match res {
-                    Ok(inner_res) => inner_res,
-                    Err(_) => Err(McpError::new("connection closed before a response")),
+                    Ok(inner_res) => inner_res.map_err(TransportSendError::from),
+                    Err(_) => Err(McpError::new("connection closed before a response").into()),
                 };
             }
             _ = async {
@@ -1359,7 +1738,7 @@ async fn request(
                 inner.pending.lock().unwrap().remove(&id);
                 inner.progress.lock().unwrap().remove(&id);
                 send_cancelled(inner, id, "aborted").await;
-                return Err(McpError::aborted());
+                return Err(McpError::aborted().into());
             }
             changed = async {
                 match pause.as_mut() {
@@ -1868,6 +2247,7 @@ async fn connect_mcp_server_inner(
                     lease: None,
                     client: None,
                     lazy_stdio: Some(lazy),
+                    recoverable_remote: None,
                     call_timeout_ms,
                 };
             }
@@ -2031,6 +2411,39 @@ async fn connect_mcp_server_inner(
     }
 
     let tools_arc = Arc::new(Mutex::new(tools));
+    let recoverable_remote = if matches!(
+        config,
+        McpServerConfig::Http { .. } | McpServerConfig::Sse { .. }
+    ) {
+        let mut opts = base_opts.clone();
+        opts.mcp_authorize_handler = None;
+        opts.skip_needs_auth_cache = Some(true);
+        let remote = Arc::new(RecoverableRemoteConnection {
+            live: tokio::sync::Mutex::new(RemoteLiveState::Connected {
+                generation: 0,
+                client: client.clone(),
+                lease: lease.clone(),
+            }),
+            opts,
+            tools: Arc::downgrade(&tools_arc),
+            raw_tools: raw_tools.clone(),
+            tool_config: tool_config.clone(),
+            tool_refresh_lock: tool_refresh_lock.clone(),
+            connect_timeout_ms,
+            call_timeout_ms,
+        });
+        *tools_arc.lock().unwrap() = wrap_listed_with_call(
+            make_recoverable_tool_call(remote.clone()),
+            &name,
+            config_always_load(config),
+            raw_tools.lock().unwrap().clone(),
+            config,
+        );
+        remote.install_listener(&client);
+        Some(remote)
+    } else {
+        None
+    };
     let managed = ManagedClient {
         declaration: None,
         name: RuntimeString::from(name.clone()),
@@ -2048,24 +2461,27 @@ async fn connect_mcp_server_inner(
         raw_tools: Some(raw_tools.clone()),
         tool_config: Some(tool_config.clone()),
         tool_refresh_lock: Some(tool_refresh_lock.clone()),
-        lease: Some(lease.clone()),
-        client: Some(client.clone()),
+        lease: recoverable_remote.is_none().then(|| lease.clone()),
+        client: recoverable_remote.is_none().then(|| client.clone()),
         lazy_stdio: None,
+        recoverable_remote,
         call_timeout_ms,
     };
 
-    install_tools_list_changed_listener(
-        &client,
-        &lease,
-        &tools_arc,
-        &raw_tools,
-        &tool_config,
-        &tool_refresh_lock,
-        name,
-        connect_timeout_ms,
-        call_timeout_ms,
-        stdio_cache,
-    );
+    if managed.recoverable_remote.is_none() {
+        install_tools_list_changed_listener(
+            &client,
+            &lease,
+            &tools_arc,
+            &raw_tools,
+            &tool_config,
+            &tool_refresh_lock,
+            name,
+            connect_timeout_ms,
+            call_timeout_ms,
+            stdio_cache,
+        );
+    }
 
     managed
 }
@@ -2503,6 +2919,7 @@ fn stated_client(
         lease: None,
         client: None,
         lazy_stdio: None,
+        recoverable_remote: None,
         call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
     }
 }
@@ -2707,22 +3124,25 @@ async fn read_resource_safe(
     timeout: u64,
 ) -> Vec<McpResourceContent> {
     match client.read_resource(uri, timeout).await {
-        Ok(r) => r
-            .get("contents")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| McpResourceContent {
-                        uri: c.get("uri").and_then(Value::as_str).cloned(),
-                        text: c.get("text").and_then(Value::as_str).cloned(),
-                        mime_type: c.get("mimeType").and_then(Value::as_str).cloned(),
-                        blob: c.get("blob").and_then(Value::as_str).cloned(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        Ok(r) => parse_resource_contents(&r),
         Err(_) => Vec::new(),
     }
+}
+
+fn parse_resource_contents(r: &Value) -> Vec<McpResourceContent> {
+    r.get("contents")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|c| McpResourceContent {
+                    uri: c.get("uri").and_then(Value::as_str).cloned(),
+                    text: c.get("text").and_then(Value::as_str).cloned(),
+                    mime_type: c.get("mimeType").and_then(Value::as_str).cloned(),
+                    blob: c.get("blob").and_then(Value::as_str).cloned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn get_prompt_safe(
@@ -2735,6 +3155,10 @@ async fn get_prompt_safe(
         Ok(r) => r,
         Err(_) => return RuntimeString::default(),
     };
+    format_prompt_messages(&r)
+}
+
+fn format_prompt_messages(r: &Value) -> RuntimeString {
     let mut parts = Vec::new();
     if let Some(messages) = r.get("messages").and_then(Value::as_array) {
         for m in messages {
@@ -4400,6 +4824,246 @@ mod tests {
         assert!(out.ends_with("… [truncated]"));
     }
 
+    #[tokio::test]
+    async fn http_expired_session_recovers_once_and_does_not_loop_on_persistent_404() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let initialized = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU64::new(0));
+        let sessions = initialized.clone();
+        let mode = phase.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                let mut session = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if key.eq_ignore_ascii_case("mcp-session-id") {
+                            session = value.trim().to_owned();
+                        }
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).await.unwrap();
+                let frame = parse_http_json(&bytes);
+                let method = frame.get("method").and_then(Value::as_str);
+                let mut header = String::new();
+                let mut status = "200 OK";
+                let result = match method {
+                    Some(m) if m == "initialize" => {
+                        let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+                        header = format!("mcp-session-id: s{n}\r\n");
+                        json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}, "resources": {}}})
+                    }
+                    Some(m) if m == "tools/list" => {
+                        json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]})
+                    }
+                    Some(m) if m == "resources/list" => {
+                        json!({"resources":[{"uri":"memo://one","name":"memo"}]})
+                    }
+                    Some(m) if m == "resources/read" => {
+                        json!({"contents":[{"uri":"memo://one","text":"memo"}]})
+                    }
+                    Some(m) if m == "tools/call" => {
+                        let phase = mode.load(Ordering::SeqCst);
+                        if phase == 2 || (phase == 1 && session == "s1") {
+                            status = "404 Not Found";
+                        }
+                        json!({"content":[{"type":"text","text":"echo"}]})
+                    }
+                    _ => json!({}),
+                };
+                let body = if let Some(id) = frame.get("id").filter(|_| status == "200 OK") {
+                    runtime_json::stringify(
+                        &json!({"jsonrpc":"2.0","id":id.clone(),"result":result}),
+                    )
+                    .to_node_utf8()
+                } else {
+                    if status == "200 OK" {
+                        status = "204 No Content";
+                    }
+                    Vec::new()
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\n{header}Content-Length: {}\r\n\r\n", body.len()).as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        let config = McpServerConfig::Http {
+            name: "recovery".to_owned(),
+            url,
+            headers: None,
+            oauth: None,
+            options: McpServerOptions::default(),
+        };
+        let client = connect_mcp_server(&config, &test_connect_options()).await;
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        phase.store(1, Ordering::SeqCst);
+        let tool = RuntimeString::from("echo");
+        assert!(client.call_tool(&tool, json!({}), None).await.is_ok());
+        assert_eq!(initialized.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client
+                .read_resource(&RuntimeString::from("memo://one"))
+                .await
+                .len(),
+            1
+        );
+        phase.store(2, Ordering::SeqCst);
+        let error = client
+            .call_tool(&tool, json!({}), None)
+            .await
+            .expect_err("persistent expiry fails");
+        assert!(error.try_to_utf8().unwrap().contains("HTTP 404"));
+        assert_eq!(initialized.load(Ordering::SeqCst), 3);
+        client.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_elicitation_reply_404_fails_inflight_call_without_replay_and_recovers_next_call()
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let initialized = Arc::new(AtomicU64::new(0));
+        let tool_executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sessions = initialized.clone();
+        let executions = tool_executions.clone();
+        let server = tokio::spawn(async move {
+            let mut open_stream = None;
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                let mut session = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if key.eq_ignore_ascii_case("mcp-session-id") {
+                            session = value.trim().to_owned();
+                        }
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).await.unwrap();
+                let frame = parse_http_json(&bytes);
+                let method = frame.get("method").and_then(Value::as_str);
+                let mut header = String::new();
+                let mut status = "200 OK";
+                let result = match method {
+                    Some(m) if m == "initialize" => {
+                        let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+                        header = format!("mcp-session-id: s{n}\r\n");
+                        json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}, "resources": {}}})
+                    }
+                    Some(m) if m == "tools/list" => {
+                        json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]})
+                    }
+                    Some(m) if m == "tools/call" => {
+                        if executions.fetch_add(1, Ordering::SeqCst) == 0 {
+                            assert_eq!(session, "s1");
+                            let mut stream = reader.into_inner();
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                            stream.write_all(b"data: {\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{\"message\":\"Confirm?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\n\n").await.unwrap();
+                            stream.flush().await.unwrap();
+                            open_stream = Some(stream);
+                            continue;
+                        }
+                        assert_eq!(session, "s2");
+                        drop(open_stream.take());
+                        json!({"content":[{"type":"text","text":"echo"}]})
+                    }
+                    None if frame.get("id").and_then(Value::as_i64) == Some(77) => {
+                        assert_eq!(session, "s1");
+                        assert!(open_stream.is_some());
+                        status = "404 Not Found";
+                        json!({})
+                    }
+                    _ => json!({}),
+                };
+                let body = if let Some(id) = frame.get("id").filter(|_| status == "200 OK") {
+                    runtime_json::stringify(
+                        &json!({"jsonrpc":"2.0","id":id.clone(),"result":result}),
+                    )
+                    .to_node_utf8()
+                } else {
+                    if status == "200 OK" {
+                        status = "204 No Content";
+                    }
+                    Vec::new()
+                };
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\n{header}Content-Length: {}\r\n\r\n", body.len()).as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        let config = McpServerConfig::Http {
+            name: "recovery".to_owned(),
+            url,
+            headers: None,
+            oauth: None,
+            options: McpServerOptions::default(),
+        };
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let router = McpElicitationRouter::new(
+            Some(Arc::new(RecordingMcpElicitationPresenter {
+                events: event_tx,
+            })),
+            Arc::new(|| "recovery".to_string()),
+        );
+        let client = connect_mcp_server(
+            &config,
+            &ConnectMcpOptions {
+                call_timeout_ms: Some(5_000),
+                mcp_elicitation_router: Some(router.clone()),
+                ..test_connect_options()
+            },
+        )
+        .await;
+        assert_eq!(client.state, McpConnectionState::Ready);
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        let tool = RuntimeString::from("echo");
+        let first = client.call_tool(&tool, json!({}), None);
+        tokio::pin!(first);
+        let event = tokio::select! {
+            event = tokio::time::timeout(Duration::from_secs(2), events.recv()) => event.unwrap().unwrap(),
+            _ = &mut first => panic!("tool completed before elicitation"),
+        };
+        let started = Instant::now();
+        router
+            .resolve(&event.request_id, McpElicitationResponse::cancel())
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .expect_err("expired session fails the pending tool");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.try_to_utf8().unwrap().contains("HTTP 404"));
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(initialized.load(Ordering::SeqCst), 1);
+        assert!(client.call_tool(&tool, json!({}), None).await.is_ok());
+        assert_eq!(initialized.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 2);
+        client.close().await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
     // ---- OAuth Streamable HTTP fixture ------------------------------------
 
     mod oauth_http_server {
@@ -5112,6 +5776,7 @@ mod tests {
             pub url: String,
             last_auth: Arc<Mutex<Option<String>>>,
             shutdown: Arc<AtomicBool>,
+            sessions: Arc<Mutex<HashMap<String, Arc<InMemoryTransport>>>>,
         }
 
         impl SseTestServer {
@@ -5158,7 +5823,18 @@ mod tests {
                     url: format!("http://127.0.0.1:{port}/sse"),
                     last_auth,
                     shutdown,
+                    sessions,
                 }
+            }
+
+            pub async fn drop_active_sessions(&self) -> Vec<String> {
+                let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
+                let mut ids = Vec::new();
+                for (id, transport) in sessions {
+                    transport.close().await.unwrap();
+                    ids.push(id);
+                }
+                ids
             }
 
             pub fn auth_seen(&self) -> Option<String> {
@@ -5396,6 +6072,37 @@ mod tests {
             seen = srv.auth_seen();
         }
         assert_eq!(seen.as_deref(), Some("Bearer cfg-token"));
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn sse_stream_disconnect_recovers_automatically_on_next_call() {
+        let srv = sse_server::SseTestServer::start(tokio::runtime::Handle::current());
+        let config = McpServerConfig::Sse {
+            name: "fix".into(),
+            url: srv.url.clone(),
+            headers: None,
+            oauth: None,
+            options: McpServerOptions::default(),
+        };
+        let client = connect_mcp_server(&config, &test_connect_options()).await;
+        assert_eq!(client.state, McpConnectionState::Ready);
+        let echo = client
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name() == "mcp__fix__echo")
+            .unwrap();
+        assert!(call_text(&echo, json!({"msg": "first"}))
+            .await
+            .contains("echo:first"));
+        let old = srv.drop_active_sessions().await;
+        assert_eq!(old.len(), 1);
+        assert!(call_text(&echo, json!({"msg": "second"}))
+            .await
+            .contains("echo:second"));
+        let replacement = srv.drop_active_sessions().await;
+        assert_eq!(replacement.len(), 1);
+        assert_ne!(old, replacement);
         client.close().await;
     }
 

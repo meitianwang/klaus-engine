@@ -9,6 +9,79 @@ use crate::runtime_values::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub const MAX_HOOK_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_HOOK_ADDITIONAL_CONTEXT_CHARS: usize = 40_000;
+pub const MAX_HOOK_MESSAGE_CHARS: usize = 40_000;
+
+async fn read_bounded_and_drain(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> (Vec<u8>, bool) {
+    let mut output = Vec::new();
+    let mut overflowed = false;
+    let mut chunk = [0; 8192];
+    while let Ok(n @ 1..) = reader.read(&mut chunk).await {
+        let keep = n.min(MAX_HOOK_STDOUT_BYTES - output.len());
+        output.extend_from_slice(&chunk[..keep]);
+        overflowed |= keep < n;
+    }
+    (output, overflowed)
+}
+
+async fn drain_pipe(reader: &mut (impl tokio::io::AsyncRead + Unpin)) {
+    let mut chunk = [0; 8192];
+    while let Ok(1..) = reader.read(&mut chunk).await {}
+}
+
+pub(crate) fn truncate_hook_text(text: &RuntimeString, max_chars: usize) -> RuntimeString {
+    let units = text.as_utf16();
+    if units.len() <= max_chars {
+        return text.clone();
+    }
+    let splits_pair = |index: usize| {
+        index > 0
+            && index < units.len()
+            && (0xD800..=0xDBFF).contains(&units[index - 1])
+            && (0xDC00..=0xDFFF).contains(&units[index])
+    };
+    let mut retained = max_chars;
+    loop {
+        let mut head = retained / 2;
+        let mut tail = units.len() - (retained - head);
+        head -= usize::from(splits_pair(head));
+        tail += usize::from(splits_pair(tail));
+        let omitted = tail - head;
+        let marker: Vec<u16> = format!("\n…[{omitted} chars truncated]…\n")
+            .encode_utf16()
+            .collect();
+        if marker.len() > max_chars {
+            return RuntimeString::from_utf16(Vec::new());
+        }
+        if units.len() - omitted <= max_chars - marker.len() {
+            let mut output = units[..head].to_vec();
+            output.extend(marker);
+            output.extend_from_slice(&units[tail..]);
+            return RuntimeString::from_utf16(output);
+        }
+        retained = max_chars - marker.len();
+    }
+}
+
+pub(crate) fn bound_hook_outcome(mut outcome: HookOutcome) -> HookOutcome {
+    for (field, limit) in [
+        (
+            &mut outcome.additional_context,
+            MAX_HOOK_ADDITIONAL_CONTEXT_CHARS,
+        ),
+        (&mut outcome.permission_reason, MAX_HOOK_MESSAGE_CHARS),
+        (&mut outcome.system_message, MAX_HOOK_MESSAGE_CHARS),
+    ] {
+        if let Some(text) = field.as_mut().filter(|text| text.len_utf16() > limit) {
+            *text = truncate_hook_text(text, limit);
+        }
+    }
+    outcome
+}
+
 /// Run a command hook: the HookInput JSON is written to the command's stdin, and
 /// its stdout (if JSON) is translated into a HookOutcome. Tolerant — a failing or
 /// non-JSON command degrades to `failed_continue` rather than erroring.
@@ -58,16 +131,15 @@ pub async fn run_command_hook(
             }
         };
         let read = async {
-            let mut buf = Vec::new();
             if let Some(stdout) = stdout.as_mut() {
-                let _ = stdout.read_to_end(&mut buf).await;
+                read_bounded_and_drain(stdout).await
+            } else {
+                (Vec::new(), false)
             }
-            buf
         };
         let drain_stderr = async {
-            let mut discarded = Vec::new();
             if let Some(stderr) = stderr.as_mut() {
-                let _ = stderr.read_to_end(&mut discarded).await;
+                drain_pipe(stderr).await;
             }
         };
         let ((), out, ()) = tokio::join!(write, read, drain_stderr);
@@ -75,7 +147,7 @@ pub async fn run_command_hook(
         (out, status)
     };
     let raced = tokio::time::timeout(Duration::from_millis(timeout_ms), work).await;
-    let (out, status) = match raced {
+    let ((out, overflowed), status) = match raced {
         Ok(result) => result,
         Err(_) => {
             // Dropping the owned runtime child executes its closed hard-kill policy.
@@ -95,6 +167,12 @@ pub async fn run_command_hook(
     } else {
         HookResult::FailedContinue
     };
+    if overflowed {
+        return HookOutcome {
+            result: Some(base_result),
+            ..HookOutcome::default()
+        };
+    }
     let mut decoder = WhatwgUtf8::new();
     let out = decoder.feed(&out).concat(&decoder.finish());
     match runtime_json::parse(&out) {
@@ -227,13 +305,47 @@ pub fn translate_hook_wire_output(parsed: &RuntimeObject) -> HookOutcome {
     if let Some(worktree_path) = parsed.get("worktreePath").and_then(Json::as_str) {
         out.worktree_path = Some(worktree_path.clone());
     }
-    out
+    bound_hook_outcome(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::types::HookEvent;
+
+    #[tokio::test]
+    async fn drains_oversized_stdout_and_stderr_without_losing_exit_status() {
+        let outcome = run_command_hook(
+            &crate::runtime_process::test_runtime_process_context(),
+            "cat >/dev/null; head -c 4194304 /dev/zero && head -c 4194304 /dev/zero >&2",
+            &input(),
+            None,
+        )
+        .await;
+        assert_eq!(outcome.result, Some(HookResult::Success));
+    }
+
+    #[test]
+    fn bounds_wire_context_and_reason_without_splitting_emoji() {
+        let text = format!("head{}tail", "😀".repeat(25_000));
+        let outcome = translate_hook_wire_output(&exact_object(&format!(
+            r#"{{"decision":"block","additionalContext":"{text}","hookSpecificOutput":{{"permissionDecisionReason":"{text}"}}}}"#
+        )));
+        assert_eq!(outcome.decision, Some(HookDecision::Block));
+        for (bounded, limit) in [
+            (
+                outcome.additional_context.unwrap(),
+                MAX_HOOK_ADDITIONAL_CONTEXT_CHARS,
+            ),
+            (outcome.permission_reason.unwrap(), MAX_HOOK_MESSAGE_CHARS),
+        ] {
+            assert!(bounded.len_utf16() <= limit);
+            let decoded = String::from_utf16(bounded.as_utf16()).unwrap();
+            assert!(decoded.starts_with("head😀"));
+            assert!(decoded.ends_with("😀tail"));
+            assert!(decoded.contains(" chars truncated]"));
+        }
+    }
 
     fn exact_json(source: &str) -> Json {
         runtime_json::parse(&RuntimeString::from(source)).expect("valid exact runtime JSON")

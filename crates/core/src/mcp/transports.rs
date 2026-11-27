@@ -22,7 +22,9 @@ use crate::runtime_process::{
     RuntimeChildStdin, RuntimeEnv, RuntimeProcessContext, RuntimeProcessController, RuntimeSignal,
     SignalDelivery, SpawnedRuntimeProcess,
 };
-use crate::runtime_values::{runtime_json, NodeBufferUtf8, RuntimeJson, RuntimeString, WhatwgUtf8};
+use crate::runtime_values::{
+    runtime_json, NodeBufferUtf8, RuntimeJson, RuntimeObject, RuntimeString, WhatwgUtf8,
+};
 use crate::types::abort::AbortSignal;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -160,6 +162,7 @@ pub fn parse_sse_event(block: &RuntimeString) -> SseEvent {
 /// Event boundaries are blank lines (`\n\n`); `\r\n` is normalized to `\n`.
 pub struct SseDecoder {
     buf: Vec<u16>,
+    scan_offset: usize,
     utf8: WhatwgUtf8,
 }
 
@@ -173,14 +176,25 @@ impl SseDecoder {
     pub fn new() -> Self {
         SseDecoder {
             buf: Vec::new(),
+            scan_offset: 0,
             utf8: WhatwgUtf8::new(),
         }
     }
 
     /// Append a chunk of decoded text and return any events it completed.
     pub fn push(&mut self, chunk: &RuntimeString) -> Vec<SseEvent> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        let mut search_from = self.scan_offset.saturating_sub(2);
         let units = chunk.as_utf16();
         let mut index = 0;
+        if let Some(last) = self.buf.last_mut() {
+            if *last == u16::from(b'\r') && units.first() == Some(&u16::from(b'\n')) {
+                *last = u16::from(b'\n');
+                index = 1;
+            }
+        }
         while index < units.len() {
             if units[index] == u16::from(b'\r') && units.get(index + 1) == Some(&u16::from(b'\n')) {
                 self.buf.push(u16::from(b'\n'));
@@ -191,20 +205,23 @@ impl SseDecoder {
             }
         }
         let mut events = Vec::new();
-        loop {
-            let Some(index) = self
-                .buf
-                .windows(2)
-                .position(|window| window == [u16::from(b'\n'), u16::from(b'\n')])
-            else {
-                break;
-            };
-            let block = RuntimeString::from_utf16(self.buf[..index].to_vec());
-            self.buf.drain(..index + 2);
-            if !block.is_empty() {
+        let mut event_start = 0;
+        while let Some(rel) = self.buf[search_from..]
+            .windows(2)
+            .position(|window| window == [u16::from(b'\n'), u16::from(b'\n')])
+        {
+            let delim = search_from + rel;
+            if delim > event_start {
+                let block = RuntimeString::from_utf16(self.buf[event_start..delim].to_vec());
                 events.push(parse_sse_event(&block));
             }
+            event_start = delim + 2;
+            search_from = event_start;
         }
+        if event_start > 0 {
+            self.buf.drain(..event_start);
+        }
+        self.scan_offset = self.buf.len();
         events
     }
 
@@ -291,6 +308,22 @@ pub enum TransportEvent {
     Close,
 }
 
+/// A send failure and whether the request is known not to have executed.
+#[derive(Debug, Clone)]
+pub struct TransportSendError {
+    pub error: McpError,
+    pub recoverable_session_loss: bool,
+}
+
+impl From<McpError> for TransportSendError {
+    fn from(error: McpError) -> Self {
+        Self {
+            error,
+            recoverable_session_loss: false,
+        }
+    }
+}
+
 /// The transport seam a [`crate::mcp::client::Client`] talks to. Object-safe so a
 /// client can hold `Arc<dyn Transport>` regardless of the concrete wire.
 ///
@@ -302,6 +335,11 @@ pub trait Transport: Send + Sync {
     async fn start(&self, sink: mpsc::UnboundedSender<TransportEvent>) -> McpResult<()>;
     /// Send one JSON-RPC message.
     async fn send(&self, message: RuntimeJson) -> McpResult<()>;
+    /// Send a frame with per-call failure classification.
+    async fn send_classified(&self, message: RuntimeJson) -> Result<(), TransportSendError> {
+        self.send(message).await.map_err(TransportSendError::from)
+    }
+
     /// Close the transport and release its resources. Idempotent.
     async fn close(&self) -> McpResult<()>;
     /// The session id the server assigned (streamable HTTP), if any.
@@ -454,10 +492,10 @@ impl OAuthTransport {
         &self,
         observed_generation: u64,
         operation: F,
-    ) -> McpResult<T>
+    ) -> Result<T, TransportSendError>
     where
         F: FnOnce(Arc<dyn Transport>) -> Fut,
-        Fut: std::future::Future<Output = McpResult<T>>,
+        Fut: std::future::Future<Output = Result<T, TransportSendError>>,
     {
         let guard = self.auth_lock.lock().await;
         let transport = self
@@ -469,7 +507,7 @@ impl OAuthTransport {
         if self.auth_generation.load(Ordering::SeqCst) == observed_generation {
             match self.authenticate_after_unauthorized().await? {
                 AuthResult::Redirect => {
-                    return Err(McpError::with_code("MCP authorization required", 401));
+                    return Err(McpError::with_code("MCP authorization required", 401).into());
                 }
                 AuthResult::Authorized => {}
             }
@@ -488,14 +526,14 @@ impl OAuthTransport {
                 })?;
             let access_token = runtime_oauth_access_token_to_header_host(&access_token)?;
             if access_token.trim().is_empty() {
-                return Err(McpError::new(
-                    "MCP OAuth refresh returned no usable access token",
-                ));
+                return Err(
+                    McpError::new("MCP OAuth refresh returned no usable access token").into(),
+                );
             }
             if !transport.replace_bearer_token(access_token) {
-                return Err(McpError::new(
-                    "MCP OAuth transport cannot update its bearer in place",
-                ));
+                return Err(
+                    McpError::new("MCP OAuth transport cannot update its bearer in place").into(),
+                );
             }
             self.auth_generation.fetch_add(1, Ordering::SeqCst);
         }
@@ -543,6 +581,12 @@ impl Transport for OAuthTransport {
     }
 
     async fn send(&self, message: RuntimeJson) -> McpResult<()> {
+        self.send_classified(message)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn send_classified(&self, message: RuntimeJson) -> Result<(), TransportSendError> {
         let auth_generation = self.auth_generation.load(Ordering::SeqCst);
         let transport = self
             .inner
@@ -550,11 +594,11 @@ impl Transport for OAuthTransport {
             .await
             .clone()
             .ok_or_else(|| McpError::new("OAuth transport is not started"))?;
-        match transport.send(message.clone()).await {
+        match transport.send_classified(message.clone()).await {
             Ok(()) => Ok(()),
-            Err(error) if is_auth_error(&error) => {
+            Err(error) if is_auth_error(&error.error) => {
                 self.retry_after_auth(auth_generation, move |transport| async move {
-                    transport.send(message).await
+                    transport.send_classified(message).await
                 })
                 .await
             }
@@ -955,6 +999,21 @@ fn http_error(status: reqwest::StatusCode, context: &str) -> McpError {
     )
 }
 
+fn is_rpc_request(message: &RuntimeJson) -> bool {
+    message
+        .get("method")
+        .and_then(RuntimeJson::as_str)
+        .is_some()
+        && matches!(message.get("id"), Some(id) if !id.is_null())
+}
+
+fn emit_expiry(sink: &Mutex<Option<mpsc::UnboundedSender<TransportEvent>>>, error: McpError) {
+    if let Some(sink) = sink.lock().unwrap().take() {
+        let _ = sink.send(TransportEvent::Error(error));
+        let _ = sink.send(TransportEvent::Close);
+    }
+}
+
 /// The legacy Server-Sent-Events transport: a long-lived GET event stream plus a
 /// POST channel whose endpoint the server announces via an `endpoint` event.
 pub struct SseTransport {
@@ -964,6 +1023,8 @@ pub struct SseTransport {
     message_url: Arc<AsyncMutex<Option<String>>>,
     endpoint_ready: Arc<tokio::sync::Notify>,
     started: AtomicBool,
+    closed: AbortSignal,
+    stream_closed: AbortSignal,
     sink: Mutex<Option<mpsc::UnboundedSender<TransportEvent>>>,
 }
 
@@ -976,6 +1037,8 @@ impl SseTransport {
             message_url: Arc::new(AsyncMutex::new(None)),
             endpoint_ready: Arc::new(tokio::sync::Notify::new()),
             started: AtomicBool::new(false),
+            closed: AbortSignal::new(),
+            stream_closed: AbortSignal::new(),
             sink: Mutex::new(None),
         }
     }
@@ -1005,20 +1068,32 @@ impl Transport for SseTransport {
             .map_err(|e| McpError::new(format!("invalid SSE url: {e}")))?;
         let message_url = self.message_url.clone();
         let endpoint_ready = self.endpoint_ready.clone();
+        let notified = self.endpoint_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let closed = self.closed.clone();
+        let stream_closed = self.stream_closed.clone();
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
             let mut decoder = SseDecoder::new();
-            while let Some(chunk) = stream.next().await {
-                let bytes = match chunk {
-                    Ok(b) => b,
-                    Err(e) => {
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    _ = closed.cancelled() => break,
+                    chunk = stream.next() => chunk,
+                };
+                let eof = chunk.is_none();
+                let events = match chunk {
+                    Some(Ok(bytes)) => decoder.push_bytes(&bytes),
+                    None => decoder.finish(),
+                    Some(Err(e)) => {
                         let _ = sink.send(TransportEvent::Error(McpError::new(format!(
                             "SSE read error: {e}"
                         ))));
                         break;
                     }
                 };
-                for ev in decoder.push_bytes(&bytes) {
+                for ev in events {
                     if ev.event.as_ref().is_some_and(|event| event == "endpoint") {
                         if let Ok(joined) = base.join(&url_terminal_input(&ev.data)) {
                             *message_url.lock().await = Some(joined.to_string());
@@ -1028,22 +1103,29 @@ impl Transport for SseTransport {
                         // "message" (or a data-only event) carries a JSON-RPC payload.
                         if let Ok(v) = decode_ndjson(&ev.data) {
                             if sink.send(TransportEvent::Message(v)).is_err() {
-                                return;
+                                break;
                             }
                         }
                     }
                 }
+                if eof || sink.is_closed() {
+                    break;
+                }
             }
-            let _ = sink.send(TransportEvent::Close);
+            stream_closed.cancel();
+            if !closed.is_cancelled() {
+                let _ = sink.send(TransportEvent::Close);
+            }
         });
 
         // Wait until the server announced the POST endpoint, so the first send
         // (initialize) has somewhere to go. Bounded so a silent server cannot
         // hang the connect indefinitely.
         if self.message_url.lock().await.is_none() {
-            let notified = self.endpoint_ready.notified();
             tokio::select! {
                 _ = notified => {}
+                _ = self.closed.cancelled() => return Err(McpError::new("SSE transport closed")),
+                _ = self.stream_closed.cancelled() => return Err(McpError::new("SSE stream closed before endpoint announcement")),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     if self.message_url.lock().await.is_none() {
                         return Err(McpError::new("SSE server did not send an endpoint event"));
@@ -1055,10 +1137,23 @@ impl Transport for SseTransport {
     }
 
     async fn send(&self, message: RuntimeJson) -> McpResult<()> {
+        self.send_classified(message)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn send_classified(&self, message: RuntimeJson) -> Result<(), TransportSendError> {
         let target = {
             let guard = self.message_url.lock().await;
             guard.clone()
         };
+        let is_request = is_rpc_request(&message);
+        if self.closed.is_cancelled() || self.stream_closed.is_cancelled() {
+            return Err(TransportSendError {
+                error: McpError::new("SSE stream is closed"),
+                recoverable_session_loss: is_request,
+            });
+        }
         let target = target.ok_or_else(|| McpError::new("SSE endpoint is not ready"))?;
         let headers = self.headers.lock().unwrap().clone();
         let body = runtime_json::stringify(&message).to_node_utf8();
@@ -1072,12 +1167,28 @@ impl Transport for SseTransport {
             .await
             .map_err(|e| McpError::new(format!("SSE POST failed: {e}")))?;
         if !resp.status().is_success() {
-            return Err(http_error(resp.status(), "SSE POST failed"));
+            let error = http_error(resp.status(), "SSE POST failed");
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+            ) {
+                self.closed.cancel();
+                self.stream_closed.cancel();
+                emit_expiry(&self.sink, error.clone());
+                return Err(TransportSendError {
+                    error,
+                    recoverable_session_loss: is_request
+                        && reqwest::Url::parse(&target).ok().as_ref() == Some(resp.url()),
+                });
+            }
+            return Err(error.into());
         }
         Ok(())
     }
 
     async fn close(&self) -> McpResult<()> {
+        self.closed.cancel();
+        self.stream_closed.cancel();
         if let Some(sink) = self.sink.lock().unwrap().take() {
             let _ = sink.send(TransportEvent::Close);
         }
@@ -1128,21 +1239,29 @@ impl Transport for HttpTransport {
     }
 
     async fn send(&self, message: RuntimeJson) -> McpResult<()> {
-        let sink = self
-            .sink
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| McpError::new("HttpTransport is not started"))?;
-        // Only a JSON-RPC request (carries a method and a non-null id) awaits
-        // a server response on the shared router. Outbound replies (including
-        // `"id": null` error replies) and outbound notifications (`method`
-        // without `id`) are one-way messages with no pending waiter.
-        let is_request = message
-            .get("method")
-            .and_then(RuntimeJson::as_str)
-            .is_some()
-            && matches!(message.get("id"), Some(id) if !id.is_null());
+        self.send_classified(message)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn send_classified(&self, message: RuntimeJson) -> Result<(), TransportSendError> {
+        let is_request = is_rpc_request(&message);
+        let sink = self.sink.lock().unwrap().clone();
+        let sink = match sink {
+            Some(sink) if !self.closed.is_cancelled() => sink,
+            _ => {
+                return Err(TransportSendError {
+                    error: McpError::new(
+                        if self.started.load(Ordering::SeqCst) || self.closed.is_cancelled() {
+                            "HttpTransport is closed"
+                        } else {
+                            "HttpTransport is not started"
+                        },
+                    ),
+                    recoverable_session_loss: is_request,
+                })
+            }
+        };
         let is_reply = message.get("method").is_none()
             && message.get("id").is_some()
             && (message.get("result").is_some() || message.get("error").is_some());
@@ -1158,33 +1277,49 @@ impl Transport for HttpTransport {
             )
             .headers(header_map(&headers))
             .body(body);
-        if let Some(sid) = self.session_id.lock().unwrap().clone() {
+        let sent_session_id = self.session_id.lock().unwrap().clone();
+        if let Some(sid) = &sent_session_id {
             req = req.header("mcp-session-id", sid);
         }
         let resp = tokio::select! {
             biased;
-            _ = self.closed.cancelled() => return Err(McpError::new("HttpTransport is closed")),
+            _ = self.closed.cancelled() => return Err(McpError::new("HttpTransport is closed").into()),
             response = req.send() => response
                 .map_err(|e| McpError::new(format!("HTTP POST failed: {e}")))?,
         };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND && sent_session_id.is_some() {
+            let mut session = self.session_id.lock().unwrap();
+            *session = None;
+            self.closed.cancel();
+            drop(session);
+            emit_expiry(
+                &self.sink,
+                McpError::with_code("MCP session expired: HTTP 404", 404),
+            );
+            return Err(TransportSendError {
+                error: http_error(status, "HTTP POST failed"),
+                recoverable_session_loss: is_request
+                    && reqwest::Url::parse(&self.url).ok().as_ref() == Some(resp.url()),
+            });
+        }
         if let Some(sid) = resp
             .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
         {
             let mut session_id = self.session_id.lock().unwrap();
-            if !self.closed.is_cancelled() {
+            if status != reqwest::StatusCode::NOT_FOUND && !self.closed.is_cancelled() {
                 *session_id = Some(sid.to_string());
             }
         }
-        let status = resp.status();
         if status == reqwest::StatusCode::ACCEPTED
             || (!is_request && status == reqwest::StatusCode::NO_CONTENT)
         {
             return Ok(());
         }
         if !status.is_success() {
-            return Err(http_error(status, "HTTP POST failed"));
+            return Err(http_error(status, "HTTP POST failed").into());
         }
         if !is_request {
             if is_reply {
@@ -1195,7 +1330,8 @@ impl Transport for HttpTransport {
                 return Err(McpError::new(format!(
                     "HTTP reply POST returned unexpected status {}",
                     status.as_u16()
-                )));
+                ))
+                .into());
             }
             // Outbound notifications have no pending waiter. Accept a generic
             // 2xx acknowledgement while dropping any body or stream before it
@@ -1210,30 +1346,54 @@ impl Transport for HttpTransport {
             .to_string();
         if content_type.contains("text/event-stream") {
             let closed = self.closed.clone();
+            let request_id = message.get("id").and_then(RuntimeJson::as_i64);
             tokio::spawn(async move {
                 let mut stream = resp.bytes_stream();
                 let mut decoder = SseDecoder::new();
+                let mut delivered = false;
                 loop {
                     let chunk = tokio::select! {
                         biased;
                         _ = closed.cancelled() => return,
                         chunk = stream.next() => chunk,
                     };
-                    let Some(chunk) = chunk else { break };
-                    let Ok(bytes) = chunk else { break };
-                    for ev in decoder.push_bytes(&bytes) {
+                    let eof = chunk.is_none();
+                    let events = match chunk {
+                        Some(Ok(bytes)) => decoder.push_bytes(&bytes),
+                        None => decoder.finish(),
+                        Some(Err(_)) => break,
+                    };
+                    for ev in events {
                         if let Ok(v) = decode_ndjson(&ev.data) {
+                            delivered |= v.get("method").is_none()
+                                && v.get("id").and_then(RuntimeJson::as_i64) == request_id;
                             if sink.send(TransportEvent::Message(v)).is_err() {
                                 return;
                             }
                         }
                     }
+                    if eof {
+                        break;
+                    }
+                }
+                if let Some(id) = request_id.filter(|_| !delivered && !closed.is_cancelled()) {
+                    let mut error = RuntimeObject::new();
+                    error.insert("code", RuntimeJson::from(-32000_i64));
+                    error.insert(
+                        "message",
+                        RuntimeJson::from("HTTP SSE stream ended before delivering a response"),
+                    );
+                    let mut reply = RuntimeObject::new();
+                    reply.insert("jsonrpc", RuntimeJson::from("2.0"));
+                    reply.insert("id", RuntimeJson::from(id));
+                    reply.insert("error", RuntimeJson::Object(error));
+                    let _ = sink.send(TransportEvent::Message(RuntimeJson::Object(reply)));
                 }
             });
         } else {
             let body = tokio::select! {
                 biased;
-                _ = self.closed.cancelled() => return Err(McpError::new("HttpTransport is closed")),
+                _ = self.closed.cancelled() => return Err(McpError::new("HttpTransport is closed").into()),
                 body = resp.bytes() => body
                     .map_err(|e| McpError::new(format!("HTTP response read failed: {e}")))?,
             };
@@ -1380,6 +1540,40 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].data, "hello");
         assert_eq!(evs[1].data, "two");
+    }
+
+    #[test]
+    fn sse_decoder_normalizes_crlf_split_across_chunks() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(&RuntimeString::from("data: ok\r")).is_empty());
+        assert!(decoder.push(&RuntimeString::from("\n\r")).is_empty());
+        let events = decoder.push(&RuntimeString::from("\n"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "ok");
+    }
+
+    #[test]
+    fn sse_decoder_scans_large_chunked_event_incrementally() {
+        let mut decoder = SseDecoder::new();
+        let chunk = RuntimeString::from_utf16(vec![u16::from(b'x'); 16 * 1024]);
+        let start = std::time::Instant::now();
+        assert!(decoder.push(&RuntimeString::from("data: ")).is_empty());
+        for _ in 0..512 {
+            assert!(decoder.push(&chunk).is_empty());
+        }
+        let events = decoder.push(&RuntimeString::from("\n\n"));
+        let elapsed = start.elapsed();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data.len_utf16(), 8 * 1024 * 1024);
+        assert!(events[0]
+            .data
+            .as_utf16()
+            .iter()
+            .all(|unit| *unit == u16::from(b'x')));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "decoding took {elapsed:?}"
+        );
     }
 
     #[test]
