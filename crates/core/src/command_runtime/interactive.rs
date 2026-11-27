@@ -1712,6 +1712,153 @@ mod tests {
         assert!(policy.network_allowed);
         m.dispose_all();
     }
+
+    #[cfg(unix)]
+    struct KillOnDrop(libc::pid_t);
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if self.0 > 1 {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn parse_tagged_pid(output: &str, prefix: &str) -> Option<libc::pid_t> {
+        output.match_indices(prefix).find_map(|(idx, _)| {
+            let rest = &output[idx + prefix.len()..];
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            digits.parse::<libc::pid_t>().ok().filter(|&pid| pid > 1)
+        })
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_pid_gone(pid: libc::pid_t, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_kill_terminates_background_process_groups_in_session() {
+        if !skip_without_a_pty() {
+            return;
+        }
+        let m = InteractiveCommandRegistry::new();
+        let r = m
+            .exec(
+                crate::runtime_process::test_runtime_process_context(),
+                ExecCommandParams {
+                    command: RuntimeString::from("bash --noprofile --norc -i"),
+                    cwd: cwd(),
+                    sandbox: Arc::new(TestSandbox),
+                    env: None,
+                    network_allowed: None,
+                    managed_network: None,
+                    writable_roots: None,
+                    unconfined_writes: false,
+                    yield_ms: Some(300),
+                    max_output_bytes: Some(4096),
+                    signal: None,
+                    terminal: Some(TerminalOptions { cols: 80, rows: 24 }),
+                },
+            )
+            .await;
+        assert!(!r.exited, "result: {r:?}");
+        let id = r.session_id.clone().unwrap();
+
+        let started = m
+            .write_stdin(WriteStdinParams {
+                session_id: id.clone(),
+                input: Some(RuntimeString::from(
+                    "perl -e 'setpgrp(0, 0); $| = 1; printf \"BG_PID=%d\\n\", $$; sleep 60' </dev/null &\n",
+                )),
+                yield_ms: Some(4000),
+                signal: None,
+                resize: None,
+                tail_bytes: None,
+            })
+            .await;
+        let rendered = ui_string(&started.output);
+        let bg_pid = parse_tagged_pid(&rendered, "BG_PID=")
+            .unwrap_or_else(|| panic!("expected BG_PID in PTY output, got: {rendered:?}"));
+        let _guard = KillOnDrop(bg_pid);
+
+        assert_eq!(
+            unsafe { libc::kill(bg_pid, 0) },
+            0,
+            "background job should be running before kill"
+        );
+        assert_eq!(
+            unsafe { libc::getpgid(bg_pid) },
+            bg_pid,
+            "interactive job control must place background job in its own process group"
+        );
+
+        assert!(m.kill(&id));
+        assert!(
+            wait_until_pid_gone(bg_pid, Duration::from_secs(5)).await,
+            "background process group {bg_pid} survived PTY kill"
+        );
+        m.dispose_all();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_shell_exit_terminates_background_process_groups_and_reaches_eof() {
+        if !skip_without_a_pty() {
+            return;
+        }
+        let m = InteractiveCommandRegistry::new();
+        let finished = m
+            .exec(
+                crate::runtime_process::test_runtime_process_context(),
+                ExecCommandParams {
+                    command: RuntimeString::from(
+                        "perl -e 'setpgrp(0, 0); $| = 1; printf \"BG_PID=%d\\n\", $$; sleep 60' & sleep 0.2; exit 0",
+                    ),
+                    cwd: cwd(),
+                    sandbox: Arc::new(TestSandbox),
+                    env: None,
+                    network_allowed: None,
+                    managed_network: None,
+                    writable_roots: None,
+                    unconfined_writes: false,
+                    yield_ms: Some(5000),
+                    max_output_bytes: Some(4096),
+                    signal: None,
+                    terminal: Some(TerminalOptions { cols: 80, rows: 24 }),
+                },
+            )
+            .await;
+        let rendered = ui_string(&finished.output);
+        let bg_pid = parse_tagged_pid(&rendered, "BG_PID=")
+            .unwrap_or_else(|| panic!("expected BG_PID in PTY output, got: {rendered:?}"));
+        let _guard = KillOnDrop(bg_pid);
+
+        assert!(
+            finished.exited,
+            "PTY session must finish instead of hanging on background slave fd: {rendered:?}"
+        );
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(
+            wait_until_pid_gone(bg_pid, Duration::from_secs(5)).await,
+            "background process group {bg_pid} survived shell exit"
+        );
+        m.dispose_all();
+    }
 }
 
 #[cfg(test)]

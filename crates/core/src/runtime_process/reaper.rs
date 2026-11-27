@@ -46,7 +46,7 @@ use super::macos_notifier::{
     PendingKqueueWatch, ProvenExitCollector, SharedRetainedHiddenScheduler,
 };
 use super::unix_spawn::UnregisteredUnixChild;
-use super::KillTarget;
+use super::{KillTarget, ProcessTopology};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RegistrationIdentity {
@@ -288,6 +288,29 @@ pub(super) trait UnixChildKernel: Send + Sync + 'static {
         abort()
     }
 
+    fn signal_session_members(
+        &self,
+        identity: RegistrationIdentity,
+        signal: c_int,
+    ) -> KernelSignalObservation {
+        let _ = (identity, signal);
+        KernelSignalObservation::AlreadyGone
+    }
+
+    fn terminate_session_before_reap(&self, identity: RegistrationIdentity, proven_exit: bool) {
+        let _ = (identity, proven_exit);
+    }
+
+    fn session_has_other_members(&self, identity: RegistrationIdentity) -> bool {
+        let _ = identity;
+        false
+    }
+
+    fn pid_is_absent(&self, identity: RegistrationIdentity) -> bool {
+        let _ = identity;
+        false
+    }
+
     #[cfg(any(target_os = "linux", test))]
     fn prepare_pidfd(&self, identity: RegistrationIdentity) -> Option<PreparedPidfd> {
         let _ = identity;
@@ -423,6 +446,39 @@ impl UnixChildKernel for LibcUnixChildKernel {
                 KernelSignalObservation::Error(errno)
             };
         }
+    }
+
+    fn signal_session_members(
+        &self,
+        identity: RegistrationIdentity,
+        signal: c_int,
+    ) -> KernelSignalObservation {
+        signal_unix_session_members(identity.pid, signal, false)
+    }
+
+    fn terminate_session_before_reap(&self, identity: RegistrationIdentity, proven_exit: bool) {
+        if !proven_exit && !has_exited_without_reap(identity.pid) {
+            return;
+        }
+        let _ = self.signal_process_group(identity, libc::SIGKILL);
+        let _ = signal_unix_session_members(identity.pid, libc::SIGKILL, false);
+    }
+
+    fn session_has_other_members(&self, identity: RegistrationIdentity) -> bool {
+        if !valid_owned_session_id(identity.pid) {
+            return false;
+        }
+        session_member_pids(identity.pid)
+            .into_iter()
+            .any(|pid| pid != identity.pid)
+    }
+
+    fn pid_is_absent(&self, identity: RegistrationIdentity) -> bool {
+        if identity.pid <= 1 {
+            return true;
+        }
+        let rc = unsafe { libc::kill(identity.pid, 0) };
+        rc == -1 && last_errno() == libc::ESRCH
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -1154,6 +1210,7 @@ impl SharedUnixReaper {
                 generation,
                 drop_action,
                 cleanup_target,
+                topology: ProcessTopology::Inherit,
                 terminal_tx,
             }),
             hidden_cleanup: None,
@@ -1650,6 +1707,7 @@ struct PreparedRegistration {
     generation: u64,
     drop_action: RuntimeDropAction,
     cleanup_target: KillTarget,
+    topology: ProcessTopology,
     terminal_tx: watch::Sender<Option<SharedWaitOutcome>>,
 }
 
@@ -1680,6 +1738,12 @@ pub(super) struct UnixSpawnAdmission<'a> {
 }
 
 impl ReaperSpawnPermit {
+    pub(super) fn set_topology(&mut self, topology: ProcessTopology) {
+        if let Some(prepared) = self.prepared.as_mut() {
+            prepared.topology = topology;
+        }
+    }
+
     pub(super) fn authorize_unix_spawn(
         &mut self,
     ) -> Result<UnixSpawnAdmission<'_>, ReaperAdmissionError> {
@@ -2311,6 +2375,7 @@ struct Registration {
     identity: RegistrationIdentity,
     drop_action: RuntimeDropAction,
     cleanup_target: KillTarget,
+    topology: ProcessTopology,
     lifecycle: Mutex<RegistrationLifecycle>,
     terminal_tx: watch::Sender<Option<SharedWaitOutcome>>,
     // A live/retained registration keeps its namespace supervisor alive even
@@ -2346,9 +2411,11 @@ impl Registration {
             },
             drop_action: prepared.drop_action,
             cleanup_target: prepared.cleanup_target,
+            topology: prepared.topology,
             lifecycle: Mutex::new(RegistrationLifecycle {
                 kind: RegistrationKind::Unpublished,
                 terminal: None,
+                session_may_have_survivors: false,
                 owner_dropped: false,
                 drop_action_state: DropActionState::Armed,
                 retained_invariant: false,
@@ -2397,17 +2464,37 @@ impl Registration {
         kernel.signal_child(self.identity, signal)
     }
 
+    fn owns_session(&self) -> bool {
+        matches!(
+            self.topology,
+            ProcessTopology::UnixNewSession | ProcessTopology::UnixControllingPty
+        )
+    }
+
+    fn terminate_session_on_leader_exit(&self) -> bool {
+        self.topology == ProcessTopology::UnixControllingPty
+    }
+
     fn perform_hard_action(
         &self,
         kernel: &dyn UnixChildKernel,
         target: KillTarget,
         signal: c_int,
+        sweep_session: bool,
     ) -> DirectChildActionResult {
         match target {
             KillTarget::Child => direct_action_result(self.signal_direct_child(kernel, signal)),
             KillTarget::UnixProcessGroup => {
-                let group =
-                    signal_action_result(kernel.signal_process_group(self.identity, signal));
+                let group_observation = kernel.signal_process_group(self.identity, signal);
+                let session_observation = if sweep_session && self.owns_session() {
+                    kernel.signal_session_members(self.identity, signal)
+                } else {
+                    KernelSignalObservation::AlreadyGone
+                };
+                let group = combine_signal_results(
+                    signal_action_result(group_observation),
+                    signal_action_result(session_observation),
+                );
                 let direct_child_fallback = if group == SignalActionResult::Delivered {
                     None
                 } else {
@@ -2534,7 +2621,7 @@ impl Registration {
             abort();
         }
         let result = consume_drop_action(&mut lifecycle, || {
-            self.perform_hard_action(kernel, self.cleanup_target, libc::SIGKILL)
+            self.perform_hard_action(kernel, self.cleanup_target, libc::SIGKILL, true)
         });
         self.hidden_cleanup_pollable.store(true, Ordering::Release);
         drop(lifecycle);
@@ -2626,6 +2713,12 @@ impl Registration {
         {
             abort();
         }
+        if self.terminate_session_on_leader_exit() {
+            kernel.terminate_session_before_reap(self.identity, false);
+        }
+        let survivors_before_reap = self.owns_session()
+            && !self.terminate_session_on_leader_exit()
+            && kernel.session_has_other_members(self.identity);
         let observation = kernel.wait_nonblocking(self.identity);
         let outcome = match observation {
             KernelWaitObservation::Running => return ReaperPollResult::Running,
@@ -2646,6 +2739,7 @@ impl Registration {
                 })
             }
         };
+        lifecycle.session_may_have_survivors = survivors_before_reap && outcome.is_ok();
         lifecycle.drop_action_state = DropActionState::Disarmed;
         lifecycle.terminal = Some(outcome);
         #[cfg(any(target_os = "linux", test))]
@@ -2666,6 +2760,12 @@ impl Registration {
         if lifecycle.kind != RegistrationKind::Published {
             abort();
         }
+        if self.terminate_session_on_leader_exit() {
+            kernel.terminate_session_before_reap(self.identity, true);
+        }
+        let survivors_before_reap = self.owns_session()
+            && !self.terminate_session_on_leader_exit()
+            && kernel.session_has_other_members(self.identity);
         let outcome = match kernel.wait_proven_exit(self.identity) {
             KernelWaitObservation::Exited(raw) => Ok(SharedExitStatus(ExitStatus::from_raw(raw))),
             KernelWaitObservation::Running => Err(ReaperInvariant::ProvenExitNotTerminal {
@@ -2687,6 +2787,7 @@ impl Registration {
                 })
             }
         };
+        lifecycle.session_may_have_survivors = survivors_before_reap && outcome.is_ok();
         lifecycle.macos_proven_exit_pending = false;
         lifecycle.drop_action_state = DropActionState::Disarmed;
         lifecycle.terminal = Some(outcome);
@@ -2719,12 +2820,17 @@ impl Registration {
             }
             RuntimeDropAction::HardKill(KillTarget::Child) => {
                 consume_drop_action(&mut lifecycle, || {
-                    self.perform_hard_action(kernel, KillTarget::Child, libc::SIGKILL)
+                    self.perform_hard_action(kernel, KillTarget::Child, libc::SIGKILL, false)
                 })
             }
             RuntimeDropAction::HardKill(KillTarget::UnixProcessGroup) => {
                 consume_drop_action(&mut lifecycle, || {
-                    self.perform_hard_action(kernel, KillTarget::UnixProcessGroup, libc::SIGKILL)
+                    self.perform_hard_action(
+                        kernel,
+                        KillTarget::UnixProcessGroup,
+                        libc::SIGKILL,
+                        true,
+                    )
                 })
             }
             RuntimeDropAction::HardKill(_) => abort(),
@@ -2759,6 +2865,7 @@ impl Registration {
 struct RegistrationLifecycle {
     kind: RegistrationKind,
     terminal: Option<SharedWaitOutcome>,
+    session_may_have_survivors: bool,
     owner_dropped: bool,
     drop_action_state: DropActionState,
     retained_invariant: bool,
@@ -2896,8 +3003,40 @@ impl RuntimeChildController {
     }
 
     pub(super) fn signal(&self, target: KillTarget, signal: c_int) -> DirectChildActionResult {
-        self.registration
-            .perform_hard_action(self.supervisor.kernel.as_ref(), target, signal)
+        let mut lifecycle = self
+            .registration
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let kernel = self.supervisor.kernel.as_ref();
+        let sweep_session = if lifecycle.terminal.is_none() {
+            true
+        } else if lifecycle.session_may_have_survivors {
+            if kernel.pid_is_absent(self.registration.identity) {
+                true
+            } else {
+                lifecycle.session_may_have_survivors = false;
+                false
+            }
+        } else {
+            false
+        };
+        let result = self
+            .registration
+            .perform_hard_action(kernel, target, signal, sweep_session);
+        if lifecycle.terminal.is_some()
+            && matches!(
+                result,
+                DirectChildActionResult::AlreadyGone
+                    | DirectChildActionResult::ProcessGroup {
+                        group: SignalActionResult::AlreadyGone,
+                        ..
+                    }
+            )
+        {
+            lifecycle.session_may_have_survivors = false;
+        }
+        result
     }
 }
 
@@ -2937,4 +3076,263 @@ fn last_errno() -> c_int {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EINVAL)
+}
+
+fn combine_signal_results(
+    primary: SignalActionResult,
+    secondary: SignalActionResult,
+) -> SignalActionResult {
+    match (primary, secondary) {
+        (SignalActionResult::Delivered, _) | (_, SignalActionResult::Delivered) => {
+            SignalActionResult::Delivered
+        }
+        (SignalActionResult::Failed { errno }, _) | (_, SignalActionResult::Failed { errno }) => {
+            SignalActionResult::Failed { errno }
+        }
+        (SignalActionResult::AlreadyGone, SignalActionResult::AlreadyGone) => {
+            SignalActionResult::AlreadyGone
+        }
+    }
+}
+
+fn valid_owned_session_id(sid: pid_t) -> bool {
+    if sid <= 1 {
+        return false;
+    }
+    let caller_sid = unsafe { libc::getsid(0) };
+    caller_sid > 0 && sid != caller_sid
+}
+
+#[cfg(target_os = "linux")]
+fn siginfo_pid(info: &libc::siginfo_t) -> pid_t {
+    unsafe { info.si_pid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn siginfo_pid(info: &libc::siginfo_t) -> pid_t {
+    info.si_pid
+}
+
+fn has_exited_without_reap(pid: pid_t) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return siginfo_pid(&info) == pid;
+        }
+        if last_errno() == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn session_member_pids(sid: pid_t) -> Vec<pid_t> {
+    extern "C" {
+        fn proc_listallpids(buffer: *mut libc::c_void, buffersize: c_int) -> c_int;
+    }
+
+    let estimate = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    if estimate <= 0 {
+        return Vec::new();
+    }
+    let capacity = (estimate as usize).saturating_add(128);
+    let mut all = vec![0 as pid_t; capacity];
+    let byte_len =
+        i32::try_from(capacity.saturating_mul(std::mem::size_of::<pid_t>())).unwrap_or(i32::MAX);
+    let filled = unsafe { proc_listallpids(all.as_mut_ptr().cast::<libc::c_void>(), byte_len) };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    all.truncate((filled as usize).min(capacity));
+    let mut members: Vec<pid_t> = all
+        .into_iter()
+        .filter(|&pid| pid > 1 && unsafe { libc::getsid(pid) } == sid)
+        .collect();
+    members.sort_unstable();
+    members.dedup();
+    members
+}
+
+#[cfg(target_os = "linux")]
+fn session_member_pids(sid: pid_t) -> Vec<pid_t> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse::<pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid > 1 && unsafe { libc::getsid(pid) } == sid {
+            members.push(pid);
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    members
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn session_member_pids(_sid: pid_t) -> Vec<pid_t> {
+    Vec::new()
+}
+
+fn signal_verified_session_member(
+    member: pid_t,
+    sid: pid_t,
+    signal: c_int,
+) -> KernelSignalObservation {
+    if member <= 1 {
+        return KernelSignalObservation::AlreadyGone;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, member as c_int, 0 as libc::c_uint) };
+        if pidfd >= 0 {
+            let pidfd = pidfd as c_int;
+            let observation = if unsafe { libc::getsid(member) } != sid {
+                KernelSignalObservation::AlreadyGone
+            } else {
+                loop {
+                    let rc = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd,
+                            signal,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0 as libc::c_uint,
+                        )
+                    };
+                    if rc == 0 {
+                        break KernelSignalObservation::Delivered;
+                    }
+                    let errno = last_errno();
+                    if errno == libc::EINTR {
+                        continue;
+                    }
+                    break if errno == libc::ESRCH {
+                        KernelSignalObservation::AlreadyGone
+                    } else {
+                        KernelSignalObservation::Error(errno)
+                    };
+                }
+            };
+            unsafe {
+                libc::close(pidfd);
+            }
+            return observation;
+        }
+    }
+    if unsafe { libc::getsid(member) } != sid {
+        return KernelSignalObservation::AlreadyGone;
+    }
+    loop {
+        let rc = unsafe { libc::kill(member, signal) };
+        if rc == 0 {
+            return KernelSignalObservation::Delivered;
+        }
+        let errno = last_errno();
+        if errno == libc::EINTR {
+            continue;
+        }
+        return if errno == libc::ESRCH {
+            KernelSignalObservation::AlreadyGone
+        } else {
+            KernelSignalObservation::Error(errno)
+        };
+    }
+}
+
+fn signal_unix_session_members(
+    sid: pid_t,
+    signal: c_int,
+    include_leader: bool,
+) -> KernelSignalObservation {
+    if !valid_owned_session_id(sid) {
+        return KernelSignalObservation::AlreadyGone;
+    }
+    let caller_pgid = unsafe { libc::getpgrp() };
+    let max_passes = if signal == libc::SIGKILL { 8 } else { 1 };
+    let mut delivered = false;
+    let mut first_error = None;
+    let mut previous = Vec::new();
+    let mut unchanged_passes = 0usize;
+
+    for _ in 0..max_passes {
+        let mut members = session_member_pids(sid);
+        if !include_leader {
+            members.retain(|&pid| pid != sid);
+        }
+        if members.is_empty() {
+            break;
+        }
+        let mut groups = Vec::new();
+        for &member in &members {
+            let pgid = unsafe { libc::getpgid(member) };
+            if pgid > 1 && pgid != sid && pgid != caller_pgid && !groups.contains(&pgid) {
+                groups.push(pgid);
+            }
+        }
+        for pgid in groups {
+            if let Some(neg) = pgid.checked_neg() {
+                let rc = unsafe { libc::kill(neg, signal) };
+                if rc == 0 {
+                    delivered = true;
+                } else {
+                    let errno = last_errno();
+                    if errno != libc::ESRCH && first_error.is_none() {
+                        first_error = Some(errno);
+                    }
+                }
+            }
+        }
+        for &member in &members {
+            match signal_verified_session_member(member, sid, signal) {
+                KernelSignalObservation::Delivered => delivered = true,
+                KernelSignalObservation::AlreadyGone => {}
+                KernelSignalObservation::Error(errno) => {
+                    if first_error.is_none() {
+                        first_error = Some(errno);
+                    }
+                }
+            }
+        }
+        if max_passes == 1 {
+            break;
+        }
+        if members == previous {
+            unchanged_passes += 1;
+            if unchanged_passes >= 2 {
+                break;
+            }
+        } else {
+            unchanged_passes = 0;
+            previous = members;
+        }
+    }
+
+    if delivered {
+        KernelSignalObservation::Delivered
+    } else if let Some(errno) = first_error {
+        KernelSignalObservation::Error(errno)
+    } else {
+        KernelSignalObservation::AlreadyGone
+    }
 }

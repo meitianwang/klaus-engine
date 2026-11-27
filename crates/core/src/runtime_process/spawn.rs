@@ -301,6 +301,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = Rust193ForkFallbackShadowSpawner::spawn_unregistered(
             permit
                 .authorize_unix_spawn()
@@ -349,6 +350,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = Rust193ForkFallbackShadowSpawner::spawn_unregistered(
             permit
                 .authorize_unix_spawn()
@@ -404,6 +406,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let fork_guard = SHADOW_FORK_DESCRIPTOR_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -467,6 +470,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = spawn_node20_libuv146_unregistered(
             permit
                 .authorize_unix_spawn()
@@ -518,6 +522,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = spawn_node20_pty_unregistered(
             permit
                 .authorize_unix_spawn()
@@ -559,6 +564,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = spawn_rust193_unregistered(
             permit
                 .authorize_unix_spawn()
@@ -601,6 +607,7 @@ impl SharedRuntimeSpawner {
             .reaper
             .admit_spawn_with_target(policy.drop_action, policy.kill_target())
             .map_err(SharedSpawnError::Reaper)?;
+        permit.set_topology(policy.topology);
         let spawned = Rust193ForkFallbackShadowSpawner::spawn_unregistered_with_test_control(
             permit
                 .authorize_unix_spawn()
