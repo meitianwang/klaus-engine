@@ -20,26 +20,26 @@
 //! console output is preserved, and later calls continue in the same context.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use futures::future::{BoxFuture, Either};
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::code_mode::protocol::{CodeModeToolKind, NestedToolMetadata};
-use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString, runtime_json};
+use crate::runtime_values::{runtime_json, RuntimeJson, RuntimeObject, RuntimeString};
 use crate::schemas::content::OutputBlock;
 use crate::types::errors::{CodeModeToolRejection, ToolError};
 use crate::types::tool::{InvokeToolFn, InvokeToolResult};
 use crate::v8_platform::{
-    HeapLimitWatch, SCRIPT_HEAP_LIMIT_BYTES, heap_limited_isolate, initialize_v8,
+    heap_limited_isolate, initialize_v8, HeapLimitWatch, SCRIPT_HEAP_LIMIT_BYTES,
 };
 
 use super::isolate::value::{

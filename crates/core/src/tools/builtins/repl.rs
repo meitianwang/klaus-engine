@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::engine::code_mode::runtime::repl_session::{
-    REPL_DEFAULT_TIMEOUT_MS, REPL_MAX_TIMEOUT_MS, ReplExecOutcome, ReplExecRequest, ReplToolBinding,
+    ReplExecOutcome, ReplExecRequest, ReplToolBinding, REPL_DEFAULT_TIMEOUT_MS, REPL_MAX_TIMEOUT_MS,
 };
 use crate::engine::code_mode::session::{CodeModeSessionProvider, ReplSessionHandle};
 use crate::runtime_values::{RuntimeJson, RuntimeObject, RuntimeString};
