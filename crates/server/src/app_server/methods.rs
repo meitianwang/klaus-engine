@@ -120,6 +120,7 @@ typed_results! {
     wire::SessionFollowResult,
     wire::ApprovalReviewDenialsResult,
     wire::EngineBuiltinSkillsResult,
+    wire::EngineCheckSkillDependenciesResult,
     wire::EngineBuiltinAgentsResult,
     wire::ThreadReadResult,
     wire::EngineImportExternalSessionResult,
@@ -297,6 +298,8 @@ facade_methods! {
     /// Session-less binary introspection: the built-in skill roster is compiled
     /// into the engine, so a host can list it before (or without) any session.
     EngineBuiltinSkills => "engine/builtinSkills" (wire::EngineBuiltinSkillsParams) -> wire::EngineBuiltinSkillsResult;
+    /// Read dependency availability without creating a conversation.
+    EngineCheckSkillDependencies => "engine/checkSkillDependencies" (wire::EngineCheckSkillDependenciesParams) -> wire::EngineCheckSkillDependenciesResult;
 
     /// Session-less binary introspection: the built-in agent roster (with each
     /// role's declared model tier and effort) is compiled into the engine, so a

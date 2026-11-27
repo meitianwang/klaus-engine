@@ -990,6 +990,57 @@ async fn a_rejected_config_write_reports_its_reason_and_writes_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn skill_dependencies_answer_without_a_session_and_publish_a_narrow_schema() {
+    let mut client = TestClient::start(make_create_session(&[]));
+    client.initialize().await;
+    let root = tempfile::tempdir().unwrap();
+    client
+        .send(json!({
+            "id": 2,
+            "method": "engine/checkSkillDependencies",
+            "params": { "cwd": root.path(), "os": ["other-platform"] }
+        }))
+        .await;
+    let (response, _) = client.response_for(2).await;
+    assert_eq!(
+        response["result"],
+        json!({
+            "missingBins": [],
+            "missingEnv": [],
+            "unsupported": true
+        })
+    );
+    for (id, extra) in [
+        (3, json!({"env": ["BAD;echo secret"]})),
+        (4, json!({"environment": {"TOKEN": "secret"}})),
+    ] {
+        let mut params = json!({"cwd": root.path()});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        client
+            .send(json!({
+                "id": id,
+                "method": "engine/checkSkillDependencies",
+                "params": params
+            }))
+            .await;
+        let (response, _) = client.response_for(id).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(super::wire::INVALID_PARAMS)
+        );
+    }
+    let schema = schema_bundle();
+    let method = &schema["requests"]["engine/checkSkillDependencies"];
+    assert_eq!(method["params"]["properties"]["cwd"]["type"], "string");
+    assert_eq!(method["params"]["additionalProperties"], false);
+    assert_eq!(method["result"]["properties"].as_object().unwrap().len(), 3);
+    client.close().await;
+}
+
 /// `engine/builtinSkills` answers WITHOUT a session: the roster is compiled
 /// into the binary, and a host that had to start a session to learn it would
 /// hand-copy the list instead (and then drift from it).

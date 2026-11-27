@@ -16,6 +16,7 @@ pub mod shell;
 pub mod shell_env_snapshot;
 pub mod shell_session;
 pub mod shell_setup;
+pub mod skill_dependencies;
 pub mod subagent_stream;
 pub mod tool_schema;
 

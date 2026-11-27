@@ -156,6 +156,7 @@ enum ProcessSurfacePolicyId {
     RustEvalCommandSuccess,
     ScalarActionAllowlist,
     TsShellEnvSnapshot,
+    SkillDependencyCheck,
     TsRipgrepExecFile,
     TsLsp,
     TsMcpStdio,
@@ -195,6 +196,7 @@ impl ProcessSurfacePolicyId {
             Self::RustEvalCommandSuccess => "rust_eval_command_success",
             Self::ScalarActionAllowlist => "scalar_action_allowlist",
             Self::TsShellEnvSnapshot => "ts_shell_env_snapshot",
+            Self::SkillDependencyCheck => "skill_dependency_check",
             Self::TsRipgrepExecFile => "ts_ripgrep_execfile",
             Self::TsLsp => "ts_lsp",
             Self::TsMcpStdio => "ts_mcp_stdio_1_29_0",
@@ -507,6 +509,7 @@ impl RuntimeSpawnRequest {
             | ProcessSurfacePolicyId::TsCredentialExecFile
             | ProcessSurfacePolicyId::RustEvalCommandSuccess
             | ProcessSurfacePolicyId::TsShellEnvSnapshot
+            | ProcessSurfacePolicyId::SkillDependencyCheck
             | ProcessSurfacePolicyId::TsRipgrepExecFile
             | ProcessSurfacePolicyId::TsLsp
             | ProcessSurfacePolicyId::RustCodeModeHost
@@ -1189,6 +1192,7 @@ impl RuntimeProcessContext {
             cwd,
             timeout,
             max_stdout_bytes,
+            environment,
         } = request;
         if !surface.supports_current_target() {
             return Err(RuntimeExecFileError::new(
@@ -1229,6 +1233,13 @@ impl RuntimeProcessContext {
                 ),
             ));
         }
+        if environment.is_some() && surface != RuntimeCompletedProcessSurface::SkillDependencyCheck
+        {
+            return Err(RuntimeExecFileError::new(
+                RuntimeExecFileErrorStage::Initialization,
+                "explicit environment is restricted to dependency probes",
+            ));
+        }
         let (stdout_stdio, stderr_stdio) = surface.output_stdio();
         let mut spawn_request = RuntimeSpawnRequest::new(file)
             .with_args(args)
@@ -1242,6 +1253,9 @@ impl RuntimeProcessContext {
         }
         if let Some(cwd) = cwd {
             spawn_request = spawn_request.with_cwd(cwd);
+        }
+        if let Some(environment) = environment {
+            spawn_request.env = Some(environment);
         }
         let mut child = self
             .spawner()
@@ -3087,6 +3101,7 @@ pub(crate) enum RuntimeCompletedProcessSurface {
     EvalCommandSuccess,
     WindowsBashSetup,
     ShellEnvSnapshot,
+    SkillDependencyCheck,
 }
 
 pub(crate) const SHELL_ENV_SNAPSHOT_MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
@@ -3101,12 +3116,13 @@ impl RuntimeCompletedProcessSurface {
             Self::EvalCommandSuccess => ProcessSurfacePolicyId::RustEvalCommandSuccess,
             Self::WindowsBashSetup => ProcessSurfacePolicyId::ScalarActionAllowlist,
             Self::ShellEnvSnapshot => ProcessSurfacePolicyId::TsShellEnvSnapshot,
+            Self::SkillDependencyCheck => ProcessSurfacePolicyId::SkillDependencyCheck,
         }
     }
 
     const fn output_stdio(self) -> (RuntimeStdio, RuntimeStdio) {
         match self {
-            Self::FileIndexGitStream | Self::ShellEnvSnapshot => {
+            Self::FileIndexGitStream | Self::ShellEnvSnapshot | Self::SkillDependencyCheck => {
                 (RuntimeStdio::Pipe, RuntimeStdio::Null)
             }
             Self::EvalCommandSuccess => (RuntimeStdio::Null, RuntimeStdio::Null),
@@ -3118,11 +3134,14 @@ impl RuntimeCompletedProcessSurface {
     }
 
     const fn allows_explicit_timeout(self) -> bool {
-        matches!(self, Self::PdfExecFile | Self::ShellEnvSnapshot)
+        matches!(
+            self,
+            Self::PdfExecFile | Self::ShellEnvSnapshot | Self::SkillDependencyCheck
+        )
     }
 
     const fn allows_stdout_limit(self) -> bool {
-        matches!(self, Self::ShellEnvSnapshot)
+        matches!(self, Self::ShellEnvSnapshot | Self::SkillDependencyCheck)
     }
 
     const fn keep_alive_on_drop(self) -> bool {
@@ -3130,7 +3149,10 @@ impl RuntimeCompletedProcessSurface {
     }
 
     const fn uses_node20_image(self) -> bool {
-        matches!(self, Self::WindowsBashSetup | Self::ShellEnvSnapshot)
+        matches!(
+            self,
+            Self::WindowsBashSetup | Self::ShellEnvSnapshot | Self::SkillDependencyCheck
+        )
     }
 
     const fn supports_current_target(self) -> bool {
@@ -3150,6 +3172,7 @@ pub(crate) struct RuntimeCompletedProcessRequest {
     cwd: Option<RuntimePath>,
     timeout: Option<Duration>,
     max_stdout_bytes: Option<usize>,
+    environment: Option<RuntimeEnv>,
 }
 
 impl RuntimeCompletedProcessRequest {
@@ -3161,6 +3184,7 @@ impl RuntimeCompletedProcessRequest {
             cwd: None,
             timeout: None,
             max_stdout_bytes: None,
+            environment: None,
         }
     }
 
@@ -3181,6 +3205,11 @@ impl RuntimeCompletedProcessRequest {
 
     pub(crate) fn with_max_stdout_bytes(mut self, max_stdout_bytes: usize) -> Self {
         self.max_stdout_bytes = Some(max_stdout_bytes);
+        self
+    }
+
+    pub(crate) fn with_environment(mut self, environment: RuntimeEnv) -> Self {
+        self.environment = Some(environment);
         self
     }
 }

@@ -1111,6 +1111,28 @@ pub struct EngineBuiltinSkillsParams {
     pub submission_id: Option<String>,
 }
 
+/// Data-only requirements evaluated in the engine's recovered shell environment.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EngineCheckSkillDependenciesParams {
+    pub cwd: String,
+    #[serde(default)]
+    pub bins: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub os: Vec<String>,
+}
+
+/// Presence information only: no environment values or resolved paths.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCheckSkillDependenciesResult {
+    pub missing_bins: Vec<String>,
+    pub missing_env: Vec<String>,
+    pub unsupported: bool,
+}
+
 /// `engine/builtinAgents` request params. Like the skill roster, the built-in
 /// agent roster is compiled into the binary, so no session is needed to list it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

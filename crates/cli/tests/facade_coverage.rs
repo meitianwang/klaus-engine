@@ -41,6 +41,7 @@ enum Reach {
 /// Keyed on the marker type's own name rather than the wire name, because the
 /// marker is what a caller writes. `MethodSpec::marker` exists for exactly this.
 const COVERAGE: &[(&str, Reach)] = &[
+    ("EngineCheckSkillDependencies", Reach::Withheld("The desktop checks marketplace requirements before a session exists; the CLI has no marketplace dependency view")),
     ("EngineReadThreadFileChanges", Reach::Withheld("The CLI does not present saved file-change cards")),
     ("KiroStatus", Reach::Withheld("`klaus auth status` reads the same record in process")),
     ("KiroLoginStart", Reach::Withheld("`klaus login kiro` drives `kiro::login::start` in process")),

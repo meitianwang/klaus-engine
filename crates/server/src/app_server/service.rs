@@ -430,6 +430,7 @@ pub(super) async fn write_app_output<O: AsyncWrite + Unpin>(
 }
 
 pub(super) struct AppServerState {
+    skill_dependencies: klaus_agent_core::tools::skill_dependencies::SkillDependencyChecker,
     connection_closed: Arc<AtomicBool>,
     windows_sandbox_context: super::windows_sandbox::Context,
     initialized: AtomicBool,
@@ -732,6 +733,7 @@ async fn run_app_server_inner<I, O>(
     );
     let lifecycle = queue::wrap_lifecycle(opts.lifecycle, queue_store.clone());
     let state = Arc::new(AppServerState {
+        skill_dependencies: Default::default(),
         connection_closed: Arc::new(AtomicBool::new(false)),
         windows_sandbox_context: opts
             .windows_sandbox_context
@@ -2968,6 +2970,62 @@ async fn handle_request(state: Arc<AppServerState>, id: Value, method: String, p
                         state
                             .send(wire::error_response(&id, code, &error.to_string()))
                             .await;
+                    }
+                }
+            });
+        }
+        "engine/checkSkillDependencies" => {
+            let params = match params.deserialize::<wire::EngineCheckSkillDependenciesParams>() {
+                Ok(params) => params,
+                Err(error) => return send_invalid_params(&state, &id, &error).await,
+            };
+            if let Err(error) = klaus_agent_core::tools::skill_dependencies::validate_requirements(
+                &params.cwd,
+                &params.bins,
+                &params.env,
+                &params.os,
+            ) {
+                return send_invalid_params_message(&state, &id, &error).await;
+            }
+            let Some(guard) = HeavyRequestGuard::acquire(&state, &id).await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _guard = guard;
+                #[cfg(test)]
+                let context = Ok::<_, String>(crate::test_process_context());
+                #[cfg(not(test))]
+                let context =
+                    klaus_agent_core::runtime_process::RuntimeProcessSupervisor::initialize_current()
+                        .and_then(klaus_agent_core::runtime_process::RuntimeProcessContext::initialize)
+                        .map_err(|_| "Unable to initialize the dependency checker".to_owned());
+                let result = match context {
+                    Ok(context) => {
+                        state
+                            .skill_dependencies
+                            .check(&context, &params.cwd, &params.bins, &params.env, &params.os)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(result) => {
+                        state
+                            .send(wire::response(
+                                &id,
+                                serde_json::to_value(wire::EngineCheckSkillDependenciesResult {
+                                    missing_bins: result.missing_bins,
+                                    missing_env: result.missing_env,
+                                    unsupported: result.unsupported,
+                                })
+                                .unwrap(),
+                            ))
+                            .await
+                    }
+                    Err(error) => {
+                        state
+                            .send(wire::error_response(&id, wire::ENGINE_ERROR, &error))
+                            .await
                     }
                 }
             });

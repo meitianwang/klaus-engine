@@ -185,6 +185,28 @@ cargo nextest run -p klaus-agent-server app_server::
 
 ---
 
+### Skill dependency checks before a session exists
+
+`engine/checkSkillDependencies({cwd, bins?, env?, os?})` checks requirements
+without creating a session or invoking a model. `cwd` must be an existing
+absolute directory; omitted arrays default to empty. Platform names use
+`darwin`, `linux`, and `win32`. Each array is bounded to 256 nonempty names.
+
+The result is `{missingBins, missingEnv, unsupported}`. Only names cross the
+facade: environment values and resolved executable paths stay inside Core.
+Environment names indicate presence in the effective tool environment (an empty
+value is present), after the tool's environment scrub. The checker recovers the
+login-shell environment through the same capture used by shell tools, then
+resolves executable files through the tool's platform shell without running
+them. A successful capture is cached per endpoint and working directory; failed
+captures are retried. Windows uses its inherited tool environment.
+
+Invalid inputs return `INVALID_PARAMS`. Capture, probe, timeout, or malformed
+output failures return `ENGINE_ERROR`; clients must retain an unavailable/error
+state and must not project these failures as ready. Tests that inject a host
+environment should keep their isolated fixture path and should not call this
+method to inspect the real login shell.
+
 ### Live inference publication
 
 `session/beginModelUpdate({sessionId, changeId, expectedRevision?})` establishes
