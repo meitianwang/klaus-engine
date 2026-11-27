@@ -309,3 +309,192 @@ async fn antigravity_cold_account_reconfigure_resolves_unbundled_and_placeholder
         ),
     }
 }
+
+#[tokio::test]
+async fn antigravity_refresh_failure_leaves_the_admitted_prompt_on_disk() {
+    use klaus_agent_core::runtime_process::{
+        remove_process_environment_var, set_process_environment_var,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PROMPT: &str = "Keep this prompt even when OAuth renewal fails.";
+    struct RestoreEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..) {
+                if let Some(value) = previous {
+                    set_process_environment_var(key, value);
+                } else {
+                    remove_process_environment_var(key);
+                }
+            }
+        }
+    }
+
+    let mut fixture = Fixture::with_provider_transport().await;
+    crate::app_server::antigravity::set_config_root(fixture.root.path());
+    let session_dir = fixture.root.path().join("sessions");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let _environment = RestoreEnvironment(
+        [
+            ("KLAUS_ANTIGRAVITY_API_URL", origin.as_str()),
+            ("KLAUS_ANTIGRAVITY_OAUTH_URL", &format!("{origin}/token")),
+            ("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", "1"),
+            ("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456"),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            let previous = std::env::var_os(key);
+            set_process_environment_var(key, value);
+            (key, previous)
+        })
+        .collect(),
+    );
+    crate::app_server::antigravity::auth::adopt(crate::app_server::antigravity::auth::Credential {
+        access_token: "expired-access".into(),
+        refresh_token: Some("renewable-refresh".into()),
+        expires_at: Some(1_000),
+        account: Some("antigravity@example.invalid".into()),
+        auth_method: "consumer".into(),
+        project: Some("fixture-project".into()),
+        client_id: Some("fixture-client".into()),
+        client_secret: Some("fixture-secret".into()),
+    })
+    .await
+    .unwrap();
+
+    std::fs::write(fixture.root.path().join("antigravity-models.json"), json!({
+        "generation": crate::app_server::antigravity::auth::generation().unwrap(),
+        "clientIdentity": crate::app_server::antigravity::cloud_test_identity(),
+        "fetchedAt": chrono::Utc::now().timestamp_millis(),
+        "payload": {"defaultAgentModelId":"gemini-4-carbon-high", "models": {
+            "gemini-4-carbon-high":{"displayName":"Gemini 4 Carbon High","maxTokens":1048576,"maxOutputTokens":65536}
+        }}
+    }).to_string()).unwrap();
+
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        request(
+            &mut fixture.client,
+            220,
+            "session/start",
+            json!({"init":{
+                "cwd":fixture.root.path(), "modelSelection":"antigravity:gemini-4-carbon-high",
+                "config":{"prewarm":false,"autoMemory":false,"checkpointing":false,
+                    "shellEnvCapture":false,"includeGitContext":false,"maxRetries":0,
+                    "unboundedNetworkRetries":false}
+            }}),
+        ),
+    )
+    .await
+    .expect("session admission must not wait for OAuth");
+    let session_id = started["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{started}"));
+    fixture
+        .client
+        .send(json!({"id":221,"method":"turn/start","params":{
+            "sessionId":session_id,"input":PROMPT
+        }}))
+        .await;
+    let (admitted, early) = fixture.client.response_for(221).await;
+    assert!(admitted.get("error").is_none(), "{admitted}");
+    let rollout = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(path) = std::fs::read_dir(&session_dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                })
+                .find(|path| std::fs::read_to_string(path).is_ok_and(|text| text.contains(PROMPT)))
+            {
+                break path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the prompt must reach disk before OAuth responds");
+
+    let token_posts = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&token_posts);
+    let oauth = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") && headers.len() < 65536 {
+                match socket.read_u8().await {
+                    Ok(byte) => headers.push(byte),
+                    Err(_) => break,
+                }
+            }
+            if !headers.ends_with(b"\r\n\r\n") {
+                continue;
+            }
+            let content_length = String::from_utf8_lossy(&headers)
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if tokio::io::copy(
+                &mut (&mut socket).take(content_length),
+                &mut tokio::io::sink(),
+            )
+            .await
+            .ok()
+                != Some(content_length)
+            {
+                continue;
+            }
+            let (status, body) = if headers.starts_with(b"POST /token ")
+                && counted.fetch_add(1, Ordering::Relaxed) > 0
+            {
+                ("400 Bad Request", r#"{"error":"invalid_grant"}"#)
+            } else {
+                ("503 Service Unavailable", "{}")
+            };
+            let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = std::collections::VecDeque::from(early);
+        loop {
+            let event = match events.pop_front() {
+                Some(event) => event,
+                None => fixture.client.next_message().await,
+            };
+            assert_ne!(event["method"], "turn/completed", "{event}");
+            if event["method"] == "turn/failed"
+                || (event["method"] == "session/event"
+                    && event["params"]["event"]["event"]["type"] == "turn.failed")
+            {
+                break event;
+            }
+        }
+    })
+    .await;
+    oauth.abort();
+    let failed = failed.unwrap_or_else(|error| {
+        panic!(
+            "The turn must report the OAuth failure: {error}; token posts: {}",
+            token_posts.load(Ordering::Relaxed)
+        )
+    });
+    assert!(
+        failed.to_string().contains("antigravity_login_expired"),
+        "{failed}"
+    );
+    // The second token request proves that the initial 503 was retried.
+    assert!(token_posts.load(Ordering::Relaxed) >= 2);
+    assert!(std::fs::read_to_string(&rollout).unwrap().contains(PROMPT));
+    fixture.client.close().await;
+    crate::app_server::antigravity::auth::logout()
+        .await
+        .unwrap();
+}

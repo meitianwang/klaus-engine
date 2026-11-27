@@ -745,27 +745,46 @@ pub(super) async fn force_refresh(
 
 /// Resolve the active head's credential, advancing past expired queued heads when
 /// spare accounts remain in the pool.
-pub(super) async fn active_or_rotated_credential() -> Result<Credential, String> {
+fn fresh_access_token(credential: &Credential, now: i64) -> bool {
+    clean(&credential.access_token)
+        && credential
+            .expires_at
+            .is_none_or(|expiry| expiry > now + REFRESH_SKEW_MS)
+}
+
+pub(super) fn has_fresh_access_token(generation: &str) -> bool {
+    let now = chrono::Utc::now().timestamp_millis();
+    accounts().iter().any(|entry| {
+        entry.generation == generation
+            && !entry.needs_login
+            && fresh_access_token(&entry.credential, now)
+    })
+}
+
+pub(super) async fn active_or_rotated_local_generation() -> Result<String, String> {
     let mut attempted = Vec::new();
     loop {
-        let head = generation().ok_or("antigravity_not_signed_in")?;
-        match credential(Some(&head)).await {
-            Ok(cred) => return Ok(cred),
-            Err(error) if error == "antigravity_login_expired" && account_count() > 1 => {
-                if attempted.contains(&head) {
-                    return Err(error);
-                }
-                attempted.push(head.clone());
-                match rotate(&head).await {
-                    RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
-                        if !attempted.contains(&next) =>
-                    {
-                        continue;
-                    }
-                    _ => return Err(error),
-                }
+        let head = {
+            let _guard = credential_lock().lock().await;
+            let entries = accounts();
+            let head = entries.first().ok_or("antigravity_not_signed_in")?;
+            let now = chrono::Utc::now().timestamp_millis();
+            if !head.needs_login
+                && (fresh_access_token(&head.credential, now)
+                    || head.credential.refresh_token.as_deref().is_some_and(clean))
+            {
+                return Ok(head.generation.clone());
             }
-            Err(error) => return Err(error),
+            if entries.len() <= 1 || attempted.contains(&head.generation) {
+                return Err("antigravity_login_expired".into());
+            }
+            head.generation.clone()
+        };
+        attempted.push(head.clone());
+        match rotate(&head).await {
+            RotateOutcome::Rotated(next) | RotateOutcome::AlreadyAdvanced(next)
+                if !attempted.contains(&next) => {}
+            _ => return Err("antigravity_login_expired".into()),
         }
     }
 }

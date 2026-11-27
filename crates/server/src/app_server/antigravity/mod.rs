@@ -984,8 +984,8 @@ pub async fn resolve(
     let explicit = explicit_selection_model(selection, &tiers);
     let placeholder = explicit.as_deref().and_then(antigravity_placeholder_family);
     for attempt in 0..3 {
-        auth::active_or_rotated_credential().await?;
-        let generation = auth::generation().ok_or("antigravity_not_signed_in")?;
+        let generation = auth::active_or_rotated_local_generation().await?;
+        let token_fresh = auth::has_fresh_access_token(&generation);
         let (mut payload, mut schedule_background_refresh) =
             if let Some(cached) = cached_payload(&generation) {
                 let stale = cached.from_disk
@@ -997,7 +997,9 @@ pub async fn resolve(
         let is_baseline = payload.get("catalogBaseline").and_then(Value::as_bool) == Some(true);
         let fresh_in_memory = has_fresh_memory_catalog(&generation);
 
-        if (explicit.is_none() && is_baseline) || (placeholder.is_some() && !fresh_in_memory) {
+        if ((explicit.is_none() && is_baseline) || (placeholder.is_some() && !fresh_in_memory))
+            && token_fresh
+        {
             match ensure_live_catalog(&generation).await {
                 Ok(live) => {
                     payload = live;
@@ -1005,7 +1007,6 @@ pub async fn resolve(
                 }
                 Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
                 Err(err) if err == "antigravity_credential_changed" => return Err(err),
-                Err(err) if placeholder.is_some() => return Err(err),
                 Err(_) => {}
             }
         }
@@ -1044,7 +1045,7 @@ pub async fn resolve(
                 Err(err) if err == "antigravity_credential_changed" && attempt < 2 => continue,
                 Err(err) => return Err(err),
             }
-        } else if tier_missing && !fresh_in_memory {
+        } else if tier_missing && !fresh_in_memory && token_fresh {
             match ensure_live_catalog(&generation).await {
                 Ok(live) => {
                     payload = live;

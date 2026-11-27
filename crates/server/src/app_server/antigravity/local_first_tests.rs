@@ -112,26 +112,37 @@ impl CloudFixture {
     }
 }
 
-struct Environment(Option<OsString>);
+struct Environment(Vec<(&'static str, Option<OsString>)>);
 
 impl Environment {
     fn set(endpoint: &str) -> Self {
-        let previous = std::env::var_os("KLAUS_ANTIGRAVITY_API_URL");
-        set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", endpoint);
-        // Pin the protocol identity so catalog reads never spawn the
-        // installed app's helper processes mid-test.
-        set_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456");
-        Self(previous)
+        let settings = [
+            ("KLAUS_ANTIGRAVITY_API_URL", endpoint),
+            ("KLAUS_ANTIGRAVITY_OAUTH_URL", &format!("{endpoint}/token")),
+            ("KLAUS_ANTIGRAVITY_ALLOW_DIRECT", "1"),
+            ("KLAUS_ANTIGRAVITY_HUB_IDENTITY", "9.9.9:123456"),
+        ];
+        Self(
+            settings
+                .into_iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    set_process_environment_var(key, value);
+                    (key, previous)
+                })
+                .collect(),
+        )
     }
 }
 
 impl Drop for Environment {
     fn drop(&mut self) {
-        remove_process_environment_var("KLAUS_ANTIGRAVITY_HUB_IDENTITY");
-        if let Some(previous) = self.0.take() {
-            set_process_environment_var("KLAUS_ANTIGRAVITY_API_URL", previous);
-        } else {
-            remove_process_environment_var("KLAUS_ANTIGRAVITY_API_URL");
+        for (key, previous) in self.0.drain(..) {
+            if let Some(previous) = previous {
+                set_process_environment_var(key, previous);
+            } else {
+                remove_process_environment_var(key);
+            }
         }
     }
 }
@@ -625,5 +636,78 @@ async fn cold_resolve_surfaces_catalog_fetch_failure_instead_of_claiming_model_u
         "a failed catalog fetch on a cold account must not claim the model does not exist"
     );
 
+    antigravity::auth::logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_token_session_start_does_not_await_oauth_refresh_and_rotates_unrenewable_head() {
+    let root = tempfile::tempdir().unwrap();
+    antigravity::set_config_root(root.path());
+    let server = CloudFixture::start(Reply::Hold).await;
+    let _environment = Environment::set(&server.origin);
+    let deadline = Duration::from_millis(500);
+    let mut renewable = credential();
+    renewable.account = Some("renewable@example.invalid".into());
+    renewable.expires_at = Some(1_000);
+    renewable.refresh_token = Some("ref-valid".into());
+    renewable.client_id = Some("fixture-client".into());
+    renewable.client_secret = Some("fixture-secret".into());
+    antigravity::auth::adopt(renewable.clone()).await.unwrap();
+    for model in ["gemini-4-carbon-high", "claude-opus-5-5-disabled"] {
+        tokio::time::timeout(
+            deadline,
+            antigravity::resolve(model, &serde_json::Map::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let mut client = start_client(root.path());
+    client.initialize().await;
+    let response = tokio::time::timeout(deadline, async {
+        client
+            .send(json!({"id":701,"method":"session/start","params":{"init":{
+                "cwd":root.path(),"modelSelection":"antigravity:gemini-4-carbon-high",
+                "modelTierSelections":{"low":"unbundled-tier-id"},"config":{"prewarm":false}
+            }}}))
+            .await;
+        client.response_for(701).await.0
+    })
+    .await
+    .unwrap();
+    assert!(response["result"]["sessionId"].is_string(), "{response}");
+    client.close().await;
+    antigravity::auth::logout().await.unwrap();
+
+    let mut head = credential();
+    head.account = Some("unrenewable@example.invalid".into());
+    head.expires_at = Some(1_000);
+    antigravity::auth::adopt(head).await.unwrap();
+    let head_generation = antigravity::auth::generation().unwrap();
+    renewable.refresh_token = Some("ref-b".into());
+    antigravity::auth::adopt(renewable).await.unwrap();
+    assert_eq!(
+        antigravity::auth::generation().as_deref(),
+        Some(head_generation.as_str())
+    );
+    assert_eq!(
+        antigravity::auth::status()["accounts"][0]["email"],
+        "unrenewable@example.invalid"
+    );
+    tokio::time::timeout(
+        deadline,
+        antigravity::resolve("gemini-4-carbon-high", &serde_json::Map::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(
+        antigravity::auth::generation().as_deref(),
+        Some(head_generation.as_str())
+    );
+    assert_eq!(
+        antigravity::auth::status()["accounts"][0]["email"],
+        "renewable@example.invalid"
+    );
     antigravity::auth::logout().await.unwrap();
 }
