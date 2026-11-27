@@ -965,7 +965,7 @@ fn bundled_commentary_flows_from_catalog_data_with_identical_bytes() {
     );
     assert_eq!(
         crate::prompt_catalog::bundled().revision,
-        RuntimeString::from("bundled-r11")
+        RuntimeString::from("bundled-r12")
     );
 }
 
@@ -1186,7 +1186,7 @@ fn for_route_binds_the_source_key_through_the_active_store() {
     );
 
     store.install((*bundled_before).clone());
-    assert_eq!(store.active().revision, RuntimeString::from("bundled-r11"));
+    assert_eq!(store.active().revision, RuntimeString::from("bundled-r12"));
 }
 
 mod store_refresh {
@@ -1251,7 +1251,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r11"
+            "bundled-r12"
         );
 
         let v1 = document("distributed-v1");
@@ -1374,7 +1374,7 @@ mod store_refresh {
         let store = PromptCatalogStore::load(Some(&dir));
         assert_eq!(
             store.active().revision.try_to_utf8().unwrap().as_str(),
-            "bundled-r11"
+            "bundled-r12"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1947,6 +1947,7 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
     assert!(family_base.starts_with("You are Klaus."));
     for expected in [
         "You are powered by a Gemini model.",
+        "Before your first tool call, say in one plain sentence what you are about to do; after that, call tools directly without visible text",
         "# Communication style",
         "- Keep your responses concise.",
         "# Behavioral guidelines",
@@ -1960,7 +1961,13 @@ fn bundled_gemini_family_encodes_shared_and_profile_specific_prompt_text() {
             "Gemini family base misses {expected}"
         );
     }
-    for banned in ["run_command", "create_file", "view_file", "replace_chunks"] {
+    for banned in [
+        "run_command",
+        "create_file",
+        "view_file",
+        "replace_chunks",
+        "You share progress updates in messages between tool calls.",
+    ] {
         assert!(
             !family_base.contains(banned),
             "Gemini family base still contains {banned}"
@@ -2096,6 +2103,35 @@ When a command you launched is still running and will finish later: YOU MUST TAK
             "{model} must share the Gemini 4 pack"
         );
     }
+    for model in [
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-medium",
+        "gemini-4-carbon-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
+        "gemini-4-neon-low",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-high",
+        "gemini-4-neon-xhigh",
+    ] {
+        let fragments =
+            ModelFragments::for_route(&RuntimeString::from(model), Some("antigravity"), None);
+        assert_eq!(
+            fragments.resolved().profile_ref,
+            Some(RuntimeString::from("model/gemini-4")),
+            "{model} must resolve model/gemini-4"
+        );
+        assert_eq!(
+            fragments.base_instructions(),
+            carbon.base_instructions(),
+            "{model} must share the Gemini 4 pack"
+        );
+    }
 
     assert_eq!(
         family.commentary(),
@@ -2103,6 +2139,12 @@ When a command you launched is still running and will finish later: YOU MUST TAK
             crate::context::system_prompt::COMMENTARY_UNTAGGED_THINKING_CHANNEL
         ))
     );
+    let commentary = family.commentary().unwrap().try_to_utf8().unwrap();
+    assert!(commentary.contains(
+        "Even on steps where you emit no thinking block, never think out loud in visible text"
+    ));
+    assert!(commentary.contains("stay silent between routine tool calls"));
+    assert!(!commentary.contains("Between tool calls, emit at most a one-sentence status update"));
 }
 
 #[test]

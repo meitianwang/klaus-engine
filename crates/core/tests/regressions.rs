@@ -10,6 +10,9 @@
 //! - The file header records what broke, the one-line root cause, and the
 //!   fixing commit / work item for traceability.
 
+#[path = "regressions/r20261127_gemini_commentary_and_tier_routes.rs"]
+mod r20261127_gemini_commentary_and_tier_routes;
+
 #[path = "regressions/r20261124_outside_write_directory_grant.rs"]
 mod r20261124_outside_write_directory_grant;
 

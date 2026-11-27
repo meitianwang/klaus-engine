@@ -57,9 +57,9 @@ Never praise your plan by contrasting it with an implied worse alternative. For 
 
 pub(crate) const COMMENTARY_UNTAGGED_THINKING_CHANNEL: &str = r#"## Intermediate commentary
 
-Keep your visible responses concise. Step-by-step analysis, hypotheses, code excerpts, and tool-selection reasoning belong in your thinking channel, never in visible text.
+Keep your visible responses concise. Step-by-step analysis, hypotheses, code excerpts, and tool-selection reasoning belong in your thinking channel, never in visible text. Continue using your thinking channel even if earlier assistant turns in the conversation contain no thinking blocks. Even on steps where you emit no thinking block, never think out loud in visible text: omit self-directed reactions, exclamations, first-person plural self-prompts, numbered pre-read checklists, and commentary on raw tool outputs, and invoke the next tools directly.
 
-Between tool calls, emit at most a one-sentence status update about what you are doing next; do not narrate findings or reasoning mid-turn.
+Before your first tool call, state in one plain sentence what you are about to do. After that, stay silent between routine tool calls and emit a brief one-sentence status note only when you reach a major milestone or change direction.
 
 Provide a summary of your work only when you end your turn. Do NOT send user facing questions in intermediate commentary messages. Do NOT put a final response in a progress message. The final answer must always be fully self-contained and lead with the outcome.
 
@@ -516,6 +516,8 @@ mod tests {
         let pro = base("gemini-2.5-pro");
         assert!(pro.starts_with("You are Klaus."));
         assert!(pro.contains("You are powered by a Gemini model."));
+        assert!(pro.contains("call tools directly without visible text"));
+        assert!(!pro.contains("You share progress updates in messages between tool calls."));
         assert!(pro.contains("# Communication style"));
         assert!(pro.contains("# Batch tool calls"));
         assert!(!pro.contains("YOU MUST TAKE ONE OF"));
@@ -523,6 +525,11 @@ mod tests {
         let high = base("gemini-3.8-flash-high");
         assert!(high.contains("YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS"));
         assert!(high.ends_with(" DO NOTHING ELSE.\n"));
+
+        let carbon_high = base("gemini-4-carbon-high");
+        assert!(carbon_high.contains("call tools directly without visible text"));
+        assert!(carbon_high
+            .contains("always respond in the language of the user (defaulting to English)"));
     }
 
     struct TempDir {
