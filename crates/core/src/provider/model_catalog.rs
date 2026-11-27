@@ -686,7 +686,7 @@ impl ModelCatalog {
     pub async fn refresh_from_env_default(
         self: &Arc<Self>,
     ) -> Option<Result<CatalogRefresh, String>> {
-        let http = reqwest::Client::new();
+        let http = crate::provider::shared_http_client();
         self.refresh_from_env_if_stale(&http).await
     }
 

@@ -244,6 +244,16 @@ pub struct ThreadReadSnapshot {
     pub archived: bool,
 }
 
+/// Lightweight storage identity and authoritative header metadata for a saved
+/// rollout without reading or decoding the transcript body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadStamp {
+    pub meta: SessionMeta,
+    pub updated_at: i64,
+    pub archived: bool,
+    pub stamp: Vec<u8>,
+}
+
 /// A sub-agent snapshot that neither resumes its parent nor opens a lifecycle writer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubAgentReadSnapshot {
@@ -794,6 +804,14 @@ pub trait SessionStore: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "session store does not support read-only thread inspection",
         ))
+    }
+    /// Read authoritative header metadata and file stamp without decoding the
+    /// rollout body. `None` keeps callers on [`Self::read_thread`].
+    async fn read_thread_stamp(
+        &self,
+        _thread_id: &str,
+    ) -> std::io::Result<Option<ThreadReadStamp>> {
+        Ok(None)
     }
     /// Read original top-level messages by UUID, preserving request order and
     /// the first persisted occurrence. Unknown IDs are omitted so the authority

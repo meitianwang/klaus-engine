@@ -698,6 +698,22 @@ pub type ReadThreadPageFuture = Pin<
 pub type ReadThreadPage =
     Arc<dyn Fn(String, ThreadPageRequest) -> ReadThreadPageFuture + Send + Sync>;
 
+pub type ReadThreadStamp = Arc<
+    dyn Fn(
+            String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<klaus_agent_core::store::session_store::ThreadReadStamp>,
+                            BoxError,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 pub type ReadThreadFileChanges = Arc<
     dyn Fn(
             String,
@@ -748,6 +764,7 @@ pub struct ProtocolLifecycle {
     pub saved_goal_request: Option<SavedGoalRequestHandler>,
     pub classify_goal_pursuit: Option<ClassifyGoalPursuit>,
     pub read_thread: Option<ReadThread>,
+    pub read_thread_stamp: Option<ReadThreadStamp>,
     /// Paged saved-transcript reads backed by the store's durable turn index.
     /// `None` keeps every paged read on the whole-file projection.
     pub read_thread_page: Option<ReadThreadPage>,
@@ -7813,7 +7830,37 @@ impl ServerInner {
             "[session-start] {submission_id} stage=init-host-capabilities elapsedMs={}",
             init_stage.elapsed().as_millis()
         );
-        let mut targets = match targets_from_init(&init, self.credential_store.clone()).await {
+        let store = self.credential_store.clone();
+        let (targets_res, advisor_res, orchestrator_res, feature_res) = tokio::join!(
+            targets_from_init(&init, store.clone()),
+            advisor_target_from_init(&init, store.clone()),
+            orchestrator_target_from_init(&init, store.clone()),
+            feature_targets_from_init(&init, store),
+        );
+        let mut targets = match targets_res {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.report_op_error(&submission_id, error.into()).await;
+                return;
+            }
+        };
+        let mut advisor_target = match advisor_res {
+            Ok(target) => target,
+            Err(error) => {
+                self.report_op_error(&submission_id, error.into()).await;
+                return;
+            }
+        };
+        let mut orchestrator_target = match orchestrator_res {
+            Ok(target) => target,
+            Err(error) => {
+                self.report_op_error(&submission_id, error.into()).await;
+                return;
+            }
+        };
+        let orchestration_mode = init.orchestration_mode.unwrap_or(false);
+        let orchestrator_fallback_to_main = init.orchestrator_fallback_to_main.unwrap_or(false);
+        let mut feature_targets = match feature_res {
             Ok(targets) => targets,
             Err(error) => {
                 self.report_op_error(&submission_id, error.into()).await;
@@ -7822,46 +7869,12 @@ impl ServerInner {
         };
         if let Some(decorate) = self.provider_decorator.lock().unwrap().as_ref() {
             decorate_model_targets(&mut targets, decorate);
-        }
-        let mut advisor_target =
-            match advisor_target_from_init(&init, self.credential_store.clone()).await {
-                Ok(target) => target,
-                Err(error) => {
-                    self.report_op_error(&submission_id, error.into()).await;
-                    return;
-                }
-            };
-        if let (Some(target), Some(decorate)) = (
-            advisor_target.as_mut(),
-            self.provider_decorator.lock().unwrap().as_ref(),
-        ) {
-            decorate_model_target(target, decorate);
-        }
-        let mut orchestrator_target =
-            match orchestrator_target_from_init(&init, self.credential_store.clone()).await {
-                Ok(target) => target,
-                Err(error) => {
-                    self.report_op_error(&submission_id, error.into()).await;
-                    return;
-                }
-            };
-        if let (Some(target), Some(decorate)) = (
-            orchestrator_target.as_mut(),
-            self.provider_decorator.lock().unwrap().as_ref(),
-        ) {
-            decorate_model_target(target, decorate);
-        }
-        let orchestration_mode = init.orchestration_mode.unwrap_or(false);
-        let orchestrator_fallback_to_main = init.orchestrator_fallback_to_main.unwrap_or(false);
-        let mut feature_targets =
-            match feature_targets_from_init(&init, self.credential_store.clone()).await {
-                Ok(targets) => targets,
-                Err(error) => {
-                    self.report_op_error(&submission_id, error.into()).await;
-                    return;
-                }
-            };
-        if let Some(decorate) = self.provider_decorator.lock().unwrap().as_ref() {
+            if let Some(target) = advisor_target.as_mut() {
+                decorate_model_target(target, decorate);
+            }
+            if let Some(target) = orchestrator_target.as_mut() {
+                decorate_model_target(target, decorate);
+            }
             decorate_feature_targets(&mut feature_targets, decorate);
         }
         let prospective = SessionInitState {
@@ -13122,16 +13135,23 @@ async fn targets_from_init(
         return Err("modelTierTargets contains an unknown tier".into());
     }
     let mut targets = InferenceTargets::default();
-    for (name, slot) in [
-        ("high", &mut targets.high),
-        ("medium", &mut targets.medium),
-        ("low", &mut targets.low),
-    ] {
-        let Some(value) = values.get(name).filter(|value| !value.is_null()) else {
-            continue;
-        };
-        *slot = Some(target_from_value(value, store.clone()).await?);
-    }
+    let resolve_slot = |name: &'static str, store: Option<Arc<dyn CredentialStore>>| {
+        let slot_val = values.get(name).filter(|value| !value.is_null()).cloned();
+        async move {
+            match slot_val {
+                Some(value) => target_from_value(&value, store).await.map(Some),
+                None => Ok(None),
+            }
+        }
+    };
+    let (high, medium, low) = tokio::join!(
+        resolve_slot("high", store.clone()),
+        resolve_slot("medium", store.clone()),
+        resolve_slot("low", store),
+    );
+    targets.high = high?;
+    targets.medium = medium?;
+    targets.low = low?;
     Ok(Some(targets))
 }
 
@@ -13218,28 +13238,32 @@ async fn feature_targets_from_init(
     {
         return Err("featureTargets contains an unknown feature".into());
     }
-    for slot in [
-        FeatureSlot::Title,
-        FeatureSlot::Prediction,
-        FeatureSlot::Memory,
-    ] {
-        let Some(value) = values.get(slot.name()).filter(|value| !value.is_null()) else {
-            continue;
-        };
-        let state = target_from_value(value, store.clone())
-            .await
-            .unwrap_or_else(|message| InferenceTargetState::Unavailable {
-                source: value["source"].as_str().unwrap_or_default().to_string(),
-                model_id: value["modelId"].as_str().unwrap_or_default().to_string(),
-                code: "MODEL_TARGET_UNAVAILABLE".into(),
-                message,
-            });
-        match slot {
-            FeatureSlot::Title => features.title = Some(state),
-            FeatureSlot::Prediction => features.prediction = Some(state),
-            FeatureSlot::Memory => features.memory = Some(state),
+    let resolve_feature = |slot: FeatureSlot, store: Option<Arc<dyn CredentialStore>>| {
+        let slot_val = values
+            .get(slot.name())
+            .filter(|value| !value.is_null())
+            .cloned();
+        async move {
+            let value = slot_val?;
+            let state = target_from_value(&value, store)
+                .await
+                .unwrap_or_else(|message| InferenceTargetState::Unavailable {
+                    source: value["source"].as_str().unwrap_or_default().to_string(),
+                    model_id: value["modelId"].as_str().unwrap_or_default().to_string(),
+                    code: "MODEL_TARGET_UNAVAILABLE".into(),
+                    message,
+                });
+            Some(state)
         }
-    }
+    };
+    let (title, prediction, memory) = tokio::join!(
+        resolve_feature(FeatureSlot::Title, store.clone()),
+        resolve_feature(FeatureSlot::Prediction, store.clone()),
+        resolve_feature(FeatureSlot::Memory, store),
+    );
+    features.title = title;
+    features.prediction = prediction;
+    features.memory = memory;
     Ok(features)
 }
 

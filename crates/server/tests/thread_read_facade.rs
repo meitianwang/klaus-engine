@@ -525,3 +525,87 @@ async fn read_thread_store_reads_alongside_the_existing_writer_without_changing_
     writer.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn read_thread_tail_cache_skips_full_rereads_until_rollout_changes_and_reflects_title_updates(
+) {
+    use std::io::Write;
+
+    let dir =
+        std::env::temp_dir().join(format!("klaus-thread-tail-cache-{}", uuid::Uuid::new_v4()));
+    let mut rows = vec![fixture_header("cached")];
+    rows.extend(fixture_turn("one", "first prompt preview"));
+    rows.push(json!({"kind":"compacted","summary":"compressed","replacedRange":[0,2],"replacementHistory":[]}));
+    rows.extend(fixture_turn("two", "second prompt"));
+    rows.extend(fixture_turn("three", "latest prompt"));
+    let path = write_fixture(&dir, "cached", &rows);
+
+    let store = store(&dir);
+    let agent = make_agent_for_tests(vec![]);
+    let mut lifecycle = crate::lifecycle::protocol_lifecycle(agent, Some(store.clone()));
+    let full_reads = Arc::new(AtomicUsize::new(0));
+    let stamp_reads = Arc::new(AtomicUsize::new(0));
+    let base_read = lifecycle.read_thread.take().expect("read_thread hook");
+    let full_counter = full_reads.clone();
+    lifecycle.read_thread = Some(Arc::new(move |thread_id| {
+        full_counter.fetch_add(1, Ordering::SeqCst);
+        base_read(thread_id)
+    }));
+    let base_stamp = lifecycle
+        .read_thread_stamp
+        .take()
+        .expect("read_thread_stamp hook");
+    let stamp_counter = stamp_reads.clone();
+    lifecycle.read_thread_stamp = Some(Arc::new(move |thread_id| {
+        stamp_counter.fetch_add(1, Ordering::SeqCst);
+        base_stamp(thread_id)
+    }));
+    let create: CreateSession = Arc::new(|_| Box::pin(async { Err("read-only".into()) }));
+    let mut client = TestClient::start_with(create, Some(lifecycle));
+    client.initialize().await;
+
+    let first = read(&mut client, 20, json!({"threadId":"cached"})).await;
+    assert_eq!(first["result"]["turns"][0]["id"], "three", "{first}");
+    assert_eq!(first["result"]["thread"]["preview"], "first prompt preview");
+    assert_eq!(first["result"]["page"]["hasMore"], true);
+    assert_eq!(first["result"]["page"]["nextCursor"], "three");
+    assert_eq!(full_reads.load(Ordering::SeqCst), 1);
+
+    // Repeat default tail read on an unchanged rollout must hit the stamp cache
+    // without re-reading or re-decoding the full rollout body.
+    let second = read(&mut client, 21, json!({"threadId":"cached"})).await;
+    assert_eq!(second["result"], first["result"]);
+    assert_eq!(full_reads.load(Ordering::SeqCst), 1);
+    assert!(stamp_reads.load(Ordering::SeqCst) >= 3);
+
+    // Sidecar title authority updates are reflected immediately without invalidating
+    // the unchanged rollout body cache.
+    store.update_title("cached", "Updated title").await.unwrap();
+    let renamed = read(&mut client, 22, json!({"threadId":"cached"})).await;
+    assert_eq!(renamed["result"]["thread"]["title"], "Updated title");
+    assert_eq!(renamed["result"]["turns"][0]["id"], "three");
+    assert_eq!(full_reads.load(Ordering::SeqCst), 1);
+
+    // Appending a new turn changes the rollout stamp and refreshes the tail cache.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for row in fixture_turn("four", "appended prompt") {
+            writeln!(file, "{row}").unwrap();
+        }
+        file.flush().unwrap();
+    }
+    let after_append = read(&mut client, 23, json!({"threadId":"cached"})).await;
+    assert_eq!(after_append["result"]["turns"][0]["id"], "four");
+    assert_eq!(after_append["result"]["page"]["nextCursor"], "four");
+    assert_eq!(full_reads.load(Ordering::SeqCst), 2);
+
+    let after_append_cached = read(&mut client, 24, json!({"threadId":"cached"})).await;
+    assert_eq!(after_append_cached["result"], after_append["result"]);
+    assert_eq!(full_reads.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}

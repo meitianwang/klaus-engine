@@ -370,7 +370,7 @@ impl GeminiProvider {
             retry: opts.retry.unwrap_or_default(),
             auth_source: opts.auth_source,
             code_assist,
-            http: reqwest::Client::new(),
+            http: crate::provider::shared_http_client(),
             interceptor: opts.interceptor,
             capabilities: opts.capabilities.unwrap_or_default(),
             capabilities_by_model: opts.capabilities_by_model.unwrap_or_default(),
@@ -734,7 +734,7 @@ impl RealGeminiClient {
             api_key,
             base_url,
             vertex,
-            http: reqwest::Client::new(),
+            http: crate::provider::shared_http_client(),
         }
     }
 

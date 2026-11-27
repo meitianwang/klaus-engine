@@ -54,7 +54,7 @@ pub struct CatalogIoStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     length: u64,
     modified_nanos: Option<u128>,
     created_nanos: Option<u128>,
@@ -253,13 +253,12 @@ impl HeaderIndex {
         }
         self.load_root(dir).await;
         self.stats.directory_scans += 1;
-        let mut names: Vec<String> = Vec::new();
-        match tokio::fs::read_dir(dir).await {
-            Ok(mut entries) => {
-                while let Some(entry) = entries.next_entry().await? {
-                    names.push(native_text_to_node_host(&entry.file_name()));
-                }
-            }
+        let dir_owned = dir.to_path_buf();
+        let scanned = tokio::task::spawn_blocking(move || scan_root_stamps_sync(&dir_owned))
+            .await
+            .map_err(|error| io::Error::other(format!("catalog scan task failed: {error}")))?;
+        let entries = match scanned {
+            Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 self.replace_scanned_root(dir.to_path_buf(), Vec::new());
                 self.files_by_root
@@ -268,24 +267,23 @@ impl HeaderIndex {
                 return Ok(false);
             }
             Err(err) => return Err(err),
-        }
+        };
 
-        names.sort();
         let previous = self.files_by_root.get(dir).cloned().unwrap_or_default();
         let mut files = BTreeMap::new();
         let mut discovered = Vec::new();
-        let plain_names = names.iter().cloned().collect::<HashSet<_>>();
-        for name in names {
-            if name.ends_with(".jsonl.zst")
-                && plain_names.contains(name.strip_suffix(".zst").unwrap())
-            {
-                continue;
-            }
-            if !crate::store::compression::is_rollout_name(&name) {
-                continue;
-            }
+        for (name, stamp_result) in entries {
+            self.stats.metadata_reads += 1;
+            let initial_stamp = match stamp_result {
+                Ok(Some(stamp)) => stamp,
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            };
             let path = dir.join(&name);
-            let Some(file) = self.refresh_file(&path, previous.get(&name)).await? else {
+            let Some(file) = self
+                .refresh_file_with_stamp(&path, initial_stamp, previous.get(&name))
+                .await?
+            else {
                 continue;
             };
             if let Some(entry) = cached_entry(&path, &file, opts.archived) {
@@ -317,9 +315,18 @@ impl HeaderIndex {
         path: &Path,
         cached: Option<&CachedFile>,
     ) -> io::Result<Option<CachedFile>> {
-        let Some(mut stamp) = self.stamp(path).await? else {
+        let Some(stamp) = self.stamp(path).await? else {
             return Ok(None);
         };
+        self.refresh_file_with_stamp(path, stamp, cached).await
+    }
+
+    async fn refresh_file_with_stamp(
+        &mut self,
+        path: &Path,
+        mut stamp: FileStamp,
+        cached: Option<&CachedFile>,
+    ) -> io::Result<Option<CachedFile>> {
         if let Some(cached) = cached.filter(|cached| cached.stamp == stamp) {
             return Ok(Some(cached.clone()));
         }
@@ -555,8 +562,46 @@ fn cached_entry(path: &Path, cached: &CachedFile, archived: bool) -> Option<Head
     })
 }
 
+fn scan_root_stamps_sync(dir: &Path) -> io::Result<Vec<(String, io::Result<Option<FileStamp>>)>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        names.push(native_text_to_node_host(&entry.file_name()));
+    }
+    names.sort();
+    let plain_names = names.iter().cloned().collect::<HashSet<_>>();
+    let mut results = Vec::with_capacity(names.len());
+    for name in names {
+        if name.ends_with(".jsonl.zst") && plain_names.contains(name.strip_suffix(".zst").unwrap())
+        {
+            continue;
+        }
+        if !crate::store::compression::is_rollout_name(&name) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let stamp = match file_stamp_sync(&path) {
+            Ok(stamp) => Ok(Some(stamp)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                results.push((name, Err(error)));
+                break;
+            }
+        };
+        results.push((name, stamp));
+    }
+    Ok(results)
+}
+
 async fn file_stamp(path: &Path) -> io::Result<FileStamp> {
-    let metadata = tokio::fs::metadata(path).await?;
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || file_stamp_sync(&owned))
+        .await
+        .map_err(|error| io::Error::other(format!("file stamp task failed: {error}")))?
+}
+
+pub(crate) fn file_stamp_sync(path: &Path) -> io::Result<FileStamp> {
+    let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -585,7 +630,7 @@ async fn file_stamp(path: &Path) -> io::Result<FileStamp> {
             FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
             BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
         };
-        let handle = tokio::fs::File::open(path).await?.into_std().await;
+        let handle = std::fs::File::open(path)?;
         let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
         // SAFETY: the handle remains live and the API initializes the output on success.
         let ok =

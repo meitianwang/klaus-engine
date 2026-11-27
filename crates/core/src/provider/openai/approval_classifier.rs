@@ -509,15 +509,6 @@ fn default_client(
 }
 
 fn default_tls_config() -> Result<Arc<rustls::ClientConfig>, ProviderError> {
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
-        tracing::warn!(
-            native_root_error_count = native.errors.len(),
-            "encountered errors while loading system root certificates"
-        );
-    }
-    roots.add_parsable_certificates(native.certs);
     let ca = std::env::var("KLAUS_CA_CERTIFICATE")
         .ok()
         .filter(|path| !path.is_empty())
@@ -526,6 +517,25 @@ fn default_tls_config() -> Result<Arc<rustls::ClientConfig>, ProviderError> {
                 .ok()
                 .filter(|path| !path.is_empty())
         });
+    if ca.is_none() {
+        static DEFAULT_CONFIG: std::sync::LazyLock<Result<Arc<rustls::ClientConfig>, String>> =
+            std::sync::LazyLock::new(|| {
+                let roots = crate::provider::shared_native_root_store().clone();
+                let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|_| "could not configure classifier TLS protocols".to_string())?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                Ok(Arc::new(config))
+            });
+        return DEFAULT_CONFIG
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|message| classifier_build_error(message));
+    }
+    let mut roots = crate::provider::shared_native_root_store().clone();
     if let Some(path) = ca {
         let bytes = std::fs::read(&path).map_err(|_| {
             classifier_build_error("could not read the configured CA certificate bundle")

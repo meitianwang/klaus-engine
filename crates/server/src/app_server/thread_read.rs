@@ -384,8 +384,211 @@ fn bounded_tool_output(previous: &RuntimeString, next: &RuntimeString) -> (Runti
     (RuntimeString::from_utf16(retained), discarded)
 }
 
+fn message_uuid_rt(message: &klaus_agent_core::schemas::message::Message) -> &RuntimeString {
+    use klaus_agent_core::schemas::message::Message;
+    match message {
+        Message::User(msg) => &msg.uuid,
+        Message::Assistant(msg) => &msg.uuid,
+        Message::ToolResult(msg) => &msg.uuid,
+        Message::System(msg) => &msg.uuid,
+        Message::CompactBoundary(msg) => &msg.uuid,
+    }
+}
+
+#[derive(Clone)]
+enum TurnEntry<'a> {
+    DiskMessage {
+        message: &'a klaus_agent_core::schemas::message::Message,
+        external_origin: Option<RuntimeJson>,
+        inspection_output: Option<RuntimeJson>,
+    },
+    DiskCompacted {
+        position: usize,
+        raw: &'a klaus_agent_core::schemas::rollout::RolloutItem,
+    },
+    DiskFileChange {
+        position: usize,
+        payload: &'a RuntimeJson,
+    },
+    DiskEvent {
+        position: usize,
+        raw: &'a klaus_agent_core::schemas::rollout::RolloutItem,
+    },
+    DiskActivity {
+        position: usize,
+        raw: &'a klaus_agent_core::schemas::rollout::RolloutItem,
+    },
+    Materialized(RuntimeJson),
+}
+
+impl<'a> TurnEntry<'a> {
+    fn uuid_rt(&self) -> Option<&RuntimeString> {
+        match self {
+            Self::DiskMessage { message, .. } => Some(message_uuid_rt(message)),
+            Self::Materialized(value) => field(value, "uuid").as_string(),
+            Self::DiskCompacted { .. }
+            | Self::DiskFileChange { .. }
+            | Self::DiskEvent { .. }
+            | Self::DiskActivity { .. } => None,
+        }
+    }
+
+    fn uuid_scalar(&self) -> Result<Option<String>, String> {
+        self.uuid_rt()
+            .map(|id| id.try_to_utf8().map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    fn is_user(&self) -> bool {
+        match self {
+            Self::DiskMessage { message, .. } => matches!(
+                message,
+                klaus_agent_core::schemas::message::Message::User(user)
+                    if user.is_meta != Some(true)
+            ),
+            Self::Materialized(value) => is_user_message(value),
+            Self::DiskCompacted { .. }
+            | Self::DiskFileChange { .. }
+            | Self::DiskEvent { .. }
+            | Self::DiskActivity { .. } => false,
+        }
+    }
+
+    fn tool_result_use_id(&self) -> Option<&RuntimeString> {
+        match self {
+            Self::DiskMessage {
+                message: klaus_agent_core::schemas::message::Message::ToolResult(result),
+                ..
+            } => Some(&result.tool_use_id),
+            Self::Materialized(value) if is(field(value, "type"), "tool_result") => {
+                field(value, "toolUseId").as_string()
+            }
+            _ => None,
+        }
+    }
+
+    fn set_inspection_output(&mut self, output: RuntimeJson) {
+        match self {
+            Self::DiskMessage {
+                inspection_output, ..
+            } => {
+                *inspection_output = Some(output);
+            }
+            Self::Materialized(value) => {
+                set(value, "_inspectionOutput", output);
+            }
+            Self::DiskCompacted { .. }
+            | Self::DiskFileChange { .. }
+            | Self::DiskEvent { .. }
+            | Self::DiskActivity { .. } => {}
+        }
+    }
+
+    fn preview_text(&self) -> Result<RuntimeString, String> {
+        match self {
+            Self::DiskMessage { message, .. } => Ok(message_text(&exact_value(message)?)),
+            Self::Materialized(value) => Ok(message_text(value)),
+            Self::DiskCompacted { .. }
+            | Self::DiskFileChange { .. }
+            | Self::DiskEvent { .. }
+            | Self::DiskActivity { .. } => Ok(RuntimeString::default()),
+        }
+    }
+
+    fn materialize(self, thread_id: &str, turn_id: &str) -> Result<RuntimeJson, String> {
+        match self {
+            Self::DiskMessage {
+                message,
+                external_origin,
+                inspection_output,
+            } => {
+                let mut encoded = exact_value(message)?;
+                if let Some(origin) = external_origin {
+                    set(&mut encoded, "_externalSource", origin);
+                }
+                if let Some(output) = inspection_output {
+                    set(&mut encoded, "_inspectionOutput", output);
+                }
+                Ok(encoded)
+            }
+            Self::DiskCompacted { position, raw } => {
+                let item = exact_value(raw)?;
+                let projected = object! {
+                    "id" => format!("{thread_id}-compaction-{position}"),
+                    "type" => "contextCompaction", "summary" => field(&item, "summary"), "source" => &item,
+                };
+                Ok(object! { "type" => "_item", "item" => projected })
+            }
+            Self::DiskFileChange { position, payload } => {
+                let projected = object! {
+                    "id" => format!("{turn_id}-change-{position}"), "type" => "fileChange", "status" => "completed",
+                    "changes" => vec![project_file_change(payload)?],
+                };
+                Ok(object! { "type" => "_item", "item" => projected })
+            }
+            Self::DiskEvent { position, raw } => {
+                let item = exact_value(raw)?;
+                let projected = object! { "type" => "klausItem", "id" => format!("{turn_id}-event-{position}"), "item" => item };
+                Ok(object! { "type" => "_item", "item" => projected })
+            }
+            Self::DiskActivity { position, raw } => {
+                let item = exact_value(raw)?;
+                let projected = object! { "type" => "klausItem", "id" => format!("{turn_id}-activity-{position}"), "item" => item };
+                Ok(object! { "type" => "_item", "item" => projected })
+            }
+            Self::Materialized(value) => Ok(value),
+        }
+    }
+}
+
 #[derive(Default)]
-struct TurnBuilder {
+struct TurnBuilder<'a> {
+    id: String,
+    goal_continuation: Option<bool>,
+    input_origin: Option<RuntimeString>,
+    goal_id: Option<RuntimeString>,
+    status: Option<String>,
+    error: Option<RuntimeJson>,
+    error_details: Option<RuntimeJson>,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+    duration_ms: Option<u64>,
+    entries: Vec<TurnEntry<'a>>,
+    final_message_id: Option<String>,
+    tools: HashMap<String, std::borrow::Cow<'a, RuntimeJson>>,
+    has_user: bool,
+    context_owned: bool,
+}
+
+impl<'a> TurnBuilder<'a> {
+    fn new(id: String, context_owned: bool) -> Self {
+        Self {
+            id,
+            context_owned,
+            ..Default::default()
+        }
+    }
+
+    fn materialize_parts(
+        self,
+        thread_id: &str,
+    ) -> Result<(Vec<RuntimeJson>, HashMap<String, RuntimeJson>), String> {
+        let turn_id = self.id;
+        let mut messages = Vec::with_capacity(self.entries.len());
+        for entry in self.entries {
+            messages.push(entry.materialize(thread_id, &turn_id)?);
+        }
+        let tools = self
+            .tools
+            .into_iter()
+            .map(|(id, value)| (id, value.into_owned()))
+            .collect();
+        Ok((messages, tools))
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct CachedDiskTurn {
     id: String,
     goal_continuation: Option<bool>,
     input_origin: Option<RuntimeString>,
@@ -403,17 +606,110 @@ struct TurnBuilder {
     context_owned: bool,
 }
 
-impl TurnBuilder {
-    fn new(id: String, context_owned: bool) -> Self {
-        Self {
-            id,
-            context_owned,
-            ..Default::default()
+impl CachedDiskTurn {
+    fn from_builder(turn: &TurnBuilder<'_>, thread_id: &str) -> Result<Option<Self>, String> {
+        const MAX_CACHED_TAIL_ENTRIES: usize = 2_048;
+        const MAX_CACHED_TAIL_UTF16_UNITS: usize = 2 * 1024 * 1024;
+        if turn.entries.len().saturating_add(turn.tools.len()) > MAX_CACHED_TAIL_ENTRIES {
+            return Ok(None);
+        }
+        let mut messages = Vec::with_capacity(turn.entries.len());
+        let mut units = 0usize;
+        for entry in &turn.entries {
+            let value = entry.clone().materialize(thread_id, &turn.id)?;
+            units = units.saturating_add(estimated_runtime_units(&value));
+            if units > MAX_CACHED_TAIL_UTF16_UNITS {
+                return Ok(None);
+            }
+            messages.push(value);
+        }
+        let mut tools = HashMap::with_capacity(turn.tools.len());
+        for (id, value) in &turn.tools {
+            let owned = value.as_ref().clone();
+            units = units
+                .saturating_add(id.len())
+                .saturating_add(estimated_runtime_units(&owned));
+            if units > MAX_CACHED_TAIL_UTF16_UNITS {
+                return Ok(None);
+            }
+            tools.insert(id.clone(), owned);
+        }
+        Ok(Some(Self {
+            id: turn.id.clone(),
+            goal_continuation: turn.goal_continuation,
+            input_origin: turn.input_origin.clone(),
+            goal_id: turn.goal_id.clone(),
+            status: turn.status.clone(),
+            error: turn.error.clone(),
+            error_details: turn.error_details.clone(),
+            started_at: turn.started_at,
+            completed_at: turn.completed_at,
+            duration_ms: turn.duration_ms,
+            messages,
+            final_message_id: turn.final_message_id.clone(),
+            tools,
+            has_user: turn.has_user,
+            context_owned: turn.context_owned,
+        }))
+    }
+
+    fn into_builder<'a>(self) -> TurnBuilder<'a> {
+        TurnBuilder {
+            id: self.id,
+            goal_continuation: self.goal_continuation,
+            input_origin: self.input_origin,
+            goal_id: self.goal_id,
+            status: self.status,
+            error: self.error,
+            error_details: self.error_details,
+            started_at: self.started_at,
+            completed_at: self.completed_at,
+            duration_ms: self.duration_ms,
+            entries: self
+                .messages
+                .into_iter()
+                .map(TurnEntry::Materialized)
+                .collect(),
+            final_message_id: self.final_message_id,
+            tools: self
+                .tools
+                .into_iter()
+                .map(|(id, value)| (id, std::borrow::Cow::Owned(value)))
+                .collect(),
+            has_user: self.has_user,
+            context_owned: self.context_owned,
         }
     }
 }
 
-fn bind_goal_submission(turns: &mut Vec<TurnBuilder>, turn_id: &str, payload: &RuntimeJson) {
+/// Bounded pre-live tail summary keyed by an unchanged rollout file stamp.
+#[derive(Clone)]
+pub(super) struct CachedThreadTail {
+    prefix_turn_ids: Vec<String>,
+    prefix_preview: Option<RuntimeString>,
+    seen: HashSet<String>,
+    tail_turn: Option<CachedDiskTurn>,
+}
+
+fn estimated_runtime_units(value: &RuntimeJson) -> usize {
+    match value {
+        RuntimeJson::Null | RuntimeJson::Bool(_) | RuntimeJson::Number(_) => 8,
+        RuntimeJson::String(text) => text.as_utf16().len().saturating_add(8),
+        RuntimeJson::Array(items) => items.iter().fold(8usize, |acc, item| {
+            acc.saturating_add(estimated_runtime_units(item))
+        }),
+        RuntimeJson::Object(fields) => fields.values().fold(
+            fields.len().saturating_mul(16).saturating_add(8),
+            |acc, item| acc.saturating_add(estimated_runtime_units(item)),
+        ),
+    }
+}
+
+fn bind_goal_submission<'a>(
+    turns: &mut Vec<TurnBuilder<'a>>,
+    turn_id: &str,
+    payload: &RuntimeJson,
+) {
     let ids: Vec<_> = ["messageUuid", "displayUuid"]
         .into_iter()
         .filter_map(|key| field(payload, key).as_string())
@@ -423,18 +719,15 @@ fn bind_goal_submission(turns: &mut Vec<TurnBuilder>, turn_id: &str, payload: &R
     }
     let mut bound = Vec::new();
     for turn in turns.iter_mut() {
-        turn.messages.retain(|message| {
-            if field(message, "uuid")
-                .as_string()
-                .is_some_and(|id| ids.contains(&id))
-            {
-                bound.push(message.clone());
+        turn.entries.retain(|entry| {
+            if entry.uuid_rt().is_some_and(|id| ids.contains(&id)) {
+                bound.push(entry.clone());
                 false
             } else {
                 true
             }
         });
-        turn.has_user = turn.messages.iter().any(is_user_message);
+        turn.has_user = turn.entries.iter().any(TurnEntry::is_user);
     }
     let target = match turns.iter().position(|turn| turn.id == turn_id) {
         Some(target) => target,
@@ -443,13 +736,13 @@ fn bind_goal_submission(turns: &mut Vec<TurnBuilder>, turn_id: &str, payload: &R
             turns.len() - 1
         }
     };
-    bound.append(&mut turns[target].messages);
-    turns[target].messages = bound;
-    turns[target].has_user = turns[target].messages.iter().any(is_user_message);
+    bound.append(&mut turns[target].entries);
+    turns[target].entries = bound;
+    turns[target].has_user = turns[target].entries.iter().any(TurnEntry::is_user);
     turns.retain(|turn| {
         turn.id == turn_id
             || turn.context_owned
-            || !turn.messages.is_empty()
+            || !turn.entries.is_empty()
             || !turn.tools.is_empty()
             || turn.status.is_some()
     });
@@ -459,24 +752,32 @@ fn is_user_message(message: &RuntimeJson) -> bool {
     is(field(message, "type"), "user") && field(message, "isMeta").as_bool() != Some(true)
 }
 
-fn current_turn(turns: &mut Vec<TurnBuilder>, fallback: String) -> &mut TurnBuilder {
-    if turns.is_empty() {
-        turns.push(TurnBuilder::new(fallback, false));
-    }
-    turns.last_mut().unwrap()
+pub(super) struct ProjectionOverlay<'a> {
+    pub live: Option<&'a Session>,
+    pub active: &'a HashSet<String>,
+    pub pending_active: bool,
+    pub flags: Vec<String>,
+    pub live_items: &'a HashMap<String, Vec<RuntimeJson>>,
+}
+
+struct ProjectionMeta {
+    prefix_preview: Option<RuntimeString>,
+    meta: RuntimeJson,
+    updated_at: i64,
+    archived: bool,
+    limit: usize,
 }
 
 /// Build the complete current branch oldest-first, then page turns newest-first.
 /// Every content-bearing value remains in the exact runtime representation.
-pub(super) fn project(
+pub(super) fn project_with_tail_cache(
     snapshot: ThreadReadSnapshot,
     params: &wire::EngineReadThreadParams,
-    live: Option<&Session>,
-    active: &HashSet<String>,
-    pending_active: bool,
-    flags: Vec<String>,
-    live_items: &HashMap<String, Vec<RuntimeJson>>,
-) -> Result<RuntimeJson, String> {
+    overlay: ProjectionOverlay<'_>,
+    capture_tail_cache: bool,
+) -> Result<(RuntimeJson, Option<CachedThreadTail>), String> {
+    use klaus_agent_core::schemas::rollout::RolloutItem;
+
     let limit = params.limit.unwrap_or(1);
     if !(1..=10).contains(&limit) || params.thread_id.trim().is_empty() {
         return Err("threadId must be nonempty and limit must be between 1 and 10".into());
@@ -484,31 +785,37 @@ pub(super) fn project(
     let meta = exact_value(&snapshot.meta)?;
     let visible_start =
         klaus_agent_core::store::thread_history::side_task_visible_start_index(&snapshot.raw_items);
-    let mut turns: Vec<TurnBuilder> = Vec::new();
+    let mut turns: Vec<TurnBuilder<'_>> = Vec::new();
     let mut seen = HashSet::new();
     let mut external_origin: Option<RuntimeJson> = None;
+    static NULL_JSON: RuntimeJson = RuntimeJson::Null;
+
     for (position, raw) in snapshot.raw_items.iter().enumerate().skip(visible_start) {
-        let item = exact_value(raw)?;
-        match scalar(field(&item, "kind"))?.as_deref().unwrap_or_default() {
-            "turn_context" => {
-                let ctx = item.get("ctx").unwrap_or(&item);
-                let id = scalar(field(ctx, "turnId"))?
+        match raw {
+            RolloutItem::TurnContext { ctx } => {
+                let id = ctx
+                    .turn_id
+                    .as_ref()
+                    .map(|id| id.try_to_utf8().map_err(|error| error.to_string()))
+                    .transpose()?
                     .unwrap_or_else(|| format!("{}-turn-{position}", params.thread_id));
                 if turns.last().is_none_or(|turn| turn.id != id) {
                     turns.push(TurnBuilder::new(id, true));
                 }
-                turns.last_mut().unwrap().started_at = field(ctx, "startedAtMs").as_i64();
+                turns.last_mut().unwrap().started_at = ctx.started_at_ms;
             }
-            "message" => {
-                let mut message = item.get("message").unwrap_or(&item).clone();
-                let id = scalar(field(&message, "uuid"))?.unwrap_or_default();
-                if let Some(origin) = external_origin
+            RolloutItem::Message { message } => {
+                let id = message_uuid_rt(message)
+                    .try_to_utf8()
+                    .map_err(|error| error.to_string())?;
+                let matched_origin = external_origin
                     .take()
-                    .filter(|origin| is(field(origin, "messageId"), &id))
-                {
-                    set(&mut message, "_externalSource", origin);
-                }
-                let is_user = is_user_message(&message);
+                    .filter(|origin| is(field(origin, "messageId"), &id));
+                let is_user = matches!(
+                    message,
+                    klaus_agent_core::schemas::message::Message::User(user)
+                        if user.is_meta != Some(true)
+                );
                 if is_user
                     && turns
                         .last()
@@ -516,30 +823,40 @@ pub(super) fn project(
                 {
                     turns.push(TurnBuilder::new(id.clone(), false));
                 }
-                let turn = current_turn(&mut turns, id.clone());
-                if !turn.context_owned && message.get("_externalSource").is_some() {
+                if turns.is_empty() {
+                    turns.push(TurnBuilder::new(id.clone(), false));
+                }
+                let turn = turns.last_mut().unwrap();
+                if !turn.context_owned && matched_origin.is_some() {
                     turn.status = Some("imported".into());
                 }
                 turn.has_user |= is_user;
                 seen.insert(id);
-                turn.messages.push(message);
+                turn.entries.push(TurnEntry::DiskMessage {
+                    message,
+                    external_origin: matched_origin,
+                    inspection_output: None,
+                });
             }
-            "compacted" => {
-                let turn =
-                    current_turn(&mut turns, format!("{}-turn-{position}", params.thread_id));
-                let projected = object! {
-                    "id" => format!("{}-compaction-{position}", params.thread_id),
-                    "type" => "contextCompaction", "summary" => field(&item, "summary"), "source" => &item,
-                };
-                turn.messages
-                    .push(object! { "type" => "_item", "item" => projected });
+            RolloutItem::Compacted(_) => {
+                if turns.is_empty() {
+                    turns.push(TurnBuilder::new(
+                        format!("{}-turn-{position}", params.thread_id),
+                        false,
+                    ));
+                }
+                turns
+                    .last_mut()
+                    .unwrap()
+                    .entries
+                    .push(TurnEntry::DiskCompacted { position, raw });
             }
-            "rollback" => {
-                let mut count = field(&item, "numTurns").as_u64().unwrap_or_default();
+            RolloutItem::Rollback(rollback) => {
+                let mut count = u64::from(rollback.num_turns);
                 while count > 0 {
                     let Some(removed) = turns.pop() else { break };
-                    for message in &removed.messages {
-                        if let Some(id) = scalar(field(message, "uuid"))? {
+                    for entry in &removed.entries {
+                        if let Some(id) = entry.uuid_scalar()? {
                             seen.remove(&id);
                         }
                     }
@@ -548,9 +865,12 @@ pub(super) fn project(
                     }
                 }
             }
-            "event" => {
-                let event = scalar(field(&item, "event"))?.unwrap_or_default();
-                let payload = field(&item, "payload").clone();
+            RolloutItem::Event(event_item) => {
+                let event = event_item
+                    .event
+                    .try_to_utf8()
+                    .map_err(|error| error.to_string())?;
+                let payload = event_item.payload.as_ref().unwrap_or(&NULL_JSON);
                 if matches!(
                     event.as_str(),
                     klaus_agent_core::engine::approval_capture::APPROVAL_PARENT_HISTORY_EVENT
@@ -560,16 +880,16 @@ pub(super) fn project(
                     continue;
                 }
                 if event == klaus_agent_core::store::external_import::MESSAGE_EVENT {
-                    external_origin = Some(payload);
+                    external_origin = Some(payload.clone());
                     continue;
                 }
-                let turn_id = match scalar(field(&item, "turnId"))? {
-                    Some(id) => Some(id),
-                    None => scalar(field(&payload, "turnId"))?,
+                let turn_id = match event_item.turn_id.as_ref() {
+                    Some(id) => Some(id.try_to_utf8().map_err(|error| error.to_string())?),
+                    None => scalar(field(payload, "turnId"))?,
                 };
                 if event == "goal_submission_bound" {
                     if let Some(turn_id) = turn_id {
-                        bind_goal_submission(&mut turns, &turn_id, &payload);
+                        bind_goal_submission(&mut turns, &turn_id, payload);
                     }
                     continue;
                 }
@@ -578,22 +898,20 @@ pub(super) fn project(
                     .and_then(|id| turns.iter_mut().find(|turn| &turn.id == id));
                 if let Some(turn) = target {
                     if event == "turn_lifecycle" {
-                        turn.goal_continuation = field(&payload, "goalContinuation").as_bool();
-                        turn.input_origin = field(&payload, "inputOrigin").as_string().cloned();
-                        turn.goal_id = field(&payload, "goalId").as_string().cloned();
-                        let details = match raw {
-                            klaus_agent_core::schemas::rollout::RolloutItem::Event(event) => event.payload.as_ref()
-                                .and_then(klaus_agent_core::engine::session::turn_error_details_from_lifecycle),
-                            _ => None,
-                        };
+                        turn.goal_continuation = field(payload, "goalContinuation").as_bool();
+                        turn.input_origin = field(payload, "inputOrigin").as_string().cloned();
+                        turn.goal_id = field(payload, "goalId").as_string().cloned();
+                        let details = event_item.payload.as_ref().and_then(
+                            klaus_agent_core::engine::session::turn_error_details_from_lifecycle,
+                        );
                         turn.error_details = details.as_ref().map(exact_value).transpose()?;
-                        turn.status = scalar(field(&payload, "status"))?;
-                        turn.final_message_id = scalar(field(&payload, "finalMessageId"))?;
+                        turn.status = scalar(field(payload, "status"))?;
+                        turn.final_message_id = scalar(field(payload, "finalMessageId"))?;
                         turn.started_at =
-                            field(&payload, "startedAtMs").as_i64().or(turn.started_at);
-                        turn.completed_at = field(&payload, "finishedAtMs").as_i64();
-                        turn.duration_ms = field(&payload, "durationMs").as_u64();
-                        let error = field(&payload, "error").as_string().cloned().or_else(|| {
+                            field(payload, "startedAtMs").as_i64().or(turn.started_at);
+                        turn.completed_at = field(payload, "finishedAtMs").as_i64();
+                        turn.duration_ms = field(payload, "durationMs").as_u64();
+                        let error = field(payload, "error").as_string().cloned().or_else(|| {
                             turn.error_details
                                 .as_ref()
                                 .and_then(|details| field(details, "message").as_string())
@@ -601,7 +919,7 @@ pub(super) fn project(
                         });
                         if let Some(message) = error {
                             let additional =
-                                field(&payload, "kind").as_string().cloned().or_else(|| {
+                                field(payload, "kind").as_string().cloned().or_else(|| {
                                     turn.error_details
                                         .as_ref()
                                         .and_then(|details| field(details, "kind").as_string())
@@ -612,47 +930,38 @@ pub(super) fn project(
                             );
                         }
                     } else if event == "tool_lifecycle" {
-                        if let Some(id) = scalar(field(&payload, "toolUseId"))? {
-                            turn.tools.insert(id, payload);
+                        if let Some(id) = scalar(field(payload, "toolUseId"))? {
+                            turn.tools.insert(id, std::borrow::Cow::Borrowed(payload));
                         }
                     } else if event == "tool_result_output" {
-                        if let Some(message) = turn.messages.iter_mut().rev().find(|message| {
-                            is(field(message, "type"), "tool_result")
-                                && field(message, "toolUseId") == field(&payload, "toolUseId")
+                        let target_tool_id = field(payload, "toolUseId").as_string();
+                        if let Some(entry) = turn.entries.iter_mut().rev().find(|entry| {
+                            target_tool_id.is_some() && entry.tool_result_use_id() == target_tool_id
                         }) {
-                            set(
-                                message,
-                                "_inspectionOutput",
-                                field(&payload, "output").clone(),
-                            );
+                            entry.set_inspection_output(field(payload, "output").clone());
                         }
                     } else if event == "file_change" {
-                        let projected = object! {
-                            "id" => format!("{}-change-{position}", turn.id), "type" => "fileChange", "status" => "completed",
-                            "changes" => vec![project_file_change(&payload)?],
-                        };
-                        turn.messages
-                            .push(object! { "type" => "_item", "item" => projected });
+                        turn.entries
+                            .push(TurnEntry::DiskFileChange { position, payload });
                     } else {
-                        let projected = object! { "type" => "klausItem", "id" => format!("{}-event-{position}", turn.id), "item" => item };
-                        turn.messages
-                            .push(object! { "type" => "_item", "item" => projected });
+                        turn.entries.push(TurnEntry::DiskEvent { position, raw });
                     }
                 }
             }
-            "subagent_lifecycle" => {
-                let owner = scalar(field(
-                    field(field(&item, "record"), "context"),
-                    "spawnTurnId",
-                ))?;
+            RolloutItem::SubagentLifecycle(subagent) => {
+                let owner = subagent
+                    .record
+                    .context
+                    .spawn_turn_id
+                    .as_ref()
+                    .map(|id| id.try_to_utf8().map_err(|error| error.to_string()))
+                    .transpose()?;
                 match owner
                     .as_ref()
                     .and_then(|id| turns.iter_mut().find(|turn| &turn.id == id))
                 {
                     Some(turn) => {
-                        let projected = object! { "type" => "klausItem", "id" => format!("{}-activity-{position}", turn.id), "item" => item };
-                        turn.messages
-                            .push(object! { "type" => "_item", "item" => projected });
+                        turn.entries.push(TurnEntry::DiskActivity { position, raw });
                     }
                     None => eprintln!(
                         "[app-server] dropping turn-scoped lifecycle row for unknown turn `{}`",
@@ -660,16 +969,153 @@ pub(super) fn project(
                     ),
                 }
             }
-            "background_process_lifecycle" => {
+            RolloutItem::BackgroundProcessLifecycle(_) => {
                 if let Some(turn) = turns.last_mut() {
-                    let projected = object! { "type" => "klausItem", "id" => format!("{}-activity-{position}", turn.id), "item" => item };
-                    turn.messages
-                        .push(object! { "type" => "_item", "item" => projected });
+                    turn.entries.push(TurnEntry::DiskActivity { position, raw });
                 }
             }
-            _ => {}
+            RolloutItem::SessionMeta { .. }
+            | RolloutItem::Checkpoint(_)
+            | RolloutItem::UsageLedger(_) => {}
         }
     }
+
+    let cached_tail = if capture_tail_cache && params.cursor.is_none() && limit == 1 {
+        let prefix_len = turns.len().saturating_sub(1);
+        let prefix_turn_ids = turns[..prefix_len]
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect();
+        let prefix_preview = turns[..prefix_len]
+            .iter()
+            .flat_map(|turn| &turn.entries)
+            .find(|entry| entry.is_user())
+            .map(TurnEntry::preview_text)
+            .transpose()?;
+        let tail_turn = match turns.last() {
+            Some(last) => CachedDiskTurn::from_builder(last, &params.thread_id)?.map(Some),
+            None => Some(None),
+        };
+        tail_turn.map(|tail_turn| CachedThreadTail {
+            prefix_turn_ids,
+            prefix_preview,
+            seen: seen.clone(),
+            tail_turn,
+        })
+    } else {
+        None
+    };
+
+    let reply = finish_projection(
+        turns,
+        seen,
+        ProjectionMeta {
+            prefix_preview: None,
+            meta,
+            updated_at: snapshot.updated_at,
+            archived: snapshot.archived,
+            limit,
+        },
+        params,
+        overlay,
+    )?;
+    Ok((reply, cached_tail))
+}
+
+pub(super) fn project_cached_tail(
+    cached: &CachedThreadTail,
+    stamp: &klaus_agent_core::store::session_store::ThreadReadStamp,
+    params: &wire::EngineReadThreadParams,
+    overlay: ProjectionOverlay<'_>,
+) -> Result<Option<RuntimeJson>, String> {
+    let limit = params.limit.unwrap_or(1);
+    if params.cursor.is_some() || limit != 1 {
+        return Ok(None);
+    }
+    if params.thread_id.trim().is_empty() {
+        return Err("threadId must be nonempty and limit must be between 1 and 10".into());
+    }
+    let prefix_len = cached.prefix_turn_ids.len();
+    if let Some(session) = overlay.live {
+        let index = session.turn_index_snapshot();
+        for source in session.visible_history() {
+            let id = message_uuid_rt(&source)
+                .try_to_utf8()
+                .map_err(|error| error.to_string())?;
+            if cached.seen.contains(&id) {
+                continue;
+            }
+            if matches!(
+                source,
+                klaus_agent_core::schemas::message::Message::CompactBoundary(_)
+            ) {
+                continue;
+            }
+            let turn_id = index
+                .message_turn
+                .get(&RuntimeString::from(id))
+                .map(|id| id.try_to_utf8().map_err(|error| error.to_string()))
+                .transpose()?;
+            if let Some(turn_id) = turn_id {
+                if cached
+                    .prefix_turn_ids
+                    .iter()
+                    .any(|prefix| prefix == &turn_id)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    if prefix_len > 0 && cached.tail_turn.is_none() {
+        return Ok(None);
+    }
+    let mut turns: Vec<TurnBuilder<'_>> = cached
+        .prefix_turn_ids
+        .iter()
+        .map(|id| TurnBuilder::new(id.clone(), true))
+        .collect();
+    if let Some(tail) = &cached.tail_turn {
+        turns.push(tail.clone().into_builder());
+    }
+    let meta = exact_value(&stamp.meta)?;
+    finish_projection(
+        turns,
+        cached.seen.clone(),
+        ProjectionMeta {
+            prefix_preview: cached.prefix_preview.clone(),
+            meta,
+            updated_at: stamp.updated_at,
+            archived: stamp.archived,
+            limit,
+        },
+        params,
+        overlay,
+    )
+    .map(Some)
+}
+
+fn finish_projection<'a>(
+    mut turns: Vec<TurnBuilder<'a>>,
+    mut seen: HashSet<String>,
+    projection: ProjectionMeta,
+    params: &wire::EngineReadThreadParams,
+    overlay: ProjectionOverlay<'_>,
+) -> Result<RuntimeJson, String> {
+    let ProjectionMeta {
+        prefix_preview,
+        meta,
+        updated_at,
+        archived,
+        limit,
+    } = projection;
+    let ProjectionOverlay {
+        live,
+        active,
+        pending_active,
+        flags,
+        live_items,
+    } = overlay;
     if let Some(session) = live {
         let index = session.turn_index_snapshot();
         for source in session.visible_history() {
@@ -682,16 +1128,14 @@ pub(super) fn project(
             let id = scalar(field(&message, "uuid"))?.unwrap_or_default();
             if seen.contains(&id) {
                 if !field(&message, "_inspectionOutput").is_null() {
+                    let target_id = RuntimeString::from(id.clone());
                     if let Some(persisted) = turns
                         .iter_mut()
-                        .flat_map(|turn| &mut turn.messages)
-                        .find(|row| is(field(row, "uuid"), &id))
+                        .flat_map(|turn| &mut turn.entries)
+                        .find(|row| row.uuid_rt() == Some(&target_id))
                     {
-                        set(
-                            persisted,
-                            "_inspectionOutput",
-                            field(&message, "_inspectionOutput").clone(),
-                        );
+                        persisted
+                            .set_inspection_output(field(&message, "_inspectionOutput").clone());
                     }
                 }
                 continue;
@@ -713,7 +1157,7 @@ pub(super) fn project(
                 turns.last_mut().unwrap()
             };
             turn.has_user |= is_user_message(&message);
-            turn.messages.push(message);
+            turn.entries.push(TurnEntry::Materialized(message));
             seen.insert(id);
         }
         for turn in &mut turns {
@@ -772,12 +1216,16 @@ pub(super) fn project(
             turns.push(TurnBuilder::new(id.clone(), true));
         }
     }
-    let preview = turns
-        .iter()
-        .flat_map(|turn| &turn.messages)
-        .find(|message| is_user_message(message))
-        .map(message_text)
-        .unwrap_or_default();
+    let preview = match prefix_preview {
+        Some(preview) => preview,
+        None => turns
+            .iter()
+            .flat_map(|turn| &turn.entries)
+            .find(|entry| entry.is_user())
+            .map(TurnEntry::preview_text)
+            .transpose()?
+            .unwrap_or_default(),
+    };
     let cwd = text(field(&meta, "cwd"));
     let mut status = object! { "type" => if pending_active || !active.is_empty() { "active" } else if live.is_some() { "idle" } else { "notLoaded" } };
     if !flags.is_empty() {
@@ -786,7 +1234,7 @@ pub(super) fn project(
     let info = object! {
         "id" => &params.thread_id, "title" => text(field(&meta, "title")), "preview" => preview,
         "cwd" => &cwd, "createdAt" => field(&meta, "createdAt").as_i64().unwrap_or_default(),
-        "updatedAt" => snapshot.updated_at, "archived" => snapshot.archived, "status" => status,
+        "updatedAt" => updated_at, "archived" => archived, "status" => status,
     };
     let end = match params.cursor.as_deref() {
         Some(cursor) => turns
@@ -801,21 +1249,33 @@ pub(super) fn project(
     let mut output = Vec::new();
     let mut error_details = std::collections::BTreeMap::new();
     for turn in turns.drain(start..end).rev() {
-        let is_active = active.contains(&turn.id);
+        let turn_id = turn.id.clone();
+        let goal_continuation = turn.goal_continuation;
+        let input_origin = turn.input_origin.clone();
+        let goal_id = turn.goal_id.clone();
+        let turn_status = turn.status.clone();
+        let turn_error = turn.error.clone();
+        let turn_error_details = turn.error_details.clone();
+        let started_at = turn.started_at;
+        let completed_at = turn.completed_at;
+        let duration_ms = turn.duration_ms;
+        let final_message_id = turn.final_message_id.clone();
+        let (messages, tools) = turn.materialize_parts(&params.thread_id)?;
+        let is_active = active.contains(&turn_id);
         let status = if is_active {
             "inProgress".to_owned()
         } else {
-            turn.status.clone().unwrap_or_else(|| "interrupted".into())
+            turn_status.unwrap_or_else(|| "interrupted".into())
         };
         let mut items = project_messages(
-            &turn.messages,
-            &turn.tools,
+            &messages,
+            &tools,
             &cwd,
             &status,
-            turn.final_message_id.as_deref(),
+            final_message_id.as_deref(),
         )?;
         if is_active {
-            if let Some(streamed) = live_items.get(&turn.id) {
+            if let Some(streamed) = live_items.get(&turn_id) {
                 for item in streamed {
                     let projected = project_live_item(item, &cwd)?;
                     let id = field(&projected, "id");
@@ -836,33 +1296,25 @@ pub(super) fn project(
             }
         }
         if status == "failed" {
-            if let Some(details) = turn.error_details {
-                error_details.insert(turn.id.clone(), details);
+            if let Some(details) = turn_error_details {
+                error_details.insert(turn_id.clone(), details);
             }
         }
-        let mut projected = object! { "id" => &turn.id };
-        if let Some(value) = turn.goal_continuation {
+        let mut projected = object! { "id" => &turn_id };
+        if let Some(value) = goal_continuation {
             set(&mut projected, "goalContinuation", value.into());
         }
-        if let Some(value) = turn.input_origin {
+        if let Some(value) = input_origin {
             set(&mut projected, "inputOrigin", value.into());
         }
-        if let Some(value) = turn.goal_id {
+        if let Some(value) = goal_id {
             set(&mut projected, "goalId", value.into());
         }
         set(&mut projected, "status", status.into());
-        set(&mut projected, "error", exact_value(&turn.error)?);
-        set(&mut projected, "startedAt", exact_value(&turn.started_at)?);
-        set(
-            &mut projected,
-            "completedAt",
-            exact_value(&turn.completed_at)?,
-        );
-        set(
-            &mut projected,
-            "durationMs",
-            exact_value(&turn.duration_ms)?,
-        );
+        set(&mut projected, "error", exact_value(&turn_error)?);
+        set(&mut projected, "startedAt", exact_value(&started_at)?);
+        set(&mut projected, "completedAt", exact_value(&completed_at)?);
+        set(&mut projected, "durationMs", exact_value(&duration_ms)?);
         set(&mut projected, "items", items.into());
         output.push(projected);
     }

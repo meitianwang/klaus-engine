@@ -583,7 +583,7 @@ impl AnthropicProvider {
         };
         AnthropicProvider {
             info,
-            client: reqwest::Client::new(),
+            client: crate::provider::shared_http_client(),
             api_key: opts.api_key,
             auth_source: opts.auth_source,
             api_key_scheme: opts.api_key_scheme,

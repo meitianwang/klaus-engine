@@ -6789,11 +6789,10 @@ impl OpenAIProvider {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let classifier_requires_client_factory =
             opts.http_client.is_some() && opts.classifier_http_client_factory.is_none();
-        let client = opts.http_client.unwrap_or_default();
-        let ws_client = reqwest::Client::builder()
-            .http1_only()
-            .build()
-            .unwrap_or_else(|_| client.clone());
+        let client = opts
+            .http_client
+            .unwrap_or_else(crate::provider::shared_http_client);
+        let ws_client = crate::provider::shared_http1_client();
         let api_key = opts.api_key.clone();
         let api = opts.api.unwrap_or_default();
         let retry = opts.retry.unwrap_or_default();

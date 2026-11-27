@@ -82,6 +82,62 @@ const CONNECTION_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_s
 /// slow client retain the engine's entire transcript in memory.
 const SESSION_STREAM_MAX_EVENTS: usize = 2_048;
 const SESSION_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
+const THREAD_TAIL_CACHE_CAPACITY: usize = 32;
+
+struct ThreadTailCacheEntry {
+    thread_id: String,
+    stamp: Vec<u8>,
+    tail: super::thread_read::CachedThreadTail,
+}
+
+#[derive(Default)]
+struct ThreadTailCache {
+    entries: VecDeque<ThreadTailCacheEntry>,
+}
+
+impl ThreadTailCache {
+    fn get(
+        &mut self,
+        thread_id: &str,
+        stamp: &[u8],
+    ) -> Option<super::thread_read::CachedThreadTail> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.thread_id == thread_id)?;
+        if self.entries[index].stamp != stamp {
+            self.entries.remove(index);
+            return None;
+        }
+        let entry = self.entries.remove(index).expect("indexed cache entry");
+        let tail = entry.tail.clone();
+        self.entries.push_back(entry);
+        Some(tail)
+    }
+
+    fn put(
+        &mut self,
+        thread_id: String,
+        stamp: Vec<u8>,
+        tail: super::thread_read::CachedThreadTail,
+    ) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.thread_id == thread_id)
+        {
+            self.entries.remove(index);
+        }
+        while self.entries.len() >= THREAD_TAIL_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(ThreadTailCacheEntry {
+            thread_id,
+            stamp,
+            tail,
+        });
+    }
+}
 
 /// Ceiling for concurrently processing heavy (spawned) requests. Saturation
 /// rejects new ones with `-32001` so clients back off instead of queueing
@@ -437,6 +493,7 @@ pub(super) struct AppServerState {
     realtime: realtime::RealtimeSessions,
     dictation: dictation::DictationSessions,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    thread_tail_cache: Mutex<ThreadTailCache>,
     queue_revisions: Mutex<HashMap<String, u64>>,
     queue_store: super::queue_store::Store,
     /// Lazily-built ENDPOINT-level inner server for `engine/op` (lifecycle,
@@ -743,6 +800,7 @@ async fn run_app_server_inner<I, O>(
         realtime: realtime::RealtimeSessions::default(),
         dictation: dictation::DictationSessions::default(),
         sessions: Mutex::new(HashMap::new()),
+        thread_tail_cache: Mutex::new(ThreadTailCache::default()),
         queue_revisions: Mutex::new(HashMap::new()),
         queue_store,
         control: Mutex::new(None),
@@ -1454,6 +1512,96 @@ async fn read_thread(state: Arc<AppServerState>, id: Value, params: wire::Engine
     let live = handle
         .as_ref()
         .and_then(|handle| handle.ps.existing_session());
+    let current_overlay = || {
+        let submissions = handle
+            .as_ref()
+            .map(|handle| handle.turns.lock().unwrap().clone())
+            .unwrap_or_default();
+        let (active, items) = handle
+            .as_ref()
+            .map(|handle| {
+                let items = handle.read_items.lock().unwrap();
+                let active = submissions
+                    .iter()
+                    .filter_map(|id| items.submission_turns.get(id).cloned())
+                    .collect();
+                (active, items.snapshot())
+            })
+            .unwrap_or_default();
+        let mut flags = Vec::new();
+        for request in state
+            .pending_reverse
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|request| request.session_id == params.thread_id)
+        {
+            let flag = match request.kind {
+                ReverseKind::Approval { .. } => "waitingOnApproval",
+                ReverseKind::Elicitation { .. } => "waitingOnUserInput",
+            };
+            if !flags.iter().any(|existing| existing == flag) {
+                flags.push(flag.to_string());
+            }
+        }
+        (submissions, active, items, flags)
+    };
+
+    let tail_eligible = params.cursor.is_none()
+        && params.limit.unwrap_or(1) == 1
+        && !params.thread_id.trim().is_empty();
+    let read_stamp = if tail_eligible {
+        state
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.read_thread_stamp.clone())
+    } else {
+        None
+    };
+    let mut pre_read_stamp = None;
+    let mut stamp_error: Option<crate::lifecycle::BoxError> = None;
+    if let Some(read_stamp_fn) = read_stamp.as_ref() {
+        match read_stamp_fn(params.thread_id.clone()).await {
+            Ok(Some(stamp)) => {
+                let cached = state
+                    .thread_tail_cache
+                    .lock()
+                    .unwrap()
+                    .get(&params.thread_id, &stamp.stamp);
+                if let Some(cached) = cached {
+                    let (submissions, active, items, flags) = current_overlay();
+                    match super::thread_read::project_cached_tail(
+                        &cached,
+                        &stamp,
+                        &params,
+                        super::thread_read::ProjectionOverlay {
+                            live: live.as_deref(),
+                            active: &active,
+                            pending_active: !submissions.is_empty(),
+                            flags,
+                            live_items: &items,
+                        },
+                    ) {
+                        Ok(Some(result)) => {
+                            return state.send(exact_payload::response(&id, result)).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return state
+                                .send(wire::error_response(&id, wire::INVALID_PARAMS, &error))
+                                .await;
+                        }
+                    }
+                }
+                pre_read_stamp = Some(stamp);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                stamp_error = Some(error);
+            }
+        }
+    }
+
     // The store snapshot is strictly read-only. Accepted in-memory messages and
     // streaming items are overlaid below; even an existing writer is untouched.
     let read = state
@@ -1461,15 +1609,16 @@ async fn read_thread(state: Arc<AppServerState>, id: Value, params: wire::Engine
         .as_ref()
         .and_then(|lifecycle| lifecycle.read_thread.clone());
     let has_store_reader = read.is_some();
-    let snapshot_result = match read {
-        Some(read) => read(params.thread_id.clone()).await,
-        None => Err(Box::new(std::io::Error::new(
+    let snapshot_result = match (stamp_error, read) {
+        (Some(error), _) => Err(error),
+        (None, Some(read)) => read(params.thread_id.clone()).await,
+        (None, None) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "thread has no persistent store",
         )) as crate::lifecycle::BoxError),
     };
-    let snapshot = match snapshot_result {
-        Ok(snapshot) => snapshot,
+    let (snapshot, from_disk) = match snapshot_result {
+        Ok(snapshot) => (snapshot, true),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -1479,7 +1628,7 @@ async fn read_thread(state: Arc<AppServerState>, id: Value, params: wire::Engine
                     handle.read_seed.is_some() && !handle.read_items.lock().unwrap().ever_started
                 }) =>
         {
-            handle.as_ref().unwrap().read_seed.clone().unwrap()
+            (handle.as_ref().unwrap().read_seed.clone().unwrap(), false)
         }
         Err(error)
             if live.as_ref().is_some_and(|session| {
@@ -1492,12 +1641,15 @@ async fn read_thread(state: Arc<AppServerState>, id: Value, params: wire::Engine
             }) =>
         {
             let session = live.as_ref().unwrap();
-            klaus_agent_core::store::session_store::ThreadReadSnapshot {
-                meta: session.meta.clone(),
-                raw_items: Vec::new(),
-                updated_at: session.meta.created_at,
-                archived: false,
-            }
+            (
+                klaus_agent_core::store::session_store::ThreadReadSnapshot {
+                    meta: session.meta.clone(),
+                    raw_items: Vec::new(),
+                    updated_at: session.meta.created_at,
+                    archived: false,
+                },
+                false,
+            )
         }
         Err(error) => {
             let code = if error
@@ -1513,47 +1665,36 @@ async fn read_thread(state: Arc<AppServerState>, id: Value, params: wire::Engine
                 .await;
         }
     };
-    let submissions = handle
-        .as_ref()
-        .map(|handle| handle.turns.lock().unwrap().clone())
-        .unwrap_or_default();
-    let (active, items) = handle
-        .as_ref()
-        .map(|handle| {
-            let items = handle.read_items.lock().unwrap();
-            let active = submissions
-                .iter()
-                .filter_map(|id| items.submission_turns.get(id).cloned())
-                .collect();
-            (active, items.snapshot())
-        })
-        .unwrap_or_default();
-    let mut flags = Vec::new();
-    for request in state
-        .pending_reverse
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|request| request.session_id == params.thread_id)
-    {
-        let flag = match request.kind {
-            ReverseKind::Approval { .. } => "waitingOnApproval",
-            ReverseKind::Elicitation { .. } => "waitingOnUserInput",
-        };
-        if !flags.iter().any(|existing| existing == flag) {
-            flags.push(flag.to_string());
-        }
-    }
-    match super::thread_read::project(
+    let (submissions, active, items, flags) = current_overlay();
+    let capture_tail = from_disk && pre_read_stamp.is_some();
+    match super::thread_read::project_with_tail_cache(
         snapshot,
         &params,
-        live.as_deref(),
-        &active,
-        !submissions.is_empty(),
-        flags,
-        &items,
+        super::thread_read::ProjectionOverlay {
+            live: live.as_deref(),
+            active: &active,
+            pending_active: !submissions.is_empty(),
+            flags,
+            live_items: &items,
+        },
+        capture_tail,
     ) {
-        Ok(result) => state.send(exact_payload::response(&id, result)).await,
+        Ok((result, cached_tail)) => {
+            if let (Some(stamp_before), Some(read_stamp_fn), Some(tail)) =
+                (pre_read_stamp, read_stamp, cached_tail)
+            {
+                if let Ok(Some(stamp_after)) = read_stamp_fn(params.thread_id.clone()).await {
+                    if stamp_after.stamp == stamp_before.stamp {
+                        state.thread_tail_cache.lock().unwrap().put(
+                            params.thread_id.clone(),
+                            stamp_after.stamp,
+                            tail,
+                        );
+                    }
+                }
+            }
+            state.send(exact_payload::response(&id, result)).await
+        }
         Err(error) => {
             state
                 .send(wire::error_response(&id, wire::INVALID_PARAMS, &error))

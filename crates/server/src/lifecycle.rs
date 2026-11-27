@@ -444,6 +444,7 @@ fn protocol_lifecycle_with_config_root(
         });
     let goal_store = store.clone();
     let read_store = store.clone();
+    let stamp_store = store.clone();
     let page_store = read_store.clone();
     let summary_store = store.clone();
     let profile_store = store.clone();
@@ -535,6 +536,15 @@ fn protocol_lifecycle_with_config_root(
             Box::pin(async move {
                 store
                     .read_thread(&thread_id)
+                    .await
+                    .map_err(|e| Box::new(e) as BoxError)
+            })
+        })),
+        read_thread_stamp: Some(Arc::new(move |thread_id: String| {
+            let store = stamp_store.clone();
+            Box::pin(async move {
+                store
+                    .read_thread_stamp(&thread_id)
                     .await
                     .map_err(|e| Box::new(e) as BoxError)
             })

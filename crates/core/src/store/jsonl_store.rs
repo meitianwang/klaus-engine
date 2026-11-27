@@ -1613,6 +1613,68 @@ impl SessionStore for JsonlSessionStore {
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "thread disappeared")))
     }
 
+    async fn read_thread_stamp(
+        &self,
+        thread_id: &str,
+    ) -> io::Result<Option<crate::store::session_store::ThreadReadStamp>> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let path = self.locate(thread_id).await?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("session {thread_id} not found"),
+                )
+            })?;
+            let path_clone = path.clone();
+            let stamp_result = tokio::task::spawn_blocking(move || {
+                let metadata = std::fs::metadata(&path_clone)?;
+                let updated_at = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or_default();
+                let stamp = crate::store::header_index::file_stamp_sync(Path::new(&path_clone))?;
+                let encoded = serde_json::to_vec(&(&path_clone, &stamp))
+                    .map_err(|error| io::Error::other(format!("stamp encode failed: {error}")))?;
+                Ok::<(i64, Vec<u8>), io::Error>((updated_at, encoded))
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("thread stamp task failed: {error}")))?;
+            let (updated_at, stamp) = match stamp_result {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut meta = match read_file_meta(&path).await {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if meta.id != thread_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "thread header id mismatch",
+                ));
+            }
+            self.read_authority_meta(&mut meta).await?;
+            return Ok(Some(crate::store::session_store::ThreadReadStamp {
+                meta,
+                updated_at,
+                archived: Path::new(&path).starts_with(&self.archive_root),
+                stamp,
+            }));
+        }
+        Err(last_error
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "thread disappeared")))
+    }
+
     async fn read_sub_agent(
         &self,
         thread_id: &str,
@@ -3789,15 +3851,21 @@ pub(crate) fn file_stamp(metadata: &std::fs::Metadata) -> i64 {
 }
 
 pub(crate) fn parse_items(bytes: &[u8]) -> Vec<RolloutItem> {
-    let content = NodeBufferUtf8::decode(bytes)
-        .try_to_utf8()
-        .expect("Node UTF-8 decode yields Unicode scalar JSONL text");
     let mut items: Vec<RolloutItem> = Vec::new();
-    for line in content.split('\n') {
-        if line.is_empty() {
+    for raw_line in bytes.split(|&byte| byte == b'\n') {
+        if raw_line.is_empty() {
             continue;
         }
-        let Some(item) = parse_rollout_line(line) else {
+        let parsed = match std::str::from_utf8(raw_line) {
+            Ok(line) => parse_rollout_line(line),
+            Err(_) => {
+                let decoded = NodeBufferUtf8::decode(raw_line)
+                    .try_to_utf8()
+                    .expect("Node UTF-8 decode yields Unicode scalar JSONL text");
+                parse_rollout_line(&decoded)
+            }
+        };
+        let Some(item) = parsed else {
             continue; // tolerant: skip corrupt/truncated lines
         };
         items.push(item);
@@ -5342,6 +5410,32 @@ mod tests {
     use std::sync::Arc;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn parse_items_decodes_utf8_and_non_utf8_lines_identically_to_node_buffer_utf8() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            br#"{"kind":"session_meta","schemaVersion":3,"meta":{"id":"t1","createdAt":1,"cwd":"/tmp","model":"m"}}"#,
+        );
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"kind":"message","message":{"type":"user","uuid":"u1","content":[{"type":"text","text":"hello "#);
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        raw.extend_from_slice(br#" world"}]}}"#);
+        raw.push(b'\n');
+        raw.extend_from_slice(b"{truncated");
+
+        let parsed = parse_items(&raw);
+        let legacy_content = NodeBufferUtf8::decode(&raw)
+            .try_to_utf8()
+            .expect("Node UTF-8 decode");
+        let legacy: Vec<RolloutItem> = legacy_content
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(parse_rollout_line)
+            .collect();
+        assert_eq!(parsed, legacy);
+        assert_eq!(parsed.len(), 2);
+    }
 
     // A stopped holder (e.g. an orphaned engine left by a previous run) still
     // answers kill(pid,0) as alive; the writer-lock reclaim must recognise it as

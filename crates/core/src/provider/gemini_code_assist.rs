@@ -86,7 +86,7 @@ pub async fn open_code_assist_stream(
     ))
     .to_node_utf8();
 
-    let client = reqwest::Client::new();
+    let client = crate::provider::shared_http_client();
     let signal_stream = signal.clone();
 
     let response = with_retry(retry, signal.clone(), move |_attempt: u32| {
