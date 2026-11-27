@@ -867,3 +867,6 @@ mod r20261123_pin_during_session_restore;
 
 #[path = "regressions/r20261126_antigravity_and_cross_mode_cache_guards.rs"]
 mod r20261126_antigravity_and_cross_mode_cache_guards;
+
+#[path = "regressions/r20261126_orchestration_prompt_and_executor_role.rs"]
+mod r20261126_orchestration_prompt_and_executor_role;

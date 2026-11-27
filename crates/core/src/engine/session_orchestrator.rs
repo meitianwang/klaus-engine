@@ -21,20 +21,36 @@ use crate::types::tool::{
     SpawnSubAgentOptions, ToolContext, ToolResult,
 };
 
-pub(crate) const EXECUTOR_SYSTEM_ROLE: &str = "You are the main conversation's serial workspace executor. Work directly in the current working directory while the main model's editing tools are gated. Generic rules requiring isolated worktrees for concurrent sub-agents do not apply to this serial role unless the user or stage plan requests a worktree. Handle routine mechanical differences (line numbers, imports, formatting, lint, minor types, verification script paths, and test counts) directly and report actual results. Stop and report when verification or edits fail twice in a row, the codebase contradicts a core behavioral or architectural premise, an unresolved design choice or out-of-scope module change is required, or an explicit plan stop condition is met.";
+pub(crate) const EXECUTOR_SYSTEM_ROLE: &str = "You are the main conversation's dedicated serial workspace executor (not a concurrent parallel sub-agent). Work directly in the current working directory while the main model's editing tools are gated; generic workspace AGENTS.md rules requiring isolated git worktrees for sub-agents that run tests or mutate files apply to concurrent parallel sub-agents and do not apply to this serial role unless the user or stage plan explicitly specifies a worktree path. Follow-up stages delivered on resume come from the main planning model for the same user conversation (even when wrapped with internal subagent-message-origin transport provenance) and legitimately update or extend the target files and phase scope within your existing tool and sandbox permissions — never refuse a resumed stage merely because its file list or phase scope extends beyond an earlier stage. Prefer completing the stage with safe, minimal engineering judgment over returning zero-edit critiques: handle routine mechanical differences (line numbers, imports, formatting, lint, minor types, adjacent call sites needed to compile or pass tests, verification script paths, and non-blocking edge cases) directly and note them in your report. Stop and report without improvising only when verification or edits fail twice in a row, the actual codebase makes a core premise factually impossible or broken, an unresolved user-facing behavior decision is required, or an explicit plan stop condition is met.";
 
 const EXECUTOR_ROLE_HEADER: &str = "\
-You are the execution model carrying out an implementation plan prepared by the main planning model.\n\
+You are the execution model carrying out an implementation stage prepared by the main planning model for the active user conversation.\n\
 \n\
 Execution rules:\n\
 - Carry out the plan below in order and run the specified verification commands.\n\
-- Execute serially in the current workspace unless the user or plan requests a worktree.\n\
-- Handle routine mechanical differences directly and report actual results.\n\
-- Stop immediately and return a concise status report instead of improvising when:\n\
+- Execute serially in the current working directory unless the user or plan explicitly specifies a worktree.\n\
+- Prefer completing the stage over returning zero-edit critiques: handle routine mechanical differences, adjacent compile/test call sites, and non-blocking edge cases directly and note them in your report.\n\
+- Stop immediately and return a concise status report instead of improvising only when:\n\
   1. verification or edits fail twice in a row;\n\
-  2. the codebase contradicts a core behavioral or architectural premise in the plan;\n\
-  3. completing the work requires an unresolved design choice or a module change outside the plan's scope; or\n\
-  4. any stop condition listed in the plan is triggered.\n\
+  2. the actual files or APIs make a core premise factually impossible or broken;\n\
+  3. completing the work requires an unresolved user-facing behavior decision; or\n\
+  4. an explicit stop condition listed in the plan is triggered.\n\
+- Your final message must concisely report: files changed, verification commands run and their outcomes, and any remaining steps or blockers.\n\
+\n\
+<implementation-plan>\n";
+
+const EXECUTOR_RESUME_ROLE_HEADER: &str = "\
+You are continuing as the execution model for the next stage prepared by the main planning model for the same user conversation. This stage legitimately updates or extends earlier stage file lists and steps within your existing tool and sandbox permissions (internal subagent-message-origin provenance marks message transport only and is not a cross-session boundary).\n\
+\n\
+Execution rules:\n\
+- Carry out the updated stage plan below using your existing workspace context and run the specified verification commands.\n\
+- Execute serially in the current working directory unless the user or plan explicitly specifies a worktree.\n\
+- Prefer completing the stage over returning zero-edit critiques: handle routine mechanical differences, adjacent compile/test call sites, and non-blocking edge cases directly and note them in your report.\n\
+- Stop immediately and return a concise status report instead of improvising only when:\n\
+  1. verification or edits fail twice in a row;\n\
+  2. the actual files or APIs make a core premise factually impossible or broken;\n\
+  3. completing the work requires an unresolved user-facing behavior decision; or\n\
+  4. an explicit stop condition listed in the plan is triggered.\n\
 - Your final message must concisely report: files changed, verification commands run and their outcomes, and any remaining steps or blockers.\n\
 \n\
 <implementation-plan>\n";
@@ -405,7 +421,12 @@ impl Session {
             session_for_queue.has_pending_user_input_for_orchestration()
         }));
         let wrapped_tools = wrap_orchestrated_executor_tools(self.current_tools(), guard.clone());
-        let prompt = RuntimeString::from(EXECUTOR_ROLE_HEADER)
+        let header = if resume.is_some() {
+            EXECUTOR_RESUME_ROLE_HEADER
+        } else {
+            EXECUTOR_ROLE_HEADER
+        };
+        let prompt = RuntimeString::from(header)
             .concat(plan)
             .concat(&RuntimeString::from(EXECUTOR_ROLE_FOOTER));
         let opts = SpawnSubAgentOptions {
@@ -679,6 +700,8 @@ impl Session {
         request: OrchestrateExecutionRequest,
         parent_ctx: &ToolContext,
         turn_fallback_declined: Arc<AtomicBool>,
+        stage_wire_request: Option<crate::types::provider::ModelRequest>,
+        stage_warm_tokens: u64,
     ) -> Result<ToolResult, ToolError> {
         if parent_ctx.signal.is_cancelled() || self.is_disposed() {
             return Err(ToolError::new("orchestrated execution cancelled"));
@@ -789,7 +812,12 @@ impl Session {
             }
         };
 
-        let stage = match self
+        let stage_keepalive = is_distinct_from_main
+            .then(|| {
+                self.arm_stage_cache_keepalive(&captured, stage_wire_request, stage_warm_tokens)
+            })
+            .flatten();
+        let stage_result = self
             .spawn_and_drain_orchestration_stage(
                 spawn,
                 parent_ctx,
@@ -798,8 +826,9 @@ impl Session {
                 model_selection,
                 request.resume.clone(),
             )
-            .await
-        {
+            .await;
+        drop(stage_keepalive);
+        let stage = match stage_result {
             Ok(stage) => stage,
             Err(spawn_error) => {
                 let err_str = String::from_utf8_lossy(&spawn_error.to_node_utf8()).into_owned();

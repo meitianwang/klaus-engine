@@ -273,6 +273,87 @@ impl Session {
             task.abort();
         }
     }
+
+    /// Keep an eligible main-model prompt cache warm while an active turn is
+    /// blocked awaiting a long-running orchestrated stage on a distinct worker
+    /// model. Dropping the returned guard immediately cancels any in-flight or
+    /// scheduled ping before the main model's next step starts.
+    pub(crate) fn arm_stage_cache_keepalive(
+        self: &Arc<Self>,
+        bundle: &Arc<InferenceBundle>,
+        last_wire_request: Option<ModelRequest>,
+        warm_tokens: u64,
+    ) -> Option<PromptCacheKeepAlive> {
+        if !self.config.prewarm || self.lifecycle.is_disposed() {
+            return None;
+        }
+        if self.meta.role == Some(SessionRole::SideTask) {
+            return None;
+        }
+        let source_request = last_wire_request?;
+        if !is_keepalive_eligible_bundle(bundle, &source_request, warm_tokens) {
+            return None;
+        }
+        let revision = bundle.revision;
+        if self.model_revision() != revision {
+            return None;
+        }
+        let interval = keepalive_interval_for_request(&source_request);
+        let first_deadline = tokio::time::Instant::now() + interval;
+        let ping_template = prepare_keepalive_request(&source_request);
+        let provider = bundle.provider.clone();
+        let weak_session: Weak<Session> = Arc::downgrade(self);
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+
+        let task = tokio::spawn(async move {
+            let mut next_deadline = first_deadline;
+            for round in 0..MAX_CONSECUTIVE_KEEPALIVES {
+                tokio::select! {
+                    biased;
+                    _ = worker_cancel.cancelled() => return,
+                    _ = tokio::time::sleep_until(next_deadline) => {}
+                }
+                let Some(session) = weak_session.upgrade() else {
+                    return;
+                };
+                if session.lifecycle.is_disposed() || session.model_revision() != revision {
+                    return;
+                }
+                drop(session);
+
+                let Some(refreshed_warm_tokens) =
+                    run_single_keepalive_ping(&provider, ping_template.clone(), &worker_cancel)
+                        .await
+                else {
+                    debug!(
+                        round = round + 1,
+                        "stage prompt cache keep-alive: stopped after failed or cancelled ping"
+                    );
+                    return;
+                };
+
+                let Some(session) = weak_session.upgrade() else {
+                    return;
+                };
+                if session.lifecycle.is_disposed() || session.model_revision() != revision {
+                    return;
+                }
+                session.turn.mark_response_at_ms((session.deps.now)());
+                debug!(
+                    round = round + 1,
+                    refreshed_warm_tokens,
+                    "stage prompt cache keep-alive: refreshed main model sliding cache ttl"
+                );
+                if refreshed_warm_tokens < MIN_KEEPALIVE_CACHED_TOKENS {
+                    return;
+                }
+                next_deadline = tokio::time::Instant::now() + interval;
+            }
+        });
+
+        Some(PromptCacheKeepAlive { task, cancel })
+    }
 }
 
 #[cfg(test)]

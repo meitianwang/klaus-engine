@@ -42,6 +42,14 @@ pub(crate) const EXPLICIT_MODE: &str = "Any earlier instruction enabling proacti
     delegation no longer applies. Do not spawn sub-agents unless the user or applicable \
     AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
 
+pub(crate) const ORCHESTRATION_EDIT_GATE_REMINDER: &str =
+    "Workspace edit orchestration is active: \
+    write, edit, multi_edit, apply_patch, and notebook_edit are gated on the main model (including \
+    after context compaction) — never call them directly; dispatch workspace file changes, \
+    engineering verification, and multi-step Git staging/commit/push delivery through \
+    orchestrate_execution (pass resume with agentId for follow-up stages), and answer pure Q&A or \
+    read-only analysis directly without orchestrate_execution.";
+
 /// Delegation role/mode parts resolved through the model prompt catalog.
 ///
 /// The resolved fragments bind to this inference: engine defaults at the
@@ -50,14 +58,28 @@ pub(crate) const EXPLICIT_MODE: &str = "Any earlier instruction enabling proacti
 /// explicitly empty text) omits its part, preserving the pre-catalog
 /// suppression semantics.
 pub(crate) fn instructions_with_fragments(
-    _tools: &[ToolSpec],
+    tools: &[ToolSpec],
     agent_id: Option<&RuntimeString>,
     ultra_mode: bool,
     fragments: &crate::prompt_catalog::ModelFragments,
     configured_hint: Option<&RuntimeString>,
 ) -> Vec<SystemPromptPart> {
     let role_text = fragments.agent_role(agent_id.is_some()).cloned();
-    let mode_text = fragments.agent_mode(ultra_mode, configured_hint);
+    let mut mode_text = fragments.agent_mode(ultra_mode, configured_hint);
+    let orchestration_active = agent_id.is_none()
+        && configured_hint.is_none()
+        && tools.iter().any(|tool| {
+            tool.name == crate::tools::builtins::orchestrate::ORCHESTRATE_EXECUTION_TOOL_NAME
+        });
+    if orchestration_active {
+        let reminder = RuntimeString::from(ORCHESTRATION_EDIT_GATE_REMINDER);
+        mode_text = Some(match mode_text.filter(|text| !text.is_empty()) {
+            Some(existing) => existing
+                .concat(&RuntimeString::from("\n\n"))
+                .concat(&reminder),
+            None => reminder,
+        });
+    }
     let mut parts = Vec::new();
     for (name, text) in [(ROLE_PART, role_text), (MODE_PART, mode_text)] {
         if let Some(text) = text.filter(|text| !text.is_empty()) {

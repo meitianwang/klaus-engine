@@ -1038,15 +1038,21 @@ impl Session {
             let slot = inference_slot.clone();
             let initial = initial_bundle.clone();
             let turn_declined = turn_fallback_declined.clone();
-            move || {
+            let wire_request = last_wire_request.clone();
+            let warm_tokens = last_step_warm_tokens.clone();
+            Arc::new(move || {
                 let session = session.clone();
                 let slot = slot.clone();
                 let initial = initial.clone();
                 let turn_declined = turn_declined.clone();
+                let wire_request = wire_request.clone();
+                let warm_tokens = warm_tokens.clone();
                 crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(Arc::new(
                     move |request, ctx| {
                         let session = session.clone();
                         let turn_declined = turn_declined.clone();
+                        let stage_wire_request = wire_request.lock_recover().clone();
+                        let stage_warm_tokens = warm_tokens.load(Ordering::SeqCst);
                         let mut captured = (*Session::bundle_from_slot(&slot, &initial)).clone();
                         captured.orchestrator_target = initial.orchestrator_target.clone();
                         captured.orchestration_mode = initial.orchestration_mode;
@@ -1055,12 +1061,19 @@ impl Session {
                         let captured = Arc::new(captured);
                         Box::pin(async move {
                             session
-                                .run_orchestrated_execution(captured, request, ctx, turn_declined)
+                                .run_orchestrated_execution(
+                                    captured,
+                                    request,
+                                    ctx,
+                                    turn_declined,
+                                    stage_wire_request,
+                                    stage_warm_tokens,
+                                )
                                 .await
                         })
                     },
                 ))
-            }
+            })
         };
         let mut available_tools = web_selection.tools;
         available_tools.retain(|tool| advisor_enabled || tool.name() != "advisor");
@@ -1121,10 +1134,10 @@ impl Session {
             let slot = inference_slot.clone();
             let initial = initial_bundle.clone();
             let model_override = opts.model.clone();
-            let turn_declined = turn_fallback_declined.clone();
+            let build_orchestrate = build_orchestrate_tool.clone();
             Some(Box::new(move || {
                 let this = this.clone();
-                let turn_declined = turn_declined.clone();
+                let build_orchestrate = build_orchestrate.clone();
                 let bundle = Session::bundle_from_slot(&slot, &initial);
                 let turn_model = model_override
                     .clone()
@@ -1170,28 +1183,7 @@ impl Session {
                         crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
                             &mut tools,
                         );
-                        let exec_session = this.clone();
-                        let exec_initial = bundle.clone();
-                        let exec_declined = turn_declined.clone();
-                        tools.push(
-                            crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
-                                Arc::new(move |request, ctx| {
-                                    let exec_session = exec_session.clone();
-                                    let exec_initial = exec_initial.clone();
-                                    let exec_declined = exec_declined.clone();
-                                    Box::pin(async move {
-                                        exec_session
-                                            .run_orchestrated_execution(
-                                                exec_initial,
-                                                request,
-                                                ctx,
-                                                exec_declined,
-                                            )
-                                            .await
-                                    })
-                                }),
-                            ),
-                        );
+                        tools.push(build_orchestrate());
                     }
                     if let Some(definition) = &this.root_agent_definition {
                         definition.retain_tools(&mut tools);
@@ -2282,28 +2274,7 @@ impl Session {
                     crate::tools::builtins::orchestrate::wrap_orchestration_planner_tools(
                         &mut params.tools,
                     );
-                    let exec_session = this2.clone();
-                    let exec_initial = initial_bundle.clone();
-                    let exec_declined = turn_fallback_declined.clone();
-                    params.tools.push(
-                        crate::tools::builtins::orchestrate::create_orchestrate_execution_tool(
-                            Arc::new(move |request, ctx| {
-                                let exec_session = exec_session.clone();
-                                let exec_initial = exec_initial.clone();
-                                let exec_declined = exec_declined.clone();
-                                Box::pin(async move {
-                                    exec_session
-                                        .run_orchestrated_execution(
-                                            exec_initial,
-                                            request,
-                                            ctx,
-                                            exec_declined,
-                                        )
-                                        .await
-                                })
-                            }),
-                        ),
-                    );
+                    params.tools.push(build_orchestrate_tool());
                 }
                 if let Some(definition) = &this2.root_agent_definition {
                     definition.retain_tools(&mut params.tools);

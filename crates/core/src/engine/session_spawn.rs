@@ -1742,12 +1742,17 @@ impl Session {
             }
 
             // Role prompt + optional critical reminder + memory + teammate addendum.
-            let role_instructions = def
-                .as_ref()
-                .and_then(|d| d.prompt.clone().or_else(|| d.system_prompt.clone()))
-                .or_else(|| opts.orchestration_guard.is_some().then(|| {
-                    RuntimeString::from(super::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE)
-                }));
+            // Orchestrated workspace executors must receive EXECUTOR_SYSTEM_ROLE rather
+            // than the generic built-in `general-purpose` sub-agent prompt, whose module-
+            // boundary and concurrent sub-agent rules conflict with serial stage execution.
+            let role_instructions = if opts.orchestration_guard.is_some() {
+                Some(RuntimeString::from(
+                    super::session_orchestrator_part::EXECUTOR_SYSTEM_ROLE,
+                ))
+            } else {
+                def.as_ref()
+                    .and_then(|d| d.prompt.clone().or_else(|| d.system_prompt.clone()))
+            };
             let critical_reminder = def.as_ref().and_then(|d| d.critical_system_reminder.clone());
             let memory_text = memory_bundle.as_ref().map(|m| m.text.clone());
             let child_cwd = run_opts.cwd_override.clone().unwrap_or_else(|| this.cwd_now());
@@ -2877,6 +2882,11 @@ impl Session {
                 let role_name = role_name.clone();
                 Box::pin(async move {
                     let mut parts = (base_provider)().await;
+                    parts.retain(|part| {
+                        part.name != "advisor"
+                            && part.name
+                                != crate::context::system_prompt::ORCHESTRATION_GUIDANCE_PART
+                    });
                     if env_rebuild {
                         for p in parts.iter_mut() {
                             if p.name == "env" {

@@ -100,7 +100,7 @@ pub fn create_orchestrate_execution_tool(execute: OrchestrateExecuteFn) -> Arc<d
                 "resume": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Optional agentId returned by an earlier stage in this conversation. Reuse it to continue discovery, implementation, or verification with the same worker context."
+                    "description": "Optional agentId returned by an earlier stage in this conversation. Reuse it to continue implementation, verification, or Git delivery with the same worker context."
                 }
             },
             "required": ["description", "plan"],
@@ -120,7 +120,7 @@ impl Tool for OrchestrateExecutionTool {
     }
 
     fn static_description(&self) -> &str {
-        "Dispatch a concise discovery, implementation, or verification stage to the configured worker in this workspace. Returns a structured stage report; pass resume with its agentId for short follow-up stages using the same context."
+        "Dispatch a concise implementation, verification, or Git staging/commit/push delivery stage to the configured worker in this workspace. Do not call for standalone Q&A or read-only research; pass resume with its agentId for short follow-up stages using the same context."
     }
 
     fn static_input_schema(&self) -> &JsonSchema {
