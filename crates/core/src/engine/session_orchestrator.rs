@@ -197,6 +197,92 @@ struct ExecutedStage {
     steps_used: usize,
 }
 
+fn push_compact_stage_item(items: &mut Vec<RuntimeJson>, item: &ThreadItem) {
+    let mut compact = item.clone();
+    match &mut compact {
+        ThreadItem::AgentMessage { text, .. }
+        | ThreadItem::Reasoning { text, .. }
+        | ThreadItem::CommandExecution {
+            aggregated_output: text,
+            ..
+        }
+        | ThreadItem::ToolCall {
+            result: Some(RuntimeJson::String(text)),
+            ..
+        } => {
+            if text.len_utf16() > 24_000 {
+                *text = text.slice_utf16(..24_000);
+            }
+        }
+        _ => {}
+    }
+    if let Ok(encoded) = crate::runtime_values::runtime_codec::encode_value(&compact) {
+        items.push(encoded);
+    }
+}
+
+async fn emit_stage_progress_event(
+    ctx: &ToolContext,
+    agent_id: &RuntimeJson,
+    items: &mut Vec<RuntimeJson>,
+    event: EngineEvent,
+) {
+    if let EngineEvent::ItemCompleted { item, .. } = &event {
+        push_compact_stage_item(items, item);
+    }
+    (ctx.emit)(ToolDomainEvent::OrchestratorStageProgress {
+        agent_id: agent_id.clone(),
+        event: Box::new(event),
+    })
+    .await;
+}
+
+fn stamp_stage_commentary_phase(event: &mut EngineEvent) {
+    match event {
+        EngineEvent::TextDelta { phase, .. } => {
+            *phase = Some("commentary".into());
+        }
+        EngineEvent::ItemStarted {
+            item: ThreadItem::AgentMessage { phase, .. },
+            ..
+        }
+        | EngineEvent::ItemUpdated {
+            item: ThreadItem::AgentMessage { phase, .. },
+            ..
+        }
+        | EngineEvent::ItemCompleted {
+            item: ThreadItem::AgentMessage { phase, .. },
+            ..
+        } => {
+            *phase = Some("commentary".into());
+        }
+        _ => {}
+    }
+}
+
+fn stage_message_id_and_phase(
+    event: &EngineEvent,
+) -> Option<(Option<&RuntimeString>, Option<&RuntimeString>)> {
+    match event {
+        EngineEvent::TextDelta {
+            message_id, phase, ..
+        } => Some((message_id.as_ref(), phase.as_ref())),
+        EngineEvent::ItemStarted {
+            item: ThreadItem::AgentMessage { id, phase, .. },
+            ..
+        }
+        | EngineEvent::ItemUpdated {
+            item: ThreadItem::AgentMessage { id, phase, .. },
+            ..
+        }
+        | EngineEvent::ItemCompleted {
+            item: ThreadItem::AgentMessage { id, phase, .. },
+            ..
+        } => Some((Some(id), phase.as_ref())),
+        _ => None,
+    }
+}
+
 async fn drain_orchestration_stage(
     ctx: &ToolContext,
     run: ForegroundSubAgentRun,
@@ -211,6 +297,8 @@ async fn drain_orchestration_stage(
         mut events,
     } = run;
     let mut items = Vec::new();
+    let mut pending_unphased_messages: Vec<EngineEvent> = Vec::new();
+    let mut suppressed_final_ids: HashSet<RuntimeString> = HashSet::new();
     loop {
         let mut e = tokio::select! {
             biased;
@@ -225,8 +313,8 @@ async fn drain_orchestration_stage(
             },
         };
 
-        // Capture the clean final answer / failure off the same event before it is
-        // forwarded (the forward moves it onward).
+        // Capture the clean final answer / failure off the same event before any UI
+        // suppression so `<execution-report>` always receives the stage's closing report.
         match &e {
             EngineEvent::ItemCompleted {
                 item: ThreadItem::AgentMessage { text, .. },
@@ -250,59 +338,88 @@ async fn drain_orchestration_stage(
             }
             _ => {}
         }
-        let forward = match &mut e {
-            EngineEvent::TextDelta { phase, .. } => {
-                *phase = Some("commentary".into());
-                true
+
+        if let Some((msg_id, phase)) = stage_message_id_and_phase(&e) {
+            let id_owned = msg_id.cloned();
+            let is_final = phase.is_some_and(|p| p == "final_answer")
+                || id_owned
+                    .as_ref()
+                    .is_some_and(|id| suppressed_final_ids.contains(id));
+            if is_final {
+                if let Some(id) = id_owned {
+                    pending_unphased_messages.retain(|pending| {
+                        stage_message_id_and_phase(pending)
+                            .and_then(|(pid, _)| pid)
+                            .is_none_or(|pid| pid != &id)
+                    });
+                    suppressed_final_ids.insert(id);
+                }
+                continue;
             }
+            if phase.is_some() {
+                for mut pending in pending_unphased_messages.drain(..) {
+                    stamp_stage_commentary_phase(&mut pending);
+                    emit_stage_progress_event(ctx, &agent_id, &mut items, pending).await;
+                }
+                stamp_stage_commentary_phase(&mut e);
+                emit_stage_progress_event(ctx, &agent_id, &mut items, e).await;
+                continue;
+            }
+            pending_unphased_messages.push(e);
+            continue;
+        }
+
+        let is_tool_activity = matches!(
+            &e,
+            EngineEvent::ToolEvent { .. }
+                | EngineEvent::ItemStarted {
+                    item: ThreadItem::ToolCall { .. }
+                        | ThreadItem::CommandExecution { .. }
+                        | ThreadItem::FileChange { .. },
+                    ..
+                }
+                | EngineEvent::ItemUpdated {
+                    item: ThreadItem::ToolCall { .. }
+                        | ThreadItem::CommandExecution { .. }
+                        | ThreadItem::FileChange { .. },
+                    ..
+                }
+                | EngineEvent::ItemCompleted {
+                    item: ThreadItem::ToolCall { .. }
+                        | ThreadItem::CommandExecution { .. }
+                        | ThreadItem::FileChange { .. },
+                    ..
+                }
+        );
+        if is_tool_activity {
+            for mut pending in pending_unphased_messages.drain(..) {
+                stamp_stage_commentary_phase(&mut pending);
+                emit_stage_progress_event(ctx, &agent_id, &mut items, pending).await;
+            }
+            emit_stage_progress_event(ctx, &agent_id, &mut items, e).await;
+            continue;
+        }
+
+        let forward_auxiliary = matches!(
+            &e,
             EngineEvent::ThinkingDelta { .. }
-            | EngineEvent::ToolEvent { .. }
-            | EngineEvent::CompactionProgress { .. }
-            | EngineEvent::Compaction { .. } => true,
-            EngineEvent::ItemStarted { item, .. }
-            | EngineEvent::ItemUpdated { item, .. }
-            | EngineEvent::ItemCompleted { item, .. } => match item {
-                ThreadItem::AgentMessage { phase, .. } => {
-                    *phase = Some("commentary".into());
-                    true
+                | EngineEvent::CompactionProgress { .. }
+                | EngineEvent::Compaction { .. }
+                | EngineEvent::ItemStarted {
+                    item: ThreadItem::Reasoning { .. },
+                    ..
                 }
-                ThreadItem::Reasoning { .. }
-                | ThreadItem::ToolCall { .. }
-                | ThreadItem::CommandExecution { .. }
-                | ThreadItem::FileChange { .. } => true,
-                _ => false,
-            },
-            _ => false,
-        };
-        if forward {
-            if let EngineEvent::ItemCompleted { item, .. } = &e {
-                let mut compact = item.clone();
-                match &mut compact {
-                    ThreadItem::AgentMessage { text, .. }
-                    | ThreadItem::Reasoning { text, .. }
-                    | ThreadItem::CommandExecution {
-                        aggregated_output: text,
-                        ..
-                    }
-                    | ThreadItem::ToolCall {
-                        result: Some(RuntimeJson::String(text)),
-                        ..
-                    } => {
-                        if text.len_utf16() > 24_000 {
-                            *text = text.slice_utf16(..24_000);
-                        }
-                    }
-                    _ => {}
+                | EngineEvent::ItemUpdated {
+                    item: ThreadItem::Reasoning { .. },
+                    ..
                 }
-                if let Ok(item) = crate::runtime_values::runtime_codec::encode_value(&compact) {
-                    items.push(item);
+                | EngineEvent::ItemCompleted {
+                    item: ThreadItem::Reasoning { .. },
+                    ..
                 }
-            }
-            (ctx.emit)(ToolDomainEvent::OrchestratorStageProgress {
-                agent_id: agent_id.clone(),
-                event: Box::new(e),
-            })
-            .await;
+        );
+        if forward_auxiliary {
+            emit_stage_progress_event(ctx, &agent_id, &mut items, e).await;
         }
     }
     if !terminal_seen && failure.is_none() {

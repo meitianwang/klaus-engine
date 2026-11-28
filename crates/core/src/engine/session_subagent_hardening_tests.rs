@@ -3577,6 +3577,11 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
     let mut turns = Vec::new();
     for index in 0..31 {
         let mut events = vec![ev::message_start(None)];
+        if index == 0 {
+            events.push(crate::types::provider::ModelStreamEvent::TextDelta {
+                text: "starting stage probe".into(),
+            });
+        }
         events.extend(exact_tool_use_events(
             &format!("stage-probe-{index}"),
             "message_gate",
@@ -3678,11 +3683,25 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
     assert_eq!(first.get("stepsUsed"), Some(&RuntimeJson::from(30_i64)));
     let id = first.get("agentId").and_then(RuntimeJson::as_str).unwrap();
     let resume_index = requests.lock().unwrap().len();
-    let resumed = session
+    let resumed_result = session
         .run_orchestration_stage_for_test(&ctx, Some(id.clone()))
         .await
         .unwrap();
-    let resumed = resumed.serializable.output;
+    let resumed_text: String = resumed_result
+        .serializable
+        .model_content
+        .iter()
+        .filter_map(|block| match block {
+            crate::schemas::content::OutputBlock::Text(t) => t.text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        resumed_text.contains("<execution-report>\nstage done\n</execution-report>"),
+        "closing execution report must remain in ToolResult for the planning model: {resumed_text}"
+    );
+    let resumed = resumed_result.serializable.output;
     assert!(session.background_agent_summaries().is_empty());
     assert_eq!(resumed.get("agentId"), first.get("agentId"));
     assert_eq!(
@@ -3691,13 +3710,43 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
         "{resumed:?}"
     );
     assert_eq!(resumed.get("stepsUsed"), Some(&RuntimeJson::from(1_i64)));
+    assert!(
+        first
+            .get("items")
+            .and_then(RuntimeJson::as_array)
+            .unwrap()
+            .iter()
+            .any(
+                |item| item.get("type") == Some(&RuntimeJson::from("agent_message"))
+                    && item.get("text") == Some(&RuntimeJson::from("starting stage probe"))
+            ),
+        "in-stage commentary before tool calls must be retained in stage items"
+    );
+    for stage_payload in [&first, &resumed] {
+        assert!(
+            stage_payload
+                .get("items")
+                .and_then(RuntimeJson::as_array)
+                .unwrap()
+                .iter()
+                .all(|item| item.get("text") != Some(&RuntimeJson::from("stage done"))),
+            "closing execution report must be omitted from stage transcript items: {stage_payload:?}"
+        );
+    }
     assert_eq!(probe.permissions.lock().unwrap().len(), 31);
     use crate::types::events::ToolDomainEvent;
     {
         let events = captured.lock().unwrap();
         assert!(events.iter().any(|event| matches!(event,
         ToolDomainEvent::OrchestratorStageProgress { event, .. }
-            if matches!(event.as_ref(), EngineEvent::TextDelta { phase: Some(phase), .. } if phase == &RuntimeString::from("commentary"))
+            if matches!(event.as_ref(), EngineEvent::TextDelta { text, phase: Some(phase), .. }
+                if phase == &RuntimeString::from("commentary") && text == &RuntimeString::from("starting stage probe"))
+    )));
+        assert!(events.iter().all(|event| !matches!(event,
+        ToolDomainEvent::OrchestratorStageProgress { event, .. }
+            if matches!(event.as_ref(), EngineEvent::TextDelta { text, .. } if text == &RuntimeString::from("stage done"))
+                || matches!(event.as_ref(), EngineEvent::ItemCompleted { item: ThreadItem::AgentMessage { text, .. }, .. }
+                    if text == &RuntimeString::from("stage done"))
     )));
         assert!(events.iter().all(|event| matches!(event,
         ToolDomainEvent::OrchestratorStageProgress { event, .. }
@@ -3763,4 +3812,156 @@ async fn session_orchestrator_resume_resets_checkpoint_and_preserves_request_pre
         .is_empty());
     drop(ctx);
     cold.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_orchestrator_suppresses_phased_final_answer_report_while_streaming_commentary() {
+    use crate::types::events::ToolDomainEvent;
+    use crate::types::provider::ModelStreamEvent;
+
+    let probe = gate();
+    probe.release.add_permits(1);
+    let mut step_with_tool = vec![
+        ev::message_start(None),
+        ModelStreamEvent::TextMessage {
+            id: "msg-commentary".into(),
+            phase: Some("commentary".into()),
+        },
+        ModelStreamEvent::TextDelta {
+            text: "Inspecting target files first.".into(),
+        },
+    ];
+    step_with_tool.extend(exact_tool_use_events(
+        "stage-tool-1",
+        "message_gate",
+        &exact_json!({}),
+    ));
+    step_with_tool.push(ev::stop(
+        Some(ModelStopReason::ToolUse),
+        Some(make_usage(None, None)),
+    ));
+
+    let closing_report = vec![
+        ev::message_start(None),
+        ModelStreamEvent::TextMessage {
+            id: "msg-final".into(),
+            phase: Some("final_answer".into()),
+        },
+        ModelStreamEvent::TextDelta {
+            text: "Stage complete: updated three files and ran tests.".into(),
+        },
+        ev::stop(Some(ModelStopReason::EndTurn), Some(make_usage(None, None))),
+    ];
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut config = default_config();
+    config.agent_memory = false;
+    config.memory_recall = false;
+    config.fork = false;
+    let session = mk_session_with_provider_memory_store_and_agents(
+        Arc::new(fake_provider()),
+        unique_subagent_test_deps(recording_deps(
+            requests,
+            vec![step_with_tool, closing_report],
+        )),
+        config,
+        vec![probe],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut ctx = crate::tools::builtins::test_ctx::make_ctx("/tmp");
+    ctx.permission = session.permission_context();
+    ctx.background_tasks = Some(session.background_task_registry());
+    ctx.spawn_sub_agent = Some(session.make_spawn_sub_agent(
+        0,
+        CancellationToken::new(),
+        ctx.permission.clone(),
+        Arc::new(Vec::new),
+        false,
+        None,
+        None,
+    ));
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    ctx.emit = Arc::new(move |event| {
+        sink.lock().unwrap().push(event);
+        Box::pin(async {})
+    });
+
+    let result = session
+        .run_orchestration_stage_for_test(&ctx, None)
+        .await
+        .unwrap();
+    let result_text: String = result
+        .serializable
+        .model_content
+        .iter()
+        .filter_map(|block| match block {
+            crate::schemas::content::OutputBlock::Text(t) => t.text.try_to_utf8().ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        result_text.contains(
+            "<execution-report>\nStage complete: updated three files and ran tests.\n</execution-report>"
+        ),
+        "closing phased report must still reach the planning model: {result_text}"
+    );
+
+    let items = result
+        .serializable
+        .output
+        .get("items")
+        .and_then(RuntimeJson::as_array)
+        .unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item.get("type") == Some(&RuntimeJson::from("agent_message"))
+                && item.get("text") == Some(&RuntimeJson::from("Inspecting target files first."))
+        }),
+        "phased commentary must remain in stage items: {items:?}"
+    );
+    assert!(
+        items.iter().all(|item| {
+            item.get("text")
+                != Some(&RuntimeJson::from(
+                    "Stage complete: updated three files and ran tests.",
+                ))
+        }),
+        "phased final_answer report must be suppressed from stage items: {items:?}"
+    );
+
+    {
+        let events = captured.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ToolDomainEvent::OrchestratorStageProgress { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    EngineEvent::TextDelta { text, phase: Some(phase), .. }
+                        if phase == &RuntimeString::from("commentary")
+                            && text == &RuntimeString::from("Inspecting target files first.")
+                )
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ToolDomainEvent::OrchestratorStageProgress { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    EngineEvent::TextDelta { text, .. }
+                        if text == &RuntimeString::from("Stage complete: updated three files and ran tests.")
+                ) || matches!(
+                    event.as_ref(),
+                    EngineEvent::ItemCompleted { item: ThreadItem::AgentMessage { text, .. }, .. }
+                        if text == &RuntimeString::from("Stage complete: updated three files and ran tests.")
+                )
+        )));
+    }
+    drop(ctx);
+    session.shutdown_and_wait().await.unwrap();
 }
